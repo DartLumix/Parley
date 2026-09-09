@@ -9,4 +9,4 @@ pub mod pb {
 }
 
 pub use handshake::PROTOCOL_VERSION;
-pub use pb::{Hello, HelloAck};
+pub use pb::{AuthDenied, AuthOk, AuthRequest, Hello, HelloAck};

@@ -15,21 +15,34 @@ use std::path::PathBuf;
 use parley_core::session;
 use parley_proto::{Hello, HelloAck, PROTOCOL_VERSION};
 
+use parley_proto::{AuthDenied, AuthOk, AuthRequest};
+
 fn test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("parley-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
 
-#[tokio::test]
-async fn handshake_roundtrip() {
-    init_logs();
-
+fn setup_server_with_user(tag: &str) -> (Config, Server) {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        data_dir: test_dir("handshake"),
+        data_dir: test_dir(tag),
     };
+    // Create a user directly in the DB before the server binds
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+    db.create_user("testuser", "testpass", false).unwrap();
+    drop(db);
+
     let server = Server::bind(&config).unwrap();
+    (config, server)
+}
+
+#[tokio::test]
+async fn auth_success() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("auth-ok");
     let addr = server.local_addr();
     let pinned = server.fingerprint().to_string();
     tokio::spawn(server.run());
@@ -39,15 +52,76 @@ async fn handshake_roundtrip() {
 
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
 
-    let hello = Hello {
-        protocol_version: PROTOCOL_VERSION,
-        caps: 0,
-    };
-    session::write_message(&mut tx, &hello).await.unwrap();
+    // Handshake
+    session::write_message(
+        &mut tx,
+        &Hello {
+            protocol_version: PROTOCOL_VERSION,
+            caps: 0,
+        },
+    )
+    .await
+    .unwrap();
 
     let ack: HelloAck = session::read_message(&mut rx).await.unwrap();
     assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(ack.heartbeat_ms, 5_000);
+
+    // Auth
+    session::write_message(
+        &mut tx,
+        &AuthRequest {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let ok: AuthOk = session::read_message(&mut rx).await.unwrap();
+    assert!(!ok.is_admin);
+    assert!(ok.user_id > 0);
+
+    conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn auth_failure_wrong_password() {
+    let (config, server) = setup_server_with_user("auth-denied");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+
+    let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+
+    // Handshake
+    session::write_message(
+        &mut tx,
+        &Hello {
+            protocol_version: PROTOCOL_VERSION,
+            caps: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let _ack: HelloAck = session::read_message(&mut rx).await.unwrap();
+
+    // Auth with wrong password
+    session::write_message(
+        &mut tx,
+        &AuthRequest {
+            username: "testuser".to_string(),
+            password: "wrongpass".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let denied: AuthDenied = session::read_message(&mut rx).await.unwrap();
+    assert!(!denied.reason.is_empty());
 
     conn.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);

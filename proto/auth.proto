@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package parley;
+
+message AuthRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthOk {
+  uint32 user_id = 1;
+  bool is_admin = 2;
+}
+
+message AuthDenied {
+  string reason = 1;
+}

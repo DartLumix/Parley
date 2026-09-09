@@ -25,4 +25,10 @@ pub enum Error {
     Config(String),
     #[error("session: {0}")]
     Session(#[from] parley_core::Error),
+    #[error("database: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("password hash: {0}")]
+    Hash(String),
+    #[error("internal: {0}")]
+    Internal(String),
 }
