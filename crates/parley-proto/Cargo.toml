@@ -1,0 +1,4 @@
+[package]
+name = "parley-proto"
+version.workspace = true
+edition.workspace = true

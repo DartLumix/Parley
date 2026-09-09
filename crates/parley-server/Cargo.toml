@@ -1,0 +1,8 @@
+[package]
+name = "parley-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+parley-core = { path = "../parley-core" }
+parley-proto = { path = "../parley-proto" }
