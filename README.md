@@ -66,7 +66,7 @@ Every message carries version + capability bits — later features are additive,
 - [x] TOML config file with defaults
 - [x] Protobuf `Hello` / `HelloAck` over length-prefixed QUIC streams
 - [x] Accounts: SQLite, Argon2id, login flow, admin bootstrap
-- [...] Presence: online user list, heartbeats, session tokens
+- [x] Presence: online user list, heartbeats, session tokens
 
 ### Phase 2 — Text Chat (basic)
 - [ ] Channel model, raw text, SQLite persistence, history fetch
