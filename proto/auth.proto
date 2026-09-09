@@ -5,11 +5,13 @@ package parley;
 message AuthRequest {
   string username = 1;
   string password = 2;
+  string session_token = 3;
 }
 
 message AuthOk {
   uint32 user_id = 1;
   bool is_admin = 2;
+  string session_token = 3;
 }
 
 message AuthDenied {

@@ -32,7 +32,13 @@ impl Db {
                 password_hash TEXT NOT NULL,
                 is_admin INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            ",
         )?;
         Ok(Self { conn })
     }
@@ -92,6 +98,37 @@ impl Db {
                     Ok(None)
                 }
             }
+            None => Ok(None),
+        }
+    }
+
+    pub fn create_session(&self, user_id: u32) -> Result<String, Error> {
+        use rand_core::{OsRng, RngCore};
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        self.conn.execute(
+            "INSERT INTO sessions (token, user_id) VALUES (?1, ?2)",
+            rusqlite::params![token, user_id as i64],
+        )?;
+        Ok(token)
+    }
+
+    pub fn verify_session_token(&self, token: &str) -> Result<Option<UserInfo>, Error> {
+        let row: Option<(i64, i32)> = self
+            .conn
+            .query_row(
+                "SELECT u.id, u.is_admin FROM sessions s
+             JOIN users u ON u.id = s.user_id WHERE s.token = ?1",
+                rusqlite::params![token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((id, is_admin)) => Ok(Some(UserInfo {
+                id: id as u32,
+                is_admin: is_admin != 0,
+            })),
             None => Ok(None),
         }
     }
