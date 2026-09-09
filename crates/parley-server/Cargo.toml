@@ -4,5 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-parley-core = { path = "../parley-core" }
-parley-proto = { path = "../parley-proto" }
+parley-proto.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+hex.workspace = true

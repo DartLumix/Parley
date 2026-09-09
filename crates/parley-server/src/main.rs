@@ -1,15 +1,16 @@
-//! parley-server entry point. Phase 0: identify and exit cleanly.
-//! Phase 1 replaces this body with the QUIC listener.
+//! Thin launcher: logging, bind, run. All logic lives in the library.
 
-use parley_core::Error;
-use parley_proto::handshake::PROTOCOL_VERSION;
+use parley_server::{Error, Server};
 
-fn main() -> Result<(), Error> {
-    println!(
-        "parley-server {} (protocol v{})",
-        env!("CARGO_PKG_VERSION"),
-        PROTOCOL_VERSION
-    );
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-    Ok(()) // nothing fallible yet; Phase 1 propagates real errors with `?`
+    let server = Server::bind_default()?;
+    server.run().await
 }

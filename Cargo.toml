@@ -12,6 +12,17 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+parley-core = { path = "crates/parley-core" }
+parley-proto = { path = "crates/parley-proto" }
 
 
 [profile.release]

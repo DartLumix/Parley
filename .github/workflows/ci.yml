@@ -28,4 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t parley:ci .
-      - run: docker run --rm parley:ci
+      - name: server boots and listens
+        run: |
+          docker run -d --name smoke parley:ci
+          sleep 3
+          docker logs smoke 2>&1 | grep -q "listening"
+          docker rm -f smoke

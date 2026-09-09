@@ -1,6 +1,9 @@
 # ---- Stage 1: shared base with the tools we need ----
 FROM rust:1 AS chef
 RUN rustup target add x86_64-unknown-linux-musl
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef
 WORKDIR /app
 
