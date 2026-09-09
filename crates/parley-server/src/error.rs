@@ -23,4 +23,6 @@ pub enum Error {
     QuinnTls(String),
     #[error("config: {0}")]
     Config(String),
+    #[error("session: {0}")]
+    Session(#[from] parley_core::Error),
 }

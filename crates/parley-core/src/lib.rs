@@ -1,7 +1,7 @@
-//! Shared engine used by the server *and* every client
-//! QUIC session, media pipeline, jitter buffer, mixing, rate control.
-//! Stub today - contents arrive with Phase 1.
+//! Shared engine used by the server *and* every client:
+//! session I/O, media pipeline, jitter buffer, mixing, rate control.
 
 pub mod error;
+pub mod session;
 
 pub use error::Error;

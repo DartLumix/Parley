@@ -25,6 +25,9 @@ parley-core = { path = "crates/parley-core" }
 parley-proto = { path = "crates/parley-proto" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+prost = "0.13"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
 
 [profile.release]
 strip = true

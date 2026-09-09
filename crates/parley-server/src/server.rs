@@ -9,6 +9,8 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::error::Error;
 use crate::tls;
+use parley_core::session;
+use parley_proto::{Hello, HelloAck, PROTOCOL_VERSION};
 
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -78,12 +80,22 @@ async fn handle_connection(conn: quinn::Connection) {
 
 async fn serve(conn: &quinn::Connection) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
-    let request = rx.read_to_end(64).await?;
-    let text = String::from_utf8_lossy(&request).trim().to_string();
-    info!(%text, "request");
 
-    let reply = format!("parley: {text}");
-    tx.write_all(reply.as_bytes()).await?;
+    let hello: Hello = session::read_message(&mut rx).await?;
+    info!(version = hello.protocol_version, caps = hello.caps, "hello");
+
+    if hello.protocol_version != PROTOCOL_VERSION {
+        return Err(Error::Session(parley_core::Error::Protocol(
+            "unsupported protocol version",
+        )));
+    }
+
+    let ack = HelloAck {
+        protocol_version: PROTOCOL_VERSION,
+        server_caps: 0,
+        heartbeat_ms: 5_000,
+    };
+    session::write_message(&mut tx, &ack).await?;
     tx.finish()?;
     Ok(())
 }

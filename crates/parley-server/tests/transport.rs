@@ -12,22 +12,22 @@ use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use parley_server::Config;
 use std::path::PathBuf;
 
+use parley_core::session;
+use parley_proto::{Hello, HelloAck, PROTOCOL_VERSION};
+
 fn test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("parley-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_connects_server_echoes() {
-    // Watch it happen: RUST_LOG=info cargo test -p parley-server \
-    //   --test transport -- --nocapture
+#[tokio::test]
+async fn handshake_roundtrip() {
     init_logs();
 
-    // Port 0 = "OS, pick a free port" — tests never collide.
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        data_dir: test_dir("echo"),
+        data_dir: test_dir("handshake"),
     };
     let server = Server::bind(&config).unwrap();
     let addr = server.local_addr();
@@ -38,13 +38,18 @@ async fn client_connects_server_echoes() {
     let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
-    tx.write_all(b"hello parley").await.unwrap();
-    tx.finish().unwrap(); // half-close: server sees EOF
-    let reply = rx.read_to_end(1024).await.unwrap();
-    assert_eq!(reply, b"parley: hello parley");
+
+    let hello = Hello {
+        protocol_version: PROTOCOL_VERSION,
+        caps: 0,
+    };
+    session::write_message(&mut tx, &hello).await.unwrap();
+
+    let ack: HelloAck = session::read_message(&mut rx).await.unwrap();
+    assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(ack.heartbeat_ms, 5_000);
 
     conn.close(0u32.into(), b"done");
-
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 

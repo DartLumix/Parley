@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package parley;
+
+message Hello {
+  uint32 protocol_version = 1;
+  uint32 caps = 2;
+}
+
+message HelloAck {
+  uint32 protocol_version = 1;
+  uint32 server_caps = 2;
+  uint32 heartbeat_ms = 3;
+}

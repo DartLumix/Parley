@@ -1,10 +1,16 @@
 /// The crate-wide error type.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Remote side violated the protocol (bad version, malformed frame).
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
-    /// Transport-level failure (QUIC stream/datagram error).
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("stream read: {0}")]
+    ReadExact(#[from] quinn::ReadExactError),
+    #[error("stream write: {0}")]
+    Write(#[from] quinn::WriteError),
+    #[error("protobuf decode: {0}")]
+    Decode(#[from] prost::DecodeError),
+    #[error("message exceeds size limit")]
+    MessageTooLarge,
 }
