@@ -7,3 +7,6 @@ pub mod tls;
 
 pub use error::Error;
 pub use server::Server;
+
+pub mod config;
+pub use config::Config;

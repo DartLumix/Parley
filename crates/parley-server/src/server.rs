@@ -6,13 +6,9 @@ use std::sync::Arc;
 use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{info, warn};
 
+use crate::config::Config;
 use crate::error::Error;
 use crate::tls;
-
-/// Port 4443, not 443: unprivileged, so it runs without root in
-/// development — and as user `nobody` in the container. The compose
-/// file maps host 443 → container 4443.
-const DEFAULT_ADDR: &str = "0.0.0.0:4443";
 
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -21,11 +17,13 @@ pub struct Server {
 
 impl Server {
     /// Bind + TLS setup. Synchronous: it's CPU work, no I/O to await.
-    pub fn bind(addr: SocketAddr) -> Result<Self, Error> {
+    pub fn bind(config: &Config) -> Result<Self, Error> {
         tls::init_provider();
 
-        let identity = tls::generate_identity()?;
+        let (identity, _new) = tls::load_or_generate(&config.data_dir)?;
         let fingerprint = tls::fingerprint(&identity.cert);
+
+        let addr: SocketAddr = config.listen.parse()?;
 
         let mut rustls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -44,14 +42,6 @@ impl Server {
         })
     }
 
-    /// Default address, or `$PARLEY_ADDR`.
-    pub fn bind_default() -> Result<Self, Error> {
-        let addr: SocketAddr = std::env::var("PARLEY_ADDR")
-            .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
-            .parse()?;
-        Self::bind(addr)
-    }
-
     /// The address actually bound (meaningful with port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.endpoint.local_addr().expect("socket is bound")
@@ -66,7 +56,6 @@ impl Server {
     pub async fn run(self) -> Result<(), Error> {
         info!(addr = %self.local_addr(), fingerprint = %self.fingerprint, "parley listening");
         while let Some(incoming) = self.endpoint.accept().await {
-            // `incoming` = half-finished handshake; awaiting completes it.
             match incoming.await {
                 Ok(conn) => {
                     tokio::spawn(handle_connection(conn));
@@ -84,8 +73,6 @@ async fn handle_connection(conn: quinn::Connection) {
         Ok(()) => info!(%peer, "connection served"),
         Err(e) => warn!(%peer, error = %e, "connection failed"),
     }
-    // Hold the connection open until the client closes, so queued
-    // reply data is actually delivered before we shut down.
     conn.closed().await;
 }
 

@@ -1,6 +1,6 @@
 //! Thin launcher: logging, bind, run. All logic lives in the library.
 
-use parley_server::{Error, Server};
+use parley_server::{Config, Error, Server};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -11,6 +11,9 @@ async fn main() -> Result<(), Error> {
         )
         .init();
 
-    let server = Server::bind_default()?;
+    let config_path = std::env::var("PARLEY_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
+    let config = Config::load_or_default(std::path::Path::new(&config_path))?;
+
+    let server = Server::bind(&config)?;
     server.run().await
 }

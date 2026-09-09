@@ -9,6 +9,15 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
+use parley_server::Config;
+use std::path::PathBuf;
+
+fn test_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("parley-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_connects_server_echoes() {
     // Watch it happen: RUST_LOG=info cargo test -p parley-server \
@@ -16,9 +25,11 @@ async fn client_connects_server_echoes() {
     init_logs();
 
     // Port 0 = "OS, pick a free port" — tests never collide.
-    let server = tokio::spawn(async { Server::bind("127.0.0.1:0".parse().unwrap()).unwrap() })
-        .await
-        .unwrap();
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        data_dir: test_dir("echo"),
+    };
+    let server = Server::bind(&config).unwrap();
     let addr = server.local_addr();
     let pinned = server.fingerprint().to_string();
     tokio::spawn(server.run());
@@ -33,6 +44,23 @@ async fn client_connects_server_echoes() {
     assert_eq!(reply, b"parley: hello parley");
 
     conn.close(0u32.into(), b"done");
+
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn fingerprint_survives_restart() {
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        data_dir: test_dir("restart"),
+    };
+
+    let fp1 = Server::bind(&config).unwrap().fingerprint().to_string();
+    let fp2 = Server::bind(&config).unwrap().fingerprint().to_string();
+
+    assert_eq!(fp1, fp2, "fingerprint must be stable across restarts");
+
+    let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 
 fn init_logs() {

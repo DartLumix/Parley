@@ -1,4 +1,5 @@
 //! TLS identity: self-signed certificate, fingerprint, crypto provider.
+use std::path::Path;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -11,18 +12,33 @@ pub struct Identity {
     pub key: PrivateKeyDer<'static>,
 }
 
-/// Generate a fresh self-signed identity (Ed25519).
-/// 1b replaces this with load-or-generate from the data directory so the
-/// fingerprint — the thing clients pin — survives restarts.
-pub fn generate_identity() -> Result<Identity, Error> {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-    Ok(Identity {
-        cert: certified.cert.into(),
-        // KeyPair → raw PKCS#8 DER bytes → owned key object
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified.key_pair.serialize_der().to_vec(),
-        )),
-    })
+/// Load identity from `data_dir`, or generate and persist a new one.
+/// Returns (identity, was_newly_generated).
+pub fn load_or_generate(data_dir: &Path) -> Result<(Identity, bool), Error> {
+    let cert_path = data_dir.join("cert.der");
+    let key_path = data_dir.join("key.pk8");
+
+    let (cert_bytes, key_bytes, generated) = if cert_path.exists() && key_path.exists() {
+        (std::fs::read(&cert_path)?, std::fs::read(&key_path)?, false)
+    } else {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let cert_der: CertificateDer<'static> = certified.cert.into();
+        let cert_bytes = cert_der.as_ref().to_vec();
+        let key_bytes = certified.key_pair.serialize_der().to_vec();
+
+        std::fs::create_dir_all(data_dir)?;
+        std::fs::write(&cert_path, &cert_bytes)?;
+        std::fs::write(&key_path, &key_bytes)?;
+        (cert_bytes, key_bytes, true)
+    };
+
+    Ok((
+        Identity {
+            cert: CertificateDer::from(cert_bytes),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes)),
+        },
+        generated,
+    ))
 }
 
 /// SHA-256 of the certificate's DER bytes, hex-encoded.

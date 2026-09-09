@@ -21,4 +21,6 @@ pub enum Error {
     Finished(#[from] quinn::ClosedStream),
     #[error("quinn tls setup: {0}")]
     QuinnTls(String),
+    #[error("config: {0}")]
+    Config(String),
 }
