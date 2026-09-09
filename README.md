@@ -1,79 +1,160 @@
-# Parley
+# 🎙️ Parley
 
-Self-hosted voice, video and screen-share server for a team of people who
-already know each other. One binary, one container, one UDP port. TeamSpeak's
-shape, not Discord's: one install = one community. Voice is the product;
-everything else grows later.
+> Self-hosted voice, video and screen-share for teams that already know each other.
+> **One binary. One container. One UDP port.**
 
-## What it is
-- Group voice channels, screen share at source quality (1440p60+), camera video.
-- Native clients: **Linux → Android → Windows → iOS**, in that order.
-- Join by IP/domain + account. 15–20 concurrent users target, no hard limits.
-- Deploy: `docker compose up`. Config in one TOML file. Static IP assumed.
+TeamSpeak's shape, not Discord's — one install serves one community.
+Voice is the product; everything else grows later.
 
-## What it's not
-- No browser client, no macOS, no Electron/webview, ever.
-- No multi-server hosting, federation, bots/public API, threads/forums.
-- No E2EE at v1 — the server owner is trusted by design. DMs, rich text,
-  search, push: later, not never.
+---
 
-## Tech decisions
-- **Rust** — server *and* a shared core crate linked into every client.
-  Protocol and media logic exist once, compiled per platform.
-- **Flutter** for UI only (via flutter_rust_bridge); everything
-  performance-critical stays in Rust.
-- **QUIC** (quinn) as the only transport. TLS 1.3 built in, one connection:
-  reliable streams for control/chat, unreliable datagrams for media.
-  No WebRTC — no browser and no P2P means ICE/STUN/TURN are dead weight.
-- **SFU, no transcoding** — server forwards encoded packets; clients decode
-  and mix themselves, which gives per-user volume. Audio never touches the
-  server's CPU beyond a copy.
-- **Opus** audio: 64 kbps speech default, up to 256 kbps stereo for music
-  channels, auto-downgrade under congestion.
-- **H.264** video: hardware encode/decode on every target platform. Codec
-  IDs are negotiated per stream, so VP9/AV1 are additions, not rewrites.
-- **Echo cancellation / noise suppression**: WebRTC's audio processing
-  library (same one PipeWire uses). Never hand-rolled.
-- **Accounts**: per-server username + password (Argon2id), simple
-  admin/user roles. Self-signed cert, fingerprint pinned on first connect
-  (share the fingerprint with the invite — TeamSpeak model).
-- **SQLite (WAL)** for persistence. **Protobuf** for control messages.
-- Wire protocol carries version + capability bits everywhere, so later
-  features are additive, never rewrites.
+## 📈 Status
 
-## Roadmap
-| Phase | Scope | Done when |
-|---|---|---|
-| 0 | Repo, crates, CI matrix, Docker image, protocol skeleton | Builds on all targets, server runs in compose |
-| 1 | QUIC connect, cert pinning, login, presence | Two clients online, see each other, reconnect works |
-| 2 | Basic text chat + SQLite | Messages survive restart, 20 clients stable |
-| 3 | Voice MVP: Opus, SFU routing, jitter buffer, mixing | Mouth-to-ear ≤ 150 ms (80 ms LAN), 1% loss tolerated |
-| 4 | Voice hardening: AEC/NS, FEC, per-user volume, bitrate ladder | Music channel at 256 kbps, 5% loss survivable |
-| 5 | Screen share: capture, H.264, 1440p60, multi-sharer | Glass-to-glass ≤ 250 ms, stable under bandwidth cap |
-| 6 | Camera video + A/V sync | Sync skew ≤ 40 ms |
-| 7+ | Android/Windows/iOS bring-up, file transfer, roles, rich text, search, DMs, push, auto-update | Ordered by need |
+| Phase | Scope | |
+|:---|:---|:---:|
+| 0 | Workspace, crates, CI, Docker image | ✅ |
+| 1a | QUIC transport, TLS identity, first stream | ✅ |
+| 1b | Config file, persistent certificate, stable fingerprint | ✅ |
+| 1c | Protobuf control protocol, framed messages | ✅ |
+| 1d | Accounts — SQLite, Argon2id, login | 🔜 |
+| 1e | Presence, heartbeats, session tokens | ⏳ |
+| 2+ | Text chat, voice, video, screen share, platforms | ⏳ |
 
-Platform bring-up (Android, Windows, iOS) starts after Phase 4; Linux is the
-development platform throughout.
+---
 
-## Performance budgets
-Mouth-to-ear ≤ 150 ms · screen share ≤ 250 ms · server idle ≤ 64 MB RSS ·
-10 talkers ≤ 5% of one core · login→connected ≤ 400 ms · binary ≤ 15 MB.
+## ✨ What it is
+
+- 🎯 Group voice channels, screen share at source quality (1440p60+), camera video
+- 🐧 Native clients: **Linux → Android → Windows → iOS** — no Electron, no webviews, ever
+- 🔑 Join by IP/domain + account · 15–20 concurrent users target
+- 🐳 Deploy with `docker compose up` · one TOML config · one UDP port
+
+## 🚫 What it's not
+
+- No Electron bulls**t
+- No multi-server hosting, federation, or public API (internal for now)
+- No E2EE at v1 — the server owner is trusted by design
+- DMs, rich text, search, push — later, not never
+
+---
+
+## ⚙️ Tech stack
+
+| Layer | Choice | Why |
+|:---|:---|:---|
+| Language | **Rust** | Server *and* shared core crate compiled into every client — protocol exists once |
+| UI | **Flutter** + `flutter_rust_bridge` | UI only; all performance-critical code stays in Rust |
+| Transport | **QUIC** (quinn) | TLS 1.3 built in · streams for control, datagrams for media · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
+| Voice | **SFU, no transcoding** | Server forwards packets; clients mix — per-user volume, near-zero server CPU |
+| Audio codec | **Opus** | 64 kbps speech → 256 kbps stereo music, auto-downgrade under congestion |
+| Video codec | **H.264** | Universal hardware encode/decode · codec IDs negotiated per stream |
+| AEC / NS | **WebRTC APM** | Battle-tested echo cancellation and noise suppression |
+| Auth | **Argon2id** | Per-server username + password · TOFU cert pinning (share the fingerprint with the invite) |
+| Storage | **SQLite** (WAL) | Zero-config persistence |
+| Messages | **Protobuf** (prost) | Versioned wire format, forward-compatible |
+| TLS | **rustls + ring** | Pure Rust · pinned to ring for clean musl cross-compilation |
+
+Every message carries version + capability bits — later features are additive, never rewrites.
+
+---
+
+## 🗺️ Roadmap
+
+### Phase 1 — Transport & Identity
+- [x] QUIC listener, self-signed TLS certificate, SHA-256 fingerprint
+- [x] Persistent identity — cert survives restarts, fingerprint is stable
+- [x] TOML config file with defaults
+- [x] Protobuf `Hello` / `HelloAck` over length-prefixed QUIC streams
+- [ ] Accounts: SQLite, Argon2id, login flow, admin bootstrap
+- [ ] Presence: online user list, heartbeats, session tokens
+
+### Phase 2 — Text Chat (basic)
+- [ ] Channel model, raw text, SQLite persistence, history fetch
+
+### Phase 3 — Voice MVP
+- [ ] Linux capture (PipeWire) → Opus → QUIC datagrams → SFU → decode + mix
+- [ ] Adaptive jitter buffer, per-user volume
+- [ ] **Mouth-to-ear ≤ 150 ms (80 ms LAN)**
+
+### Phase 4 — Voice Hardening
+- [ ] AEC / noise suppression (WebRTC APM), FEC
+- [ ] Bitrate ladder (64→256 kbps), music channels, congestion response
+
+### Phase 5 — Screen Share
+- [ ] PipeWire capture → H.264 hardware encode → multi-sharer / multi-viewer
+- [ ] **1440p60, glass-to-glass ≤ 250 ms**
+
+### Phase 6 — Camera Video
+- [ ] Same pipeline, A/V sync ≤ 40 ms
+
+### Phase 7+ — Later
+- [ ] Android / Windows / iOS bring-up
+- [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
+
+---
+
+## 🚀 Development
+
+```bash
+git clone <repo> && cd parley
+
+cargo test --workspace                              # run tests
+cargo run -p parley-server                          # dev mode (listens :4443)
+docker build -t parley . && docker run --rm parley  # container build
+
+cargo fmt --all                                     # format (CI enforces)
+cargo clippy --workspace --all-targets -- -D warnings  # lint (CI enforces)
+```
+
+Config (`config.toml`, auto-created with defaults):
+```toml
+listen = "0.0.0.0:4443"
+data_dir = "data"
+```
+
+First run generates `data/cert.der` + `data/key.pk8`. The fingerprint printed
+on startup is **permanent** — that's the value you share with your team.
+
+---
+
+## 📊 Performance budgets
+
+| Metric | Budget |
+|:---|:---|
+| Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN |
+| Screen share glass-to-glass | ≤ 250 ms |
+| Server idle RSS | ≤ 64 MB |
+| 10 active talkers | ≤ 5% of one core |
+| Login → connected | ≤ 400 ms |
+| Binary size | ≤ 15 MB |
+
 A regression is a bug, tracked as one.
 
-## Deployment
+---
+
+## 🐳 Deployment
+
 ```yaml
 services:
   parley:
     image: parley:latest
-    ports: ["443:443/udp"]
+    ports: ["443:4443/udp"]    # host 443 → container 4443
     volumes: ["./data:/data"]
     restart: unless-stopped
 ```
-First boot generates the certificate and admin account. All state (SQLite,
-certs, uploads) lives under `data/` — backup by copying. No telemetry, no
-outbound connections.
 
-## Layout
-`crates/parley-{proto,core,server}` · `app/` (Flutter client) ·
-`proto/` (protocol source of truth) · `docs/adr/` (one file per decision).
+All state lives under `data/` — backup by copying. No telemetry, no outbound connections.
+
+---
+
+## 📁 Layout
+
+```
+proto/                  # .proto files — protocol source of truth
+crates/
+  parley-proto/         # wire types, framing, generated protobuf code
+  parley-core/          # shared session I/O (server + future clients)
+  parley-server/        # binary: QUIC listener, TLS, config, routing
+app/                    # Flutter client (future)
+docs/adr/               # one file per architectural decision
+```
