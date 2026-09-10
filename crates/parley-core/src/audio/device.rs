@@ -1,3 +1,5 @@
+#![cfg(feature = "audio-device")]
+
 //! Platform audio device I/O (cpal: PipeWire/ALSA on Linux, WASAPI,
 //! CoreAudio, etc.). We don't build streams here — we only discover
 //! devices and sane configs. Stream construction with our exact

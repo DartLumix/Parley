@@ -1,3 +1,5 @@
+#![cfg(feature = "audio-device")]
+
 //! Full-duplex hardware test, gated behind PARLEY_AUDIO=1.
 //!
 //! Records ~2 s from the default input while playing a 440 Hz tone on
