@@ -16,9 +16,11 @@ Voice is the product; everything else grows later.
 | 1a | QUIC transport, TLS identity, first stream | ✅ |
 | 1b | Config file, persistent certificate, stable fingerprint | ✅ |
 | 1c | Protobuf control protocol, framed messages | ✅ |
-| 1d | Accounts — SQLite, Argon2id, login | 🔜 |
-| 1e | Presence, heartbeats, session tokens | ⏳ |
-| 2+ | Text chat, voice, video, screen share, platforms | ⏳ |
+| 1d | Accounts — SQLite, Argon2id, login | ✅ |
+| 1e | Presence, heartbeats, session tokens | ✅ |
+| 2 | Text chat — channels, messages, history, broadcast | ✅ |
+| 3 | Voice MVP — datagrams, SFU routing, Opus, mixing | 🔜 |
+| 4+ | Hardening, screen share, video, platforms | ⏳ |
 
 ---
 
@@ -69,11 +71,14 @@ Every message carries version + capability bits — later features are additive,
 - [x] Presence: online user list, heartbeats, session tokens
 
 ### Phase 2 — Text Chat (basic)
-- [ ] Channel model, raw text, SQLite persistence, history fetch
+- [x] Channel model, raw text, SQLite persistence, history fetch
 
 ### Phase 3 — Voice MVP
-- [ ] Linux capture (PipeWire) → Opus → QUIC datagrams → SFU → decode + mix
-- [ ] Adaptive jitter buffer, per-user volume
+- [ ] Voice channels: join/leave, state broadcast, snapshot
+- [ ] Media datagrams over QUIC + SFU routing
+- [ ] Opus encode/decode (parley-core)
+- [ ] Linux audio capture/render
+- [ ] Jitter buffer + client-side mixing
 - [ ] **Mouth-to-ear ≤ 150 ms (80 ms LAN)**
 
 ### Phase 4 — Voice Hardening
@@ -111,6 +116,8 @@ Config (`config.toml`, auto-created with defaults):
 listen = "0.0.0.0:4443"
 data_dir = "data"
 ```
+
+First boot: `PARLEY_ADMIN_PASSWORD=secret cargo run -p parley-server` creates the admin account.
 
 First run generates `data/cert.der` + `data/key.pk8`. The fingerprint printed
 on startup is **permanent** — that's the value you share with your team.
