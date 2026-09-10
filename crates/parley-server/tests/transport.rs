@@ -23,6 +23,10 @@ use parley_proto::{
 
 use parley_proto::{FetchHistory, ListChannels, SendChat};
 
+use parley_proto::{JoinVoice, LeaveVoice, VoiceStatesRequest};
+use std::time::Duration;
+use tokio::time::timeout;
+
 async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientBody) {
     session::write_message(tx, &parley_proto::ClientMessage { body: Some(body) })
         .await
@@ -31,6 +35,23 @@ async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientB
 
 async fn read_server_msg(rx: &mut quinn::RecvStream) -> parley_proto::ServerMessage {
     session::read_message(rx).await.unwrap()
+}
+
+async fn expect_voice_state(
+    rx: &mut quinn::RecvStream,
+    user_id: u32,
+    channel_id: u64,
+    joined: bool,
+) {
+    let msg = read_server_msg(rx).await;
+    match msg.body {
+        Some(ServerBody::VoiceState(v)) => {
+            assert_eq!(v.user_id, user_id);
+            assert_eq!(v.channel_id, channel_id);
+            assert_eq!(v.joined, joined);
+        }
+        other => panic!("expected voice state, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -476,4 +497,84 @@ impl ServerCertVerifier for PinnedFingerprint {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+#[tokio::test]
+async fn voice_datagram_routed_between_members() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("voice-route");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    // testuser = id 1, seconduser = id 2 (creation order)
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    // A joins voice channel 1
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+
+    // B requests the snapshot: A is in channel 1
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(ServerBody::VoiceStateList(list)) => {
+            assert_eq!(list.states.len(), 1);
+            assert_eq!(list.states[0].user_id, 1);
+            assert_eq!(list.states[0].channel_id, 1);
+        }
+        other => panic!("expected voice state list, got {other:?}"),
+    }
+
+    // B joins voice channel 1
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // A sends a media datagram (synthetic payload, sender_id 0 — server stamps)
+    let payload: Vec<u8> = (0..160u32).map(|i| (i % 251) as u8).collect();
+    let dg = parley_proto::media::encode(0, 42, 48_000, 0, &payload);
+    conn_a.send_datagram(dg.into()).unwrap();
+
+    // B receives it, stamped with A's authenticated user id (1)
+    let received = timeout(Duration::from_secs(2), conn_b.read_datagram())
+        .await
+        .expect("datagram should arrive")
+        .unwrap();
+    let decoded = parley_proto::media::decode(&received).unwrap();
+    assert_eq!(decoded.sender_id, 1);
+    assert_eq!(decoded.seq, 42);
+    assert_eq!(decoded.timestamp, 48_000);
+    assert_eq!(decoded.payload, &payload[..]);
+
+    // A must NOT receive its own datagram back (no loopback in the SFU)
+    let loopback = timeout(Duration::from_millis(200), conn_a.read_datagram()).await;
+    assert!(loopback.is_err(), "no loopback expected");
+
+    // A leaves; both see the departure
+    send_client_msg(&mut tx_a, ClientBody::LeaveVoice(LeaveVoice {})).await;
+    expect_voice_state(&mut rx_a, 1, 0, false).await;
+    expect_voice_state(&mut rx_b, 1, 0, false).await;
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
 }

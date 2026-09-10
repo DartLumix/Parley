@@ -1,5 +1,5 @@
-//! Connected-session registry: tracks who is online and lets the
-//! server broadcast chat messages to every connected client.
+//! Connected-session registry: tracks who is online, broadcasts control
+//! messages, and forwards media datagrams to specific connections.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 pub struct ClientHandle {
     pub user_id: u32,
     pub username: String,
-    /// Channel for sending messages to this client's session loop.
+    /// For media datagram forwarding.
+    pub conn: quinn::Connection,
+    /// Control-plane messages for this client (broadcasts).
     pub tx: mpsc::UnboundedSender<parley_proto::ServerMessage>,
 }
 
@@ -31,15 +33,22 @@ impl SessionRegistry {
         self.clients.lock().unwrap().remove(&user_id);
     }
 
-    /// Send a message to every connected client. Dead sends are
-    /// dropped silently (session loop cleans up on its own).
+    /// Send a control-plane message to every connected client.
     pub fn broadcast(&self, msg: parley_proto::ServerMessage) {
         for handle in self.clients.lock().unwrap().values() {
             let _ = handle.tx.send(msg.clone());
         }
     }
 
-    /// usernames of online users.
+    /// Send a media datagram to one user's connection.
+    /// Returns false if they're offline or the send failed.
+    pub fn send_datagram(&self, user_id: u32, data: bytes::Bytes) -> bool {
+        match self.clients.lock().unwrap().get(&user_id) {
+            Some(h) => h.conn.send_datagram(data).is_ok(),
+            None => false,
+        }
+    }
+
     pub fn online_users(&self) -> Vec<(u32, String)> {
         self.clients
             .lock()

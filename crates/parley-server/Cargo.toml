@@ -20,3 +20,4 @@ parley-core.workspace = true
 rusqlite.workspace = true
 argon2.workspace = true
 rand_core.workspace = true
+bytes.workspace = true

@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -12,11 +13,12 @@ use crate::db::Db;
 use crate::error::Error;
 use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
+use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ClientBody, ClientMessage,
     HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser, ServerBody,
-    ServerMessage,
+    ServerMessage, VoiceState as PbVoiceState, VoiceStateList,
 };
 
 pub struct Server {
@@ -24,6 +26,7 @@ pub struct Server {
     fingerprint: String,
     db: Arc<Mutex<Db>>,
     registry: Arc<SessionRegistry>,
+    voice: Arc<VoiceManager>,
 }
 
 impl Server {
@@ -54,6 +57,7 @@ impl Server {
             fingerprint,
             db: Arc::new(Mutex::new(db)),
             registry: Arc::new(SessionRegistry::new()),
+            voice: Arc::new(VoiceManager::new()),
         })
     }
 
@@ -72,7 +76,8 @@ impl Server {
                 Ok(conn) => {
                     let db = self.db.clone();
                     let registry = self.registry.clone();
-                    tokio::spawn(handle_connection(conn, db, registry));
+                    let voice = self.voice.clone();
+                    tokio::spawn(handle_connection(conn, db, registry, voice));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
             }
@@ -85,9 +90,10 @@ async fn handle_connection(
     conn: quinn::Connection,
     db: Arc<Mutex<Db>>,
     registry: Arc<SessionRegistry>,
+    voice: Arc<VoiceManager>,
 ) {
     let peer = conn.remote_address();
-    match serve(&conn, &db, &registry).await {
+    match serve(conn.clone(), &db, &registry, &voice).await {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -95,9 +101,10 @@ async fn handle_connection(
 }
 
 async fn serve(
-    conn: &quinn::Connection,
+    conn: quinn::Connection,
     db: &Arc<Mutex<Db>>,
     registry: &Arc<SessionRegistry>,
+    voice: &Arc<VoiceManager>,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
 
@@ -156,16 +163,14 @@ async fn serve(
 
     info!(username = %info.username, user_id = info.id, "session started");
 
-    // Register with the broadcast registry before acking, so the new
-    // session is visible to other clients immediately.
-    //
-    // NOTE: registry is keyed by user_id — a second login by the same user
-    // replaces the first (the old session's event channel closes and that
-    // session ends). Multi-device sessions are a later feature.
+    // Register with the broadcast registry before acking.
+    // NOTE: keyed by user_id — a second login by the same user replaces
+    // the first (its event channel closes, that session ends).
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     registry.register(ClientHandle {
         user_id: info.id,
         username: info.username.clone(),
+        conn: conn.clone(),
         tx: event_tx,
     });
 
@@ -179,50 +184,93 @@ async fn serve(
     )
     .await?;
 
-    // --- Session loop ---
-    // Two input sources, polled concurrently:
-    //   1. broadcast events from the registry (e.g. chat messages)
-    //   2. messages from this client over the network
+    // --- Dedicated reader tasks ---
+    // Each reader owns its source, so an in-flight read is never
+    // cancelled by select — partial reads can never be lost.
+    // (A cancelled read_exact drops already-read bytes; that would
+    // desynchronize the framed stream.)
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(m) = session::read_message::<ClientMessage>(&mut rx).await {
+            if msg_tx.send(m).is_err() {
+                break;
+            }
+        }
+        // stream closed or malformed: reader ends, msg_rx closes below
+    });
+
+    let (dg_tx, mut dg_rx) = mpsc::unbounded_channel();
+    let dg_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(d) = dg_conn.read_datagram().await {
+            if dg_tx.send(d).is_err() {
+                break;
+            }
+        }
+        // connection dead: reader ends, dg_rx closes below
+    });
+
+    // --- Session loop: datagrams (hot path) > broadcasts > client msgs ---
     let result = loop {
         tokio::select! {
             biased;
 
-            msg = event_rx.recv() => match msg {
-                Some(msg) => {
-                    if let Err(e) = session::write_message(&mut tx, &msg).await {
-                        break Err(e.into());
-                    }
-                }
-                // All senders dropped (replaced by a newer login) — end quietly.
+            dg = dg_rx.recv() => match dg {
+                Some(d) => route_datagram(&d, &info, registry, voice),
                 None => break Ok(()),
             },
 
-            msg = session::read_message::<ClientMessage>(&mut rx) => match msg {
-                Ok(msg) => {
-                    match handle_client_message(msg, &info, &mut tx, db, registry).await {
+            ev = event_rx.recv() => match ev {
+                Some(m) => {
+                    if let Err(e) = session::write_message(&mut tx, &m).await {
+                        break Err(e.into());
+                    }
+                }
+                None => break Ok(()),
+            },
+
+            msg = msg_rx.recv() => match msg {
+                Some(m) => {
+                    match handle_client_message(
+                        m, &info, &mut tx, db, registry, voice,
+                    ).await {
                         Ok(true) => {}
                         Ok(false) => break Ok(()),
                         Err(e) => break Err(e),
                     }
                 }
-                Err(e) => break Err(e.into()),
+                None => break Ok(()),
             },
         }
     };
 
+    // Cleanup: leave voice if member, broadcast the departure.
+    if voice.leave(info.id).is_some() {
+        registry.broadcast(ServerMessage {
+            body: Some(ServerBody::VoiceState(PbVoiceState {
+                user_id: info.id,
+                channel_id: 0,
+                joined: false,
+            })),
+        });
+    }
     registry.unregister(info.id);
     info!(user_id = info.id, "session ended");
     let _ = tx.finish();
+    if result.is_err() {
+        conn.close(1u32.into(), b"session error");
+    }
     result
 }
 
-/// Handle one client message. Ok(false) = end session gracefully.
+/// Handle one client control message. Ok(false) = end session gracefully.
 async fn handle_client_message(
     msg: ClientMessage,
     info: &crate::db::UserInfo,
     tx: &mut quinn::SendStream,
     db: &Arc<Mutex<Db>>,
     registry: &Arc<SessionRegistry>,
+    voice: &Arc<VoiceManager>,
 ) -> Result<bool, Error> {
     match msg.body {
         Some(ClientBody::Heartbeat(hb)) => {
@@ -332,6 +380,58 @@ async fn handle_client_message(
             .await?;
         }
 
+        Some(ClientBody::JoinVoice(j)) => {
+            let exists = {
+                let guard = db
+                    .lock()
+                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
+                guard.channel_exists(j.channel_id)?
+            };
+            if exists {
+                voice.join(info.id, j.channel_id);
+                registry.broadcast(ServerMessage {
+                    body: Some(ServerBody::VoiceState(PbVoiceState {
+                        user_id: info.id,
+                        channel_id: j.channel_id,
+                        joined: true,
+                    })),
+                });
+            }
+            // joining a nonexistent channel is ignored
+        }
+
+        Some(ClientBody::LeaveVoice(_)) => {
+            if voice.leave(info.id).is_some() {
+                registry.broadcast(ServerMessage {
+                    body: Some(ServerBody::VoiceState(PbVoiceState {
+                        user_id: info.id,
+                        channel_id: 0,
+                        joined: false,
+                    })),
+                });
+            }
+        }
+
+        Some(ClientBody::VoiceStatesRequest(_)) => {
+            let states = voice.snapshot();
+            session::write_message(
+                tx,
+                &ServerMessage {
+                    body: Some(ServerBody::VoiceStateList(VoiceStateList {
+                        states: states
+                            .into_iter()
+                            .map(|(user_id, channel_id)| PbVoiceState {
+                                user_id,
+                                channel_id,
+                                joined: true,
+                            })
+                            .collect(),
+                    })),
+                },
+            )
+            .await?;
+        }
+
         None => {
             return Err(Error::Session(parley_core::Error::Protocol(
                 "empty message body",
@@ -339,6 +439,41 @@ async fn handle_client_message(
         }
     }
     Ok(true)
+}
+
+/// Forward a media datagram from `sender` to their voice channel.
+/// The sender id in the header is overwritten with the authenticated id.
+fn route_datagram(
+    data: &Bytes,
+    sender: &crate::db::UserInfo,
+    registry: &Arc<SessionRegistry>,
+    voice: &Arc<VoiceManager>,
+) {
+    let decoded = match parley_proto::media::decode(data) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(user_id = sender.id, error = e, "malformed media datagram");
+            return;
+        }
+    };
+
+    let Some(channel_id) = voice.channel_of(sender.id) else {
+        return; // sender is not in a voice channel: drop
+    };
+
+    let forwarded = Bytes::from(parley_proto::media::encode(
+        decoded.flags,
+        decoded.seq,
+        decoded.timestamp,
+        sender.id,
+        decoded.payload,
+    ));
+
+    for member in voice.members_of(channel_id) {
+        if member != sender.id {
+            registry.send_datagram(member, forwarded.clone());
+        }
+    }
 }
 
 fn now_ms() -> u64 {

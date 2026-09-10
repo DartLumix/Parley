@@ -464,6 +464,7 @@ name = "parley-server"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "bytes",
  "hex",
  "parley-core",
  "parley-proto",

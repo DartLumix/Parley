@@ -56,11 +56,31 @@ message ChatMessage {
 message FetchHistory {
   uint64 channel_id = 1;
   uint32 limit = 2;
-  uint64 before_message_id = 3;   // 0 = newest
+  uint64 before_message_id = 3;
 }
 
 message HistoryResult {
   repeated ChatMessage messages = 1;
+}
+
+// --- Voice channels ---
+
+message JoinVoice {
+  uint64 channel_id = 1;
+}
+
+message LeaveVoice {}
+
+message VoiceState {
+  uint32 user_id = 1;
+  uint64 channel_id = 2;
+  bool joined = 3;
+}
+
+message VoiceStatesRequest {}
+
+message VoiceStateList {
+  repeated VoiceState states = 1;
 }
 
 // --- Envelopes ---
@@ -72,6 +92,9 @@ message ClientMessage {
     ListChannels list_channels = 3;
     SendChat send_chat = 4;
     FetchHistory fetch_history = 5;
+    JoinVoice join_voice = 6;
+    LeaveVoice leave_voice = 7;
+    VoiceStatesRequest voice_states_request = 8;
   }
 }
 
@@ -82,5 +105,7 @@ message ServerMessage {
     ChannelList channel_list = 3;
     ChatMessage chat_message = 4;
     HistoryResult history_result = 5;
+    VoiceState voice_state = 6;
+    VoiceStateList voice_state_list = 7;
   }
 }

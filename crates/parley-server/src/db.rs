@@ -209,6 +209,18 @@ impl Db {
         out.reverse(); // oldest first
         Ok(out)
     }
+
+    pub fn channel_exists(&self, channel_id: u64) -> Result<bool, Error> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM channels WHERE id = ?1",
+                rusqlite::params![channel_id as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
 }
 
 fn hash_password(password: &str) -> Result<String, Error> {
