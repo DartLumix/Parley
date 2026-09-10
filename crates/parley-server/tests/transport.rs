@@ -27,6 +27,8 @@ use parley_proto::{JoinVoice, LeaveVoice, VoiceStatesRequest};
 use std::time::Duration;
 use tokio::time::timeout;
 
+use parley_core::audio::jitter::PopOutcome;
+
 async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientBody) {
     session::write_message(tx, &parley_proto::ClientMessage { body: Some(body) })
         .await
@@ -645,7 +647,8 @@ async fn voice_roundtrip_synthetic_audio() {
     expect_voice_state(&mut rx_a, 2, 1, true).await;
     expect_voice_state(&mut rx_b, 2, 1, true).await;
 
-    // A generates 10 frames of 440 Hz sine, encodes, sends as datagrams
+    // ---- Part 1: end-to-end through the server ----
+    // A generates 10 frames of 440 Hz sine, encodes, sends as datagrams.
     let frames = sine_frames(10);
     let mut encoder = parley_core::audio::OpusEncoder::new(64_000).unwrap();
     let mut seq: u16 = 0;
@@ -658,7 +661,7 @@ async fn voice_roundtrip_synthetic_audio() {
         ts = ts.wrapping_add(parley_core::audio::SAMPLES_PER_FRAME as u32);
     }
 
-    // B receives all 10, decodes, concatenates
+    // B receives all 10 through the SFU, decodes, concatenates.
     let mut decoder = parley_core::audio::OpusDecoder::new().unwrap();
     let mut decoded: Vec<i16> = Vec::new();
     for _ in 0..10 {
@@ -671,11 +674,56 @@ async fn voice_roundtrip_synthetic_audio() {
         decoded.extend_from_slice(decoder.decode(m.payload).unwrap());
     }
 
-    // Signal must survive the trip: encode → QUIC → SFU → decode
+    // Signal must survive the trip: encode → QUIC → SFU → decode.
     let original: Vec<i16> = frames.concat();
     assert_eq!(decoded.len(), original.len());
     let corr = best_correlation(&original, &decoded);
     assert!(corr > 0.95, "correlation too low: {corr:.3}");
+
+    // ---- Part 2: jitter buffer under loss + reorder + duplicate ----
+    // Local-only (no network): feed encoded packets into the buffer in a
+    // hostile order and verify what comes out.
+    let frames2 = sine_frames(10);
+    let mut encoder2 = parley_core::audio::OpusEncoder::new(64_000).unwrap();
+    let packets: Vec<Vec<u8>> = frames2
+        .iter()
+        .map(|f| encoder2.encode(f).unwrap().to_vec())
+        .collect();
+
+    let mut jb = parley_core::audio::JitterBuffer::new();
+
+    // Delivery order: 0-4, skip 5 (lost), 6, 7, then late 5, 8 twice, 9.
+    for &idx in &[0usize, 1, 2, 3, 4, 6, 7, 5, 8, 8, 9] {
+        let seq = 10u16.wrapping_add(idx as u16);
+        jb.push(seq, &packets[idx]);
+    }
+
+    // Drain everything. All 9 surviving frames must emerge in order 0-9
+    // minus 5; the late-arriving 5 must fill its hole; the duplicate 8
+    // must not produce a second output.
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let mut gaps = 0;
+    for _ in 0..50 {
+        match jb.pop() {
+            (PopOutcome::Packet, Some(packet)) => received.push(packet),
+            (PopOutcome::Packet, None) => unreachable!(),
+            (PopOutcome::Gap, _) => gaps += 1,
+            (PopOutcome::Empty, _) => break,
+        }
+    }
+
+    assert_eq!(
+        received.len(),
+        10,
+        "duplicate dropped, all 10 frames survive"
+    );
+    assert_eq!(gaps, 0, "late frame 5 must prevent gap declaration");
+
+    // Frames must emerge in order 0-9; the duplicate 8 produced one copy.
+    let expected = [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    for (i, packet) in received.iter().enumerate() {
+        assert_eq!(packet, &packets[expected[i]], "frame at slot {i} wrong");
+    }
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");
