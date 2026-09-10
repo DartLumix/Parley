@@ -19,7 +19,11 @@ Voice is the product; everything else grows later.
 | 1d | Accounts — SQLite, Argon2id, login | ✅ |
 | 1e | Presence, heartbeats, session tokens | ✅ |
 | 2 | Text chat — channels, messages, history, broadcast | ✅ |
-| 3 | Voice MVP — datagrams, SFU routing, Opus, mixing | 🔜 |
+| 3a | Voice channels, state broadcast, snapshot | ✅ |
+| 3b | Opus encode/decode (parley-core) | ✅ |
+| 3c | Jitter buffer + PLC | ✅ |
+| 3d | Audio device layer — cpal, feature-gated | ✅ |
+| 3e | Audio pipelines, native 48 kHz I/O, test client | 🔜 |
 | 4+ | Hardening, screen share, video, platforms | ⏳ |
 
 ---
@@ -76,9 +80,10 @@ Every message carries version + capability bits — later features are additive,
 ### Phase 3 — Voice MVP
 - [x] Voice channels: join/leave, state broadcast, snapshot
 - [x] Media datagrams over QUIC + SFU routing
-- [x] Opus encode/decode (parley-core)
-- [ ] Linux audio capture/render
-- [ ] Jitter buffer + client-side mixing
+- [x] Opus encode/decode + 20 ms framing pipelines (parley-core)
+- [x] Jitter buffer: wraparound-safe ordering + PLC on gap
+- [x] Linux audio device layer — cpal, native 48 kHz (PipeWire graph runs 48k-only → no client-side resampling; rubato dropped)
+- [ ] Test client: TOFU fingerprint store, capture → Opus → send, recv → decode → mix → render
 - [ ] **Mouth-to-ear ≤ 150 ms (80 ms LAN)**
 
 ### Phase 4 — Voice Hardening
@@ -109,6 +114,9 @@ docker build -t parley . && docker run --rm parley  # container build
 
 cargo fmt --all                                     # format (CI enforces)
 cargo clippy --workspace --all-targets -- -D warnings  # lint (CI enforces)
+
+# hardware audio test (needs mic + output; never runs in CI)
+PARLEY_AUDIO=1 cargo test -p parley-core --features audio-device --test audio_loopback -- --nocapture
 ```
 
 Config (`config.toml`, auto-created with defaults):
