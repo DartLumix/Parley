@@ -40,10 +40,9 @@ fn speaker_tone_is_audible_via_loopback() {
 
     // ---- Output: 440 Hz tone ----
     let out_device = host.default_output_device().expect("no output device");
-    let out_config = out_device
-        .default_output_config()
-        .expect("no output config");
-    eprintln!("output config: {out_config:?}");
+    let out_config =
+        parley_core::audio::device::preferred_output_config(&out_device).expect("no output config");
+    eprintln!("output stream: {} Hz", out_config.sample_rate().0);
     let out_sample_rate = out_config.sample_rate().0 as f32;
     let mut phase = 0.0f32; // cycles in [0, 1)
 
@@ -72,7 +71,9 @@ fn speaker_tone_is_audible_via_loopback() {
 
     // ---- Input: record raw f32 ----
     let in_device = host.default_input_device().expect("no input device");
-    let in_config = in_device.default_input_config().expect("no input config");
+    let in_config =
+        parley_core::audio::device::preferred_input_config(&in_device).expect("no input config");
+    eprintln!("input stream: {} Hz", in_config.sample_rate().0);
     eprintln!("input config: {in_config:?}");
     let in_sample_rate = in_config.sample_rate().0 as f32;
     let in_channels = in_config.channels() as usize;

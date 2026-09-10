@@ -103,3 +103,78 @@ mod tests {
         eprintln!("output: {name} {:?}", config);
     }
 }
+
+/// All device streams open here: Opus is 48 kHz and this machine's PipeWire
+/// graph is 48k-only, so nothing resamples anywhere.
+pub const PREFERRED_RATE: u32 = 48_000;
+
+fn preferred_from(
+    default: cpal::SupportedStreamConfig,
+    ranges: &[cpal::SupportedStreamConfigRange],
+    direction: &str,
+) -> cpal::SupportedStreamConfig {
+    let capable = ranges.iter().any(|r| {
+        r.channels() == default.channels()
+            && r.min_sample_rate().0 <= PREFERRED_RATE
+            && r.max_sample_rate().0 >= PREFERRED_RATE
+    });
+    if capable {
+        // Only the rate changes; format/channels/buffer stay the default's.
+        // Never inherit a range's sample_format — enumeration order can
+        // surface odd ones (I8 here).
+        return cpal::SupportedStreamConfig::new(
+            default.channels(),
+            cpal::SampleRate(PREFERRED_RATE),
+            default.buffer_size().clone(),
+            default.sample_format(),
+        );
+    }
+    eprintln!(
+        "parley: no {} Hz {} config (default {} Hz, {} ch); reported ranges (ch, min Hz, max Hz, fmt): {:?}",
+        PREFERRED_RATE,
+        direction,
+        default.sample_rate().0,
+        default.channels(),
+        ranges
+            .iter()
+            .map(|r| (
+                r.channels(),
+                r.min_sample_rate().0,
+                r.max_sample_rate().0,
+                r.sample_format()
+            ))
+            .collect::<Vec<_>>(),
+    );
+    default
+}
+
+/// Default output config with the rate bumped to PREFERRED_RATE when a
+/// reported range covers it; untouched default otherwise.
+pub fn preferred_output_config(
+    device: &cpal::Device,
+) -> Result<cpal::SupportedStreamConfig, cpal::DefaultStreamConfigError> {
+    let default = device.default_output_config()?;
+    let ranges = match device.supported_output_configs() {
+        Ok(ranges) => ranges.collect(),
+        Err(e) => {
+            eprintln!("parley: output config enumeration failed: {e}");
+            Vec::new()
+        }
+    };
+    Ok(preferred_from(default, &ranges, "output"))
+}
+
+/// Same for capture.
+pub fn preferred_input_config(
+    device: &cpal::Device,
+) -> Result<cpal::SupportedStreamConfig, cpal::DefaultStreamConfigError> {
+    let default = device.default_input_config()?;
+    let ranges = match device.supported_input_configs() {
+        Ok(ranges) => ranges.collect(),
+        Err(e) => {
+            eprintln!("parley: input config enumeration failed: {e}");
+            Vec::new()
+        }
+    };
+    Ok(preferred_from(default, &ranges, "input"))
+}
