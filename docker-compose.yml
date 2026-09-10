@@ -1,0 +1,11 @@
+services:
+  parley:
+    image: parley:latest
+    build: .
+    ports:
+      - "443:4443/udp"      # host 443 → container 4443
+    volumes:
+      - ./data:/data        # first run: mkdir -p data && sudo chown 65534:65534 data
+    environment:
+      - PARLEY_ADMIN_PASSWORD=${PARLEY_ADMIN_PASSWORD:-}   # first boot only
+    restart: unless-stopped

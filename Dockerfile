@@ -18,12 +18,15 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl -p parley-server
-RUN mkdir -p /data && touch /data/.keep
+RUN printf 'listen = "0.0.0.0:4443"\ndata_dir = "/data"\n' > /config.toml \
+    && mkdir -p /data && touch /data/.keep
 
 # ---- Stage 4: the image that actually ships ----
 FROM scratch
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/parley-server /parley-server
+COPY --from=builder /config.toml /config.toml
 COPY --from=builder --chown=65534:65534 /data /data
 USER 65534:65534
-EXPOSE 443/udp
+ENV PARLEY_CONFIG=/config.toml
+EXPOSE 4443/udp
 ENTRYPOINT ["/parley-server"]
