@@ -4,11 +4,11 @@
 pub mod config;
 pub mod db;
 pub mod error;
-pub mod presence;
 pub mod server;
+pub mod session;
 pub mod tls;
 
 pub use config::Config;
 pub use error::Error;
-pub use presence::PresenceManager;
 pub use server::Server;
+pub use session::SessionRegistry;

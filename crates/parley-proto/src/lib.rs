@@ -11,6 +11,7 @@ pub use handshake::PROTOCOL_VERSION;
 pub use pb::client_message::Body as ClientBody;
 pub use pb::server_message::Body as ServerBody;
 pub use pb::{
-    AuthDenied, AuthOk, AuthRequest, ClientMessage, Heartbeat, HeartbeatAck, Hello, HelloAck,
-    PresenceList, PresenceRequest, PresenceUser, ServerMessage,
+    AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChatMessage, ClientMessage,
+    FetchHistory, Heartbeat, HeartbeatAck, Hello, HelloAck, HistoryResult, ListChannels,
+    PresenceList, PresenceRequest, PresenceUser, SendChat, ServerMessage,
 };

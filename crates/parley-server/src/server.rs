@@ -1,27 +1,29 @@
-//! The QUIC listener: bind, accept, dispatch.
+//! The QUIC listener: bind, accept, dispatch, session loop.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use quinn::crypto::rustls::QuicServerConfig;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::Error;
-use crate::presence::PresenceManager;
+use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
 use parley_core::session;
 use parley_proto::{
-    AuthDenied, AuthOk, AuthRequest, ClientBody, ClientMessage, HeartbeatAck, Hello, HelloAck,
-    PROTOCOL_VERSION, PresenceList, PresenceUser, ServerBody, ServerMessage,
+    AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ClientBody, ClientMessage,
+    HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser, ServerBody,
+    ServerMessage,
 };
 
 pub struct Server {
     endpoint: quinn::Endpoint,
     fingerprint: String,
     db: Arc<Mutex<Db>>,
-    presence: Arc<PresenceManager>,
+    registry: Arc<SessionRegistry>,
 }
 
 impl Server {
@@ -51,7 +53,7 @@ impl Server {
             endpoint,
             fingerprint,
             db: Arc::new(Mutex::new(db)),
-            presence: Arc::new(PresenceManager::new()),
+            registry: Arc::new(SessionRegistry::new()),
         })
     }
 
@@ -69,8 +71,8 @@ impl Server {
             match incoming.await {
                 Ok(conn) => {
                     let db = self.db.clone();
-                    let presence = self.presence.clone();
-                    tokio::spawn(handle_connection(conn, db, presence));
+                    let registry = self.registry.clone();
+                    tokio::spawn(handle_connection(conn, db, registry));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
             }
@@ -82,10 +84,10 @@ impl Server {
 async fn handle_connection(
     conn: quinn::Connection,
     db: Arc<Mutex<Db>>,
-    presence: Arc<PresenceManager>,
+    registry: Arc<SessionRegistry>,
 ) {
     let peer = conn.remote_address();
-    match serve(&conn, &db, &presence).await {
+    match serve(&conn, &db, &registry).await {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -95,7 +97,7 @@ async fn handle_connection(
 async fn serve(
     conn: &quinn::Connection,
     db: &Arc<Mutex<Db>>,
-    presence: &Arc<PresenceManager>,
+    registry: &Arc<SessionRegistry>,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
 
@@ -106,18 +108,18 @@ async fn serve(
             "unsupported protocol version",
         )));
     }
-
-    let ack = HelloAck {
-        protocol_version: PROTOCOL_VERSION,
-        server_caps: 0,
-        heartbeat_ms: 5_000,
-    };
-    session::write_message(&mut tx, &ack).await?;
+    session::write_message(
+        &mut tx,
+        &HelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            server_caps: 0,
+            heartbeat_ms: 5_000,
+        },
+    )
+    .await?;
 
     // --- Auth (password or session token) ---
     let auth: AuthRequest = session::read_message(&mut rx).await?;
-    info!(username = %auth.username, "auth request");
-
     let user_info = {
         let guard = db
             .lock()
@@ -132,17 +134,19 @@ async fn serve(
     let info = match user_info {
         Some(info) => info,
         None => {
-            let denied = AuthDenied {
-                reason: "invalid credentials".to_string(),
-            };
-            session::write_message(&mut tx, &denied).await?;
+            session::write_message(
+                &mut tx,
+                &AuthDenied {
+                    reason: "invalid credentials".to_string(),
+                },
+            )
+            .await?;
             info!(username = %auth.username, "auth denied");
             tx.finish()?;
             return Ok(());
         }
     };
 
-    // Issue session token
     let token = {
         let guard = db
             .lock()
@@ -150,9 +154,20 @@ async fn serve(
         guard.create_session(info.id)?
     };
 
-    // Register presence BEFORE writing AuthOk, so the user is visible
-    // to other clients as soon as this client sees the ack.
-    presence.add_user(info.id, auth.username.clone());
+    info!(username = %info.username, user_id = info.id, "session started");
+
+    // Register with the broadcast registry before acking, so the new
+    // session is visible to other clients immediately.
+    //
+    // NOTE: registry is keyed by user_id — a second login by the same user
+    // replaces the first (the old session's event channel closes and that
+    // session ends). Multi-device sessions are a later feature.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    registry.register(ClientHandle {
+        user_id: info.id,
+        username: info.username.clone(),
+        tx: event_tx,
+    });
 
     session::write_message(
         &mut tx,
@@ -163,39 +178,71 @@ async fn serve(
         },
     )
     .await?;
-    info!(username = %auth.username, user_id = info.id, "session started");
 
-    // --- Session loop (until client disconnects or stream fails) ---
-    let session_result = run_session(&mut tx, &mut rx, presence).await;
+    // --- Session loop ---
+    // Two input sources, polled concurrently:
+    //   1. broadcast events from the registry (e.g. chat messages)
+    //   2. messages from this client over the network
+    let result = loop {
+        tokio::select! {
+            biased;
 
-    // Always clean up presence
-    presence.remove_user(info.id);
+            msg = event_rx.recv() => match msg {
+                Some(msg) => {
+                    if let Err(e) = session::write_message(&mut tx, &msg).await {
+                        break Err(e.into());
+                    }
+                }
+                // All senders dropped (replaced by a newer login) — end quietly.
+                None => break Ok(()),
+            },
+
+            msg = session::read_message::<ClientMessage>(&mut rx) => match msg {
+                Ok(msg) => {
+                    match handle_client_message(msg, &info, &mut tx, db, registry).await {
+                        Ok(true) => {}
+                        Ok(false) => break Ok(()),
+                        Err(e) => break Err(e),
+                    }
+                }
+                Err(e) => break Err(e.into()),
+            },
+        }
+    };
+
+    registry.unregister(info.id);
     info!(user_id = info.id, "session ended");
-
     let _ = tx.finish();
-    session_result
+    result
 }
 
-async fn run_session(
+/// Handle one client message. Ok(false) = end session gracefully.
+async fn handle_client_message(
+    msg: ClientMessage,
+    info: &crate::db::UserInfo,
     tx: &mut quinn::SendStream,
-    rx: &mut quinn::RecvStream,
-    presence: &Arc<PresenceManager>,
-) -> Result<(), Error> {
-    loop {
-        let msg: ClientMessage = session::read_message(rx).await?;
-        match msg.body {
-            Some(ClientBody::Heartbeat(hb)) => {
-                let ack = ServerMessage {
+    db: &Arc<Mutex<Db>>,
+    registry: &Arc<SessionRegistry>,
+) -> Result<bool, Error> {
+    match msg.body {
+        Some(ClientBody::Heartbeat(hb)) => {
+            session::write_message(
+                tx,
+                &ServerMessage {
                     body: Some(ServerBody::HeartbeatAck(HeartbeatAck {
                         client_time_ms: hb.client_time_ms,
                         server_time_ms: now_ms(),
                     })),
-                };
-                session::write_message(tx, &ack).await?;
-            }
-            Some(ClientBody::PresenceRequest(_)) => {
-                let users = presence.online_users();
-                let list = ServerMessage {
+                },
+            )
+            .await?;
+        }
+
+        Some(ClientBody::PresenceRequest(_)) => {
+            let users = registry.online_users();
+            session::write_message(
+                tx,
+                &ServerMessage {
                     body: Some(ServerBody::PresenceList(PresenceList {
                         users: users
                             .into_iter()
@@ -205,16 +252,93 @@ async fn run_session(
                             })
                             .collect(),
                     })),
-                };
-                session::write_message(tx, &list).await?;
+                },
+            )
+            .await?;
+        }
+
+        Some(ClientBody::ListChannels(_)) => {
+            let channels = {
+                let guard = db
+                    .lock()
+                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
+                guard.list_channels()?
+            };
+            session::write_message(
+                tx,
+                &ServerMessage {
+                    body: Some(ServerBody::ChannelList(ChannelList {
+                        channels: channels
+                            .into_iter()
+                            .map(|(id, name)| PbChannel { id, name })
+                            .collect(),
+                    })),
+                },
+            )
+            .await?;
+        }
+
+        Some(ClientBody::SendChat(chat)) => {
+            let text = chat.text.trim().to_string();
+            if text.is_empty() || text.len() > 2000 {
+                return Ok(true); // ignore empty/oversized silently
             }
-            None => {
-                return Err(Error::Session(parley_core::Error::Protocol(
-                    "empty message body",
-                )));
-            }
+            let (msg_id, ts, _) = {
+                let guard = db
+                    .lock()
+                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
+                guard.insert_message(chat.channel_id, info.id, &text)?
+            };
+            registry.broadcast(ServerMessage {
+                body: Some(ServerBody::ChatMessage(parley_proto::ChatMessage {
+                    message_id: msg_id,
+                    channel_id: chat.channel_id,
+                    user_id: info.id,
+                    username: info.username.clone(),
+                    text,
+                    timestamp_ms: ts,
+                })),
+            });
+        }
+
+        Some(ClientBody::FetchHistory(fetch)) => {
+            let limit = fetch.limit.clamp(1, 100);
+            let rows = {
+                let guard = db
+                    .lock()
+                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
+                guard.fetch_history(fetch.channel_id, limit, fetch.before_message_id)?
+            };
+            session::write_message(
+                tx,
+                &ServerMessage {
+                    body: Some(ServerBody::HistoryResult(parley_proto::HistoryResult {
+                        messages: rows
+                            .into_iter()
+                            .map(
+                                |(id, user_id, username, text, ts)| parley_proto::ChatMessage {
+                                    message_id: id,
+                                    channel_id: fetch.channel_id,
+                                    user_id,
+                                    username,
+                                    text,
+                                    timestamp_ms: ts,
+                                },
+                            )
+                            .collect(),
+                    })),
+                },
+            )
+            .await?;
+        }
+
+        None => {
+            return Err(Error::Session(parley_core::Error::Protocol(
+                "empty message body",
+            )));
         }
     }
+    Ok(true)
 }
 
 fn now_ms() -> u64 {

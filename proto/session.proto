@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package parley;
 
+// --- Heartbeats ---
+
 message Heartbeat {
   uint64 client_time_ms = 1;
 }
@@ -10,6 +12,8 @@ message HeartbeatAck {
   uint64 client_time_ms = 1;
   uint64 server_time_ms = 2;
 }
+
+// --- Presence ---
 
 message PresenceRequest {}
 
@@ -22,10 +26,52 @@ message PresenceList {
   repeated PresenceUser users = 1;
 }
 
+// --- Channels & chat ---
+
+message Channel {
+  uint64 id = 1;
+  string name = 2;
+}
+
+message ListChannels {}
+
+message ChannelList {
+  repeated Channel channels = 1;
+}
+
+message SendChat {
+  uint64 channel_id = 1;
+  string text = 2;
+}
+
+message ChatMessage {
+  uint64 message_id = 1;
+  uint64 channel_id = 2;
+  uint32 user_id = 3;
+  string username = 4;
+  string text = 5;
+  uint64 timestamp_ms = 6;
+}
+
+message FetchHistory {
+  uint64 channel_id = 1;
+  uint32 limit = 2;
+  uint64 before_message_id = 3;   // 0 = newest
+}
+
+message HistoryResult {
+  repeated ChatMessage messages = 1;
+}
+
+// --- Envelopes ---
+
 message ClientMessage {
   oneof body {
     Heartbeat heartbeat = 1;
     PresenceRequest presence_request = 2;
+    ListChannels list_channels = 3;
+    SendChat send_chat = 4;
+    FetchHistory fetch_history = 5;
   }
 }
 
@@ -33,5 +79,8 @@ message ServerMessage {
   oneof body {
     HeartbeatAck heartbeat_ack = 1;
     PresenceList presence_list = 2;
+    ChannelList channel_list = 3;
+    ChatMessage chat_message = 4;
+    HistoryResult history_result = 5;
   }
 }

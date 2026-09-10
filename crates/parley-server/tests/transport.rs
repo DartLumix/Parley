@@ -21,6 +21,120 @@ use parley_proto::{
     ClientBody, ClientMessage, Heartbeat, PresenceRequest, ServerBody, ServerMessage,
 };
 
+use parley_proto::{FetchHistory, ListChannels, SendChat};
+
+async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientBody) {
+    session::write_message(tx, &parley_proto::ClientMessage { body: Some(body) })
+        .await
+        .unwrap();
+}
+
+async fn read_server_msg(rx: &mut quinn::RecvStream) -> parley_proto::ServerMessage {
+    session::read_message(rx).await.unwrap()
+}
+
+#[tokio::test]
+async fn chat_broadcast_and_history() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("chat");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+
+    // Two sessions: sender and listener
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, _tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    // Both get the broadcast; skip any non-chat messages (none expected yet)
+    send_client_msg(
+        &mut tx_a,
+        parley_proto::ClientBody::SendChat(SendChat {
+            channel_id: 1,
+            text: "hello world".to_string(),
+        }),
+    )
+    .await;
+
+    // alice reads broadcast
+    let msg = read_server_msg(&mut rx_a).await;
+    match msg.body {
+        Some(parley_proto::ServerBody::ChatMessage(m)) => {
+            assert_eq!(m.text, "hello world");
+            assert_eq!(m.channel_id, 1);
+            assert!(m.message_id > 0);
+        }
+        _ => panic!("expected chat message"),
+    }
+    // bob reads broadcast
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(parley_proto::ServerBody::ChatMessage(m)) => {
+            assert_eq!(m.text, "hello world");
+        }
+        _ => panic!("expected chat message"),
+    }
+
+    // History: sender fetches
+    send_client_msg(
+        &mut tx_a,
+        parley_proto::ClientBody::FetchHistory(FetchHistory {
+            channel_id: 1,
+            limit: 50,
+            before_message_id: 0,
+        }),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_a).await;
+    match msg.body {
+        Some(parley_proto::ServerBody::HistoryResult(h)) => {
+            assert_eq!(h.messages.len(), 1);
+            assert_eq!(h.messages[0].text, "hello world");
+            assert_eq!(h.messages[0].username, "testuser");
+        }
+        _ => panic!("expected history result"),
+    }
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn channel_list_contains_general() {
+    let (config, server) = setup_server_with_user("channels");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn, mut tx, mut rx) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+
+    send_client_msg(
+        &mut tx,
+        parley_proto::ClientBody::ListChannels(ListChannels {}),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx).await;
+    match msg.body {
+        Some(parley_proto::ServerBody::ChannelList(list)) => {
+            assert!(
+                list.channels
+                    .iter()
+                    .any(|c| c.name == "general" && c.id == 1)
+            );
+        }
+        _ => panic!("expected channel list"),
+    }
+
+    conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
 fn test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("parley-test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -32,10 +146,10 @@ fn setup_server_with_user(tag: &str) -> (Config, Server) {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir(tag),
     };
-    // Create a user directly in the DB before the server binds
     std::fs::create_dir_all(&config.data_dir).unwrap();
     let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
     db.create_user("testuser", "testpass", false).unwrap();
+    db.create_user("seconduser", "secondpass", false).unwrap();
     drop(db);
 
     let server = Server::bind(&config).unwrap();
