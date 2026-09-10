@@ -15,4 +15,6 @@ pub enum Error {
     MessageTooLarge,
     #[error("opus codec: {0}")]
     Codec(String),
+    #[error("audio device: {0}")]
+    AudioDevice(String),
 }

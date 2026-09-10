@@ -9,3 +9,4 @@ prost.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
 audiopus.workspace = true
+cpal.workspace = true
