@@ -8,3 +8,4 @@ parley-proto.workspace = true
 prost.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
+audiopus.workspace = true

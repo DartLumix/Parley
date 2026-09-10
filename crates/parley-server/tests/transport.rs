@@ -54,6 +54,41 @@ async fn expect_voice_state(
     }
 }
 
+fn sine_frames(n_frames: usize) -> Vec<Vec<i16>> {
+    (0..n_frames)
+        .map(|f| {
+            (0..parley_core::audio::SAMPLES_PER_FRAME)
+                .map(|i| {
+                    let idx = f * parley_core::audio::SAMPLES_PER_FRAME + i;
+                    let t = idx as f64 / parley_core::audio::SAMPLE_RATE as f64;
+                    (0.3 * f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * i16::MAX as f64)
+                        as i16
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn best_correlation(a: &[i16], b: &[i16]) -> f64 {
+    let n = a.len().min(b.len());
+    let mut best = f64::NEG_INFINITY;
+    for lag in 0..600 {
+        let (mut dot, mut sa, mut sb) = (0.0, 0.0, 0.0);
+        for i in 0..(n - lag) {
+            let x = a[i] as f64;
+            let y = b[i + lag] as f64;
+            dot += x * y;
+            sa += x * x;
+            sb += y * y;
+        }
+        let denom = (sa * sb).sqrt();
+        if denom > 0.0 {
+            best = best.max(dot / denom);
+        }
+    }
+    best
+}
+
 #[tokio::test]
 async fn chat_broadcast_and_history() {
     init_logs();
@@ -573,6 +608,74 @@ async fn voice_datagram_routed_between_members() {
     send_client_msg(&mut tx_a, ClientBody::LeaveVoice(LeaveVoice {})).await;
     expect_voice_state(&mut rx_a, 1, 0, false).await;
     expect_voice_state(&mut rx_b, 1, 0, false).await;
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn voice_roundtrip_synthetic_audio() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("opus");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    // Both join voice channel 1
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // A generates 10 frames of 440 Hz sine, encodes, sends as datagrams
+    let frames = sine_frames(10);
+    let mut encoder = parley_core::audio::OpusEncoder::new(64_000).unwrap();
+    let mut seq: u16 = 0;
+    let mut ts: u32 = 0;
+    for frame in &frames {
+        let packet = encoder.encode(frame).unwrap().to_vec();
+        let dg = parley_proto::media::encode(0, seq, ts, 0, &packet);
+        conn_a.send_datagram(dg.into()).unwrap();
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(parley_core::audio::SAMPLES_PER_FRAME as u32);
+    }
+
+    // B receives all 10, decodes, concatenates
+    let mut decoder = parley_core::audio::OpusDecoder::new().unwrap();
+    let mut decoded: Vec<i16> = Vec::new();
+    for _ in 0..10 {
+        let d = timeout(Duration::from_secs(2), conn_b.read_datagram())
+            .await
+            .expect("datagram should arrive")
+            .unwrap();
+        let m = parley_proto::media::decode(&d).unwrap();
+        assert_eq!(m.sender_id, 1, "server must stamp authenticated sender id");
+        decoded.extend_from_slice(decoder.decode(m.payload).unwrap());
+    }
+
+    // Signal must survive the trip: encode → QUIC → SFU → decode
+    let original: Vec<i16> = frames.concat();
+    assert_eq!(decoded.len(), original.len());
+    let corr = best_correlation(&original, &decoded);
+    assert!(corr > 0.95, "correlation too low: {corr:.3}");
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");

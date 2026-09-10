@@ -74,9 +74,9 @@ Every message carries version + capability bits — later features are additive,
 - [x] Channel model, raw text, SQLite persistence, history fetch
 
 ### Phase 3 — Voice MVP
-- [ ] Voice channels: join/leave, state broadcast, snapshot
-- [ ] Media datagrams over QUIC + SFU routing
-- [ ] Opus encode/decode (parley-core)
+- [x] Voice channels: join/leave, state broadcast, snapshot
+- [x] Media datagrams over QUIC + SFU routing
+- [x] Opus encode/decode (parley-core)
 - [ ] Linux audio capture/render
 - [ ] Jitter buffer + client-side mixing
 - [ ] **Mouth-to-ear ≤ 150 ms (80 ms LAN)**
@@ -160,7 +160,7 @@ All state lives under `data/` — backup by copying. No telemetry, no outbound c
 proto/                  # .proto files — protocol source of truth
 crates/
   parley-proto/         # wire types, framing, generated protobuf code
-  parley-core/          # shared session I/O (server + future clients)
+  parley-core/          # shared session I/O + audio pipeline (server + future clients)
   parley-server/        # binary: QUIC listener, TLS, config, routing
 app/                    # Flutter client (future)
 docs/adr/               # one file per architectural decision
