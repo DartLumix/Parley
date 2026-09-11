@@ -1,8 +1,18 @@
 //! parley-test-client: connect, auth, join a voice channel, pump audio.
 //! Without the `audio-device` feature it's a control-only debug client
 //! (chat/presence, no mic or speakers) — that's what CI builds.
+//!
+//! Latency measurement (Phase 3f), two roles on one machine:
+//!   A: --measure   injects a click every 2 s, pairs returning reports,
+//!                  prints callback→render latency + stats
+//!   B: --report    detects clicks in the render callback and reports
+//!                  them back over chat (control-stream reuse — no
+//!                  protocol changes). Both processes share the machine
+//!                  clock, so the deltas are exact.
+//! Stay quiet while measuring; the clicks are loud.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parley_core::session;
@@ -23,6 +33,8 @@ struct Args {
     user: String,
     password: String,
     channel_id: u64,
+    measure: bool,
+    report: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -30,6 +42,7 @@ fn parse_args() -> Result<Args, String> {
     let mut user = None;
     let mut password = None;
     let mut channel_id = 1u64;
+    let (mut measure, mut report) = (false, false);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -39,6 +52,8 @@ fn parse_args() -> Result<Args, String> {
             "--channel" => {
                 channel_id = it.next().and_then(|v| v.parse().ok()).unwrap_or(channel_id)
             }
+            "--measure" => measure = true,
+            "--report" => report = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -53,6 +68,8 @@ fn parse_args() -> Result<Args, String> {
         user,
         password,
         channel_id,
+        measure,
+        report,
     })
 }
 
@@ -169,13 +186,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.server, args.user, ok.user_id, args.channel_id
     );
 
+    // Outbound control channel: heartbeats AND click reports share one
+    // writer task (audio callbacks can't await, but unbounded send is
+    // synchronous and non-blocking).
+    let (_outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+
+    #[cfg(not(feature = "audio-device"))]
+    if args.measure || args.report {
+        eprintln!("--measure/--report need the audio-device feature; ignoring");
+    }
+
     // --- audio (feature-gated) ---
     #[cfg(feature = "audio-device")]
     let voices = mixer::new_voices();
     #[cfg(feature = "audio-device")]
-    let runtime = audio::start(voices.clone())?;
+    let injections = args
+        .measure
+        .then(|| Arc::new(Mutex::new(Vec::<u64>::new())));
+    #[cfg(not(feature = "audio-device"))]
+    let injections: Option<Arc<Mutex<Vec<u64>>>> = None;
+    #[cfg(feature = "audio-device")]
+    let runtime = audio::start(
+        voices.clone(),
+        injections.clone(),
+        args.report.then(|| _outbound_tx.clone()),
+    )?;
 
-    // --- heartbeat writer owns the control stream from here on ---
+    // --- writer: heartbeats + anything the audio side posts ---
     let hb_ms = if ack.heartbeat_ms == 0 {
         5000
     } else {
@@ -185,26 +222,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tx = tx;
         let mut tick = tokio::time::interval(Duration::from_millis(hb_ms as u64));
         loop {
-            tick.tick().await;
-            let msg = ClientMessage {
-                body: Some(ClientBody::Heartbeat(Heartbeat {
-                    client_time_ms: now_ms(),
-                })),
-            };
-            if session::write_message(&mut tx, &msg).await.is_err() {
-                break;
+            tokio::select! {
+                _ = tick.tick() => {
+                    let msg = ClientMessage {
+                        body: Some(ClientBody::Heartbeat(Heartbeat {
+                            client_time_ms: now_ms(),
+                        })),
+                    };
+                    if session::write_message(&mut tx, &msg).await.is_err() {
+                        break;
+                    }
+                }
+                msg = outbound_rx.recv() => {
+                    if let Some(msg) = msg {
+                        if session::write_message(&mut tx, &msg).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    // --- control stream reader: chat / voice states / presence ---
+    // --- control stream reader: chat / voice states / latency reports ---
     #[cfg(feature = "audio-device")]
     let ctrl_voices = voices.clone();
+    let measure_flag = args.measure;
     tokio::spawn(async move {
+        let mut deltas: Vec<i64> = Vec::new();
         loop {
             match session::read_message::<ServerMessage>(&mut rx).await {
                 Ok(msg) => match msg.body {
-                    Some(ServerBody::ChatMessage(m)) => println!("[{}] {}", m.username, m.text),
+                    Some(ServerBody::ChatMessage(m)) => {
+                        if let Some(rest) = m.text.strip_prefix("PARLEY_LATENCY ") {
+                            let Ok(detected) = rest.trim().parse::<i64>() else {
+                                continue;
+                            };
+                            let Some(injections) = injections.as_ref() else {
+                                continue;
+                            };
+                            // Pair with the latest injection at or before
+                            // the detection; unmatched reports are noise.
+                            let t0 = {
+                                let list = injections.lock().unwrap();
+                                match list.iter().rev().find(|&&t| (t as i64) <= detected) {
+                                    Some(&t) => t as i64,
+                                    None => continue,
+                                }
+                            };
+                            let delta_us = detected - t0;
+                            if delta_us <= 0 || delta_us > 1_000_000 {
+                                continue; // spurious pairing
+                            }
+                            deltas.push(delta_us);
+                            println!(
+                                "latency: {:.1} ms (digital callback→render)",
+                                delta_us as f64 / 1000.0
+                            );
+                            if deltas.len().is_multiple_of(5) {
+                                let mut sorted = deltas.clone();
+                                sorted.sort_unstable();
+                                println!(
+                                    "--- {} samples: min {:.1} / median {:.1} / max {:.1} ms",
+                                    sorted.len(),
+                                    sorted[0] as f64 / 1000.0,
+                                    sorted[sorted.len() / 2] as f64 / 1000.0,
+                                    sorted[sorted.len() - 1] as f64 / 1000.0,
+                                );
+                            }
+                        } else {
+                            println!("[{}] {}", m.username, m.text);
+                        }
+                    }
                     Some(ServerBody::VoiceState(v)) => {
                         println!(
                             "user {} {} voice channel {}",
@@ -216,6 +307,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !v.joined {
                             mixer::remove(&ctrl_voices, v.user_id);
                         }
+                    }
+                    Some(ServerBody::HeartbeatAck(a)) if measure_flag => {
+                        println!(
+                            "heartbeat rtt: {} ms",
+                            now_ms().saturating_sub(a.client_time_ms)
+                        );
                     }
                     _ => {}
                 },
@@ -247,7 +344,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 for (seq, ts, pkt) in packets {
-                    // sender_id 0: the server stamps the authenticated id
                     let dg = parley_proto::media::encode(
                         parley_proto::media::FLAG_SPEAKING,
                         seq,

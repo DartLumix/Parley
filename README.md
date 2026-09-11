@@ -83,8 +83,8 @@ Every message carries version + capability bits — later features are additive,
 - [x] Opus encode/decode + 20 ms framing pipelines (parley-core)
 - [x] Jitter buffer: wraparound-safe ordering + PLC on gap
 - [x] Linux audio device layer — cpal, native 48 kHz (PipeWire graph runs 48k-only → no client-side resampling; rubato dropped)
-- [ ] Test client: TOFU fingerprint store, capture → Opus → send, recv → decode → mix → render
-- [ ] **Mouth-to-ear ≤ 150 ms (80 ms LAN)**
+- [x] Test client: TOFU fingerprint store, capture → Opus → send, recv → decode → mix → render
+- [x] **Mouth-to-ear ≤ 150 ms (80 ms LAN)**
 
 ### Phase 4 — Voice Hardening
 - [ ] AEC / noise suppression (WebRTC APM), FEC
