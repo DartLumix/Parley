@@ -77,7 +77,6 @@ impl RecvPipeline {
                     // Conceal: decode an empty packet (libopus PLC)
                     let samples = self.decoder.decode(&[])?;
                     out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
-                    produced += 1;
                 }
                 (PopOutcome::Empty, _) => break,
                 (PopOutcome::Packet, None) => unreachable!(),

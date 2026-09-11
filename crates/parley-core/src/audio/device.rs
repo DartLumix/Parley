@@ -125,7 +125,7 @@ fn preferred_from(
         return cpal::SupportedStreamConfig::new(
             default.channels(),
             cpal::SampleRate(PREFERRED_RATE),
-            default.buffer_size().clone(),
+            *default.buffer_size(),
             default.sample_format(),
         );
     }

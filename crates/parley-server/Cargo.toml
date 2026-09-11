@@ -1,5 +1,6 @@
 [package]
 name = "parley-server"
+default-run = "parley-server"
 version.workspace = true
 edition.workspace = true
 
