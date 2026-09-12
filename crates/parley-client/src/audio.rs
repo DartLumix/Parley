@@ -5,20 +5,22 @@
 //! `inject` logs click injection times (--measure), `report` sends click
 //! detections back over the control stream (--report).
 //!
-//! Buffer sizing: we request an explicit 960-frame (20 ms) period, the
-//! default negotiated 5120 frames (107 ms) being the dominant latency
-//! term we measured. Devices that refuse fixed sizes fall back to the
-//! default buffer — loudly, since that's a known-latency condition.
+//! Phase 4a: capture hands f32 mono upstream (AEC/NS runs in the encoder
+//! task, in exact 10 ms frames — see aec.rs); the render callback feeds
+//! the played mix to the AEC as the far-end reference.
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use webrtc_audio_processing::Processor;
 
 use parley_core::audio::device::{PREFERRED_RATE, preferred_input_config, preferred_output_config};
 use parley_proto::{ClientBody, ClientMessage, SendChat};
 
+use crate::aec;
 use crate::mixer::{self, SharedMixer};
 
 /// Click spec for --measure: 1.4 kHz near-full-scale burst, 5 ms — rare
@@ -38,7 +40,7 @@ const REPORT_COOLDOWN_US: u64 = 400_000;
 const PERIOD_FRAMES: u32 = 1024;
 
 pub struct Audio {
-    pub pcm_rx: UnboundedReceiver<Vec<i16>>,
+    pub pcm_rx: UnboundedReceiver<Vec<f32>>,
     _in: cpal::Stream,
     _out: cpal::Stream,
 }
@@ -50,10 +52,10 @@ fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
-// ---- capture callback: downmix, inject clicks, convert, hand off ----
+// ---- capture callback: downmix, inject clicks, hand off ----
 
 struct InputState {
-    pcm_tx: UnboundedSender<Vec<i16>>,
+    pcm_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
     inject: Option<Arc<Mutex<Vec<u64>>>>,
     channels: usize,
     first: bool,
@@ -87,18 +89,17 @@ fn input_cb(state: &mut InputState, data: &[f32]) {
             state.inject_next += CLICK_INTERVAL;
         }
     }
-    let pcm: Vec<i16> = mono
-        .iter()
-        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-        .collect();
-    let _ = state.pcm_tx.send(pcm);
+    // f32 mono; i16 conversion happens after AEC in the encoder task.
+    let _ = state.pcm_tx.send(mono);
 }
 
-// ---- render callback: mix, detect clicks, duplicate mono ----
+// ---- render callback: mix, AEC reference, detect clicks, duplicate ----
 
 struct OutputState {
     mixer: SharedMixer,
-    report: Option<UnboundedSender<ClientMessage>>,
+    report: Option<tokio::sync::mpsc::UnboundedSender<ClientMessage>>,
+    aec: Option<Arc<Processor>>,
+    render_carry: Vec<f32>,
     channels: usize,
     first: bool,
     last_report_us: u64,
@@ -106,7 +107,6 @@ struct OutputState {
 
 fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallbackInfo) {
     let frames = data.len() / state.channels;
-    let mixed = mixer::mix(&state.mixer, frames);
     if state.first {
         state.first = false;
         eprintln!(
@@ -114,6 +114,12 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
             frames,
             frames as f64 / 48.0
         );
+    }
+    let mixed = mixer::mix(&state.mixer, frames);
+    // Far-end reference for the AEC: exactly what this callback writes
+    // out (post-gain, post-clamp, mono — what each channel plays).
+    if let Some(ap) = &state.aec {
+        aec::analyze_render(ap, &mut state.render_carry, &mixed);
     }
     // --report: loudest sample above threshold = the click.
     let now = now_micros();
@@ -126,9 +132,6 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
         && now.saturating_sub(state.last_report_us) > REPORT_COOLDOWN_US
     {
         state.last_report_us = now;
-        // Device lead: how long before playback this callback fires
-        // (cpal hands us both instants). The click plays `idx` frames
-        // into the buffer, AFTER buffer[0] — add, don't subtract.
         // Device lead: how long before playback this callback fires.
         // `callback.duration_since(playback)` is None when the API
         // reports playback at/before callback time — treat as zero.
@@ -138,6 +141,7 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
             .duration_since(&ts.playback)
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
+        // The click sits `idx` frames into this buffer, AFTER buffer[0].
         let detected = now as i64 + lead_us + (idx as f64 * 1_000_000.0 / 48_000.0) as i64;
         // Channel 1 = general: chat is a global broadcast and the
         // measuring client parses the text, not the channel.
@@ -163,7 +167,8 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
 pub fn start(
     mixer: SharedMixer,
     inject: Option<Arc<Mutex<Vec<u64>>>>,
-    report: Option<UnboundedSender<ClientMessage>>,
+    report: Option<tokio::sync::mpsc::UnboundedSender<ClientMessage>>,
+    aec: Option<Arc<Processor>>,
 ) -> Result<Audio, String> {
     let host = cpal::default_host();
     let in_dev = host
@@ -191,11 +196,11 @@ pub fn start(
     let in_channels = in_cfg.channels() as usize;
     let out_channels = out_cfg.channels() as usize;
 
-    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
 
-    // Two configs per direction: explicit 20 ms period first, device
-    // default as fallback. Each build attempt gets a fresh callback
-    // state (the move closures consume their captures).
+    // Two configs per direction: explicit quantum-aligned period first,
+    // device default as fallback. Each build attempt gets a fresh
+    // callback state (the move closures consume their captures).
     let fixed_in = cpal::StreamConfig {
         channels: in_cfg.channels(),
         sample_rate: in_cfg.sample_rate(),
@@ -238,6 +243,8 @@ pub fn start(
         let mut state = OutputState {
             mixer: mixer.clone(),
             report: report.clone(),
+            aec: aec.clone(),
+            render_carry: Vec::new(),
             channels: out_channels,
             first: true,
             last_report_us: 0,

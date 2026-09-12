@@ -6,13 +6,15 @@
 //!   A: --measure   injects a click every 2 s, pairs returning reports,
 //!                  prints callback→render latency + stats
 //!   B: --report    detects clicks in the render callback and reports
-//!                  them back over chat (control-stream reuse — no
-//!                  protocol changes). Both processes share the machine
-//!                  clock, so the deltas are exact.
+//!                  them back over chat. Both processes share the
+//!                  machine clock, so the deltas are exact.
 //! Stay quiet while measuring; the clicks are loud.
 //!
 //! Per-user volume (Phase 4b): --volume <user_id>:<gain>, repeatable.
 //! 0.0 mutes that user locally; other peers are unaffected.
+//!
+//! AEC/NS (Phase 4a): on by default, --no-aec disables. The played mix
+//! is the AEC far-end reference; mic audio is processed before encoding.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -25,11 +27,9 @@ use parley_proto::{
 };
 use prost::Message as _;
 
+use parley_client::cert;
 #[cfg(feature = "audio-device")]
-mod audio;
-mod cert;
-#[cfg(feature = "audio-device")]
-mod mixer;
+use parley_client::{aec, audio, mixer};
 
 struct Args {
     server: String,
@@ -38,6 +38,7 @@ struct Args {
     channel_id: u64,
     measure: bool,
     report: bool,
+    noaec: bool,
     volumes: Vec<(u32, f32)>,
 }
 
@@ -46,7 +47,7 @@ fn parse_args() -> Result<Args, String> {
     let mut user = None;
     let mut password = None;
     let mut channel_id = 1u64;
-    let (mut measure, mut report) = (false, false);
+    let (mut measure, mut report, mut noaec) = (false, false, false);
     let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -59,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--measure" => measure = true,
             "--report" => report = true,
+            "--no-aec" => noaec = true,
             "--volume" => {
                 let spec = it.next().ok_or("--volume needs <user_id>:<gain>")?;
                 let (id, gain) = spec
@@ -84,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
         channel_id,
         measure,
         report,
+        noaec,
         volumes,
     })
 }
@@ -207,8 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
 
     #[cfg(not(feature = "audio-device"))]
-    if args.measure || args.report || !args.volumes.is_empty() {
-        eprintln!("--measure/--report/--volume need the audio-device feature; ignoring");
+    if args.measure || args.report || args.noaec || !args.volumes.is_empty() {
+        eprintln!("--measure/--report/--volume/--no-aec need the audio-device feature; ignoring");
     }
 
     // --- audio (feature-gated) ---
@@ -220,6 +223,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("volume: user {id} at {gain:.2}×");
     }
     #[cfg(feature = "audio-device")]
+    let aec_proc = if args.noaec {
+        println!("aec: disabled (--no-aec)");
+        None
+    } else {
+        match aec::new_processor() {
+            Ok(p) => {
+                println!(
+                    "aec: WebRTC AEC3 + noise suppression + high-pass on (--no-aec to disable)"
+                );
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("aec: init failed ({e}); continuing without echo cancellation");
+                None
+            }
+        }
+    };
+    #[cfg(feature = "audio-device")]
     let injections = args
         .measure
         .then(|| Arc::new(Mutex::new(Vec::<u64>::new())));
@@ -230,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_mixer.clone(),
         injections.clone(),
         args.report.then(|| _outbound_tx.clone()),
+        aec_proc.clone(),
     )?;
 
     // --- writer: heartbeats + anything the audio side posts ---
@@ -344,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- media: mic → SendPipeline → datagrams; datagrams → pipelines ---
+    // --- media: mic → [AEC/NS] → SendPipeline → datagrams ---
     #[cfg(feature = "audio-device")]
     {
         let mut pcm_rx = runtime.pcm_rx;
@@ -357,9 +379,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
+            // Reassembles arbitrary callback chunks into exact 10 ms
+            // frames for the AEC/NS processor.
+            let mut asm = aec::FrameAssembler::new();
             while let Some(chunk) = pcm_rx.recv().await {
+                let processed: Vec<f32> = match aec_proc.as_ref() {
+                    Some(ap) => {
+                        let mut out = Vec::new();
+                        aec::process_capture(ap, &mut asm, &chunk, &mut out);
+                        out
+                    }
+                    None => chunk,
+                };
+                let pcm: Vec<i16> = processed
+                    .iter()
+                    .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                    .collect();
                 let mut packets = Vec::new();
-                if let Err(e) = send.push_pcm(&chunk, &mut packets) {
+                if !pcm.is_empty()
+                    && let Err(e) = send.push_pcm(&pcm, &mut packets)
+                {
                     eprintln!("encode failed: {e}");
                     break;
                 }
