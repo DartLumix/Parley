@@ -100,7 +100,9 @@ Every message carries version + capability bits — later features are additive,
       played mix is the far-end reference. Verified by synthetic-echo test (>10 dB
       reduction) + by-ear A/B (noise floor drop with AEC on). `--no-aec` disables.
 - [x] Per-user volume — client-side gains in the mix (`--volume <user_id>:<gain>`)
-- [ ] FEC / RED, congestion response
+- [x] FEC / RED — Opus in-band FEC: encoder embeds redundancy (SILK mode≤~32 kbps), 
+      receiver reconstructs single lost frames from the successor packet before falling
+      back to PLC
 - [ ] Bitrate ladder (64→256 kbps), music channels
 - [ ] Render-period latency fix (80 ms LAN target) — see Phase 3 verdict
 
