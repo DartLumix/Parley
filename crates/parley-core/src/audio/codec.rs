@@ -29,6 +29,17 @@ impl OpusEncoder {
         encoder
             .set_bitrate(Bitrate::BitsPerSecond(bitrate_bps))
             .map_err(|e| Error::Codec(e.to_string()))?;
+        // In-band FEC: each packet may carry a low-rate copy of the
+        // previous one; the decoder can reconstruct a single lost frame
+        // from its successor (see OpusDecoder::decode_fec). The loss
+        // percentage steers how aggressively the encoder spends bits on
+        // redundancy. Static 15% for v1; congestion-adaptive is 4d.
+        encoder
+            .set_inband_fec(true)
+            .map_err(|e| Error::Codec(e.to_string()))?;
+        encoder
+            .set_packet_loss_perc(15)
+            .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(Self {
             encoder,
             packet: vec![0u8; MAX_PACKET_SIZE],
@@ -48,6 +59,13 @@ impl OpusEncoder {
             .encode(pcm, &mut self.packet)
             .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(&self.packet[..n])
+    }
+
+    /// Set the expected packet loss percentage (0–100). Higher values
+    /// make the encoder spend more bits on FEC redundancy.
+    /// Only meaningful when in-band FEC is enabled.
+    pub fn set_loss_hint(&mut self, perc: u8) {
+        let _ = self.encoder.set_packet_loss_perc(perc);
     }
 }
 
@@ -75,6 +93,21 @@ impl OpusDecoder {
                 Some(pkt),
                 MutSignals::try_from(&mut self.pcm[..]).map_err(|e| Error::Codec(e.to_string()))?,
                 false,
+            )
+            .map_err(|e| Error::Codec(e.to_string()))?;
+        Ok(&self.pcm[..n])
+    }
+
+    /// Reconstruct the previous (lost) packet's audio from this one's
+    /// embedded FEC. Feed this the packet that FOLLOWS the loss.
+    pub fn decode_fec(&mut self, packet: &[u8]) -> Result<&[i16], Error> {
+        let pkt = Packet::try_from(packet).map_err(|e| Error::Codec(e.to_string()))?;
+        let n = self
+            .decoder
+            .decode(
+                Some(pkt),
+                MutSignals::try_from(&mut self.pcm[..]).map_err(|e| Error::Codec(e.to_string()))?,
+                true,
             )
             .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(&self.pcm[..n])
@@ -138,5 +171,40 @@ mod tests {
     fn rejects_wrong_frame_size() {
         let mut enc = OpusEncoder::new(64_000).unwrap();
         assert!(enc.encode(&[0i16; 100]).is_err());
+    }
+
+    #[test]
+    fn fec_reconstructs_lost_frame() {
+        // 24 kbps forces SILK-only mode, where libopus actually embeds
+        // in-band FEC (LBRR). At higher bitrates the encoder may choose
+        // hybrid/CELT, which carries no FEC. See RFC 6716 §2.1.5.
+        // 25% loss hint makes the encoder spend more bits on redundancy.
+        let original = sine_pcm(4 * SAMPLES_PER_FRAME, 440.0);
+        let mut enc = OpusEncoder::new(24_000).unwrap();
+        // Override the default 15% with a higher value for this test
+        // (more aggressive FEC embedding).
+        enc.set_loss_hint(25);
+        let mut dec = OpusDecoder::new().unwrap();
+
+        let packets: Vec<Vec<u8>> = original
+            .chunks(SAMPLES_PER_FRAME)
+            .map(|f| enc.encode(f).unwrap().to_vec())
+            .collect();
+
+        // Drop packet 1; reconstruct frame 1 from packet 2's FEC, then
+        // decode packet 2 itself normally.
+        dec.decode(&packets[0]).unwrap();
+        let mut restored: Vec<i16> = dec.decode_fec(&packets[2]).unwrap().to_vec();
+        for p in &packets[2..] {
+            restored.extend_from_slice(dec.decode(p).unwrap());
+        }
+
+        // FEC reconstruction is a low-bitrate sketch of the lost frame —
+        // correlation with the original is modest by design (this is
+        // better than silence, not transparent reconstruction).
+        let lost = &original[SAMPLES_PER_FRAME..2 * SAMPLES_PER_FRAME];
+        let got = &restored[..SAMPLES_PER_FRAME];
+        let corr = best_correlation(lost, got);
+        assert!(corr > 0.3, "FEC reconstruction too weak: {corr:.3}");
     }
 }

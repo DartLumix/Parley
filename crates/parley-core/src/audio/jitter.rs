@@ -154,6 +154,16 @@ impl JitterBuffer {
         self.pending.len()
     }
 
+    /// The immediate successor packet, if buffered, without consuming it.
+    /// During a declared gap this is the packet whose in-band FEC (if any)
+    /// can reconstruct the lost frame.
+    pub fn peek(&self) -> Option<(u16, &[u8])> {
+        self.pending
+            .front()
+            .filter(|(s, _)| *s == self.next_seq)
+            .map(|(s, p)| (*s, p.as_slice()))
+    }
+
     /// Adaptive target: measured jitter + headroom, clamped to [1, 8].
     fn target_depth(&self) -> usize {
         let t = self.jitter_frames + HEADROOM_FRAMES;
@@ -288,5 +298,20 @@ mod tests {
         let (o, out) = jb.pop();
         assert_eq!(o, PopOutcome::Packet);
         assert_eq!(out, Some(pkt((70 - MAX_BUFFERED) as u8)));
+    }
+
+    #[test]
+    fn peek_exposes_successor_during_gap() {
+        let mut jb = JitterBuffer::new();
+        jb.push(0, &pkt(0));
+        jb.push(2, &pkt(2)); // 1 lost
+        let _ = jb.pop(); // packet 0
+        jb.push(3, &pkt(3)); // depth 2 >= target → gap can be declared
+        let (o, _) = jb.pop();
+        assert_eq!(o, PopOutcome::Gap);
+        assert_eq!(jb.peek(), Some((2, pkt(2).as_slice())));
+        let (o, p) = jb.pop();
+        assert_eq!((o, p), (PopOutcome::Packet, Some(pkt(2))));
+        assert_eq!(jb.peek(), Some((3, pkt(3).as_slice())));
     }
 }

@@ -65,6 +65,9 @@ impl RecvPipeline {
 
     /// Pull up to `max_frames` frames of decoded f32 (48 kHz mono).
     /// Appends to `out`. Runs PLC on gaps.
+    /// Pull up to `max_frames` frames of decoded f32 (48 kHz mono).
+    /// Appends to `out`. Gaps conceal via in-band FEC when the successor
+    /// packet is buffered, plain PLC otherwise.
     pub fn pull_pcm(&mut self, out: &mut Vec<f32>, max_frames: usize) -> Result<(), Error> {
         let mut produced = 0;
         while produced < max_frames {
@@ -74,9 +77,23 @@ impl RecvPipeline {
                     out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
                 }
                 (PopOutcome::Gap, _) => {
-                    // Conceal: decode an empty packet (libopus PLC)
-                    let samples = self.decoder.decode(&[])?;
-                    out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
+                    // Lost frame. If the immediate successor is buffered,
+                    // its in-band FEC reconstructs the lost audio (better
+                    // than PLC); the successor itself decodes on the next
+                    // pop. Cascaded losses fall out naturally: each Gap
+                    // conceals exactly its own frame, and packet N+2's FEC
+                    // reconstructs N+1 once the playhead reaches it.
+                    if let Some((_, pkt)) = self.jitter.peek() {
+                        let samples = match self.decoder.decode_fec(pkt) {
+                            Ok(s) => s,
+                            // No FEC embedded in that packet: PLC.
+                            Err(_) => self.decoder.decode(&[])?,
+                        };
+                        out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
+                    } else {
+                        let samples = self.decoder.decode(&[])?;
+                        out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
+                    }
                 }
                 (PopOutcome::Empty, _) => break,
                 (PopOutcome::Packet, None) => unreachable!(),
