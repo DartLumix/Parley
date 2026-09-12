@@ -19,7 +19,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use parley_core::audio::device::{PREFERRED_RATE, preferred_input_config, preferred_output_config};
 use parley_proto::{ClientBody, ClientMessage, SendChat};
 
-use crate::mixer::{self, VoicesMap};
+use crate::mixer::{self, SharedMixer};
 
 /// Click spec for --measure: 1.4 kHz near-full-scale burst, 5 ms — rare
 /// in speech, survives Opus, loudest thing in a quiet room.
@@ -97,7 +97,7 @@ fn input_cb(state: &mut InputState, data: &[f32]) {
 // ---- render callback: mix, detect clicks, duplicate mono ----
 
 struct OutputState {
-    voices: VoicesMap,
+    mixer: SharedMixer,
     report: Option<UnboundedSender<ClientMessage>>,
     channels: usize,
     first: bool,
@@ -106,6 +106,7 @@ struct OutputState {
 
 fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallbackInfo) {
     let frames = data.len() / state.channels;
+    let mixed = mixer::mix(&state.mixer, frames);
     if state.first {
         state.first = false;
         eprintln!(
@@ -114,7 +115,6 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
             frames as f64 / 48.0
         );
     }
-    let mixed = mixer::mix(&state.voices, frames);
     // --report: loudest sample above threshold = the click.
     let now = now_micros();
     if let Some(report_tx) = &state.report
@@ -161,7 +161,7 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
 /// is the pitch-shift poison mode. (Buffer-size fallback IS acceptable
 /// and announced.)
 pub fn start(
-    voices: VoicesMap,
+    mixer: SharedMixer,
     inject: Option<Arc<Mutex<Vec<u64>>>>,
     report: Option<UnboundedSender<ClientMessage>>,
 ) -> Result<Audio, String> {
@@ -236,7 +236,7 @@ pub fn start(
     let default_out: cpal::StreamConfig = out_cfg.into();
     let build_output = |cfg: &cpal::StreamConfig| {
         let mut state = OutputState {
-            voices: voices.clone(),
+            mixer: mixer.clone(),
             report: report.clone(),
             channels: out_channels,
             first: true,

@@ -10,6 +10,9 @@
 //!                  protocol changes). Both processes share the machine
 //!                  clock, so the deltas are exact.
 //! Stay quiet while measuring; the clicks are loud.
+//!
+//! Per-user volume (Phase 4b): --volume <user_id>:<gain>, repeatable.
+//! 0.0 mutes that user locally; other peers are unaffected.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -35,6 +38,7 @@ struct Args {
     channel_id: u64,
     measure: bool,
     report: bool,
+    volumes: Vec<(u32, f32)>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -43,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
     let mut password = None;
     let mut channel_id = 1u64;
     let (mut measure, mut report) = (false, false);
+    let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -54,6 +59,15 @@ fn parse_args() -> Result<Args, String> {
             }
             "--measure" => measure = true,
             "--report" => report = true,
+            "--volume" => {
+                let spec = it.next().ok_or("--volume needs <user_id>:<gain>")?;
+                let (id, gain) = spec
+                    .split_once(':')
+                    .ok_or("--volume format is <user_id>:<gain>, e.g. 2:0.5")?;
+                let id: u32 = id.parse().map_err(|_| format!("bad user id: {id}"))?;
+                let gain: f32 = gain.parse().map_err(|_| format!("bad gain: {gain}"))?;
+                volumes.push((id, gain.clamp(0.0, 4.0)));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -70,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
         channel_id,
         measure,
         report,
+        volumes,
     })
 }
 
@@ -192,13 +207,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
 
     #[cfg(not(feature = "audio-device"))]
-    if args.measure || args.report {
-        eprintln!("--measure/--report need the audio-device feature; ignoring");
+    if args.measure || args.report || !args.volumes.is_empty() {
+        eprintln!("--measure/--report/--volume need the audio-device feature; ignoring");
     }
 
     // --- audio (feature-gated) ---
     #[cfg(feature = "audio-device")]
-    let voices = mixer::new_voices();
+    let shared_mixer = mixer::new();
+    #[cfg(feature = "audio-device")]
+    for &(id, gain) in &args.volumes {
+        mixer::set_gain(&shared_mixer, id, gain);
+        println!("volume: user {id} at {gain:.2}×");
+    }
     #[cfg(feature = "audio-device")]
     let injections = args
         .measure
@@ -207,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let injections: Option<Arc<Mutex<Vec<u64>>>> = None;
     #[cfg(feature = "audio-device")]
     let runtime = audio::start(
-        voices.clone(),
+        shared_mixer.clone(),
         injections.clone(),
         args.report.then(|| _outbound_tx.clone()),
     )?;
@@ -248,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- control stream reader: chat / voice states / latency reports ---
     #[cfg(feature = "audio-device")]
-    let ctrl_voices = voices.clone();
+    let ctrl_mixer = shared_mixer.clone();
     let measure_flag = args.measure;
     tokio::spawn(async move {
         let mut deltas: Vec<i64> = Vec::new();
@@ -305,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         #[cfg(feature = "audio-device")]
                         if !v.joined {
-                            mixer::remove(&ctrl_voices, v.user_id);
+                            mixer::remove(&ctrl_mixer, v.user_id);
                         }
                     }
                     Some(ServerBody::HeartbeatAck(a)) if measure_flag => {
@@ -358,7 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        let dg_voices = voices.clone();
+        let dg_mixer = shared_mixer.clone();
         let conn_recv = conn.clone();
         let my_id = ok.user_id;
         tokio::spawn(async move {
@@ -372,11 +392,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if m.sender_id == 0 || m.sender_id == my_id {
                             continue;
                         }
-                        let mut voices = dg_voices.lock().unwrap();
-                        let v = voices.entry(m.sender_id).or_insert_with(|| {
-                            mixer::Voice::new(m.sender_id).expect("opus decoder")
-                        });
-                        v.push_packet(m.seq, m.payload);
+                        if let Err(e) = mixer::push_packet(&dg_mixer, m.sender_id, m.seq, m.payload)
+                        {
+                            eprintln!("recv pipeline for user {}: {e}", m.sender_id);
+                        }
                     }
                     Err(_) => {
                         println!("media channel closed");

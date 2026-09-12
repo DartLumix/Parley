@@ -7,7 +7,7 @@ edition.workspace = true
 # Off by default so `cargo test --workspace` (CI, no ALSA) builds the
 # control-only client. Local voice runs:
 #   cargo run -p parley-client --features audio-device -- ...
-audio-device = ["dep:cpal", "parley-core/audio-device"]
+audio-device = ["dep:cpal", "parley-core/audio-device", "dep:webrtc-audio-processing"]
 
 [dependencies]
 parley-core = { workspace = true }
@@ -19,3 +19,4 @@ prost = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 cpal = { workspace = true, optional = true }
+webrtc-audio-processing = { workspace = true, optional = true }

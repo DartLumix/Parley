@@ -1,4 +1,5 @@
-//! Per-sender receive state and the output mix. Pure logic, no cpal.
+//! Per-sender receive state, per-user output volume, and the final mix.
+//! Pure logic, no cpal.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -6,41 +7,73 @@ use std::sync::{Arc, Mutex};
 use parley_core::audio::SAMPLES_PER_FRAME;
 use parley_core::audio::pipeline::RecvPipeline;
 
-pub struct Voice {
+struct Voice {
     pipeline: RecvPipeline,
     /// Decoded samples not yet consumed by the output callback.
     pending: VecDeque<f32>,
 }
 
 impl Voice {
-    pub fn new(sender_id: u32) -> Result<Self, String> {
+    fn new(sender_id: u32) -> Result<Self, String> {
         Ok(Self {
             pipeline: RecvPipeline::new(sender_id).map_err(|e| e.to_string())?,
             pending: VecDeque::new(),
         })
     }
 
-    pub fn push_packet(&mut self, seq: u16, packet: &[u8]) {
+    fn push_packet(&mut self, seq: u16, packet: &[u8]) {
         self.pipeline.push_packet(seq, packet);
     }
 }
 
-pub type VoicesMap = Arc<Mutex<HashMap<u32, Voice>>>;
-
-pub fn new_voices() -> VoicesMap {
-    Arc::new(Mutex::new(HashMap::new()))
+pub struct Mixer {
+    voices: HashMap<u32, Voice>,
+    /// Per-user output gain (Phase 4b); unknown ids play at 1.0.
+    gains: HashMap<u32, f32>,
 }
 
-/// Drop a departed sender's decoder state.
-pub fn remove(voices: &VoicesMap, sender_id: u32) {
-    voices.lock().unwrap().remove(&sender_id);
+pub type SharedMixer = Arc<Mutex<Mixer>>;
+
+pub fn new() -> SharedMixer {
+    Arc::new(Mutex::new(Mixer {
+        voices: HashMap::new(),
+        gains: HashMap::new(),
+    }))
 }
 
-/// Pull from every sender, sum-mix, clamp. `n` = frames (per-channel
-/// samples) the output callback needs right now.
-pub fn mix(voices: &VoicesMap, n: usize) -> Vec<f32> {
-    let mut voices = voices.lock().unwrap();
-    for v in voices.values_mut() {
+/// Set a user's output gain; 0.0 mutes them. Survives them leaving/rejoining.
+pub fn set_gain(mixer: &SharedMixer, user_id: u32, gain: f32) {
+    mixer.lock().unwrap().gains.insert(user_id, gain);
+}
+
+/// Drop a departed sender's decoder state (their gain setting stays).
+pub fn remove(mixer: &SharedMixer, sender_id: u32) {
+    mixer.lock().unwrap().voices.remove(&sender_id);
+}
+
+/// Feed one received packet, creating the sender's pipeline on first sight.
+pub fn push_packet(
+    mixer: &SharedMixer,
+    sender_id: u32,
+    seq: u16,
+    packet: &[u8],
+) -> Result<(), String> {
+    let mut m = mixer.lock().unwrap();
+    if let Some(v) = m.voices.get_mut(&sender_id) {
+        v.push_packet(seq, packet);
+        return Ok(());
+    }
+    let mut v = Voice::new(sender_id)?;
+    v.push_packet(seq, packet);
+    m.voices.insert(sender_id, v);
+    Ok(())
+}
+
+/// Pull from every sender, apply per-user gains, sum-mix, clamp. `n` =
+/// frames (per-channel samples) the output callback needs right now.
+pub fn mix(mixer: &SharedMixer, n: usize) -> Vec<f32> {
+    let mut m = mixer.lock().unwrap();
+    for v in m.voices.values_mut() {
         // Pull only what we're short of — pulling a fixed frame count
         // every callback would over-drain the jitter buffer and make
         // delay grow without bound.
@@ -57,14 +90,18 @@ pub fn mix(voices: &VoicesMap, n: usize) -> Vec<f32> {
         v.pending.extend(tmp);
     }
     let mut mix = vec![0.0f32; n];
-    for v in voices.values() {
-        for (i, m) in mix.iter_mut().enumerate() {
+    for (&id, v) in m.voices.iter() {
+        let gain = m.gains.get(&id).copied().unwrap_or(1.0);
+        if gain == 0.0 {
+            continue; // muted — pending still drains below, timing stays honest
+        }
+        for (i, out) in mix.iter_mut().enumerate() {
             if let Some(&s) = v.pending.get(i) {
-                *m += s;
+                *out += s * gain;
             }
         }
     }
-    for v in voices.values_mut() {
+    for v in m.voices.values_mut() {
         let drop = v.pending.len().min(n);
         v.pending.drain(..drop);
     }

@@ -35,6 +35,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 bytes = "1"
 audiopus = "0.3.0-rc.0"
 cpal = "0.15"
+webrtc-audio-processing = "2.1"
+
 
 [profile.release]
 strip = true
