@@ -17,8 +17,8 @@ use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ClientBody, ClientMessage,
-    HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser, ServerBody,
-    ServerMessage, VoiceState as PbVoiceState, VoiceStateList,
+    HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser, ReceiverReport,
+    ServerBody, ServerMessage, VoiceState as PbVoiceState, VoiceStateList,
 };
 
 pub struct Server {
@@ -430,6 +430,24 @@ async fn handle_client_message(
                 },
             )
             .await?;
+        }
+
+        Some(ClientBody::ReceiverReport(rep)) => {
+            // 4d: loss feedback routed like media — stamped with the
+            // authenticated reporter id, delivered to voice-channel
+            // peers. v1 uses broadcast (correct while one channel);
+            // multi-channel wants member-targeted sends (registry needs
+            // a send-to-user control method first).
+            if let Some(channel_id) = voice.channel_of(info.id)
+                && voice.members_of(channel_id).len() > 1
+            {
+                registry.broadcast(ServerMessage {
+                    body: Some(ServerBody::ReceiverReport(ReceiverReport {
+                        reporter_id: info.id,
+                        gap_rate_permille: rep.gap_rate_permille,
+                    })),
+                });
+            }
         }
 
         None => {

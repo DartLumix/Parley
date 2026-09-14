@@ -14,6 +14,6 @@ pub use pb::server_message::Body as ServerBody;
 pub use pb::{
     AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChatMessage, ClientMessage,
     FetchHistory, Heartbeat, HeartbeatAck, Hello, HelloAck, HistoryResult, JoinVoice, LeaveVoice,
-    ListChannels, PresenceList, PresenceRequest, PresenceUser, SendChat, ServerMessage, VoiceState,
-    VoiceStateList, VoiceStatesRequest,
+    ListChannels, PresenceList, PresenceRequest, PresenceUser, ReceiverReport, SendChat,
+    ServerMessage, VoiceState, VoiceStateList, VoiceStatesRequest,
 };

@@ -2,21 +2,21 @@
 //! Without the `audio-device` feature it's a control-only debug client
 //! (chat/presence, no mic or speakers) — that's what CI builds.
 //!
-//! Latency measurement (Phase 3f), two roles on one machine:
-//!   A: --measure   injects a click every 2 s, pairs returning reports,
-//!                  prints callback→render latency + stats
-//!   B: --report    detects clicks in the render callback and reports
-//!                  them back over chat. Both processes share the
-//!                  machine clock, so the deltas are exact.
-//! Stay quiet while measuring; the clicks are loud.
+//! Latency measurement (Phase 3f): --measure injects a click every 2 s,
+//! --report detects it in the render callback and reports back over
+//! chat. Stay quiet while measuring; the clicks are loud.
 //!
 //! Per-user volume (Phase 4b): --volume <user_id>:<gain>, repeatable.
-//! 0.0 mutes that user locally; other peers are unaffected.
 //!
-//! AEC/NS (Phase 4a): on by default, --no-aec disables. The played mix
-//! is the AEC far-end reference; mic audio is processed before encoding.
+//! AEC/NS (Phase 4a): on by default, --no-aec disables.
+//!
+//! Loss-adaptive bitrate (Phase 4d): receivers report gap rates to their
+//! voice-channel peers; senders switch between Clean (64 kbps, FEC
+//! inert) and Robust (24 kbps + aggressive in-band FEC) on an EMA with
+//! hysteresis.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,10 @@ use prost::Message as _;
 use parley_client::cert;
 #[cfg(feature = "audio-device")]
 use parley_client::{aec, audio, mixer};
+#[cfg(feature = "audio-device")]
+use parley_core::audio::pipeline::SendPipeline;
+#[cfg(feature = "audio-device")]
+use parley_proto::ReceiverReport;
 
 struct Args {
     server: String,
@@ -204,10 +208,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.server, args.user, ok.user_id, args.channel_id
     );
 
-    // Outbound control channel: heartbeats AND click reports share one
-    // writer task (audio callbacks can't await, but unbounded send is
-    // synchronous and non-blocking).
+    // Outbound control channel: heartbeats, click reports and loss
+    // reports share one writer task.
     let (_outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+
+    // 4d: last loss report seen from a peer, permille. Written by the
+    // control reader, polled by the bitrate controller in the encode task.
+    let loss_state = Arc::new(AtomicU32::new(0));
 
     #[cfg(not(feature = "audio-device"))]
     if args.measure || args.report || args.noaec || !args.volumes.is_empty() {
@@ -288,9 +295,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- control stream reader: chat / voice states / latency reports ---
+    // --- control stream reader: chat / voice states / loss reports ---
     #[cfg(feature = "audio-device")]
     let ctrl_mixer = shared_mixer.clone();
+    let ctrl_loss_state = loss_state.clone();
     let measure_flag = args.measure;
     tokio::spawn(async move {
         let mut deltas: Vec<i64> = Vec::new();
@@ -350,6 +358,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             mixer::remove(&ctrl_mixer, v.user_id);
                         }
                     }
+                    Some(ServerBody::ReceiverReport(rep)) => {
+                        // 4d: a peer's loss report steers our send profile.
+                        // Skip our own echo (broadcast includes us) and
+                        // unstamped reports.
+                        if rep.reporter_id != 0 && rep.reporter_id != ok.user_id {
+                            ctrl_loss_state.store(rep.gap_rate_permille, Ordering::Relaxed);
+                        }
+                    }
                     Some(ServerBody::HeartbeatAck(a)) if measure_flag => {
                         println!(
                             "heartbeat rtt: {} ms",
@@ -371,47 +387,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut pcm_rx = runtime.pcm_rx;
         let conn_send = conn.clone();
+        let enc_loss_state = loss_state.clone();
         tokio::spawn(async move {
-            let mut send = match parley_core::audio::pipeline::SendPipeline::new(64_000) {
+            let mut send = match SendPipeline::new(64_000) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("opus encoder init failed: {e}");
                     return;
                 }
             };
+
+            // --- 4d: two-profile bitrate controller ---
+            // Clean:  64 kbps, loss hint 5  (CELT, max quality, FEC inert).
+            // Robust: 24 kbps, loss hint 30 (SILK + LBRR, FEC live).
+            // EMA over receiver gap-rate reports (updated every 5 s);
+            // down when EMA > 3%, back up after 20 s below 1%. 5 s
+            // switch cooldown prevents flapping.
+            let mut ema_permille: f32 = 0.0;
+            let mut mode_robust = false;
+            let mut last_switch = std::time::Instant::now();
+            let mut low_since: Option<std::time::Instant> = None;
+            let mut ctrl_tick = tokio::time::interval(Duration::from_secs(1));
+
+            fn apply_profile(send: &mut SendPipeline, robust: bool) {
+                let (rate, loss) = if robust { (24_000, 30) } else { (64_000, 5) };
+                send.set_bitrate(rate);
+                send.set_loss_hint(loss);
+            }
+            apply_profile(&mut send, false);
+
             // Reassembles arbitrary callback chunks into exact 10 ms
             // frames for the AEC/NS processor.
             let mut asm = aec::FrameAssembler::new();
-            while let Some(chunk) = pcm_rx.recv().await {
-                let processed: Vec<f32> = match aec_proc.as_ref() {
-                    Some(ap) => {
-                        let mut out = Vec::new();
-                        aec::process_capture(ap, &mut asm, &chunk, &mut out);
-                        out
+            loop {
+                tokio::select! {
+                    chunk = pcm_rx.recv() => {
+                        let Some(chunk) = chunk else { break };
+                        let processed: Vec<f32> = match aec_proc.as_ref() {
+                            Some(ap) => {
+                                let mut out = Vec::new();
+                                aec::process_capture(ap, &mut asm, &chunk, &mut out);
+                                out
+                            }
+                            None => chunk,
+                        };
+                        let pcm: Vec<i16> = processed
+                            .iter()
+                            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                            .collect();
+                        let mut packets = Vec::new();
+                        if !pcm.is_empty()
+                            && let Err(e) = send.push_pcm(&pcm, &mut packets)
+                        {
+                            eprintln!("encode failed: {e}");
+                            break;
+                        }
+                        for (seq, ts, pkt) in packets {
+                            let dg = parley_proto::media::encode(
+                                parley_proto::media::FLAG_SPEAKING,
+                                seq,
+                                ts,
+                                0, // sender_id: the server stamps the authenticated id
+                                &pkt,
+                            );
+                            if conn_send.send_datagram(dg.into()).is_err() {
+                                return; // connection gone
+                            }
+                        }
                     }
-                    None => chunk,
-                };
-                let pcm: Vec<i16> = processed
-                    .iter()
-                    .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                    .collect();
-                let mut packets = Vec::new();
-                if !pcm.is_empty()
-                    && let Err(e) = send.push_pcm(&pcm, &mut packets)
-                {
-                    eprintln!("encode failed: {e}");
-                    break;
-                }
-                for (seq, ts, pkt) in packets {
-                    let dg = parley_proto::media::encode(
-                        parley_proto::media::FLAG_SPEAKING,
-                        seq,
-                        ts,
-                        0, // sender_id: the server stamps the authenticated id
-                        &pkt,
-                    );
-                    if conn_send.send_datagram(dg.into()).is_err() {
-                        return; // connection gone
+                    _ = ctrl_tick.tick() => {
+                        let observed = enc_loss_state.load(Ordering::Relaxed) as f32;
+                        ema_permille = 0.7 * ema_permille + 0.3 * observed;
+                        let now = std::time::Instant::now();
+                        if !mode_robust {
+                            if ema_permille > 30.0
+                                && now.duration_since(last_switch).as_secs() >= 5
+                            {
+                                mode_robust = true;
+                                apply_profile(&mut send, true);
+                                last_switch = now;
+                                low_since = None;
+                                println!(
+                                    "bitrate: → Robust (24 kbps + FEC) — loss {:.1}%",
+                                    ema_permille / 10.0
+                                );
+                            }
+                        } else if ema_permille < 10.0 {
+                            let since = *low_since.get_or_insert(now);
+                            if now.duration_since(since).as_secs() >= 20
+                                && now.duration_since(last_switch).as_secs() >= 5
+                            {
+                                mode_robust = false;
+                                apply_profile(&mut send, false);
+                                last_switch = now;
+                                low_since = None;
+                                println!(
+                                    "bitrate: → Clean (64 kbps) — loss {:.1}%",
+                                    ema_permille / 10.0
+                                );
+                            }
+                        } else {
+                            low_since = None;
+                        }
                     }
                 }
             }
@@ -441,6 +518,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                 }
+            }
+        });
+
+        // --- 4d: loss reporter — one aggregate (worst-peer) report per
+        // 5 s window, routed by the server back to voice-channel peers ---
+        let rep_mixer = shared_mixer.clone();
+        let rep_outbound = _outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let rates = mixer::gap_rates(&rep_mixer);
+                if rates.is_empty() {
+                    continue; // no active voices: nothing to report
+                }
+                let worst = rates.iter().map(|&(_, r)| r).max().unwrap_or(0);
+                let _ = rep_outbound.send(ClientMessage {
+                    body: Some(ClientBody::ReceiverReport(ReceiverReport {
+                        gap_rate_permille: worst,
+                        reporter_id: 0, // server stamps the authenticated id
+                    })),
+                });
             }
         });
     }

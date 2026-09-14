@@ -67,6 +67,12 @@ impl OpusEncoder {
     pub fn set_loss_hint(&mut self, perc: u8) {
         let _ = self.encoder.set_packet_loss_perc(perc);
     }
+
+    /// 4d: runtime bitrate change. Cheap — libopus reconfigures in place.
+    /// Driven by the client's loss-aware profile switcher.
+    pub fn set_bitrate(&mut self, bps: i32) {
+        let _ = self.encoder.set_bitrate(Bitrate::BitsPerSecond(bps));
+    }
 }
 
 pub struct OpusDecoder {

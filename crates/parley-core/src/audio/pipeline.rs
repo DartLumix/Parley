@@ -7,7 +7,7 @@ use crate::audio::jitter::{JitterBuffer, PopOutcome};
 use crate::error::Error;
 
 pub struct SendPipeline {
-    /// Accumulates resampled 48k i16 samples until a full Opus frame.
+    /// Accumulates captured 48 kHz i16 samples until a full Opus frame.
     frame: Vec<i16>,
     encoder: OpusEncoder,
     pub seq: u16,
@@ -22,6 +22,16 @@ impl SendPipeline {
             seq: 0,
             timestamp: 0,
         })
+    }
+
+    /// 4d: runtime bitrate switch (libopus reconfigures in place).
+    pub fn set_bitrate(&mut self, bps: i32) {
+        self.encoder.set_bitrate(bps);
+    }
+
+    /// 4d: expected-loss hint steering FEC aggressiveness (SILK mode only).
+    pub fn set_loss_hint(&mut self, perc: u8) {
+        self.encoder.set_loss_hint(perc);
     }
 
     /// Feed one chunk of 48 kHz mono i16 samples. Returns zero or more
@@ -48,6 +58,11 @@ pub struct RecvPipeline {
     jitter: JitterBuffer,
     decoder: OpusDecoder,
     pub sender_id: u32,
+    /// Frames concealed (gap declared) since the last gap_rate_permille()
+    /// reset — the 4d loss signal.
+    pub gaps: u64,
+    /// Frames decoded since the last gap_rate_permille() reset.
+    pub frames: u64,
 }
 
 impl RecvPipeline {
@@ -56,6 +71,8 @@ impl RecvPipeline {
             jitter: JitterBuffer::new(),
             decoder: OpusDecoder::new()?,
             sender_id,
+            gaps: 0,
+            frames: 0,
         })
     }
 
@@ -63,8 +80,21 @@ impl RecvPipeline {
         self.jitter.push(seq, packet);
     }
 
-    /// Pull up to `max_frames` frames of decoded f32 (48 kHz mono).
-    /// Appends to `out`. Runs PLC on gaps.
+    /// Gap rate over the window since the last call, in thousandths of
+    /// frames (e.g. 100 = 10%). Resets the window — callers report it
+    /// downstream every reporting period.
+    pub fn gap_rate_permille(&mut self) -> u32 {
+        let total = self.gaps + self.frames;
+        let rate = if total == 0 {
+            0
+        } else {
+            ((self.gaps as f64 / total as f64) * 1000.0).round() as u32
+        };
+        self.gaps = 0;
+        self.frames = 0;
+        rate
+    }
+
     /// Pull up to `max_frames` frames of decoded f32 (48 kHz mono).
     /// Appends to `out`. Gaps conceal via in-band FEC when the successor
     /// packet is buffered, plain PLC otherwise.
@@ -75,14 +105,14 @@ impl RecvPipeline {
                 (PopOutcome::Packet, Some(packet)) => {
                     let samples = self.decoder.decode(&packet)?;
                     out.extend(samples.iter().map(|&s| s as f32 / 32768.0));
+                    self.frames += 1;
                 }
                 (PopOutcome::Gap, _) => {
+                    self.gaps += 1;
                     // Lost frame. If the immediate successor is buffered,
                     // its in-band FEC reconstructs the lost audio (better
                     // than PLC); the successor itself decodes on the next
-                    // pop. Cascaded losses fall out naturally: each Gap
-                    // conceals exactly its own frame, and packet N+2's FEC
-                    // reconstructs N+1 once the playhead reaches it.
+                    // pop.
                     if let Some((_, pkt)) = self.jitter.peek() {
                         let samples = match self.decoder.decode_fec(pkt) {
                             Ok(s) => s,

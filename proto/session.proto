@@ -95,6 +95,7 @@ message ClientMessage {
     JoinVoice join_voice = 6;
     LeaveVoice leave_voice = 7;
     VoiceStatesRequest voice_states_request = 8;
+    ReceiverReport receiver_report = 9;
   }
 }
 
@@ -107,5 +108,15 @@ message ServerMessage {
     HistoryResult history_result = 5;
     VoiceState voice_state = 6;
     VoiceStateList voice_state_list = 7;
+    ReceiverReport receiver_report = 8;
   }
+}
+
+// --- Loss feedback (4d) ---
+
+message ReceiverReport {
+  uint32 gap_rate_permille = 1;
+  // Server-stamped authenticated reporter id (clients send 0) —
+  // lets a sender ignore its own report echoed by the broadcast.
+  uint32 reporter_id = 2;
 }

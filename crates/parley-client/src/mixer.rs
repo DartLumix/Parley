@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use parley_core::audio::SAMPLES_PER_FRAME;
 use parley_core::audio::pipeline::RecvPipeline;
 
-struct Voice {
+pub struct Voice {
     pipeline: RecvPipeline,
     /// Decoded samples not yet consumed by the output callback.
     pending: VecDeque<f32>,
@@ -67,6 +67,18 @@ pub fn push_packet(
     v.push_packet(seq, packet);
     m.voices.insert(sender_id, v);
     Ok(())
+}
+
+/// 4d: collect per-sender gap rates since the last call (resets each
+/// sender's window). Returns (sender_id, permille) pairs.
+pub fn gap_rates(mixer: &SharedMixer) -> Vec<(u32, u32)> {
+    mixer
+        .lock()
+        .unwrap()
+        .voices
+        .iter_mut()
+        .map(|(&id, v)| (id, v.pipeline.gap_rate_permille()))
+        .collect()
 }
 
 /// Pull from every sender, apply per-user gains, sum-mix, clamp. `n` =
