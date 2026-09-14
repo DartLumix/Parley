@@ -10,9 +10,11 @@ quinn.workspace = true
 thiserror.workspace = true
 audiopus.workspace = true
 cpal = { workspace = true, optional = true }
+openh264 = { workspace = true, optional = true }
 
 [features]
 default = []
 # Real audio device I/O (cpal/ALSA). Clients only — the server never
 # enables this, keeping the server build free of system audio deps.
 audio-device = ["cpal"]
+video = ["dep:openh264"]

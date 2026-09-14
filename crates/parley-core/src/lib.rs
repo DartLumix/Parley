@@ -4,5 +4,7 @@
 pub mod audio;
 pub mod error;
 pub mod session;
+#[cfg(feature = "video")]
+pub mod video;
 
 pub use error::Error;

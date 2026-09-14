@@ -36,7 +36,7 @@ bytes = "1"
 audiopus = "0.3.0-rc.0"
 cpal = "0.15"
 webrtc-audio-processing = "2.1"
-
+openh264 = "0.9"
 
 [profile.release]
 strip = true
