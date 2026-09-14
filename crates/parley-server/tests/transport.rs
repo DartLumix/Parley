@@ -729,3 +729,76 @@ async fn voice_roundtrip_synthetic_audio() {
     conn_b.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
+
+#[tokio::test]
+async fn video_fragments_routed_between_members() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("video-route");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    // Both join voice channel 1 (video rides the same channel membership).
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // A sends one fragmented keyframe + one delta frame; B reassembles.
+    let keyframe: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+    let delta: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let dgs = parley_proto::video::fragment_frame(0, true, &keyframe, 0, 0, 0);
+    let dgs2 = parley_proto::video::fragment_frame(1, false, &delta, 100, 960, 0);
+
+    for dg in dgs.iter().chain(dgs2.iter()) {
+        conn_a.send_datagram(dg.clone().into()).unwrap();
+    }
+
+    // B receives all datagrams, reassembles both frames.
+    let mut asm = parley_proto::video::VideoAssembler::new();
+    let expected_total = dgs.len() + dgs2.len();
+    for _ in 0..expected_total {
+        let d = timeout(Duration::from_secs(2), conn_b.read_datagram())
+            .await
+            .expect("datagram should arrive")
+            .unwrap();
+        let m = parley_proto::media::decode(&d).unwrap();
+        assert!(m.flags & parley_proto::media::FLAG_VIDEO != 0);
+        assert_eq!(m.sender_id, 1, "server stamps sender id");
+        let frag = parley_proto::video::decode_fragment(m.payload).unwrap();
+        asm.push_fragment(frag);
+    }
+
+    let f1 = asm.pop_frame().expect("keyframe assembled");
+    assert_eq!(f1.data, keyframe);
+    assert!(f1.keyframe);
+    let f2 = asm.pop_frame().expect("delta assembled");
+    assert_eq!(f2.data, delta);
+    assert!(!f2.keyframe);
+    assert_eq!(asm.frames_completed, 2);
+
+    // A does not receive its own video back.
+    let loopback = timeout(Duration::from_millis(200), conn_a.read_datagram()).await;
+    assert!(loopback.is_err(), "no video loopback to sender");
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}

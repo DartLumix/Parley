@@ -16,6 +16,10 @@ pub const MAX_DATAGRAM_SIZE: usize = 1200;
 /// Set when the sender's voice activity detection fired.
 pub const FLAG_SPEAKING: u8 = 1 << 0;
 
+/// Set on video datagrams (Phase 5). Payload carries the video fragment
+/// sub-header (see video.rs).
+pub const FLAG_VIDEO: u8 = 1 << 1;
+
 pub const HEADER_LEN: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
