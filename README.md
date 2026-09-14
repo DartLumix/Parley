@@ -25,10 +25,10 @@ Voice is the product; everything else grows later.
 | 3d | Audio device layer — cpal, feature-gated | ✅ |
 | 3e | Audio pipelines, native 48 kHz I/O, test client | ✅ |
 | 3f | Latebct measurement --verdict below | ✅ |
-| 4 | Hardening, screen share, video, platforms | ⏳ |
+| 4 | Voice hardening — AEC/NS, volume, FEC, adaptive bitrate | ✅ |
 | 4a | AEC / NS (WebRTC APM) on mic path | ✅ |
 | 4b | Per-user volume in client mix | ✅ |
-| 4+ | FEC, bitrate ladder, congestion, screen share | ⏳ |
+| 4+ | FEC, bitrate ladder, congestion, screen share | ✅ |
 
 ---
 
