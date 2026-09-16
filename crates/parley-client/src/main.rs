@@ -227,9 +227,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "video")]
     let video_viewers = parley_client::video::new_viewers();
 
-    #[cfg(not(any(feature = "audio-device", feature = "video")))]
-    if args.measure || args.report || args.noaec || !args.volumes.is_empty() || args.share {
-        eprintln!("--measure/--report/--volume/--no-aec/--share need client features; ignoring");
+    // Feature-mismatch warnings, split per feature so every Args field
+    // stays read in every feature combination (dead_code is per-build:
+    // audio-device-only never reads `share`; video-only never reads
+    // report/noaec/volumes — both fired under -D warnings).
+    #[cfg(not(feature = "audio-device"))]
+    if args.measure || args.report || args.noaec || !args.volumes.is_empty() {
+        eprintln!("--measure/--report/--volume/--no-aec need the audio-device feature; ignoring");
+    }
+    #[cfg(not(feature = "video"))]
+    if args.share {
+        eprintln!("--share needs the video feature; ignoring");
     }
 
     // --- audio (feature-gated) ---
@@ -520,44 +528,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        let dg_mixer = shared_mixer.clone();
-        let conn_recv = conn.clone();
-        let my_id = ok.user_id;
-        tokio::spawn(async move {
-            loop {
-                match conn_recv.read_datagram().await {
-                    Ok(dg) => {
-                        let Ok(m) = parley_proto::media::decode(&dg) else {
-                            continue;
-                        };
-                        #[cfg(feature = "video")]
-                        if m.flags & parley_proto::media::FLAG_VIDEO != 0 {
-                            if m.sender_id != 0 && m.sender_id != my_id {
-                                video::handle_video_datagram(
-                                    &video_viewers,
-                                    m.sender_id,
-                                    m.payload,
-                                );
-                            }
-                            continue;
-                        }
-                        // server never loops a sender's own audio back
-                        if m.sender_id == 0 || m.sender_id == my_id {
-                            continue;
-                        }
-                        if let Err(e) = mixer::push_packet(&dg_mixer, m.sender_id, m.seq, m.payload)
-                        {
-                            eprintln!("recv pipeline for user {}: {e}", m.sender_id);
-                        }
-                    }
-                    Err(_) => {
-                        println!("media channel closed");
-                        break;
-                    }
-                }
-            }
-        });
-
         // --- 4d: loss reporter — one aggregate (worst-peer) report per
         // 5 s window, routed by the server back to voice-channel peers ---
         let rep_mixer = shared_mixer.clone();
@@ -582,7 +552,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(not(feature = "audio-device"))]
-    println!("audio-device feature off: control-only mode (no mic/speakers)");
+    println!("audio-device feature off: no mic or speakers");
+
+    // --- media datagram reader ---
+    // Hoisted out of the audio-device gate (was Open Issues #2): a
+    // video-only build now receives video. Control-only builds (no
+    // features) still never spawn it — unchanged CI behavior.
+    #[cfg(any(feature = "audio-device", feature = "video"))]
+    {
+        #[cfg(feature = "audio-device")]
+        let dg_mixer = shared_mixer.clone();
+        let my_id = ok.user_id;
+        let conn_recv = conn.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn_recv.read_datagram().await {
+                    Ok(dg) => {
+                        let Ok(m) = parley_proto::media::decode(&dg) else {
+                            continue;
+                        };
+                        #[cfg(feature = "video")]
+                        if m.flags & parley_proto::media::FLAG_VIDEO != 0 {
+                            // server never loops a sender's own video back
+                            if m.sender_id != 0 && m.sender_id != my_id {
+                                video::handle_video_datagram(
+                                    &video_viewers,
+                                    m.sender_id,
+                                    m.payload,
+                                );
+                            }
+                            continue;
+                        }
+                        #[cfg(feature = "audio-device")]
+                        {
+                            // server never loops a sender's own audio back
+                            if m.sender_id == 0 || m.sender_id == my_id {
+                                continue;
+                            }
+                            if let Err(e) =
+                                mixer::push_packet(&dg_mixer, m.sender_id, m.seq, m.payload)
+                            {
+                                eprintln!("recv pipeline for user {}: {e}", m.sender_id);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        println!("media channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     #[cfg(feature = "video")]
     if args.share {
