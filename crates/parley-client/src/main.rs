@@ -28,6 +28,8 @@ use parley_proto::{
 use prost::Message as _;
 
 use parley_client::cert;
+#[cfg(feature = "video")]
+use parley_client::video;
 #[cfg(feature = "audio-device")]
 use parley_client::{aec, audio, mixer};
 #[cfg(feature = "audio-device")]
@@ -44,6 +46,7 @@ struct Args {
     report: bool,
     noaec: bool,
     volumes: Vec<(u32, f32)>,
+    share: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,6 +57,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut measure, mut report, mut noaec) = (false, false, false);
     let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
+    let mut share = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--server" => server = it.next(),
@@ -74,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
                 let gain: f32 = gain.parse().map_err(|_| format!("bad gain: {gain}"))?;
                 volumes.push((id, gain.clamp(0.0, 4.0)));
             }
+            "--share" => share = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -92,6 +97,7 @@ fn parse_args() -> Result<Args, String> {
         report,
         noaec,
         volumes,
+        share,
     })
 }
 
@@ -216,9 +222,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // control reader, polled by the bitrate controller in the encode task.
     let loss_state = Arc::new(AtomicU32::new(0));
 
-    #[cfg(not(feature = "audio-device"))]
-    if args.measure || args.report || args.noaec || !args.volumes.is_empty() {
-        eprintln!("--measure/--report/--volume/--no-aec need the audio-device feature; ignoring");
+    // 5c: per-sender video viewers — shared by the datagram reader,
+    // control reader (cleanup), and the stats ticker.
+    #[cfg(feature = "video")]
+    let video_viewers = parley_client::video::new_viewers();
+
+    #[cfg(not(any(feature = "audio-device", feature = "video")))]
+    if args.measure || args.report || args.noaec || !args.volumes.is_empty() || args.share {
+        eprintln!("--measure/--report/--volume/--no-aec/--share need client features; ignoring");
     }
 
     // --- audio (feature-gated) ---
@@ -260,6 +271,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.report.then(|| _outbound_tx.clone()),
         aec_proc.clone(),
     )?;
+    #[cfg(feature = "video")]
+    {
+        let v = video_viewers.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                println!("{}", parley_client::video::stats_line(&v));
+            }
+        });
+    }
 
     // --- writer: heartbeats + anything the audio side posts ---
     let hb_ms = if ack.heartbeat_ms == 0 {
@@ -298,6 +320,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- control stream reader: chat / voice states / loss reports ---
     #[cfg(feature = "audio-device")]
     let ctrl_mixer = shared_mixer.clone();
+    #[cfg(feature = "video")]
+    let ctrl_viewers = video_viewers.clone();
     let ctrl_loss_state = loss_state.clone();
     let measure_flag = args.measure;
     tokio::spawn(async move {
@@ -353,9 +377,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if v.joined { "joined" } else { "left" },
                             v.channel_id
                         );
-                        #[cfg(feature = "audio-device")]
                         if !v.joined {
+                            #[cfg(feature = "audio-device")]
                             mixer::remove(&ctrl_mixer, v.user_id);
+                            #[cfg(feature = "video")]
+                            video::remove_viewer(&ctrl_viewers, v.user_id);
                         }
                     }
                     Some(ServerBody::ReceiverReport(rep)) => {
@@ -504,6 +530,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let Ok(m) = parley_proto::media::decode(&dg) else {
                             continue;
                         };
+                        #[cfg(feature = "video")]
+                        if m.flags & parley_proto::media::FLAG_VIDEO != 0 {
+                            if m.sender_id != 0 && m.sender_id != my_id {
+                                video::handle_video_datagram(
+                                    &video_viewers,
+                                    m.sender_id,
+                                    m.payload,
+                                );
+                            }
+                            continue;
+                        }
                         // server never loops a sender's own audio back
                         if m.sender_id == 0 || m.sender_id == my_id {
                             continue;
@@ -546,6 +583,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "audio-device"))]
     println!("audio-device feature off: control-only mode (no mic/speakers)");
+
+    #[cfg(feature = "video")]
+    if args.share {
+        let share_conn = conn.clone();
+        let seq = Arc::new(Mutex::new(0x8000u16));
+        match video::ShareSender::new(seq.clone()) {
+            Ok(sender) => {
+                tokio::spawn(video::share_task(share_conn, Arc::new(Mutex::new(sender))));
+            }
+            Err(e) => eprintln!("share: encoder init failed: {e}"),
+        }
+    }
 
     println!("talking — Ctrl-C to quit");
     let why = conn.closed().await;

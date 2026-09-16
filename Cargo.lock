@@ -871,6 +871,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "hex",
+ "openh264",
  "parley-core",
  "parley-proto",
  "prost",

@@ -8,6 +8,7 @@ edition.workspace = true
 # control-only client. Local voice runs:
 #   cargo run -p parley-client --features audio-device -- ...
 audio-device = ["dep:cpal", "parley-core/audio-device", "dep:webrtc-audio-processing"]
+video = ["parley-core/video"]
 
 [dependencies]
 parley-core = { workspace = true }
@@ -20,3 +21,4 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 cpal = { workspace = true, optional = true }
 webrtc-audio-processing = { workspace = true, optional = true }
+openh264 = { workspace = true, optional = true }
