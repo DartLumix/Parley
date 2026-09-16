@@ -98,7 +98,14 @@ impl VideoDecoder {
     /// from 5a). Returns Some(RGB8 data) when a picture came out —
     /// H.264 decoders can legitimately emit nothing (non-reference
     /// frames) or delay output; callers treat None as "no frame yet".
-    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    /// Decode one Annex-B frame, returning RGB8 data plus the decoded
+    /// dimensions — the SPS decides, not the caller. The viewer needs
+    /// these to size its display for sender-negotiated resolutions
+    /// (5d: real capture sends whatever the compositor serves).
+    pub fn decode_with_dims(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<(Vec<u8>, usize, usize)>, Error> {
         match self
             .decoder
             .decode(frame)
@@ -108,10 +115,18 @@ impl VideoDecoder {
                 let (w, h) = yuv.dimensions();
                 let mut rgb = vec![0u8; w * h * 3];
                 yuv.write_rgb8(&mut rgb);
-                Ok(Some(rgb))
+                Ok(Some((rgb, w, h)))
             }
             None => Ok(None),
         }
+    }
+
+    /// Decode one Annex-B frame (as assembled by video::VideoAssembler
+    /// from 5a). Returns Some(RGB8 data) when a picture came out —
+    /// H.264 decoders can legitimately emit nothing (non-reference
+    /// frames) or delay output; callers treat None as "no frame yet".
+    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.decode_with_dims(frame)?.map(|(rgb, _, _)| rgb))
     }
 }
 

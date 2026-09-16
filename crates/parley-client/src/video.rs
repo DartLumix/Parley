@@ -1,15 +1,18 @@
-//! Phase 5c: synthetic screen-share over the media datagram path.
+//! Phase 5c/5d: screen-share over the media datagram path.
 //!
-//! Send side (`--share`): generate the moving-bar test pattern (same
-//! generator as parley-core's video tests), encode 720p30, fragment,
-//! send with FLAG_VIDEO. Paced: one frame per 33 ms tick, fragments
-//! spaced to avoid bursting hundreds of datagrams into quinn at once.
+//! Send side: `--share` with the `video` feature sends the synthetic
+//! moving-bar pattern; with `screen-capture` (5d) it sends the real
+//! screen via the portal (see screen.rs). Both fragment + send with
+//! FLAG_VIDEO, paced so a keyframe doesn't burst datagrams into quinn.
 //!
 //! Receive side (any client): video datagrams are detected by flag,
 //! assembled per sender, decoded, and piped as raw RGB24 into a
-//! spawned mpv (one per sender). Video never touches the audio mixer
-//! or the jitter buffer — the paths only share the seq space, and
-//! receivers discriminate on FLAG_VIDEO before anything else.
+//! spawned mpv (one per sender). mpv is spawned lazily on the first
+//! decoded frame and sized from the H.264 SPS — the sender's
+//! negotiated resolution (720p synthetic, native monitor for real
+//! capture), never a client-side guess. Video never touches the audio
+//! mixer or the jitter buffer; the paths share only the seq space,
+//! and receivers discriminate on FLAG_VIDEO before anything else.
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
@@ -19,24 +22,23 @@ use std::time::Duration;
 use parley_core::video::{VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoDecoder, VideoEncoder};
 use parley_proto::video::{VideoAssembler, decode_fragment, fragment_frame};
 
-/// Spawn an mpv that reads raw RGB24 from our stdin pipe.
-/// One per remote sender, named after them in the window title.
+/// Spawn an mpv that reads raw RGB24 from our stdin pipe, sized to the
+/// decoded stream. One per remote sender, named after them in the title.
 ///
-/// mpv removed `--rawvideo=w:h:format` (your 0.41 errors on it); the
-/// options are `--demuxer-rawvideo-w/h/mp-format/fps` now (`-format`
-/// is FourCC-only, `-mp-format` takes pixel-format names like rgb24).
-/// stderr is inherited so a failing mpv is loud instead of silently
-/// eating frames into a dead pipe.
-fn spawn_mpv(sender_id: u32) -> Result<Child, String> {
+/// mpv 0.41: `--rawvideo=w:h:format` was REMOVED — the options are
+/// `--demuxer-rawvideo-w/h`, `-mp-format` (pixel-format names; plain
+/// `-format` is FourCC-only), `-fps`. `--title=value` form is
+/// mandatory (space-separated is rejected). stderr is inherited so a
+/// failing mpv is loud instead of silently eating frames.
+fn spawn_mpv(sender_id: u32, width: usize, height: usize) -> Result<Child, String> {
     Command::new("mpv")
         .args([
-            // mpv 0.41 rejects space-separated "--title value" — the
-            // = form is mandatory.
             &format!("--title=parley: user {sender_id}"),
+            "--cache=no",
             "--no-audio",
             "--demuxer=rawvideo",
-            &format!("--demuxer-rawvideo-w={VIDEO_WIDTH}"),
-            &format!("--demuxer-rawvideo-h={VIDEO_HEIGHT}"),
+            &format!("--demuxer-rawvideo-w={width}"),
+            &format!("--demuxer-rawvideo-h={height}"),
             "--demuxer-rawvideo-mp-format=rgb24",
             &format!("--demuxer-rawvideo-fps={VIDEO_FPS}"),
             "-",
@@ -77,7 +79,7 @@ fn test_frame_bgra(t: usize) -> Vec<u8> {
     bgra
 }
 
-// ---- send side ----
+// ---- send side (synthetic; real capture lives in screen.rs) ----
 
 /// Owns the encoder, frame_id, and the seq counter shared with the
 /// sender's audio path (same 16-bit space, discrimininated by flag).
@@ -133,11 +135,13 @@ impl ShareSender {
 // ---- receive side ----
 
 /// Per-sender receive state: assembler + decoder + mpv child.
+/// mpv spawns lazily on the first decoded frame — its size comes from
+/// the H.264 SPS, so any sender resolution displays correctly.
 pub struct Viewer {
     sender_id: u32,
     assembler: VideoAssembler,
     decoder: VideoDecoder,
-    mpv: Child,
+    mpv: Option<Child>,
     /// mpv died (window closed / exited)? Stop feeding, keep consuming
     /// datagrams so the stream stays accounted for.
     dead: bool,
@@ -151,7 +155,7 @@ impl Viewer {
             sender_id,
             assembler: VideoAssembler::new(),
             decoder: VideoDecoder::new().map_err(|e| e.to_string())?,
-            mpv: spawn_mpv(sender_id)?,
+            mpv: None,
             dead: false,
             shown: 0,
         })
@@ -163,13 +167,27 @@ impl Viewer {
             if self.dead {
                 continue; // keep consuming, don't decode for a dead viewer
             }
-            match self.decoder.decode(&frame.data) {
-                Ok(Some(rgb)) => {
-                    if feed_mpv(&mut self.mpv, &rgb) {
+            match self.decoder.decode_with_dims(&frame.data) {
+                Ok(Some((rgb, w, h))) => {
+                    if self.mpv.is_none() {
+                        println!("video: user {} sharing {w}x{h}", self.sender_id);
+                        match spawn_mpv(self.sender_id, w, h) {
+                            Ok(child) => self.mpv = Some(child),
+                            Err(e) => {
+                                eprintln!("video: {e}");
+                                self.dead = true;
+                                return;
+                            }
+                        }
+                    }
+                    let Some(mpv) = self.mpv.as_mut() else {
+                        return;
+                    };
+                    if feed_mpv(mpv, &rgb) {
                         self.shown += 1;
                     } else {
                         self.dead = true;
-                        let _ = self.mpv.try_wait(); // reap if already exited
+                        let _ = mpv.try_wait(); // reap if already exited
                         println!(
                             "video: viewer for user {} exited — not displaying (window closed?)",
                             self.sender_id
@@ -185,8 +203,10 @@ impl Viewer {
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        let _ = self.mpv.kill();
-        let _ = self.mpv.wait();
+        if let Some(mut mpv) = self.mpv.take() {
+            let _ = mpv.kill();
+            let _ = mpv.wait();
+        }
     }
 }
 
@@ -215,7 +235,7 @@ pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, payload: &[u8]) 
             v.feed_fragment(frag);
             viewers.insert(sender_id, v);
         }
-        Err(e) => eprintln!("video: viewer spawn failed: {e}"),
+        Err(e) => eprintln!("video: viewer init failed: {e}"),
     }
 }
 
@@ -244,7 +264,7 @@ pub fn remove_viewer(viewers: &Viewers, sender_id: u32) {
     viewers.lock().unwrap().remove(&sender_id);
 }
 
-// ---- send-side task ----
+// ---- send-side task (synthetic pattern) ----
 
 /// The `--share` loop: encode at ~30 fps, pace fragments, send.
 /// `pace` sleeps between fragments so a ~200-datagram keyframe doesn't

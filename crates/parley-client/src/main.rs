@@ -28,6 +28,8 @@ use parley_proto::{
 use prost::Message as _;
 
 use parley_client::cert;
+#[cfg(feature = "screen-capture")]
+use parley_client::screen;
 #[cfg(feature = "video")]
 use parley_client::video;
 #[cfg(feature = "audio-device")]
@@ -222,6 +224,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // control reader, polled by the bitrate controller in the encode task.
     let loss_state = Arc::new(AtomicU32::new(0));
 
+    // 5d: keyframe-on-join — filled by the share block below once the
+    // capture pipeline is up; the control reader pokes it when a
+    // viewer joins our voice channel.
+    #[cfg(feature = "screen-capture")]
+    let keyframe_poke: Arc<Mutex<Option<screen::ShareHandle>>> = Arc::new(Mutex::new(None));
+
     // 5c: per-sender video viewers — shared by the datagram reader,
     // control reader (cleanup), and the stats ticker.
     #[cfg(feature = "video")]
@@ -330,6 +338,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctrl_mixer = shared_mixer.clone();
     #[cfg(feature = "video")]
     let ctrl_viewers = video_viewers.clone();
+    #[cfg(feature = "screen-capture")]
+    let ctrl_poke = keyframe_poke.clone();
     let ctrl_loss_state = loss_state.clone();
     let measure_flag = args.measure;
     tokio::spawn(async move {
@@ -385,6 +395,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if v.joined { "joined" } else { "left" },
                             v.channel_id
                         );
+                        // 5d: a viewer joining our channel gets a keyframe
+                        // immediately — drop-until-IDR would otherwise cost
+                        // them up to one full intra period.
+                        #[cfg(feature = "screen-capture")]
+                        if v.joined
+                            && v.user_id != ok.user_id
+                            && let Some(h) = ctrl_poke.lock().unwrap().as_ref()
+                        {
+                            h.force_keyframe();
+                        }
                         if !v.joined {
                             #[cfg(feature = "audio-device")]
                             mixer::remove(&ctrl_mixer, v.user_id);
@@ -605,7 +625,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(feature = "screen-capture")]
+    if args.share {
+        // 5d: real capture through the portal; synthetic pattern stays
+        // available for video-only builds (below).
+        let share_conn = conn.clone();
+        let seq = Arc::new(Mutex::new(0x8000u16));
+        let poke = keyframe_poke.clone();
+        tokio::spawn(async move {
+            match screen::start(share_conn, seq).await {
+                Ok(handle) => *poke.lock().unwrap() = Some(handle),
+                Err(e) => eprintln!("share: {e}"),
+            }
+        });
+    }
+    #[cfg(all(feature = "video", not(feature = "screen-capture")))]
     if args.share {
         let share_conn = conn.clone();
         let seq = Arc::new(Mutex::new(0x8000u16));

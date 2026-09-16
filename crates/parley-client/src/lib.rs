@@ -10,5 +10,7 @@ pub mod aec;
 pub mod audio;
 #[cfg(feature = "audio-device")]
 pub mod mixer;
+#[cfg(feature = "screen-capture")]
+pub mod screen;
 #[cfg(feature = "video")]
 pub mod video;
