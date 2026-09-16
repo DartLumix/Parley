@@ -30,8 +30,9 @@ use parley_proto::video::{VideoAssembler, decode_fragment, fragment_frame};
 fn spawn_mpv(sender_id: u32) -> Result<Child, String> {
     Command::new("mpv")
         .args([
-            "--title",
-            &format!("parley: user {sender_id}"),
+            // mpv 0.41 rejects space-separated "--title value" — the
+            // = form is mandatory.
+            &format!("--title=parley: user {sender_id}"),
             "--no-audio",
             "--demuxer=rawvideo",
             &format!("--demuxer-rawvideo-w={VIDEO_WIDTH}"),
