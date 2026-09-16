@@ -21,35 +21,41 @@ use parley_proto::video::{VideoAssembler, decode_fragment, fragment_frame};
 
 /// Spawn an mpv that reads raw RGB24 from our stdin pipe.
 /// One per remote sender, named after them in the window title.
+///
+/// mpv removed `--rawvideo=w:h:format` (your 0.41 errors on it); the
+/// options are `--demuxer-rawvideo-w/h/mp-format/fps` now (`-format`
+/// is FourCC-only, `-mp-format` takes pixel-format names like rgb24).
+/// stderr is inherited so a failing mpv is loud instead of silently
+/// eating frames into a dead pipe.
 fn spawn_mpv(sender_id: u32) -> Result<Child, String> {
     Command::new("mpv")
         .args([
-            "--no-terminal",
             "--title",
             &format!("parley: user {sender_id}"),
             "--no-audio",
-            "--fps",
-            &format!("{VIDEO_FPS}"),
             "--demuxer=rawvideo",
-            &format!("--rawvideo=w={VIDEO_WIDTH}:h={VIDEO_HEIGHT}:format=rgb24"),
+            &format!("--demuxer-rawvideo-w={VIDEO_WIDTH}"),
+            &format!("--demuxer-rawvideo-h={VIDEO_HEIGHT}"),
+            "--demuxer-rawvideo-mp-format=rgb24",
+            &format!("--demuxer-rawvideo-fps={VIDEO_FPS}"),
             "-",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("failed to spawn mpv (is it installed?): {e}"))
 }
 
-/// Write one decoded RGB frame to an mpv child's stdin. Best effort:
-/// a dead viewer (user closed the window) drops frames silently.
-fn feed_mpv(child: &mut Child, rgb: &[u8]) {
+/// Write one decoded RGB frame to an mpv child's stdin. Returns false
+/// when the write fails — mpv died (window closed, bad args, crash) —
+/// so the caller can mark the viewer dead.
+fn feed_mpv(child: &mut Child, rgb: &[u8]) -> bool {
     use std::io::Write;
     let Some(stdin) = child.stdin.as_mut() else {
-        return;
+        return false;
     };
-    let _ = stdin.write_all(rgb);
-    let _ = stdin.flush();
+    stdin.write_all(rgb).is_ok() && stdin.flush().is_ok()
 }
 
 /// The moving-bar pattern from parley-core's tests — identical
@@ -127,11 +133,12 @@ impl ShareSender {
 
 /// Per-sender receive state: assembler + decoder + mpv child.
 pub struct Viewer {
+    sender_id: u32,
     assembler: VideoAssembler,
     decoder: VideoDecoder,
     mpv: Child,
-    /// mpv died (window closed)? Stop feeding, keep consuming datagrams
-    /// so the stream stays accounted for.
+    /// mpv died (window closed / exited)? Stop feeding, keep consuming
+    /// datagrams so the stream stays accounted for.
     dead: bool,
     /// Frames shown since last stats print.
     shown: u64,
@@ -140,6 +147,7 @@ pub struct Viewer {
 impl Viewer {
     fn new(sender_id: u32) -> Result<Self, String> {
         Ok(Self {
+            sender_id,
             assembler: VideoAssembler::new(),
             decoder: VideoDecoder::new().map_err(|e| e.to_string())?,
             mpv: spawn_mpv(sender_id)?,
@@ -151,12 +159,23 @@ impl Viewer {
     fn feed_fragment(&mut self, frag: parley_proto::video::VideoFragment<'_>) {
         self.assembler.push_fragment(frag);
         while let Some(frame) = self.assembler.pop_frame() {
+            if self.dead {
+                continue; // keep consuming, don't decode for a dead viewer
+            }
             match self.decoder.decode(&frame.data) {
-                Ok(Some(rgb)) if !self.dead => {
-                    feed_mpv(&mut self.mpv, &rgb);
-                    self.shown += 1;
+                Ok(Some(rgb)) => {
+                    if feed_mpv(&mut self.mpv, &rgb) {
+                        self.shown += 1;
+                    } else {
+                        self.dead = true;
+                        let _ = self.mpv.try_wait(); // reap if already exited
+                        println!(
+                            "video: viewer for user {} exited — not displaying (window closed?)",
+                            self.sender_id
+                        );
+                    }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => eprintln!("video decode error: {e}"),
             }
         }
