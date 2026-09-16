@@ -24,11 +24,15 @@ Voice is the product; everything else grows later.
 | 3c | Jitter buffer + PLC | ✅ |
 | 3d | Audio device layer — cpal, feature-gated | ✅ |
 | 3e | Audio pipelines, native 48 kHz I/O, test client | ✅ |
-| 3f | Latebct measurement --verdict below | ✅ |
-| 4 | Voice hardening — AEC/NS, volume, FEC, adaptive bitrate | ✅ |
+| 3f | Latency measurement — verdict below | ✅ |
 | 4a | AEC / NS (WebRTC APM) on mic path | ✅ |
 | 4b | Per-user volume in client mix | ✅ |
-| 4+ | FEC, bitrate ladder, congestion, screen share | ✅ |
+| 4c | Opus in-band FEC | ✅ |
+| 4d | Loss-driven bitrate ladder + congestion response | ✅ |
+| 5a | Video wire format + loss-hardened assembler | ✅ |
+| 5b | H.264 codec layer (openh264, feature-gated) | ✅ |
+| 5c | Synthetic 720p30 sender + mpv display | ✅ |
+| 5+ | Real capture, 1440p60/VAAPI, camera, platforms | ⏳ |
 
 ---
 
@@ -56,8 +60,8 @@ Voice is the product; everything else grows later.
 | UI | **Flutter** + `flutter_rust_bridge` | UI only; all performance-critical code stays in Rust |
 | Transport | **QUIC** (quinn) | TLS 1.3 built in · streams for control, datagrams for media · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
 | Voice | **SFU, no transcoding** | Server forwards packets; clients mix — per-user volume, near-zero server CPU |
-| Audio codec | **Opus** | 64 kbps speech → 256 kbps stereo music, auto-downgrade under congestion |
-| Video codec | **H.264** | Universal hardware encode/decode · codec IDs negotiated per stream |
+| Audio codec | **Opus** | 64 kbps speech ↔ 24 kbps + in-band FEC under loss · adaptive via receiver gap-rate feedback |
+| Video codec | **H.264** | openh264 (software) now → VAAPI hardware at Phase 5e · fragmented datagrams + drop-until-IDR loss recovery |
 | AEC / NS | **WebRTC APM** | Echo cancellation + noise suppression on the mic path; far-end reference from the render mix |
 | Auth | **Argon2id** | Per-server username + password · TOFU cert pinning (share the fingerprint with the invite) |
 | Storage | **SQLite** (WAL) | Zero-config persistence |
@@ -90,24 +94,34 @@ Every message carries version + capability bits — later features are additive,
 - [x] Test client: TOFU fingerprint store, capture → Opus → send, recv → decode → mix → render
 - [x] **Mouth-to-ear ≤ 150 ms (80 ms LAN)** — measured on dev machine (loopback):
       digital callback→render median 82 ms / max 114 ms; mouth-to-ear ≈ 100–135 ms.
-      **150 ms budget: met. 80 ms LAN: missed** — dominant term is the render device
-      period (106.7 ms, 5× PipeWire quantum; pipewire-alsa rejects quantum-aligned
-      requests). Lever documented for Phase 4: PipeWire-native client or ALSA
-      period workaround.
+      **150 ms budget: met. 80 ms LAN: missed at measurement time** (render period was
+      106.7 ms). The render period now negotiates at 1024 frames (21.3 ms) in recent
+      sessions — a re-measure is pending and expected to improve the verdict.
 
 ### Phase 4 — Voice Hardening
 - [x] AEC / noise suppression — WebRTC APM (AEC3 + NS + high-pass) on the mic path;
       played mix is the far-end reference. Verified by synthetic-echo test (>10 dB
       reduction) + by-ear A/B (noise floor drop with AEC on). `--no-aec` disables.
 - [x] Per-user volume — client-side gains in the mix (`--volume <user_id>:<gain>`)
-- [x] FEC / RED — Opus in-band FEC: encoder embeds redundancy (SILK mode≤~32 kbps), 
-      receiver reconstructs single lost frames from the successor packet before falling
-      back to PLC
-- [ ] Bitrate ladder (64→256 kbps), music channels
-- [ ] Render-period latency fix (80 ms LAN target) — see Phase 3 verdict
+- [x] FEC — Opus in-band FEC: encoder embeds redundancy (SILK mode only, ≤~32 kbps);
+      receiver reconstructs a single lost frame from its successor packet, falling back
+      to PLC on double loss or when no FEC is embedded
+- [x] Loss-driven bitrate ladder + congestion response — Clean (64 kbps, FEC inert) ↔
+      Robust (24 kbps + aggressive FEC); receiver gap-rate reports (`ReceiverReport`)
+      routed back over the control stream; EMA + hysteresis; netem 10% loss / 40 ms
+      verified in both directions
+- [ ] Music channels (256 kbps stereo) — needs stereo end-to-end, currently mono
+- [ ] Render-period latency fix (80 ms LAN target) — see Phase 3 verdict + re-measure
 
 ### Phase 5 — Screen Share
-- [ ] PipeWire capture → H.264 hardware encode → multi-sharer / multi-viewer
+- [x] Wire format: `FLAG_VIDEO` + fragment sub-header; drop-until-IDR assembler
+      (loss/reorder hardened; unit + SFU integration tests)
+- [x] H.264 codec layer — openh264 (vendored source build, `video` feature-gated,
+      CI-clean); encode/decode roundtrip + forced-IDR + Annex-B tests
+- [x] Synthetic 720p30 sender (`--share`) + mpv viewer — 30 fps sustained end-to-end
+      (release build; paced sends, missed-tick → Delay)
+- [ ] Real capture: PipeWire portal (ashpd) → BGRA frames → encoder
+- [ ] 1440p60, VAAPI hardware encode, keyframe-on-join, video bitrate ladder
 - [ ] **1440p60, glass-to-glass ≤ 250 ms**
 
 ### Phase 6 — Camera Video
@@ -142,6 +156,12 @@ cargo run -p parley-client --features audio-device -- --server 127.0.0.1:4443 \
 # per-user volume: append --volume <user_id>:<gain> (0.0 mutes)
 # latency measurement: one client --measure, one --report (add --no-aec; loud clicks!)
 # AEC verification (synthetic echo, no hardware): cargo test -p parley-client --features audio-device
+
+# screen share test (needs mpv; --release is REQUIRED for real-time 30 fps)
+cargo run --release -p parley-client --features audio-device,video -- \
+    --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender
+cargo run --release -p parley-client --features audio-device,video -- \
+    --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens)
 ```
 
 Config (`config.toml`, auto-created with defaults):
@@ -161,7 +181,7 @@ on startup is **permanent** — that's the value you share with your team.
 
 | Metric | Budget |
 |:---|:---|
-| Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: ~100–135 ms typical (budget met, LAN miss)** |
+| Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: ~100–135 ms (budget met, LAN miss at measurement; render period since improved — re-measure pending)** |
 | Screen share glass-to-glass | ≤ 250 ms |
 | Server idle RSS | ≤ 64 MB |
 | 10 active talkers | ≤ 5% of one core |
@@ -192,10 +212,10 @@ All state lives under `data/` — backup by copying. No telemetry, no outbound c
 ```
 proto/                  # .proto files — protocol source of truth
 crates/
-  parley-client/        # test client: TOFU pinning, 48k audio, AEC/NS, mix
-  parley-proto/         # wire types, framing, generated protobuf code
-  parley-core/          # shared session I/O + audio pipeline (server + future clients)
-  parley-server/        # binary: QUIC listener, TLS, config, routing
+  parley-proto/         # wire types, framing, media + video fragmentation, generated protobuf code
+  parley-core/          # shared session I/O + audio pipeline + H.264 codec (server + future clients)
+  parley-server/        # binary: QUIC listener, TLS, config, routing (+ parley-adduser bin)
+  parley-client/        # test client: TOFU pinning, 48k audio, AEC/NS, mix, screen share/view
 app/                    # Flutter client (future)
 docs/adr/               # one file per architectural decision
 ```
