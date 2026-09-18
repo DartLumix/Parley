@@ -72,6 +72,7 @@ pub struct SoftwareEncoder {
     encoder: Encoder,
     width: usize,
     height: usize,
+    current_bitrate: u32,
 }
 
 impl SoftwareEncoder {
@@ -92,6 +93,7 @@ impl SoftwareEncoder {
             encoder,
             width,
             height,
+            current_bitrate: VIDEO_BITRATE_BPS,
         })
     }
 }
@@ -124,11 +126,33 @@ impl VideoEncoder for SoftwareEncoder {
     }
 
     fn set_bitrate(&mut self, bps: u32) {
-        // TODO: openh264 crate may expose a runtime bitrate change.
-        // If not, we may need to recreate the encoder (disruptive) or
-        // accept a fixed bitrate for the session.
-        // For now, we log and ignore. This will be revisited after recon.
-        eprintln!("SoftwareEncoder::set_bitrate: not yet implemented (bps: {bps})");
+        // Recreate the encoder with the new bitrate
+        // This is disruptive but works reliably
+        if bps != self.current_bitrate {
+            // Create a new encoder with the new bitrate
+            let config = EncoderConfig::new()
+                .bitrate(openh264::encoder::BitRate::from_bps(bps))
+                .max_frame_rate(openh264::encoder::FrameRate::from_hz(VIDEO_FPS))
+                .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
+                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
+                    KEYFRAME_INTERVAL_FRAMES,
+                ))
+                .adaptive_quantization(false)
+                .background_detection(false)
+                .num_threads(0);
+
+            // Replace the encoder
+            match Encoder::with_api_config(openh264::OpenH264API::from_source(), config) {
+                Ok(new_encoder) => {
+                    self.encoder = new_encoder;
+                    self.current_bitrate = bps;
+                    eprintln!("SoftwareEncoder: bitrate changed to {} bps", bps);
+                }
+                Err(e) => {
+                    eprintln!("SoftwareEncoder: failed to change bitrate: {}", e);
+                }
+            }
+        }
     }
 }
 
@@ -275,6 +299,30 @@ mod tests {
             frame.starts_with(&[0, 0, 0, 1]) || frame.starts_with(&[0, 0, 1]),
             "encoder output must be Annex-B (start code first), got {:?}",
             &frame[..4.min(frame.len())]
+        );
+    }
+
+    #[test]
+    fn bitrate_change_works() {
+        let (w, h) = (320, 240);
+        let mut enc = SoftwareEncoder::new(w, h).unwrap();
+
+        // Encode a frame at the default bitrate
+        let (frame1, _k1) = enc.encode_bgra(&test_frame(w, h, 0)).unwrap();
+        let size1 = frame1.len();
+
+        // Change the bitrate
+        enc.set_bitrate(1_000_000); // 1 Mbps
+
+        // Encode another frame
+        let (frame2, _k2) = enc.encode_bgra(&test_frame(w, h, 1)).unwrap();
+        let size2 = frame2.len();
+
+        // The frame sizes might differ due to the bitrate change
+        // This is a smoke test to ensure the encoder still works
+        assert!(
+            size2 > 0,
+            "encoder must produce output after bitrate change"
         );
     }
 }
