@@ -33,6 +33,7 @@ Voice is the product; everything else grows later.
 | 5b | H.264 codec layer (openh264, feature-gated) | ✅ |
 | 5c | Synthetic 720p30 sender + mpv display | ✅ |
 | 5d | Portal screen capture | ✅ |
+| 5e | Encoder trait + software fallback (VAAPI parked) | ✅ |
 | 5+ | 1440p60/VAAPI, camera, platforms | ⏳ |
 
 ---
@@ -123,8 +124,13 @@ Every message carries version + capability bits — later features are additive,
 - [x] Synthetic 720p30 sender (`--share`) + mpv viewer — 30 fps sustained end-to-end
       (release build; paced sends, missed-tick → Delay)
 - [x] Real capture: PipeWire portal (ashpd) → BGRA frames → encoder
-- [ ] 1440p60, VAAPI hardware encode, keyframe-on-join, video bitrate ladder
-- [ ] **1440p60, glass-to-glass ≤ 250 ms**
+- [x] Encoder abstraction — `trait VideoEncoder`, software fallback,
+      runtime selection (hardware backends slot in per-platform later)
+- [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug)
+- [ ] 1440p60 (parked: needs working hardware encoder or software
+      proof at that rate)
+- [ ] Video bitrate ladder (blocked: `set_bitrate` recon)
+- [ ] Glass-to-glass ≤ 250 ms measurement
 
 ### Phase 6 — Camera Video
 - [ ] Same pipeline, A/V sync ≤ 40 ms

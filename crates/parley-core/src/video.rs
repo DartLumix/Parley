@@ -1,5 +1,11 @@
 //! H.264 encode/decode via openh264 (vendored source build).
 //!
+//! 5e architecture: `trait VideoEncoder` defines the contract;
+//! `SoftwareEncoder` (openh264) is the universal fallback. Hardware
+//! backends (VAAPI, MediaCodec, VideoToolbox) slot in behind the same
+//! trait with runtime fallback — a client that can wedge the desktop
+//! (VCE kernel hang) is unusable, so software is the safe default.
+//!
 //! v1 profile: 720p30 screen content (Phase 5b bring-up); 5e moves to
 //! 1440p60 + VAAPI. Encoder output is Annex-B (start codes included)
 //! via `EncodedBitStream::to_vec()` — layer NALs concatenated — which
@@ -22,14 +28,53 @@ pub const KEYFRAME_INTERVAL_FRAMES: u32 = 60;
 /// Screen content at 720p30 holds up well around 2.5 Mbps.
 pub const VIDEO_BITRATE_BPS: u32 = 2_500_000;
 
+/// The codec identifier for the wire protocol (future-proofing for HEVC/AV1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecId {
+    H264, // current, only implemented backend
+          // Future: H265, AV1 — wire grows one flag bit each
+}
+
+/// What every video encoder backend must provide.
+/// Backends are platform-specific; this is the contract.
+pub trait VideoEncoder: Send {
+    /// Encoder identity for capability reporting
+    fn codec(&self) -> CodecId;
+
+    /// Current frame dimensions
+    fn dimensions(&self) -> (usize, usize);
+
+    /// Encode one BGRA frame → (Annex-B bytes, is_keyframe)
+    /// Must be called at a reasonable rate; backends may drop if called too fast
+    fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error>;
+
+    /// Request an IDR on the next encode (for late joiners)
+    fn force_keyframe(&mut self);
+
+    /// Change the target bitrate at runtime (for the quality ladder)
+    /// Backends may clamp to supported ranges
+    fn set_bitrate(&mut self, bps: u32);
+}
+
+/// Construct the best available encoder for this platform.
+/// Tries hardware first (if the feature is enabled), falls back to software.
+pub fn create_encoder(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
+    // Hardware backends (e.g., VAAPI on Linux) are parked until the
+    // kernel/mesa VCE bug is resolved. They will be feature-gated and
+    // tried first, with runtime fallback to software.
+    // For now, software is the only backend.
+    Ok(Box::new(SoftwareEncoder::new(width, height)?))
+}
+
 /// Wraps the openh264 encoder. One per sharing sender.
-pub struct VideoEncoder {
+/// This is the software fallback; always available.
+pub struct SoftwareEncoder {
     encoder: Encoder,
     width: usize,
     height: usize,
 }
 
-impl VideoEncoder {
+impl SoftwareEncoder {
     pub fn new(width: usize, height: usize) -> Result<Self, Error> {
         let config = EncoderConfig::new()
             .bitrate(openh264::encoder::BitRate::from_bps(VIDEO_BITRATE_BPS))
@@ -49,11 +94,18 @@ impl VideoEncoder {
             height,
         })
     }
+}
 
-    /// Encode one BGRA frame. Returns (Annex-B frame bytes, is_keyframe).
-    ///
-    /// `bgra` must be `width * height * 4` bytes (row-major, no stride).
-    pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error> {
+impl VideoEncoder for SoftwareEncoder {
+    fn codec(&self) -> CodecId {
+        CodecId::H264
+    }
+
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error> {
         let src = openh264::formats::BgraSliceU8::new(bgra, (self.width, self.height));
         let yuv = YUVBuffer::from_bgra8_source(src);
         let stream = self
@@ -67,14 +119,16 @@ impl VideoEncoder {
         Ok((stream.to_vec(), keyframe))
     }
 
-    /// Request an IDR on the next encode (keyframe-on-join for late
-    /// viewers, Phase 5e).
-    pub fn force_keyframe(&mut self) {
+    fn force_keyframe(&mut self) {
         self.encoder.force_intra_frame();
     }
 
-    pub fn dimensions(&self) -> (usize, usize) {
-        (self.width, self.height)
+    fn set_bitrate(&mut self, bps: u32) {
+        // TODO: openh264 crate may expose a runtime bitrate change.
+        // If not, we may need to recreate the encoder (disruptive) or
+        // accept a fixed bitrate for the session.
+        // For now, we log and ignore. This will be revisited after recon.
+        eprintln!("SoftwareEncoder::set_bitrate: not yet implemented (bps: {bps})");
     }
 }
 
@@ -98,14 +152,7 @@ impl VideoDecoder {
     /// from 5a). Returns Some(RGB8 data) when a picture came out —
     /// H.264 decoders can legitimately emit nothing (non-reference
     /// frames) or delay output; callers treat None as "no frame yet".
-    /// Decode one Annex-B frame, returning RGB8 data plus the decoded
-    /// dimensions — the SPS decides, not the caller. The viewer needs
-    /// these to size its display for sender-negotiated resolutions
-    /// (5d: real capture sends whatever the compositor serves).
-    pub fn decode_with_dims(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<Option<(Vec<u8>, usize, usize)>, Error> {
+    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         match self
             .decoder
             .decode(frame)
@@ -115,18 +162,10 @@ impl VideoDecoder {
                 let (w, h) = yuv.dimensions();
                 let mut rgb = vec![0u8; w * h * 3];
                 yuv.write_rgb8(&mut rgb);
-                Ok(Some((rgb, w, h)))
+                Ok(Some(rgb))
             }
             None => Ok(None),
         }
-    }
-
-    /// Decode one Annex-B frame (as assembled by video::VideoAssembler
-    /// from 5a). Returns Some(RGB8 data) when a picture came out —
-    /// H.264 decoders can legitimately emit nothing (non-reference
-    /// frames) or delay output; callers treat None as "no frame yet".
-    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.decode_with_dims(frame)?.map(|(rgb, _, _)| rgb))
     }
 }
 
@@ -154,7 +193,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         let (w, h) = (VIDEO_WIDTH, VIDEO_HEIGHT);
-        let mut enc = VideoEncoder::new(w, h).unwrap();
+        let mut enc = SoftwareEncoder::new(w, h).unwrap();
         let mut dec = VideoDecoder::new().unwrap();
 
         let mut first_keyframe: Option<Vec<u8>> = None;
@@ -199,7 +238,7 @@ mod tests {
     #[test]
     fn forced_keyframe_is_idr() {
         let (w, h) = (320, 240);
-        let mut enc = VideoEncoder::new(w, h).unwrap();
+        let mut enc = SoftwareEncoder::new(w, h).unwrap();
         let mut dec = VideoDecoder::new().unwrap();
 
         // Prime the decoder with an initial keyframe.
@@ -230,7 +269,7 @@ mod tests {
         // which lives in parley-proto. Here we assert the encoder's
         // output starts with an Annex-B start code.
         let (w, h) = (320, 240);
-        let mut enc = VideoEncoder::new(w, h).unwrap();
+        let mut enc = SoftwareEncoder::new(w, h).unwrap();
         let (frame, _k) = enc.encode_bgra(&test_frame(w, h, 0)).unwrap();
         assert!(
             frame.starts_with(&[0, 0, 0, 1]) || frame.starts_with(&[0, 0, 1]),
