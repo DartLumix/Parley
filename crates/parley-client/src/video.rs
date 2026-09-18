@@ -19,7 +19,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use parley_core::video::{VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoDecoder, VideoEncoder};
+use parley_core::video::{
+    VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoDecoder, VideoEncoder, create_encoder,
+};
 use parley_proto::video::{VideoAssembler, decode_fragment, fragment_frame};
 
 /// Spawn an mpv that reads raw RGB24 from our stdin pipe, sized to the
@@ -84,7 +86,7 @@ fn test_frame_bgra(t: usize) -> Vec<u8> {
 /// Owns the encoder, frame_id, and the seq counter shared with the
 /// sender's audio path (same 16-bit space, discrimininated by flag).
 pub struct ShareSender {
-    encoder: VideoEncoder,
+    encoder: Box<dyn VideoEncoder>,
     frame_id: u32,
     /// Next media seq to use. Shared with the audio encode task via
     /// the mutex — both paths allocate from one wrapping counter.
@@ -94,7 +96,7 @@ pub struct ShareSender {
 impl ShareSender {
     pub fn new(seq: Arc<Mutex<u16>>) -> Result<Self, String> {
         Ok(Self {
-            encoder: VideoEncoder::new(VIDEO_WIDTH, VIDEO_HEIGHT).map_err(|e| e.to_string())?,
+            encoder: create_encoder(VIDEO_WIDTH, VIDEO_HEIGHT).map_err(|e| e.to_string())?,
             frame_id: 0,
             seq,
         })

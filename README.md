@@ -129,7 +129,8 @@ Every message carries version + capability bits — later features are additive,
 - [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug)
 - [ ] 1440p60 (parked: needs working hardware encoder or software
       proof at that rate)
-- [ ] Video bitrate ladder (blocked: `set_bitrate` recon)
+- [x] Video bitrate ladder — runtime bitrate change via encoder
+      recreation (openh264); future: non-disruptive change via raw API
 - [ ] Glass-to-glass ≤ 250 ms measurement
 
 ### Phase 6 — Camera Video

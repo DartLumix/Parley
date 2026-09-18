@@ -1,15 +1,16 @@
 //! H.264 encode/decode via openh264 (vendored source build).
 //!
-//! 5e architecture: `trait VideoEncoder` defines the contract;
-//! `SoftwareEncoder` (openh264) is the universal fallback. Hardware
-//! backends (VAAPI, MediaCodec, VideoToolbox) slot in behind the same
-//! trait with runtime fallback — a client that can wedge the desktop
-//! (VCE kernel hang) is unusable, so software is the safe default.
+//! 5e architecture: `trait VideoEncoder` is the contract every backend
+//! implements; `SoftwareEncoder` (openh264) is the universal fallback;
+//! `create_encoder()` selects the best available backend at runtime.
+//! Hardware backends (VAAPI, MediaCodec, VideoToolbox) slot in behind
+//! the same trait — a client whose encode path can wedge the whole
+//! desktop (the polaris VCE kernel hang) is unusable, so software is
+//! the default and hardware is opt-in with runtime fallback.
 //!
-//! v1 profile: 720p30 screen content (Phase 5b bring-up); 5e moves to
-//! 1440p60 + VAAPI. Encoder output is Annex-B (start codes included)
-//! via `EncodedBitStream::to_vec()` — layer NALs concatenated — which
-//! is exactly what our fragmenter and mpv both consume.
+//! v1 profile: 720p30+ screen content. Encoder output is Annex-B
+//! (start codes included) via `EncodedBitStream::to_vec()` — exactly
+//! what our fragmenter and mpv both consume.
 
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{Encoder, EncoderConfig};
@@ -28,46 +29,61 @@ pub const KEYFRAME_INTERVAL_FRAMES: u32 = 60;
 /// Screen content at 720p30 holds up well around 2.5 Mbps.
 pub const VIDEO_BITRATE_BPS: u32 = 2_500_000;
 
-/// The codec identifier for the wire protocol (future-proofing for HEVC/AV1)
+/// Codec identity for capability reporting (future-proofing for
+/// HEVC/AV1 backends — the media header's flag bits grow one bit per
+/// codec, additive, never a rewrite).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecId {
-    H264, // current, only implemented backend
-          // Future: H265, AV1 — wire grows one flag bit each
+    H264,
 }
 
-/// What every video encoder backend must provide.
-/// Backends are platform-specific; this is the contract.
+/// The contract every video encoder backend implements. Backends are
+/// platform-specific; callers hold `Box<dyn VideoEncoder>` and never
+/// know which one they got.
 pub trait VideoEncoder: Send {
-    /// Encoder identity for capability reporting
+    /// Encoder identity for capability reporting.
     fn codec(&self) -> CodecId;
 
-    /// Current frame dimensions
+    /// Current frame dimensions.
     fn dimensions(&self) -> (usize, usize);
 
-    /// Encode one BGRA frame → (Annex-B bytes, is_keyframe)
-    /// Must be called at a reasonable rate; backends may drop if called too fast
+    /// Encode one BGRA frame (`width*height*4` bytes, row-major, no
+    /// stride) → (Annex-B bytes, is_keyframe).
     fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error>;
 
-    /// Request an IDR on the next encode (for late joiners)
+    /// Request an IDR on the next encode (keyframe-on-join).
     fn force_keyframe(&mut self);
 
-    /// Change the target bitrate at runtime (for the quality ladder)
-    /// Backends may clamp to supported ranges
+    /// Change target bitrate at runtime (quality ladder). Backends may
+    /// clamp; the change takes effect over the next few frames.
     fn set_bitrate(&mut self, bps: u32);
 }
 
-/// Construct the best available encoder for this platform.
-/// Tries hardware first (if the feature is enabled), falls back to software.
+/// Construct the best available encoder for this platform. Hardware
+/// backends are feature-gated, tried first, and fall back to software
+/// at runtime; today software is the only backend (VAAPI parked after
+/// the polaris VCE kernel hang — see HANDOFF §8).
 pub fn create_encoder(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
-    // Hardware backends (e.g., VAAPI on Linux) are parked until the
-    // kernel/mesa VCE bug is resolved. They will be feature-gated and
-    // tried first, with runtime fallback to software.
-    // For now, software is the only backend.
     Ok(Box::new(SoftwareEncoder::new(width, height)?))
 }
 
-/// Wraps the openh264 encoder. One per sharing sender.
-/// This is the software fallback; always available.
+/// The openh264 encoder configuration, shared by construction and
+/// bitrate changes (the latter recreates the encoder).
+fn encoder_config(bps: u32) -> EncoderConfig {
+    EncoderConfig::new()
+        .bitrate(openh264::encoder::BitRate::from_bps(bps))
+        .max_frame_rate(openh264::encoder::FrameRate::from_hz(VIDEO_FPS))
+        .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
+        .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
+            KEYFRAME_INTERVAL_FRAMES,
+        ))
+        .adaptive_quantization(false) // unsupported for screen content
+        .background_detection(false) // unsupported for screen content
+        .num_threads(0) // auto
+}
+
+/// Software encoder (openh264). The universal fallback — available on
+/// every platform, proven end-to-end since 5b.
 pub struct SoftwareEncoder {
     encoder: Encoder,
     width: usize,
@@ -77,18 +93,11 @@ pub struct SoftwareEncoder {
 
 impl SoftwareEncoder {
     pub fn new(width: usize, height: usize) -> Result<Self, Error> {
-        let config = EncoderConfig::new()
-            .bitrate(openh264::encoder::BitRate::from_bps(VIDEO_BITRATE_BPS))
-            .max_frame_rate(openh264::encoder::FrameRate::from_hz(VIDEO_FPS))
-            .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
-            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
-                KEYFRAME_INTERVAL_FRAMES,
-            ))
-            .adaptive_quantization(false) // unsupported for screen content
-            .background_detection(false) // unsupported for screen content
-            .num_threads(0); // auto // auto
-        let encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
-            .map_err(|e| Error::Codec(e.to_string()))?;
+        let encoder = Encoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            encoder_config(VIDEO_BITRATE_BPS),
+        )
+        .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(Self {
             encoder,
             width,
@@ -125,33 +134,28 @@ impl VideoEncoder for SoftwareEncoder {
         self.encoder.force_intra_frame();
     }
 
+    /// The openh264 Rust crate does not expose the raw `SetOption`
+    /// bitrate path on the safe `Encoder` wrapper (the low-level API
+    /// has it, but that exposure was never verified — the registry
+    /// grep failed on the crate's directory layout). Instead: recreate
+    /// the encoder at the new rate. Consequences, all acceptable for
+    /// v1: the next frame is a standalone-decodable IDR (fresh
+    /// encoder), rate-control state resets (brief ramp-up), and
+    /// SPS/PPS ride in-band ahead of the IDR slice so existing
+    /// decoders pick the change up with no extra signaling.
     fn set_bitrate(&mut self, bps: u32) {
-        // Recreate the encoder with the new bitrate
-        // This is disruptive but works reliably
-        if bps != self.current_bitrate {
-            // Create a new encoder with the new bitrate
-            let config = EncoderConfig::new()
-                .bitrate(openh264::encoder::BitRate::from_bps(bps))
-                .max_frame_rate(openh264::encoder::FrameRate::from_hz(VIDEO_FPS))
-                .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
-                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
-                    KEYFRAME_INTERVAL_FRAMES,
-                ))
-                .adaptive_quantization(false)
-                .background_detection(false)
-                .num_threads(0);
-
-            // Replace the encoder
-            match Encoder::with_api_config(openh264::OpenH264API::from_source(), config) {
-                Ok(new_encoder) => {
-                    self.encoder = new_encoder;
-                    self.current_bitrate = bps;
-                    eprintln!("SoftwareEncoder: bitrate changed to {} bps", bps);
-                }
-                Err(e) => {
-                    eprintln!("SoftwareEncoder: failed to change bitrate: {}", e);
-                }
+        if bps == self.current_bitrate {
+            return;
+        }
+        match Encoder::with_api_config(openh264::OpenH264API::from_source(), encoder_config(bps)) {
+            Ok(encoder) => {
+                self.encoder = encoder;
+                self.current_bitrate = bps;
             }
+            Err(e) => eprintln!(
+                "video: bitrate change to {bps} bps failed ({e}); keeping {} bps",
+                self.current_bitrate
+            ),
         }
     }
 }
@@ -163,20 +167,20 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new() -> Result<Self, Error> {
-        // DecoderConfig::new() is presumably dimensions-free (decoder
-        // learns from SPS); if the API demands them, this is the line
-        // to adjust — see test compile feedback.
         let decoder =
             Decoder::with_api_config(openh264::OpenH264API::from_source(), DecoderConfig::new())
                 .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(Self { decoder })
     }
 
-    /// Decode one Annex-B frame (as assembled by video::VideoAssembler
-    /// from 5a). Returns Some(RGB8 data) when a picture came out —
-    /// H.264 decoders can legitimately emit nothing (non-reference
-    /// frames) or delay output; callers treat None as "no frame yet".
-    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    /// Decode one Annex-B frame, returning RGB8 data plus the decoded
+    /// dimensions — the SPS decides, not the caller. The viewer needs
+    /// these to size its display for sender-negotiated resolutions
+    /// (5d: real capture sends whatever the compositor serves).
+    pub fn decode_with_dims(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<(Vec<u8>, usize, usize)>, Error> {
         match self
             .decoder
             .decode(frame)
@@ -186,10 +190,18 @@ impl VideoDecoder {
                 let (w, h) = yuv.dimensions();
                 let mut rgb = vec![0u8; w * h * 3];
                 yuv.write_rgb8(&mut rgb);
-                Ok(Some(rgb))
+                Ok(Some((rgb, w, h)))
             }
             None => Ok(None),
         }
+    }
+
+    /// Decode one Annex-B frame (as assembled by video::VideoAssembler
+    /// from 5a). Returns Some(RGB8 data) when a picture came out —
+    /// H.264 decoders can legitimately emit nothing (non-reference
+    /// frames) or delay output; callers treat None as "no frame yet".
+    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.decode_with_dims(frame)?.map(|(rgb, _, _)| rgb))
     }
 }
 
@@ -303,26 +315,26 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_change_works() {
+    fn bitrate_change_forces_standalone_idr() {
         let (w, h) = (320, 240);
         let mut enc = SoftwareEncoder::new(w, h).unwrap();
 
-        // Encode a frame at the default bitrate
-        let (frame1, _k1) = enc.encode_bgra(&test_frame(w, h, 0)).unwrap();
-        let size1 = frame1.len();
+        // Prime: keyframe, then a delta within the intra period.
+        let _ = enc.encode_bgra(&test_frame(w, h, 0)).unwrap();
+        let (_, delta) = enc.encode_bgra(&test_frame(w, h, 1)).unwrap();
+        assert!(!delta, "second frame within the intra period is a delta");
 
-        // Change the bitrate
-        enc.set_bitrate(1_000_000); // 1 Mbps
+        // Runtime bitrate change recreates the encoder: the next frame
+        // must be a standalone-decodable IDR with in-band SPS/PPS.
+        enc.set_bitrate(1_000_000);
+        let (f2, k2) = enc.encode_bgra(&test_frame(w, h, 2)).unwrap();
+        assert!(k2, "first frame after a bitrate change must be a keyframe");
 
-        // Encode another frame
-        let (frame2, _k2) = enc.encode_bgra(&test_frame(w, h, 1)).unwrap();
-        let size2 = frame2.len();
-
-        // The frame sizes might differ due to the bitrate change
-        // This is a smoke test to ensure the encoder still works
-        assert!(
-            size2 > 0,
-            "encoder must produce output after bitrate change"
-        );
+        let mut fresh = VideoDecoder::new().unwrap();
+        let rgb = fresh
+            .decode(&f2)
+            .unwrap()
+            .expect("post-change IDR must decode standalone");
+        assert_eq!(rgb.len(), w * h * 3);
     }
 }

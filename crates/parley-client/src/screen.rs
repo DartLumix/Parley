@@ -27,7 +27,7 @@ use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
-use parley_core::video::VideoEncoder;
+use parley_core::video::{VideoEncoder, create_encoder};
 use parley_proto::video::fragment_frame;
 use pipewire as pw;
 use pw::properties::properties;
@@ -317,7 +317,7 @@ fn encoder_thread(
     seq: Arc<Mutex<u16>>,
     force_idr: Arc<AtomicBool>,
 ) {
-    let mut encoder: Option<VideoEncoder> = None;
+    let mut encoder: Option<Box<dyn VideoEncoder>> = None;
     let mut frame_id: u32 = 0;
     let mut fps = 30.0;
     let mut encoded: u64 = 0;
@@ -330,7 +330,7 @@ fn encoder_thread(
                 fps: f,
             } => {
                 fps = f;
-                match VideoEncoder::new(width as usize, height as usize) {
+                match create_encoder(width as usize, height as usize) {
                     Ok(e) => {
                         println!("share: encoder ready ({width}x{height})");
                         encoder = Some(e);
