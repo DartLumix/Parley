@@ -32,7 +32,8 @@ Voice is the product; everything else grows later.
 | 5a | Video wire format + loss-hardened assembler | ✅ |
 | 5b | H.264 codec layer (openh264, feature-gated) | ✅ |
 | 5c | Synthetic 720p30 sender + mpv display | ✅ |
-| 5+ | Real capture, 1440p60/VAAPI, camera, platforms | ⏳ |
+| 5d | Portal screen capture | ✅ |
+| 5+ | 1440p60/VAAPI, camera, platforms | ⏳ |
 
 ---
 
@@ -92,11 +93,12 @@ Every message carries version + capability bits — later features are additive,
 - [x] Jitter buffer: wraparound-safe ordering + PLC on gap
 - [x] Linux audio device layer — cpal, native 48 kHz (PipeWire graph runs 48k-only → no client-side resampling; rubato dropped)
 - [x] Test client: TOFU fingerprint store, capture → Opus → send, recv → decode → mix → render
-- [x] **Mouth-to-ear ≤ 150 ms (80 ms LAN)** — measured on dev machine (loopback):
-      digital callback→render median 82 ms / max 114 ms; mouth-to-ear ≈ 100–135 ms.
-      **150 ms budget: met. 80 ms LAN: missed at measurement time** (render period was
-      106.7 ms). The render period now negotiates at 1024 frames (21.3 ms) in recent
-      sessions — a re-measure is pending and expected to improve the verdict.
+- [x] **Mouth-to-ear ≤ 150 ms (80 ms LAN)** — measured on dev machine (loopback),
+      re-measured after the render period settled at 1024 frames (21.3 ms):
+      digital callback→render median 49.8 ms / max 50.6 ms over 105 samples,
+      spread 1.4 ms (zero rebuffers). Mouth-to-ear ≈ 70–100 ms adding the
+      acoustic paths. **150 ms budget: met with margin. 80 ms LAN: met on the
+      digital path; acoustic estimate straddles it — effectively both green.**
 
 ### Phase 4 — Voice Hardening
 - [x] AEC / noise suppression — WebRTC APM (AEC3 + NS + high-pass) on the mic path;
@@ -120,7 +122,7 @@ Every message carries version + capability bits — later features are additive,
       CI-clean); encode/decode roundtrip + forced-IDR + Annex-B tests
 - [x] Synthetic 720p30 sender (`--share`) + mpv viewer — 30 fps sustained end-to-end
       (release build; paced sends, missed-tick → Delay)
-- [ ] Real capture: PipeWire portal (ashpd) → BGRA frames → encoder
+- [x] Real capture: PipeWire portal (ashpd) → BGRA frames → encoder
 - [ ] 1440p60, VAAPI hardware encode, keyframe-on-join, video bitrate ladder
 - [ ] **1440p60, glass-to-glass ≤ 250 ms**
 
@@ -181,7 +183,7 @@ on startup is **permanent** — that's the value you share with your team.
 
 | Metric | Budget |
 |:---|:---|
-| Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: ~100–135 ms (budget met, LAN miss at measurement; render period since improved — re-measure pending)** |
+| Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: digital 49.8 ms median / 50.6 max (105 samples, 21.3 ms render period); mouth-to-ear ≈ 70–100 ms — budgets met** |
 | Screen share glass-to-glass | ≤ 250 ms |
 | Server idle RSS | ≤ 64 MB |
 | 10 active talkers | ≤ 5% of one core |
