@@ -5,17 +5,29 @@
 //! dedicated thread runs the pipewire main loop; its process callback
 //! only memcpy's the frame and try_sends it into a bounded channel —
 //! if the encoder falls behind, frames are dropped, the pw graph is
-//! never stalled. A second thread owns the openh264 encoder: encode →
-//! fragment → paced datagrams on the existing FLAG_VIDEO path.
+//! never stalled. A second thread owns the encoder (5e: a
+//! Box<dyn VideoEncoder> from create_encoder — software today,
+//! hardware backends later): encode → fragment → paced datagrams on
+//! the existing FLAG_VIDEO path.
+//!
+//! Encoder-thread output discipline (learned the hard way):
+//! - Rate pacing: mpv plays piped rawvideo at its declared fps (30);
+//!   encoding faster than that accumulates unbounded queue drift
+//!   (~3 s glass-to-glass measured over one session). Sleep to the
+//!   interval — never drop for rate.
+//! - Skip-to-newest: damage bursts queue stale captures; encoding one
+//!   while a fresher sits behind it wastes ~30 ms of CPU on the past.
 //!
 //! Keyframe-on-join: main.rs holds a ShareHandle and pokes it when a
 //! VoiceState says a viewer joined — drop-until-IDR would otherwise
-//! cost a late joiner up to one full intra period (2 s).
+//! cost a late joiner up to one full intra period (2 s). The request
+//! rides an Arc<AtomicBool>, NOT the frame channel — a bounded media
+//! channel silently swallows try_send'd control under saturation.
 //!
 //! Only BGRx and BGRA are requested — both are byte-compatible with
-//! the BGRA input VideoEncoder::encode_bgra already takes. The wire
-//! format is untouched; the negotiated size is whatever the
-//! compositor serves (the viewer sizes itself from the H.264 SPS).
+//! the BGRA input the encoders take. The wire format is untouched;
+//! the negotiated size is whatever the compositor serves (the viewer
+//! sizes itself from the H.264 SPS).
 
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +39,7 @@ use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
-use parley_core::video::{VideoEncoder, create_encoder};
+use parley_core::video::{VIDEO_FPS, VideoEncoder, create_encoder};
 use parley_proto::video::fragment_frame;
 use pipewire as pw;
 use pw::properties::properties;
@@ -309,8 +321,36 @@ fn pw_thread(node_id: u32, fd: OwnedFd, tx: SyncSender<ToEncoder>) -> Result<(),
     Ok(())
 }
 
+/// Apply a negotiated format: (re)create the encoder, record the fps.
+fn negotiate(
+    encoder: &mut Option<Box<dyn VideoEncoder>>,
+    fps: &mut f64,
+    width: u32,
+    height: u32,
+    f: f64,
+) {
+    *fps = f;
+    match create_encoder(width as usize, height as usize) {
+        Ok(e) => {
+            println!("share: encoder ready ({width}x{height})");
+            *encoder = Some(e);
+        }
+        Err(e) => eprintln!("share: encoder init failed: {e}"),
+    }
+}
+
 /// Encode → fragment → paced send. Owns the encoder once the format is
 /// negotiated; drops frames that arrive before that.
+///
+/// Output discipline, in order per frame:
+/// 1. Pace: sleep until min_interval since the last encode START —
+///    mpv consumes piped rawvideo at exactly VIDEO_FPS; sending faster
+///    accumulates drift in its queue (~3 s over a session, measured).
+///    Sleep, never drop: the frame is wanted, just early.
+/// 2. Skip-to-newest: drain anything that queued during the sleep and
+///    keep only the latest capture — encoding a stale frame while a
+///    fresher one sits behind it is pure added latency.
+/// 3. Encode + fragment + send with inter-fragment pacing.
 fn encoder_thread(
     rx: Receiver<ToEncoder>,
     conn: quinn::Connection,
@@ -321,24 +361,55 @@ fn encoder_thread(
     let mut frame_id: u32 = 0;
     let mut fps = 30.0;
     let mut encoded: u64 = 0;
+    let mut stale_skipped: u64 = 0;
     let mut window = std::time::Instant::now();
-    for msg in rx {
+    let mut last_encode: Option<std::time::Instant> = None;
+    while let Ok(msg) = rx.recv() {
         match msg {
             ToEncoder::Negotiated {
                 width,
                 height,
                 fps: f,
             } => {
-                fps = f;
-                match create_encoder(width as usize, height as usize) {
-                    Ok(e) => {
-                        println!("share: encoder ready ({width}x{height})");
-                        encoder = Some(e);
-                    }
-                    Err(e) => eprintln!("share: encoder init failed: {e}"),
-                }
+                negotiate(&mut encoder, &mut fps, width, height, f);
             }
-            ToEncoder::Frame(bgra) => {
+            ToEncoder::Frame(first) => {
+                // 1. Rate pacing (sleep, never drop).
+                let min_interval =
+                    Duration::from_nanos((1_000_000_000.0 / fps.min(VIDEO_FPS as f64)) as u64);
+                let now = std::time::Instant::now();
+                if let Some(t) = last_encode
+                    && now.duration_since(t) < min_interval
+                {
+                    std::thread::sleep(min_interval - now.duration_since(t));
+                }
+
+                // 2. Skip-to-newest. A Negotiated here is impossible
+                //    (pw delivers the format before any buffer), but
+                //    stash and apply it rather than lose it.
+                let mut bgra = first;
+                let mut renegotiate: Option<(u32, u32, f64)> = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(ToEncoder::Frame(newer)) => {
+                            bgra = newer;
+                            stale_skipped += 1;
+                        }
+                        Ok(ToEncoder::Negotiated {
+                            width,
+                            height,
+                            fps: f,
+                        }) => {
+                            renegotiate = Some((width, height, f));
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Some((width, height, f)) = renegotiate {
+                    negotiate(&mut encoder, &mut fps, width, height, f);
+                }
+
                 let Some(enc) = encoder.as_mut() else {
                     continue;
                 };
@@ -346,6 +417,7 @@ fn encoder_thread(
                     enc.force_keyframe();
                     println!("share: forced keyframe (viewer joined)");
                 }
+                last_encode = Some(std::time::Instant::now());
                 let (frame, keyframe) = match enc.encode_bgra(&bgra) {
                     Ok(x) => x,
                     Err(e) => {
@@ -380,15 +452,15 @@ fn encoder_thread(
                         std::thread::sleep(Duration::from_micros(500));
                     }
                 }
-                // Wire-rate telemetry: what the encoder actually sustains.
                 encoded += 1;
                 let el = window.elapsed();
                 if el.as_secs() >= 10 {
                     println!(
-                        "share: encoded {encoded} frames ({:.1} fps)",
+                        "share: encoded {encoded} frames ({:.1} fps), {stale_skipped} stale skipped",
                         encoded as f64 / el.as_secs_f64()
                     );
                     encoded = 0;
+                    stale_skipped = 0;
                     window = std::time::Instant::now();
                 }
             }
