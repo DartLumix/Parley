@@ -1,3 +1,4 @@
+
 # 🎙️ Parley
 
 > Self-hosted voice, video and screen-share for teams that already know each other.
@@ -32,15 +33,16 @@ Voice is the product; everything else grows later.
 | 5a | Video wire format + loss-hardened assembler | ✅ |
 | 5b | H.264 codec layer (openh264, feature-gated) | ✅ |
 | 5c | Synthetic 720p30 sender + mpv display | ✅ |
-| 5d | Portal screen capture | ✅ |
-| 5e | Encoder trait + software fallback (VAAPI parked) | ✅ |
-| 5+ | 1440p60/VAAPI, camera, platforms | ⏳ |
+| 5d | Portal screen capture (ashpd + PipeWire) | ✅ |
+| 5e | Encoder trait, rate pacing, glass-to-glass measured | ✅ |
+| 6 | Backend hardening & client-readiness | ⏳ |
+| 7+ | Flutter client, camera, platforms | ⏳ |
 
 ---
 
 ## ✨ What it is
 
-- 🎯 Group voice channels, screen share at source quality (1440p60+), camera video
+- 🎯 Group voice channels, screen share at source quality (1080p30 software today · 1440p60 with hardware encode), camera video
 - 🐧 Native clients: **Linux → Android → Windows → iOS** — no Electron, no webviews, ever
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
 - 🐳 Deploy with `docker compose up` · one TOML config · one UDP port
@@ -63,7 +65,7 @@ Voice is the product; everything else grows later.
 | Transport | **QUIC** (quinn) | TLS 1.3 built in · streams for control, datagrams for media · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
 | Voice | **SFU, no transcoding** | Server forwards packets; clients mix — per-user volume, near-zero server CPU |
 | Audio codec | **Opus** | 64 kbps speech ↔ 24 kbps + in-band FEC under loss · adaptive via receiver gap-rate feedback |
-| Video codec | **H.264** | openh264 (software) now → VAAPI hardware at Phase 5e · fragmented datagrams + drop-until-IDR loss recovery |
+| Video codec | **H.264** | openh264 (software, universal fallback) behind an encoder trait — hardware backends (VAAPI/MediaCodec/VideoToolbox) slot in per-platform · fragmented datagrams + drop-until-IDR loss recovery |
 | AEC / NS | **WebRTC APM** | Echo cancellation + noise suppression on the mic path; far-end reference from the render mix |
 | Auth | **Argon2id** | Per-server username + password · TOFU cert pinning (share the fingerprint with the invite) |
 | Storage | **SQLite** (WAL) | Zero-config persistence |
@@ -113,8 +115,6 @@ Every message carries version + capability bits — later features are additive,
       Robust (24 kbps + aggressive FEC); receiver gap-rate reports (`ReceiverReport`)
       routed back over the control stream; EMA + hysteresis; netem 10% loss / 40 ms
       verified in both directions
-- [ ] Music channels (256 kbps stereo) — needs stereo end-to-end, currently mono
-- [ ] Render-period latency fix (80 ms LAN target) — see Phase 3 verdict + re-measure
 
 ### Phase 5 — Screen Share
 - [x] Wire format: `FLAG_VIDEO` + fragment sub-header; drop-until-IDR assembler
@@ -122,21 +122,39 @@ Every message carries version + capability bits — later features are additive,
 - [x] H.264 codec layer — openh264 (vendored source build, `video` feature-gated,
       CI-clean); encode/decode roundtrip + forced-IDR + Annex-B tests
 - [x] Synthetic 720p30 sender (`--share`) + mpv viewer — 30 fps sustained end-to-end
-      (release build; paced sends, missed-tick → Delay)
-- [x] Real capture: PipeWire portal (ashpd) → BGRA frames → encoder
-- [x] Encoder abstraction — `trait VideoEncoder`, software fallback,
-      runtime selection (hardware backends slot in per-platform later)
-- [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug)
-- [ ] 1440p60 (parked: needs working hardware encoder or software
-      proof at that rate)
-- [x] Video bitrate ladder — runtime bitrate change via encoder
-      recreation (openh264); future: non-disruptive change via raw API
-- [ ] Glass-to-glass ≤ 250 ms measurement
+- [x] Real capture: PipeWire portal (ashpd) → BGRA frames → encoder — 1080p BGRx,
+      ~30 fps sustained software; viewer sizes itself from the H.264 SPS
+- [x] Keyframe-on-join — forced IDR the moment a viewer joins (atomic flag; late
+      joiner waits ~RTT, not the 2 s intra period)
+- [x] Encoder abstraction — `trait VideoEncoder` + software fallback + `create_encoder()`
+      selection; hardware backends slot in per-platform with runtime fallback
+- [x] Rate discipline — sleep-pacing + skip-to-newest in the capture encoder;
+      drift-free 30 fps (the 3-second-drift lesson lives in the handoff ledger)
+- [x] Runtime bitrate mechanism — `set_bitrate` via encoder recreation (next frame
+      is a standalone IDR with in-band SPS/PPS; tested)
+- [x] Glass-to-glass measured — **~250 ms avg / 400 ms tail** (1080p30 software, mpv
+      test viewer). Budget straddled: the remaining latency is viewer-side queuing —
+      the real client owns this budget from here
+- [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug — handoff §8)
+- [ ] 1440p60 / 1080p60 (parked: software ceiling ~32 fps @ 1080p; needs hardware)
+- [ ] Loss-driven video bitrate ladder → Phase 6
 
-### Phase 6 — Camera Video
-- [ ] Same pipeline, A/V sync ≤ 40 ms
+### Phase 6 — Backend Hardening & Client-Readiness (current)
+Goal: every open/parked backend item closed — a stable, complete backend the
+Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
+- [ ] 6a Share lifecycle — stop/start without process exit; viewer cleanup
+- [ ] 6b Multi-channel correctness + per-channel report routing
+- [ ] 6c Session-token relogin + reconnect hardening
+- [ ] 6d Music channels — 256 kbps stereo end-to-end
+- [ ] 6e Loss-driven video bitrate ladder (mirror 4d)
+- [ ] 6f Device-vanishing mitigations
+- [ ] 6g Performance budgets verified (RSS / 10 talkers / login / binary)
+- [ ] 6h Robustness — restart persistence, malformed input, netem matrix
 
-### Phase 7+ — Later
+### Phase 7+ — Client & Beyond
+- [ ] Flutter client bring-up (app/, flutter_rust_bridge over parley-core)
+- [ ] Camera video (deferred from old Phase 6 — needs client UI for preview;
+      same pipeline, A/V sync ≤ 40 ms)
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
 
@@ -166,11 +184,12 @@ cargo run -p parley-client --features audio-device -- --server 127.0.0.1:4443 \
 # latency measurement: one client --measure, one --report (add --no-aec; loud clicks!)
 # AEC verification (synthetic echo, no hardware): cargo test -p parley-client --features audio-device
 
-# screen share test (needs mpv; --release is REQUIRED for real-time 30 fps)
-cargo run --release -p parley-client --features audio-device,video -- \
-    --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender
-cargo run --release -p parley-client --features audio-device,video -- \
-    --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens)
+# screen share (needs mpv; --release is REQUIRED for real-time fps)
+cargo run --release -p parley-client --features audio-device,screen-capture -- \
+    --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender: portal picker pops up
+cargo run --release -p parley-client --features video -- \
+    --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens; video-only build)
+# synthetic test pattern (no portal): build the sender with --features audio-device,video
 ```
 
 Config (`config.toml`, auto-created with defaults):
@@ -191,7 +210,7 @@ on startup is **permanent** — that's the value you share with your team.
 | Metric | Budget |
 |:---|:---|
 | Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: digital 49.8 ms median / 50.6 max (105 samples, 21.3 ms render period); mouth-to-ear ≈ 70–100 ms — budgets met** |
-| Screen share glass-to-glass | ≤ 250 ms |
+| Screen share glass-to-glass | ≤ 250 ms — **current: ~250 ms avg / 400 ms tail (1080p30 software, mpv test viewer); remaining latency is viewer-side queuing — the real client owns this budget** |
 | Server idle RSS | ≤ 64 MB |
 | 10 active talkers | ≤ 5% of one core |
 | Login → connected | ≤ 400 ms |
@@ -222,9 +241,9 @@ All state lives under `data/` — backup by copying. No telemetry, no outbound c
 proto/                  # .proto files — protocol source of truth
 crates/
   parley-proto/         # wire types, framing, media + video fragmentation, generated protobuf code
-  parley-core/          # shared session I/O + audio pipeline + H.264 codec (server + future clients)
+  parley-core/          # shared session I/O + audio pipeline + encoder trait & H.264 codec (server + clients)
   parley-server/        # binary: QUIC listener, TLS, config, routing (+ parley-adduser bin)
-  parley-client/        # test client: TOFU pinning, 48k audio, AEC/NS, mix, screen share/view
+  parley-client/        # test client: TOFU pinning, 48k audio, AEC/NS, mix, portal screen capture + share/view
 app/                    # Flutter client (future)
 docs/adr/               # one file per architectural decision
 ```
