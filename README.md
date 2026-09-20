@@ -142,8 +142,8 @@ Every message carries version + capability bits — later features are additive,
 ### Phase 6 — Backend Hardening & Client-Readiness (current)
 Goal: every open/parked backend item closed — a stable, complete backend the
 Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
-- [ ] 6a Share lifecycle — stop/start without process exit; viewer cleanup
-- [ ] 6b Multi-channel correctness + per-channel report routing
+- [x] 6a Share lifecycle — stop/start without process exit; viewer cleanup
+- [x] 6b Multi-channel correctness + per-channel report routing
 - [ ] 6c Session-token relogin + reconnect hardening
 - [ ] 6d Music channels — 256 kbps stereo end-to-end
 - [ ] 6e Loss-driven video bitrate ladder (mirror 4d)
@@ -187,6 +187,7 @@ cargo run -p parley-client --features audio-device -- --server 127.0.0.1:4443 \
 # screen share (needs mpv; --release is REQUIRED for real-time fps)
 cargo run --release -p parley-client --features audio-device,screen-capture -- \
     --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender: portal picker pops up
+#    sender: type "share" / "stop" to start/stop without restarting
 cargo run --release -p parley-client --features video -- \
     --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens; video-only build)
 # synthetic test pattern (no portal): build the sender with --features audio-device,video

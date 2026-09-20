@@ -18,7 +18,8 @@ use parley_proto::{Hello, HelloAck, PROTOCOL_VERSION};
 use parley_proto::{AuthDenied, AuthOk, AuthRequest};
 
 use parley_proto::{
-    ClientBody, ClientMessage, Heartbeat, PresenceRequest, ServerBody, ServerMessage, StopShare,
+    ClientBody, ClientMessage, Heartbeat, PresenceRequest, ReceiverReport, ServerBody,
+    ServerMessage, StopShare,
 };
 
 use parley_proto::{FetchHistory, ListChannels, SendChat};
@@ -208,10 +209,20 @@ fn setup_server_with_user(tag: &str) -> (Config, Server) {
     let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
     db.create_user("testuser", "testpass", false).unwrap();
     db.create_user("seconduser", "secondpass", false).unwrap();
+    db.create_user("thirduser", "thirdpass", false).unwrap();
     drop(db);
 
     let server = Server::bind(&config).unwrap();
     (config, server)
+}
+
+/// Add a channel while the server is running (WAL allows the brief
+/// concurrent writer). Returns its id.
+fn add_channel(config: &Config, name: &str) -> u64 {
+    let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+    let id = db.create_channel(name).unwrap();
+    drop(db);
+    id
 }
 
 async fn connect_and_auth(
@@ -804,46 +815,6 @@ async fn video_fragments_routed_between_members() {
 }
 
 #[tokio::test]
-async fn stop_share_broadcasts_to_everyone() {
-    init_logs();
-
-    let (config, server) = setup_server_with_user("stop-share");
-    let addr = server.local_addr();
-    let pinned = server.fingerprint().to_string();
-    tokio::spawn(server.run());
-
-    let endpoint = client_endpoint(pinned);
-    // testuser = id 1
-    let (conn_a, mut tx_a, mut rx_a) =
-        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
-    let (conn_b, _tx_b, mut rx_b) =
-        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
-
-    send_client_msg(&mut tx_a, ClientBody::StopShare(StopShare {})).await;
-
-    // Broadcast reaches BOTH clients (the sharer ignores its own echo
-    // by user_id, like ReceiverReport).
-    let msg = read_server_msg(&mut rx_a).await;
-    match msg.body {
-        Some(ServerBody::ShareStopped(s)) => {
-            assert_eq!(s.user_id, 1, "stamped with the authenticated sharer id");
-        }
-        other => panic!("expected share stopped, got {other:?}"),
-    }
-    let msg = read_server_msg(&mut rx_b).await;
-    match msg.body {
-        Some(ServerBody::ShareStopped(s)) => {
-            assert_eq!(s.user_id, 1, "stamped with the authenticated sharer id");
-        }
-        other => panic!("expected share stopped, got {other:?}"),
-    }
-
-    conn_a.close(0u32.into(), b"done");
-    conn_b.close(0u32.into(), b"done");
-    let _ = std::fs::remove_dir_all(&config.data_dir);
-}
-
-#[tokio::test]
 async fn unknown_body_ignored_session_survives() {
     init_logs();
 
@@ -875,5 +846,244 @@ async fn unknown_body_ignored_session_survives() {
     }
 
     conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+// ---- Phase 6b: multi-channel correctness ----
+
+/// A + B in channel 1, C in channel 2. Returns (conn_a.., conn_b.., conn_c..).
+/// All join-broadcasts are consumed on each stream.
+async fn setup_two_channels(
+    tag: &str,
+) -> (
+    (quinn::Connection, quinn::SendStream, quinn::RecvStream),
+    (quinn::Connection, quinn::SendStream, quinn::RecvStream),
+    (quinn::Connection, quinn::SendStream, quinn::RecvStream),
+    u64,
+    Config,
+) {
+    init_logs();
+    let (config, server) = setup_server_with_user(tag);
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+    let ch2 = add_channel(&config, "stage");
+
+    let endpoint = client_endpoint(pinned);
+    let mut a = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let mut b = connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+    let mut c = connect_and_auth(&endpoint, addr, "thirduser", "thirdpass").await;
+
+    // A and B join channel 1; C joins channel 2. Consume every
+    // join broadcast on every stream (order: A, B, C).
+    send_client_msg(&mut a.1, ClientBody::JoinVoice(JoinVoice { channel_id: 1 })).await;
+    expect_voice_state(&mut a.2, 1, 1, true).await;
+    expect_voice_state(&mut b.2, 1, 1, true).await;
+    expect_voice_state(&mut c.2, 1, 1, true).await;
+
+    send_client_msg(&mut b.1, ClientBody::JoinVoice(JoinVoice { channel_id: 1 })).await;
+    expect_voice_state(&mut a.2, 2, 1, true).await;
+    expect_voice_state(&mut b.2, 2, 1, true).await;
+    expect_voice_state(&mut c.2, 2, 1, true).await;
+
+    send_client_msg(
+        &mut c.1,
+        ClientBody::JoinVoice(JoinVoice { channel_id: ch2 }),
+    )
+    .await;
+    expect_voice_state(&mut a.2, 3, ch2, true).await;
+    expect_voice_state(&mut b.2, 3, ch2, true).await;
+    expect_voice_state(&mut c.2, 3, ch2, true).await;
+
+    (a, b, c, ch2, config)
+}
+
+#[tokio::test]
+async fn media_datagrams_no_leak_across_channels() {
+    let (a, b, c, _ch2, config) = setup_two_channels("leak").await;
+
+    // A (ch1) sends an audio datagram. B (ch1) receives; C (ch2) must not.
+    let payload: Vec<u8> = (0..160u32).map(|i| (i % 251) as u8).collect();
+    let dg = parley_proto::media::encode(0, 42, 48_000, 0, &payload);
+    a.0.send_datagram(dg.into()).unwrap();
+
+    let received = timeout(Duration::from_secs(2), b.0.read_datagram())
+        .await
+        .expect("same-channel member must receive")
+        .unwrap();
+    let decoded = parley_proto::media::decode(&received).unwrap();
+    assert_eq!(decoded.sender_id, 1);
+    assert_eq!(decoded.payload, &payload[..]);
+
+    // C is in another channel: nothing may arrive.
+    let leak = timeout(Duration::from_millis(300), c.0.read_datagram()).await;
+    assert!(leak.is_err(), "media leaked across channels");
+
+    // A gets no loopback.
+    let loopback = timeout(Duration::from_millis(300), a.0.read_datagram()).await;
+    assert!(loopback.is_err(), "no loopback expected");
+
+    a.0.close(0u32.into(), b"done");
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn receiver_report_routed_to_channel_members_only() {
+    let (mut a, mut b, mut c, _ch2, config) = setup_two_channels("report").await;
+
+    // A (ch1) reports loss. B (ch1) receives it; C (ch2) and A must not.
+    send_client_msg(
+        &mut a.1,
+        ClientBody::ReceiverReport(ReceiverReport {
+            gap_rate_permille: 42,
+            reporter_id: 0, // server stamps
+        }),
+    )
+    .await;
+
+    let msg = read_server_msg(&mut b.2).await;
+    match msg.body {
+        Some(ServerBody::ReceiverReport(rep)) => {
+            assert_eq!(rep.reporter_id, 1, "stamped with authenticated id");
+            assert_eq!(rep.gap_rate_permille, 42);
+        }
+        other => panic!("expected receiver report, got {other:?}"),
+    }
+
+    // No self-echo to the reporter.
+    let echo = timeout(
+        Duration::from_millis(300),
+        session::read_message::<ServerMessage>(&mut a.2),
+    )
+    .await;
+    assert!(echo.is_err(), "reporter must not receive own echo");
+
+    // No cross-channel delivery.
+    let leak = timeout(
+        Duration::from_millis(300),
+        session::read_message::<ServerMessage>(&mut c.2),
+    )
+    .await;
+    assert!(leak.is_err(), "report leaked across channels");
+
+    a.0.close(0u32.into(), b"done");
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn stop_share_scoped_to_channel_members() {
+    let (mut a, mut b, mut c, _ch2, config) = setup_two_channels("stop-scope").await;
+
+    // A (ch1, sharing) stops. B (ch1) is told; C (ch2) and A must not be.
+    send_client_msg(&mut a.1, ClientBody::StopShare(StopShare {})).await;
+
+    let msg = read_server_msg(&mut b.2).await;
+    match msg.body {
+        Some(ServerBody::ShareStopped(s)) => {
+            assert_eq!(s.user_id, 1, "stamped with the authenticated sharer id");
+        }
+        other => panic!("expected share stopped, got {other:?}"),
+    }
+
+    let echo = timeout(
+        Duration::from_millis(300),
+        session::read_message::<ServerMessage>(&mut a.2),
+    )
+    .await;
+    assert!(echo.is_err(), "sharer must not receive own echo");
+
+    let leak = timeout(
+        Duration::from_millis(300),
+        session::read_message::<ServerMessage>(&mut c.2),
+    )
+    .await;
+    assert!(leak.is_err(), "stop notice leaked across channels");
+
+    a.0.close(0u32.into(), b"done");
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn voice_states_snapshot_two_channels() {
+    let (mut a, _b, _c, ch2, config) = setup_two_channels("snapshot").await;
+
+    // A requests the snapshot: three members, two channels.
+    send_client_msg(
+        &mut a.1,
+        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+    )
+    .await;
+    let msg = read_server_msg(&mut a.2).await;
+    match msg.body {
+        Some(ServerBody::VoiceStateList(list)) => {
+            assert_eq!(list.states.len(), 3);
+            let by_user: std::collections::HashMap<u32, u64> = list
+                .states
+                .iter()
+                .map(|s| (s.user_id, s.channel_id))
+                .collect();
+            assert_eq!(by_user[&1], 1, "testuser in channel 1");
+            assert_eq!(by_user[&2], 1, "seconduser in channel 1");
+            assert_eq!(by_user[&3], ch2, "thirduser in the created channel")
+        }
+        other => panic!("expected voice state list, got {other:?}"),
+    }
+
+    a.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn channel_switch_broadcasts_leave_then_join() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("switch");
+    let ch2 = add_channel(&config, "stage");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, _tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    // A joins ch1; both see it.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+
+    // A switches to ch2: peers must see leave(ch1) BEFORE join(ch2) —
+    // a missing leave freezes their viewers/mixers.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: ch2 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, false).await;
+    expect_voice_state(&mut rx_b, 1, 1, false).await;
+    expect_voice_state(&mut rx_a, 1, ch2, true).await;
+    expect_voice_state(&mut rx_b, 1, ch2, true).await;
+
+    // And the datagram routing followed: A in ch2, B alone in ch1.
+    let payload: Vec<u8> = vec![7u8; 160];
+    let dg = parley_proto::media::encode(0, 1, 48_000, 0, &payload);
+    conn_a.send_datagram(dg.into()).unwrap();
+    let leak = timeout(Duration::from_millis(300), conn_b.read_datagram()).await;
+    assert!(leak.is_err(), "switcher's media must not reach old channel");
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }

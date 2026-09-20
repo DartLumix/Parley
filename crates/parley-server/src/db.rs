@@ -92,6 +92,17 @@ impl Db {
         Ok(())
     }
 
+    /// Create a channel, returning its id (6b). No control-plane
+    /// caller yet — the admin surface comes later; tests and future
+    /// tooling use this.
+    pub fn create_channel(&self, name: &str) -> Result<u64, Error> {
+        self.conn.execute(
+            "INSERT INTO channels (name) VALUES (?1)",
+            rusqlite::params![name],
+        )?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
     /// Returns Some(UserInfo) on success, None on bad credentials.
     pub fn verify_user(&self, username: &str, password: &str) -> Result<Option<UserInfo>, Error> {
         let row: Option<(i64, String, String, i64)> = self

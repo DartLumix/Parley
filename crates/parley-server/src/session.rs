@@ -40,6 +40,16 @@ impl SessionRegistry {
         }
     }
 
+    /// Send a control-plane message to one user (6b: member-targeted
+    /// routing for channel-scoped notices). Returns false if they're
+    /// offline (the send itself can't fail on an unbounded channel).
+    pub fn send_to_user(&self, user_id: u32, msg: parley_proto::ServerMessage) -> bool {
+        match self.clients.lock().unwrap().get(&user_id) {
+            Some(h) => h.tx.send(msg).is_ok(),
+            None => false,
+        }
+    }
+
     /// Send a media datagram to one user's connection.
     /// Returns false if they're offline or the send failed.
     pub fn send_datagram(&self, user_id: u32, data: bytes::Bytes) -> bool {

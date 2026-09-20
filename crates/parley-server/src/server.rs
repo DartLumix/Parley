@@ -388,7 +388,20 @@ async fn handle_client_message(
                 guard.channel_exists(j.channel_id)?
             };
             if exists {
-                voice.join(info.id, j.channel_id);
+                // A switch is leave + join: peers in the OLD channel
+                // must see a departure or their viewers/mixers freeze
+                // (6b — the join() return was silently dropped before).
+                if let Some(old) = voice.join(info.id, j.channel_id)
+                    && old != j.channel_id
+                {
+                    registry.broadcast(ServerMessage {
+                        body: Some(ServerBody::VoiceState(PbVoiceState {
+                            user_id: info.id,
+                            channel_id: old,
+                            joined: false,
+                        })),
+                    });
+                }
                 registry.broadcast(ServerMessage {
                     body: Some(ServerBody::VoiceState(PbVoiceState {
                         user_id: info.id,
@@ -433,30 +446,38 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::ReceiverReport(rep)) => {
-            // 4d: loss feedback routed like media — stamped with the
-            // authenticated reporter id, delivered to voice-channel
-            // peers. v1 uses broadcast (correct while one channel);
-            // multi-channel wants member-targeted sends (registry needs
-            // a send-to-user control method first).
-            if let Some(channel_id) = voice.channel_of(info.id)
-                && voice.members_of(channel_id).len() > 1
-            {
-                registry.broadcast(ServerMessage {
+            // 4d/6b: loss feedback routed like media — to the reporter's
+            // voice-channel members only (the peers actually receiving
+            // the reporter's stream), reporter excluded (no self-echo).
+            if let Some(channel_id) = voice.channel_of(info.id) {
+                let msg = ServerMessage {
                     body: Some(ServerBody::ReceiverReport(ReceiverReport {
                         reporter_id: info.id,
                         gap_rate_permille: rep.gap_rate_permille,
                     })),
-                });
+                };
+                for member in voice.members_of(channel_id) {
+                    if member != info.id {
+                        registry.send_to_user(member, msg.clone());
+                    }
+                }
             }
         }
 
         Some(ClientBody::StopShare(_)) => {
-            // 6a: broadcast-wide like VoiceState (6b narrows to channel
-            // members once report routing lands). Viewers tear down on
-            // it; the sharer ignores its own echo by user_id.
-            registry.broadcast(ServerMessage {
-                body: Some(ServerBody::ShareStopped(ShareStopped { user_id: info.id })),
-            });
+            // 6a/6b: scoped exactly like the video datagrams it
+            // terminates — members of the sharer's channel, sharer
+            // excluded (their own state machine drove the stop).
+            if let Some(channel_id) = voice.channel_of(info.id) {
+                let msg = ServerMessage {
+                    body: Some(ServerBody::ShareStopped(ShareStopped { user_id: info.id })),
+                };
+                for member in voice.members_of(channel_id) {
+                    if member != info.id {
+                        registry.send_to_user(member, msg.clone());
+                    }
+                }
+            }
         }
 
         None => {
