@@ -28,9 +28,17 @@ message PresenceList {
 
 // --- Channels & chat ---
 
+// 6d: a channel IS speech or music — set at creation, not negotiated
+// per join. Music channels run the 256 kbps stereo profile.
+enum ChannelMode {
+  SPEECH = 0;
+  MUSIC = 1;
+}
+
 message Channel {
   uint64 id = 1;
   string name = 2;
+  ChannelMode mode = 3;
 }
 
 message ListChannels {}

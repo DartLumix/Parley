@@ -20,6 +20,11 @@ pub const FLAG_SPEAKING: u8 = 1 << 0;
 /// sub-header (see video.rs).
 pub const FLAG_VIDEO: u8 = 1 << 1;
 
+/// Stereo audio payload (6d): the Opus frame is interleaved L/R.
+/// Receivers key the decoder configuration off this flag PER PACKET —
+/// never off negotiated state (same rule as FLAG_VIDEO).
+pub const FLAG_STEREO: u8 = 1 << 2;
+
 pub const HEADER_LEN: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,5 +95,13 @@ mod tests {
         let mut buf = encode(0, 0, 0, 0, &[]);
         buf[0] = 0xFF; // version bits = 7
         assert!(decode(&buf).is_err());
+    }
+
+    #[test]
+    fn stereo_flag_survives_roundtrip() {
+        // 6d: FLAG_STEREO must round-trip through the 5 flag bits.
+        let encoded = encode(FLAG_STEREO, 1, 96_000, 1, &[0xAA]);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded.flags, FLAG_STEREO);
     }
 }

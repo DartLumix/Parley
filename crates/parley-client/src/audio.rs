@@ -115,11 +115,15 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
             frames as f64 / 48.0
         );
     }
+    // 6d: the mix is interleaved stereo (mono voices duplicated at the
+    // mixer); frames = per-channel frames.
     let mixed = mixer::mix(&state.mixer, frames);
-    // Far-end reference for the AEC: exactly what this callback writes
-    // out (post-gain, post-clamp, mono — what each channel plays).
+    // Far-end reference for the AEC: what this callback plays, downmixed
+    // to mono. Speech clients' voices are mono-duplicated, so this is
+    // exactly the old reference; music clients run without AEC.
     if let Some(ap) = &state.aec {
-        aec::analyze_render(ap, &mut state.render_carry, &mixed);
+        let mono: Vec<f32> = mixed.chunks(2).map(|p| (p[0] + p[1]) * 0.5).collect();
+        aec::analyze_render(ap, &mut state.render_carry, &mono);
     }
     // --report: loudest sample above threshold = the click.
     let now = now_micros();
@@ -142,7 +146,8 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
         // The click sits `idx` frames into this buffer, AFTER buffer[0].
-        let detected = now as i64 + lead_us + (idx as f64 * 1_000_000.0 / 48_000.0) as i64;
+        // idx counts interleaved samples; the click's frame is idx/2.
+        let detected = now as i64 + lead_us + ((idx / 2) as f64 * 1_000_000.0 / 48_000.0) as i64;
         // Channel 1 = general: chat is a global broadcast and the
         // measuring client parses the text, not the channel.
         let _ = report_tx.send(ClientMessage {
@@ -153,9 +158,11 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
         });
         eprintln!("click detected (peak {peak:.2}), reported");
     }
-    for (frame, &s) in data.chunks_mut(state.channels).zip(mixed.iter()) {
-        for c in frame {
-            *c = s;
+    // ch0 = L, everything else = R. (A mono output device would get L
+    // only — acceptable for the test client; this machine is 2ch.)
+    for (frame, pair) in data.chunks_mut(state.channels).zip(mixed.chunks(2)) {
+        for (c, s) in frame.iter_mut().enumerate() {
+            *s = if c == 0 { pair[0] } else { pair[1] };
         }
     }
 }
@@ -276,7 +283,7 @@ pub fn start(
     let measuring = inject.is_some();
     let reporting = report.is_some();
     println!("audio: capture \"{in_name}\" 48 kHz {in_channels}ch f32 → opus 64 kbps");
-    println!("audio: render \"{out_name}\" 48 kHz {out_channels}ch (mono mix duplicated)");
+    println!("audio: render \"{out_name}\" 48 kHz {out_channels}ch (stereo mix)");
     if measuring {
         println!("measure: injecting a click every 2 s");
     }

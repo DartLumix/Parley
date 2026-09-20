@@ -218,19 +218,24 @@ fn setup_server_with_user(tag: &str) -> (Config, Server) {
 
 /// Add a channel while the server is running (WAL allows the brief
 /// concurrent writer). Returns its id.
-fn add_channel(config: &Config, name: &str) -> u64 {
+fn add_channel(config: &Config, name: &str, music: bool) -> u64 {
     let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
-    let id = db.create_channel(name).unwrap();
+    let id = db.create_channel(name, music).unwrap();
     drop(db);
     id
 }
 
-async fn connect_and_auth(
+async fn connect_and_auth_full(
     endpoint: &quinn::Endpoint,
     addr: std::net::SocketAddr,
     username: &str,
     password: &str,
-) -> (quinn::Connection, quinn::SendStream, quinn::RecvStream) {
+) -> (
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+    AuthOk,
+) {
     let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
 
@@ -262,6 +267,16 @@ async fn connect_and_auth(
         "auth must return a session token"
     );
 
+    (conn, tx, rx, ok)
+}
+
+async fn connect_and_auth(
+    endpoint: &quinn::Endpoint,
+    addr: std::net::SocketAddr,
+    username: &str,
+    password: &str,
+) -> (quinn::Connection, quinn::SendStream, quinn::RecvStream) {
+    let (conn, tx, rx, _ok) = connect_and_auth_full(endpoint, addr, username, password).await;
     (conn, tx, rx)
 }
 
@@ -867,7 +882,7 @@ async fn setup_two_channels(
     let addr = server.local_addr();
     let pinned = server.fingerprint().to_string();
     tokio::spawn(server.run());
-    let ch2 = add_channel(&config, "stage");
+    let ch2 = add_channel(&config, "stage", false);
 
     let endpoint = client_endpoint(pinned);
     let mut a = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
@@ -1044,7 +1059,7 @@ async fn channel_switch_broadcasts_leave_then_join() {
     init_logs();
 
     let (config, server) = setup_server_with_user("switch");
-    let ch2 = add_channel(&config, "stage");
+    let ch2 = add_channel(&config, "stage", false);
     let addr = server.local_addr();
     let pinned = server.fingerprint().to_string();
     tokio::spawn(server.run());
@@ -1082,6 +1097,359 @@ async fn channel_switch_broadcasts_leave_then_join() {
     conn_a.send_datagram(dg.into()).unwrap();
     let leak = timeout(Duration::from_millis(300), conn_b.read_datagram()).await;
     assert!(leak.is_err(), "switcher's media must not reach old channel");
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+// ---- Phase 6c: relogin, session replacement, dead-client reaping ----
+
+#[tokio::test]
+async fn token_relogin_end_to_end() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("token-relogin");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+
+    // Password login — grab the issued token.
+    let (conn_a, _tx_a, _rx_a, ok_a) =
+        connect_and_auth_full(&endpoint, addr, "testuser", "testpass").await;
+    assert!(!ok_a.session_token.is_empty());
+
+    // Fresh connection, token-only auth: username/password empty —
+    // the server must not need them on the token path.
+    let conn_b = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx_b, mut rx_b) = conn_b.open_bi().await.unwrap();
+    session::write_message(
+        &mut tx_b,
+        &Hello {
+            protocol_version: PROTOCOL_VERSION,
+            caps: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let _ack: HelloAck = session::read_message(&mut rx_b).await.unwrap();
+    session::write_message(
+        &mut tx_b,
+        &AuthRequest {
+            username: String::new(),
+            password: String::new(),
+            session_token: ok_a.session_token.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let ok_b: AuthOk = session::read_message(&mut rx_b).await.unwrap();
+    assert_eq!(
+        ok_b.user_id, ok_a.user_id,
+        "token must resolve to the same user"
+    );
+
+    // The token session is fully usable: heartbeat answers.
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::Heartbeat(Heartbeat { client_time_ms: 5 }),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 5),
+        other => panic!("expected heartbeat ack, got {other:?}"),
+    }
+
+    // A garbage token is denied.
+    let conn_c = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx_c, mut rx_c) = conn_c.open_bi().await.unwrap();
+    session::write_message(
+        &mut tx_c,
+        &Hello {
+            protocol_version: PROTOCOL_VERSION,
+            caps: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let _ack: HelloAck = session::read_message(&mut rx_c).await.unwrap();
+    session::write_message(
+        &mut tx_c,
+        &AuthRequest {
+            username: String::new(),
+            password: String::new(),
+            session_token: "not-a-real-token".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let denied: AuthDenied = session::read_message(&mut rx_c).await.unwrap();
+    assert!(!denied.reason.is_empty());
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    conn_c.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn second_login_replaces_session() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("replace");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    // Observer
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+    // First session of user 1, in voice.
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+
+    // Same user logs in again — replaces the registry entry.
+    let (conn_a2, mut tx_a2, mut rx_a2) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    // First connection dies. Its cleanup is generation-guarded: it
+    // must NOT unregister the successor, NOT leave voice, NOT
+    // broadcast a departure.
+    conn_a.close(0u32.into(), b"replaced");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B saw no leave for user 1.
+    let ghost = timeout(
+        Duration::from_millis(500),
+        session::read_message::<ServerMessage>(&mut rx_b),
+    )
+    .await;
+    assert!(
+        ghost.is_err(),
+        "replaced session must not broadcast a departure"
+    );
+
+    // User 1 is still in voice — membership outlived the swap.
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(ServerBody::VoiceStateList(list)) => {
+            assert_eq!(list.states.len(), 1);
+            assert_eq!(list.states[0].user_id, 1);
+            assert_eq!(list.states[0].channel_id, 1);
+        }
+        other => panic!("expected voice state list, got {other:?}"),
+    }
+
+    // The successor is fully served.
+    send_client_msg(
+        &mut tx_a2,
+        ClientBody::Heartbeat(Heartbeat { client_time_ms: 9 }),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_a2).await;
+    match msg.body {
+        Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 9),
+        other => panic!("expected heartbeat ack, got {other:?}"),
+    }
+
+    conn_b.close(0u32.into(), b"done");
+    conn_a2.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn dead_client_reaped_by_idle_timeout() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("idle-timeout");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint_b = client_endpoint(pinned.clone());
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint_b, addr, "seconduser", "secondpass").await;
+
+    // A gets its own endpoint so its death can be SILENT: forgetting
+    // every handle leaks the socket — no close frame, exactly like
+    // kill -9. (Dropping would send CONNECTION_CLOSE.)
+    let endpoint_a = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint_a, addr, "testuser", "testpass").await;
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+
+    std::mem::forget((endpoint_a, conn_a, tx_a, rx_a));
+
+    // B must heartbeat while waiting: the server's idle timeout applies
+    // to EVERY connection, observer included (QUIC negotiates the min
+    // of both endpoints — a client can't opt out), and a silent B gets
+    // reaped by the same 10 s deadline it's waiting on. Not a test
+    // artifact: any client silent for 10 s is gone by design
+    // (heartbeat_ms is 5 s; the reap window is ~2 missed beats).
+    let started = std::time::Instant::now();
+    let mut hb = tokio::time::interval(Duration::from_secs(3));
+    hb.tick().await; // intervals fire once immediately: skip that tick
+    let mut reaped = false;
+    while !reaped {
+        tokio::select! {
+            _ = hb.tick() => {
+                send_client_msg(
+                    &mut tx_b,
+                    ClientBody::Heartbeat(Heartbeat { client_time_ms: 0 }),
+                )
+                .await;
+            }
+            msg = session::read_message::<ServerMessage>(&mut rx_b) => {
+                let msg = msg.expect("B stays alive while heartbeating");
+                if let Some(ServerBody::VoiceState(v)) = &msg.body
+                    && v.user_id == 1
+                    && !v.joined
+                {
+                    reaped = true;
+                }
+                // HeartbeatAcks and anything else: keep waiting.
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "server never reaped the dead client"
+        );
+    }
+    assert!(
+        started.elapsed() >= Duration::from_secs(8),
+        "cleanup must come from the idle timeout, not an immediate close"
+    );
+
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+// ---- Phase 6d: music channels ----
+
+#[tokio::test]
+async fn music_channel_stereo_survives_the_chain() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("music");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+    let music_ch = add_channel(&config, "music-hall", true);
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice {
+            channel_id: music_ch,
+        }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, music_ch, true).await;
+    expect_voice_state(&mut rx_b, 1, music_ch, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice {
+            channel_id: music_ch,
+        }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, music_ch, true).await;
+    expect_voice_state(&mut rx_b, 2, music_ch, true).await;
+
+    // A: interleaved 440 Hz L / 880 Hz R through the music pipeline
+    // (256 kbps, Application::Audio, stereo), 10 frames.
+    let n_frames = 10;
+    let spf = parley_core::audio::SAMPLES_PER_FRAME;
+    let mut stereo_pcm: Vec<i16> = Vec::with_capacity(n_frames * spf * 2);
+    for i in 0..(n_frames * spf) {
+        let t = i as f64 / parley_core::audio::SAMPLE_RATE as f64;
+        let l = (0.3 * f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * i16::MAX as f64) as i16;
+        let r = (0.3 * f64::sin(2.0 * std::f64::consts::PI * 880.0 * t) * i16::MAX as f64) as i16;
+        stereo_pcm.push(l);
+        stereo_pcm.push(r);
+    }
+    let mut send = parley_core::audio::pipeline::SendPipeline::new_music(256_000).unwrap();
+    let mut packets = Vec::new();
+    send.push_pcm(&stereo_pcm, &mut packets).unwrap();
+    assert_eq!(packets.len(), n_frames);
+    for (seq, ts, pkt) in &packets {
+        let dg = parley_proto::media::encode(
+            parley_proto::media::FLAG_SPEAKING | parley_proto::media::FLAG_STEREO,
+            *seq,
+            *ts,
+            0, // server stamps
+            pkt,
+        );
+        conn_a.send_datagram(dg.into()).unwrap();
+    }
+
+    // B: through the SFU, into the stereo receive path.
+    let mut recv = parley_core::audio::pipeline::RecvPipeline::new(1).unwrap();
+    recv.set_stereo(true).unwrap();
+    for _ in 0..n_frames {
+        let d = timeout(Duration::from_secs(2), conn_b.read_datagram())
+            .await
+            .expect("datagram should arrive")
+            .unwrap();
+        let m = parley_proto::media::decode(&d).unwrap();
+        assert_eq!(m.sender_id, 1, "server stamps sender id");
+        assert!(
+            m.flags & parley_proto::media::FLAG_STEREO != 0,
+            "stereo flag must survive the SFU"
+        );
+        recv.push_packet(m.seq, m.payload);
+    }
+    let mut out = Vec::new();
+    recv.pull_pcm(&mut out, n_frames + 2).unwrap();
+    let decoded: Vec<i16> = out.iter().map(|&s| (s * 32767.0) as i16).collect();
+    assert_eq!(decoded.len(), n_frames * spf * 2);
+
+    let l_orig: Vec<i16> = stereo_pcm.iter().step_by(2).copied().collect();
+    let r_orig: Vec<i16> = stereo_pcm.iter().skip(1).step_by(2).copied().collect();
+    let l: Vec<i16> = decoded.iter().step_by(2).copied().collect();
+    let r: Vec<i16> = decoded.iter().skip(1).step_by(2).copied().collect();
+
+    assert!(
+        best_correlation(&l_orig, &l) > 0.9,
+        "left must survive as left: {:.3}",
+        best_correlation(&l_orig, &l)
+    );
+    assert!(
+        best_correlation(&r_orig, &r) > 0.9,
+        "right must survive as right: {:.3}",
+        best_correlation(&r_orig, &r)
+    );
+    assert!(
+        best_correlation(&l, &r_orig) < 0.5,
+        "channels must stay separate: {:.3}",
+        best_correlation(&l, &r_orig)
+    );
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");

@@ -13,7 +13,7 @@ pub use handshake::PROTOCOL_VERSION;
 pub use pb::client_message::Body as ClientBody;
 pub use pb::server_message::Body as ServerBody;
 pub use pb::{
-    AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChatMessage, ClientMessage,
+    AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChannelMode, ChatMessage, ClientMessage,
     FetchHistory, Heartbeat, HeartbeatAck, Hello, HelloAck, HistoryResult, JoinVoice, LeaveVoice,
     ListChannels, PresenceList, PresenceRequest, PresenceUser, ReceiverReport, SendChat,
     ServerMessage, ShareStopped, StopShare, VoiceState, VoiceStateList, VoiceStatesRequest,

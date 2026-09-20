@@ -1,27 +1,55 @@
 //! The voice pipeline: mic→Opus→datagram and datagram→Opus→speakers,
 //! minus the device I/O. The client (and only the client) feeds it
 //! samples and datagrams.
+//!
+//! Two profiles (6d): speech (mono, FEC, ladder-driven bitrate) and
+//! music (stereo interleaved, no FEC, fixed 256 kbps). Same seq/
+//! timestamp discipline; timestamps advance 960 per 20 ms frame in
+//! BOTH profiles (per-channel sample clock).
 
 use crate::audio::codec::{OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME};
 use crate::audio::jitter::{JitterBuffer, PopOutcome};
 use crate::error::Error;
 
 pub struct SendPipeline {
-    /// Accumulates captured 48 kHz i16 samples until a full Opus frame.
+    /// Accumulates captured interleaved i16 samples until a full frame.
     frame: Vec<i16>,
+    /// 960 (speech) or 1920 (music) samples per frame.
+    frame_samples: usize,
     encoder: OpusEncoder,
     pub seq: u16,
     pub timestamp: u32,
 }
 
 impl SendPipeline {
-    pub fn new(bitrate: i32) -> Result<Self, Error> {
+    fn new_inner(bitrate: i32, music: bool) -> Result<Self, Error> {
+        let encoder = if music {
+            OpusEncoder::new_music(bitrate)?
+        } else {
+            OpusEncoder::new(bitrate)?
+        };
+        let frame_samples = if music {
+            SAMPLES_PER_FRAME * 2
+        } else {
+            SAMPLES_PER_FRAME
+        };
         Ok(Self {
-            frame: Vec::with_capacity(SAMPLES_PER_FRAME),
-            encoder: OpusEncoder::new(bitrate)?,
+            frame: Vec::with_capacity(frame_samples),
+            frame_samples,
+            encoder,
             seq: 0,
             timestamp: 0,
         })
+    }
+
+    /// Speech profile (mono, in-band FEC).
+    pub fn new(bitrate: i32) -> Result<Self, Error> {
+        Self::new_inner(bitrate, false)
+    }
+
+    /// Music profile (6d): stereo interleaved input, 256 kbps typical.
+    pub fn new_music(bitrate: i32) -> Result<Self, Error> {
+        Self::new_inner(bitrate, true)
     }
 
     /// 4d: runtime bitrate switch (libopus reconfigures in place).
@@ -34,26 +62,31 @@ impl SendPipeline {
         self.encoder.set_loss_hint(perc);
     }
 
-    /// Feed one chunk of 48 kHz mono i16 samples. Returns zero or more
-    /// (seq, timestamp, packet) tuples ready for datagrams.
+    /// Feed one chunk of interleaved 48 kHz i16 samples (mono: 1 per
+    /// sample-clock, music: 2). Returns zero or more (seq, timestamp,
+    /// packet) tuples ready for datagrams.
     pub fn push_pcm(
         &mut self,
         pcm: &[i16],
         out: &mut Vec<(u16, u32, Vec<u8>)>,
     ) -> Result<(), Error> {
         self.frame.extend_from_slice(pcm);
-        while self.frame.len() >= SAMPLES_PER_FRAME {
-            let packet = self.encoder.encode(&self.frame[..SAMPLES_PER_FRAME])?;
+        while self.frame.len() >= self.frame_samples {
+            let packet = self.encoder.encode(&self.frame[..self.frame_samples])?;
             out.push((self.seq, self.timestamp, packet.to_vec()));
             self.seq = self.seq.wrapping_add(1);
+            // 20 ms per frame regardless of channel count: the
+            // timestamp clock is per-channel samples.
             self.timestamp = self.timestamp.wrapping_add(SAMPLES_PER_FRAME as u32);
-            self.frame.drain(..SAMPLES_PER_FRAME);
+            self.frame.drain(..self.frame_samples);
         }
         Ok(())
     }
 }
 
 /// Per-sender receive pipeline: jitter → decode → f32 out.
+/// Output is interleaved (mono senders produce mono samples; stereo
+/// senders produce L/R pairs — the caller normalizes).
 pub struct RecvPipeline {
     jitter: JitterBuffer,
     decoder: OpusDecoder,
@@ -76,6 +109,19 @@ impl RecvPipeline {
         })
     }
 
+    /// Switch the decoder between mono and stereo (6d). Called when a
+    /// packet's FLAG_STEREO disagrees with the current configuration —
+    /// per-packet flag, no negotiated state. Recreating the decoder is
+    /// correct: a mode flip mid-stream means a new sender session.
+    pub fn set_stereo(&mut self, stereo: bool) -> Result<(), Error> {
+        self.decoder = if stereo {
+            OpusDecoder::new_stereo()?
+        } else {
+            OpusDecoder::new()?
+        };
+        Ok(())
+    }
+
     pub fn push_packet(&mut self, seq: u16, packet: &[u8]) {
         self.jitter.push(seq, packet);
     }
@@ -95,9 +141,9 @@ impl RecvPipeline {
         rate
     }
 
-    /// Pull up to `max_frames` frames of decoded f32 (48 kHz mono).
-    /// Appends to `out`. Gaps conceal via in-band FEC when the successor
-    /// packet is buffered, plain PLC otherwise.
+    /// Pull up to `max_frames` frames of decoded f32 (interleaved for
+    /// stereo senders). Appends to `out`. Gaps conceal via in-band FEC
+    /// when the successor packet is buffered, plain PLC otherwise.
     pub fn pull_pcm(&mut self, out: &mut Vec<f32>, max_frames: usize) -> Result<(), Error> {
         let mut produced = 0;
         while produced < max_frames {
@@ -156,6 +202,21 @@ mod tests {
         // leftover half-frame stays buffered
         let leftover = send.frame.len();
         assert_eq!(leftover, SAMPLES_PER_FRAME / 2);
+    }
+
+    #[test]
+    fn music_pipeline_frames_interleaved() {
+        // 6d: stereo input frames at 1920 samples, same 960-per-frame
+        // timestamp clock as speech.
+        let mut send = SendPipeline::new_music(256_000).unwrap();
+        let pcm: Vec<i16> = (0..(SAMPLES_PER_FRAME * 2 * 5 / 2))
+            .map(|i| (i as f32 * 0.03).sin() as i16 * 8000)
+            .collect();
+        let mut packets = Vec::new();
+        send.push_pcm(&pcm, &mut packets).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[1].1, SAMPLES_PER_FRAME as u32);
+        assert_eq!(send.frame.len(), SAMPLES_PER_FRAME); // half-frame = 960 stereo samples
     }
 
     #[test]

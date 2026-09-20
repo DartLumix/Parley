@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
@@ -13,11 +14,17 @@ pub struct ClientHandle {
     pub conn: quinn::Connection,
     /// Control-plane messages for this client (broadcasts).
     pub tx: mpsc::UnboundedSender<parley_proto::ServerMessage>,
+    /// Registration generation (6c): unique per register() call. Guards
+    /// a dying session's cleanup — if a same-user successor has
+    /// registered, the entry (and the user's voice slot) belongs to it.
+    /// Overwritten by register(); the 0 is a placeholder.
+    pub session: u64,
 }
 
 #[derive(Default)]
 pub struct SessionRegistry {
     clients: Mutex<HashMap<u32, ClientHandle>>,
+    next_session: AtomicU64,
 }
 
 impl SessionRegistry {
@@ -25,12 +32,33 @@ impl SessionRegistry {
         Self::default()
     }
 
-    pub fn register(&self, handle: ClientHandle) {
+    /// Register a client; returns its connection generation.
+    pub fn register(&self, mut handle: ClientHandle) -> u64 {
+        let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        handle.session = session;
         self.clients.lock().unwrap().insert(handle.user_id, handle);
+        session
     }
 
-    pub fn unregister(&self, user_id: u32) {
-        self.clients.lock().unwrap().remove(&user_id);
+    /// Remove the user's entry ONLY if it still belongs to `session`.
+    /// Returns true when it did (and was removed) — only then may the
+    /// caller run session-scoped cleanup such as leaving voice.
+    pub fn unregister_if(&self, user_id: u32, session: u64) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        let ours = clients.get(&user_id).is_some_and(|h| h.session == session);
+        if ours {
+            clients.remove(&user_id);
+        }
+        ours
+    }
+
+    /// Is `session` still the live registration for `user_id`?
+    pub fn is_current(&self, user_id: u32, session: u64) -> bool {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(&user_id)
+            .is_some_and(|h| h.session == session)
     }
 
     /// Send a control-plane message to every connected client.

@@ -144,8 +144,8 @@ Goal: every open/parked backend item closed — a stable, complete backend the
 Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] 6a Share lifecycle — stop/start without process exit; viewer cleanup
 - [x] 6b Multi-channel correctness + per-channel report routing
-- [ ] 6c Session-token relogin + reconnect hardening
-- [ ] 6d Music channels — 256 kbps stereo end-to-end
+- [x] 6c Session-token relogin + reconnect hardening
+- [x] 6d Music channels — 256 kbps stereo end-to-end
 - [ ] 6e Loss-driven video bitrate ladder (mirror 4d)
 - [ ] 6f Device-vanishing mitigations
 - [ ] 6g Performance budgets verified (RSS / 10 talkers / login / binary)

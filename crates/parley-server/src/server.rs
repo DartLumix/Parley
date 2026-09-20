@@ -1,7 +1,7 @@
 //! The QUIC listener: bind, accept, dispatch, session loop.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -9,22 +9,23 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, DbHandle};
 use crate::error::Error;
 use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
 use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
-    AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ClientBody, ClientMessage,
-    HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser, ReceiverReport,
-    ServerBody, ServerMessage, ShareStopped, VoiceState as PbVoiceState, VoiceStateList,
+    AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ChannelMode, ClientBody,
+    ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser,
+    ReceiverReport, ServerBody, ServerMessage, ShareStopped, VoiceState as PbVoiceState,
+    VoiceStateList,
 };
 
 pub struct Server {
     endpoint: quinn::Endpoint,
     fingerprint: String,
-    db: Arc<Mutex<Db>>,
+    db: Db,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
 }
@@ -46,16 +47,30 @@ impl Server {
             .with_single_cert(vec![identity.cert], identity.key)?;
         rustls_config.alpn_protocols = vec![tls::alpn()];
 
-        let quinn_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut quinn_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(rustls_config)
                 .map_err(|e| Error::QuinnTls(format!("{e:?}")))?,
         ));
+        // 6c: a silently-dead client (kill -9, network black hole) is
+        // reaped by the QUIC idle timeout — 10 s ≈ 2 missed heartbeats
+        // (heartbeat_ms: 5 s below). Live connections stay clear of
+        // it: heartbeats ride the reliable control stream, so even
+        // under hostile loss QUIC's retransmissions keep producing
+        // packets. QUIC negotiates the minimum of both endpoints'
+        // timeouts, so this applies regardless of client config.
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            std::time::Duration::from_secs(10)
+                .try_into()
+                .expect("10 s is a valid IdleTimeout"),
+        ));
+        quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
         Ok(Self {
             endpoint,
             fingerprint,
-            db: Arc::new(Mutex::new(db)),
+            db,
             registry: Arc::new(SessionRegistry::new()),
             voice: Arc::new(VoiceManager::new()),
         })
@@ -71,10 +86,14 @@ impl Server {
 
     pub async fn run(self) -> Result<(), Error> {
         info!(addr = %self.local_addr(), fingerprint = %self.fingerprint, "parley listening");
+        // 6c: the db actor owns the Connection on a dedicated thread —
+        // no Mutex, no lock poisoning, and blocking work (Argon2
+        // verifies, WAL checkpoints) never touches a tokio worker.
+        let db = DbHandle::spawn(self.db);
         while let Some(incoming) = self.endpoint.accept().await {
             match incoming.await {
                 Ok(conn) => {
-                    let db = self.db.clone();
+                    let db = db.clone();
                     let registry = self.registry.clone();
                     let voice = self.voice.clone();
                     tokio::spawn(handle_connection(conn, db, registry, voice));
@@ -88,7 +107,7 @@ impl Server {
 
 async fn handle_connection(
     conn: quinn::Connection,
-    db: Arc<Mutex<Db>>,
+    db: DbHandle,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
 ) {
@@ -102,7 +121,7 @@ async fn handle_connection(
 
 async fn serve(
     conn: quinn::Connection,
-    db: &Arc<Mutex<Db>>,
+    db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
 ) -> Result<(), Error> {
@@ -127,15 +146,10 @@ async fn serve(
 
     // --- Auth (password or session token) ---
     let auth: AuthRequest = session::read_message(&mut rx).await?;
-    let user_info = {
-        let guard = db
-            .lock()
-            .map_err(|_| Error::Internal("database lock poisoned".into()))?;
-        if !auth.session_token.is_empty() {
-            guard.verify_session_token(&auth.session_token)?
-        } else {
-            guard.verify_user(&auth.username, &auth.password)?
-        }
+    let user_info = if !auth.session_token.is_empty() {
+        db.verify_token(&auth.session_token).await?
+    } else {
+        db.verify_user(&auth.username, &auth.password).await?
     };
 
     let info = match user_info {
@@ -154,24 +168,22 @@ async fn serve(
         }
     };
 
-    let token = {
-        let guard = db
-            .lock()
-            .map_err(|_| Error::Internal("database lock poisoned".into()))?;
-        guard.create_session(info.id)?
-    };
+    let token = db.create_session(info.id).await?;
 
     info!(username = %info.username, user_id = info.id, "session started");
 
-    // Register with the broadcast registry before acking.
-    // NOTE: keyed by user_id — a second login by the same user replaces
-    // the first (its event channel closes, that session ends).
+    // Register with the broadcast registry before acking. Keyed by
+    // user_id: a second login by the same user replaces the first —
+    // the old event channel closes and that session ends. The returned
+    // generation guards the OLD session's cleanup against tearing down
+    // its successor (6c).
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    registry.register(ClientHandle {
+    let session_gen = registry.register(ClientHandle {
         user_id: info.id,
         username: info.username.clone(),
         conn: conn.clone(),
         tx: event_tx,
+        session: 0, // assigned by register()
     });
 
     session::write_message(
@@ -232,7 +244,7 @@ async fn serve(
             msg = msg_rx.recv() => match msg {
                 Some(m) => {
                     match handle_client_message(
-                        m, &info, &mut tx, db, registry, voice,
+                        m, &info, session_gen, &mut tx, db, registry, voice,
                     ).await {
                         Ok(true) => {}
                         Ok(false) => break Ok(()),
@@ -244,8 +256,14 @@ async fn serve(
         }
     };
 
-    // Cleanup: leave voice if member, broadcast the departure.
-    if voice.leave(info.id).is_some() {
+    // Cleanup is generation-guarded (6c): if a same-user successor
+    // registered after us, the registry entry and the voice slot
+    // belong to IT — our death must not unregister or boot them.
+    // (Residual micro-race: a register landing between unregister_if
+    // and voice.leave would be booted from voice; coupling the two
+    // locks isn't worth it.)
+    let still_current = registry.unregister_if(info.id, session_gen);
+    if still_current && voice.leave(info.id).is_some() {
         registry.broadcast(ServerMessage {
             body: Some(ServerBody::VoiceState(PbVoiceState {
                 user_id: info.id,
@@ -254,7 +272,6 @@ async fn serve(
             })),
         });
     }
-    registry.unregister(info.id);
     info!(user_id = info.id, "session ended");
     let _ = tx.finish();
     if result.is_err() {
@@ -267,8 +284,9 @@ async fn serve(
 async fn handle_client_message(
     msg: ClientMessage,
     info: &crate::db::UserInfo,
+    session_gen: u64,
     tx: &mut quinn::SendStream,
-    db: &Arc<Mutex<Db>>,
+    db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
 ) -> Result<bool, Error> {
@@ -306,19 +324,22 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::ListChannels(_)) => {
-            let channels = {
-                let guard = db
-                    .lock()
-                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
-                guard.list_channels()?
-            };
+            let channels = db.list_channels().await?;
             session::write_message(
                 tx,
                 &ServerMessage {
                     body: Some(ServerBody::ChannelList(ChannelList {
                         channels: channels
                             .into_iter()
-                            .map(|(id, name)| PbChannel { id, name })
+                            .map(|(id, name, music)| PbChannel {
+                                id,
+                                name,
+                                mode: if music {
+                                    ChannelMode::Music as i32
+                                } else {
+                                    ChannelMode::Speech as i32
+                                },
+                            })
                             .collect(),
                     })),
                 },
@@ -331,12 +352,7 @@ async fn handle_client_message(
             if text.is_empty() || text.len() > 2000 {
                 return Ok(true); // ignore empty/oversized silently
             }
-            let (msg_id, ts, _) = {
-                let guard = db
-                    .lock()
-                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
-                guard.insert_message(chat.channel_id, info.id, &text)?
-            };
+            let (msg_id, ts, _) = db.insert_message(chat.channel_id, info.id, &text).await?;
             registry.broadcast(ServerMessage {
                 body: Some(ServerBody::ChatMessage(parley_proto::ChatMessage {
                     message_id: msg_id,
@@ -351,12 +367,9 @@ async fn handle_client_message(
 
         Some(ClientBody::FetchHistory(fetch)) => {
             let limit = fetch.limit.clamp(1, 100);
-            let rows = {
-                let guard = db
-                    .lock()
-                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
-                guard.fetch_history(fetch.channel_id, limit, fetch.before_message_id)?
-            };
+            let rows = db
+                .fetch_history(fetch.channel_id, limit, fetch.before_message_id)
+                .await?;
             session::write_message(
                 tx,
                 &ServerMessage {
@@ -381,16 +394,13 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::JoinVoice(j)) => {
-            let exists = {
-                let guard = db
-                    .lock()
-                    .map_err(|_| Error::Internal("database lock poisoned".into()))?;
-                guard.channel_exists(j.channel_id)?
-            };
-            if exists {
+            let exists = db.channel_exists(j.channel_id).await?;
+            // is_current: a replaced session's stray messages must not
+            // touch the successor's voice membership (6c).
+            if exists && registry.is_current(info.id, session_gen) {
                 // A switch is leave + join: peers in the OLD channel
                 // must see a departure or their viewers/mixers freeze
-                // (6b — the join() return was silently dropped before).
+                // (6b).
                 if let Some(old) = voice.join(info.id, j.channel_id)
                     && old != j.channel_id
                 {
@@ -414,7 +424,7 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::LeaveVoice(_)) => {
-            if voice.leave(info.id).is_some() {
+            if registry.is_current(info.id, session_gen) && voice.leave(info.id).is_some() {
                 registry.broadcast(ServerMessage {
                     body: Some(ServerBody::VoiceState(PbVoiceState {
                         user_id: info.id,
@@ -447,8 +457,7 @@ async fn handle_client_message(
 
         Some(ClientBody::ReceiverReport(rep)) => {
             // 4d/6b: loss feedback routed like media — to the reporter's
-            // voice-channel members only (the peers actually receiving
-            // the reporter's stream), reporter excluded (no self-echo).
+            // voice-channel members only, reporter excluded.
             if let Some(channel_id) = voice.channel_of(info.id) {
                 let msg = ServerMessage {
                     body: Some(ServerBody::ReceiverReport(ReceiverReport {
