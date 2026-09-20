@@ -18,7 +18,7 @@ use parley_proto::{Hello, HelloAck, PROTOCOL_VERSION};
 use parley_proto::{AuthDenied, AuthOk, AuthRequest};
 
 use parley_proto::{
-    ClientBody, ClientMessage, Heartbeat, PresenceRequest, ServerBody, ServerMessage,
+    ClientBody, ClientMessage, Heartbeat, PresenceRequest, ServerBody, ServerMessage, StopShare,
 };
 
 use parley_proto::{FetchHistory, ListChannels, SendChat};
@@ -671,7 +671,7 @@ async fn voice_roundtrip_synthetic_audio() {
             .unwrap();
         let m = parley_proto::media::decode(&d).unwrap();
         assert_eq!(m.sender_id, 1, "server must stamp authenticated sender id");
-        decoded.extend_from_slice(decoder.decode(m.payload).unwrap());
+        decoded.extend(decoder.decode(m.payload).unwrap());
     }
 
     // Signal must survive the trip: encode → QUIC → SFU → decode.
@@ -800,5 +800,80 @@ async fn video_fragments_routed_between_members() {
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn stop_share_broadcasts_to_everyone() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("stop-share");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    // testuser = id 1
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, _tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(&mut tx_a, ClientBody::StopShare(StopShare {})).await;
+
+    // Broadcast reaches BOTH clients (the sharer ignores its own echo
+    // by user_id, like ReceiverReport).
+    let msg = read_server_msg(&mut rx_a).await;
+    match msg.body {
+        Some(ServerBody::ShareStopped(s)) => {
+            assert_eq!(s.user_id, 1, "stamped with the authenticated sharer id");
+        }
+        other => panic!("expected share stopped, got {other:?}"),
+    }
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(ServerBody::ShareStopped(s)) => {
+            assert_eq!(s.user_id, 1, "stamped with the authenticated sharer id");
+        }
+        other => panic!("expected share stopped, got {other:?}"),
+    }
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn unknown_body_ignored_session_survives() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("unknown-body");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn, mut tx, mut rx) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+
+    // body: None — exactly what an older prost decodes a NEWER client's
+    // unknown oneof variant to. Must be ignored, not fatal: the protocol
+    // is additive, an old server survives a new client.
+    session::write_message(&mut tx, &ClientMessage { body: None })
+        .await
+        .unwrap();
+
+    // Session still alive: heartbeat still answers.
+    send_client_msg(
+        &mut tx,
+        ClientBody::Heartbeat(Heartbeat { client_time_ms: 1 }),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx).await;
+    match msg.body {
+        Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 1),
+        other => panic!("expected heartbeat ack, got {other:?}"),
+    }
+
+    conn.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }

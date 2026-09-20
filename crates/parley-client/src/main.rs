@@ -14,6 +14,11 @@
 //! voice-channel peers; senders switch between Clean (64 kbps, FEC
 //! inert) and Robust (24 kbps + aggressive in-band FEC) on an EMA with
 //! hysteresis.
+//!
+//! Share lifecycle (Phase 6a): "share" / "stop" typed on stdin drive
+//! start/stop without process exit; --share is just a "share" command
+//! at boot. Stopping tears down the portal session + pipewire + the
+//! encoder, then signals StopShare; viewers close their windows.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,10 +28,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ClientBody, ClientMessage, Heartbeat, Hello, HelloAck,
-    JoinVoice, PROTOCOL_VERSION, ServerBody, ServerMessage,
+    JoinVoice, PROTOCOL_VERSION, ServerBody, ServerMessage, StopShare,
 };
 use prost::Message as _;
 
+use parley_client::ShareEvent;
 use parley_client::cert;
 #[cfg(feature = "screen-capture")]
 use parley_client::screen;
@@ -101,6 +107,12 @@ fn parse_args() -> Result<Args, String> {
         volumes,
         share,
     })
+}
+
+/// Stdin commands (6a): drive the share lifecycle without exiting.
+enum Command {
+    Share,
+    Stop,
 }
 
 fn now_ms() -> u64 {
@@ -224,7 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // control reader, polled by the bitrate controller in the encode task.
     let loss_state = Arc::new(AtomicU32::new(0));
 
-    // 5d: keyframe-on-join — filled by the share block below once the
+    // 5d: keyframe-on-join — filled by the share command task once the
     // capture pipeline is up; the control reader pokes it when a
     // viewer joins our voice channel.
     #[cfg(feature = "screen-capture")]
@@ -412,6 +424,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             video::remove_viewer(&ctrl_viewers, v.user_id);
                         }
                     }
+                    Some(ServerBody::ShareStopped(s)) => {
+                        // 6a: the sharer's echo is ignored by user_id;
+                        // viewers tear down (and freeze-proof against
+                        // straggler datagrams) on this.
+                        if s.user_id != ok.user_id {
+                            println!("video: user {} stopped sharing", s.user_id);
+                            #[cfg(feature = "video")]
+                            video::mark_stopped(&ctrl_viewers, s.user_id);
+                        }
+                    }
                     Some(ServerBody::ReceiverReport(rep)) => {
                         // 4d: a peer's loss report steers our send profile.
                         // Skip our own echo (broadcast includes us) and
@@ -575,9 +597,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("audio-device feature off: no mic or speakers");
 
     // --- media datagram reader ---
-    // Hoisted out of the audio-device gate (was Open Issues #2): a
-    // video-only build now receives video. Control-only builds (no
-    // features) still never spawn it — unchanged CI behavior.
+    // Hoisted out of the audio-device gate: a video-only build receives
+    // video. Control-only builds (no features) still never spawn it.
     #[cfg(any(feature = "audio-device", feature = "video"))]
     {
         #[cfg(feature = "audio-device")]
@@ -625,33 +646,200 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    #[cfg(feature = "screen-capture")]
-    if args.share {
-        // 5d: real capture through the portal; synthetic pattern stays
-        // available for video-only builds (below).
-        let share_conn = conn.clone();
-        let seq = Arc::new(Mutex::new(0x8000u16));
-        let poke = keyframe_poke.clone();
-        tokio::spawn(async move {
-            match screen::start(share_conn, seq).await {
-                Ok(handle) => *poke.lock().unwrap() = Some(handle),
-                Err(e) => eprintln!("share: {e}"),
+    // --- share lifecycle (Phase 6a) ---
+    // One command task owns the share state machine. Sources: stdin
+    // commands (a plain OS thread — tokio io-std isn't in the feature
+    // set) and ShareEvents from the capture supervisor / synthetic
+    // sender. On Ended the task sends StopShare — only after the
+    // supervisor confirmed full teardown, so no video datagram can
+    // follow the stop notice.
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+    let (_events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ShareEvent>();
+
+    // stdin reader thread. On EOF (Ctrl-D) the sender drops and the
+    // command task stops reading commands — but keeps share state
+    // alive until the connection ends (a share must not die with the
+    // terminal's stdin).
+    {
+        let cmd_tx = cmd_tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let cmd = match line.trim() {
+                    "share" => Command::Share,
+                    "stop" => Command::Stop,
+                    "" => continue,
+                    other => {
+                        println!("unknown command: {other} (share | stop)");
+                        continue;
+                    }
+                };
+                if cmd_tx.send(cmd).is_err() {
+                    break;
+                }
             }
         });
     }
+
+    // Share state, per feature (cfg the variables, not the reads, to
+    // keep every feature combination warning-free).
+    #[cfg(feature = "screen-capture")]
+    let share_ctrl: Arc<Mutex<Option<screen::ShareController>>> = Arc::new(Mutex::new(None));
+    #[cfg(feature = "screen-capture")]
+    let share_poke = keyframe_poke.clone();
+    #[cfg(any(feature = "video", feature = "screen-capture"))]
+    let share_conn = conn.clone();
+    #[cfg(any(feature = "video", feature = "screen-capture"))]
+    let share_events = _events_tx.clone();
+    #[cfg(feature = "screen-capture")]
+    let mut share_starting = false;
     #[cfg(all(feature = "video", not(feature = "screen-capture")))]
-    if args.share {
-        let share_conn = conn.clone();
-        let seq = Arc::new(Mutex::new(0x8000u16));
-        match video::ShareSender::new(seq.clone()) {
-            Ok(sender) => {
-                tokio::spawn(video::share_task(share_conn, Arc::new(Mutex::new(sender))));
+    let mut synth_share: Option<tokio::task::AbortHandle> = None;
+    let share_outbound = _outbound_tx.clone();
+
+    let mut cmd_open = true;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                c = cmd_rx.recv(), if cmd_open => {
+                    match c {
+                        Some(Command::Share) => {
+                            #[cfg(feature = "screen-capture")]
+                            {
+                                if share_starting || share_ctrl.lock().unwrap().is_some() {
+                                    println!("share: already active or starting");
+                                } else {
+                                    share_starting = true;
+                                    println!("share: requesting screen capture — pick a monitor or window in the portal dialog");
+                                    // Starter task: keeps the command loop
+                                    // free while the portal dialog is open.
+                                    let conn = share_conn.clone();
+                                    let poke = share_poke.clone();
+                                    let ctrl_slot = share_ctrl.clone();
+                                    let events = share_events.clone();
+                                    tokio::spawn(async move {
+                                        match screen::start(conn, events.clone()).await {
+                                            Ok((handle, ctrl)) => {
+                                                *poke.lock().unwrap() = Some(handle);
+                                                *ctrl_slot.lock().unwrap() = Some(ctrl);
+                                                let _ = events.send(ShareEvent::Started);
+                                            }
+                                            Err(e) => {
+                                                let _ = events.send(ShareEvent::StartFailed(e));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            #[cfg(all(feature = "video", not(feature = "screen-capture")))]
+                            {
+                                if synth_share.is_some() {
+                                    println!("share: already active");
+                                } else {
+                                    match video::ShareSender::new() {
+                                        Ok(sender) => {
+                                            let task = tokio::spawn(video::share_task(share_conn.clone(), sender));
+                                            synth_share = Some(task.abort_handle());
+                                            let _ = share_events.send(ShareEvent::Started);
+                                        }
+                                        Err(e) => {
+                                            let _ = share_events.send(ShareEvent::StartFailed(e));
+                                        }
+                                    }
+                                }
+                            }
+                            #[cfg(not(any(feature = "video", feature = "screen-capture")))]
+                            eprintln!("share: not built with video or screen-capture");
+                        }
+                        Some(Command::Stop) => {
+                            #[cfg(feature = "screen-capture")]
+                            {
+                                if let Some(c) = share_ctrl.lock().unwrap().take() {
+                                    c.request_stop();
+                                    // ShareEvent::Ended follows after full teardown
+                                } else if share_starting {
+                                    println!("share: still starting — finish or cancel the portal dialog first");
+                                } else {
+                                    println!("share: not active");
+                                }
+                            }
+                            #[cfg(all(feature = "video", not(feature = "screen-capture")))]
+                            {
+                                if let Some(abort) = synth_share.take() {
+                                    abort.abort();
+                                    let _ = share_events.send(ShareEvent::Ended { external: false });
+                                } else {
+                                    println!("share: not active");
+                                }
+                            }
+                            #[cfg(not(any(feature = "video", feature = "screen-capture")))]
+                            println!("share: not active");
+                        }
+                        None => cmd_open = false,
+                    }
+                }
+                e = events_rx.recv() => {
+                    match e {
+                        Some(ev) => match ev {
+                            ShareEvent::Started => {
+                                // Readiness is logged by the subsystems
+                                // (pw "stream connected" / share_task pattern
+                                // line); only clear the starting flag here.
+                                #[cfg(feature = "screen-capture")]
+                                {
+                                    share_starting = false;
+                                }
+                            }
+                            ShareEvent::StartFailed(e) => {
+                                #[cfg(feature = "screen-capture")]
+                                {
+                                    share_starting = false;
+                                }
+                                eprintln!("share: {e}");
+                            }
+                            ShareEvent::Ended { external } => {
+                                #[cfg(feature = "screen-capture")]
+                                {
+                                    *share_ctrl.lock().unwrap() = None;
+                                    *share_poke.lock().unwrap() = None;
+                                    share_starting = false;
+                                }
+                                #[cfg(all(feature = "video", not(feature = "screen-capture")))]
+                                {
+                                    synth_share = None;
+                                }
+                                // Only now — after the supervisor joined the
+                                // threads — can no more video datagrams exist.
+                                let _ = share_outbound.send(ClientMessage {
+                                    body: Some(ClientBody::StopShare(StopShare {})),
+                                });
+                                println!(
+                                    "share: stopped{}",
+                                    if external { " (closed from the desktop)" } else { "" }
+                                );
+                            }
+                        },
+                        None => {
+                            // _events_tx is held by main for the whole
+                            // session; None means the client is shutting down.
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
             }
-            Err(e) => eprintln!("share: encoder init failed: {e}"),
         }
+    });
+
+    // --share at boot is just a "share" command.
+    if args.share {
+        let _ = cmd_tx.send(Command::Share);
     }
 
     println!("talking — Ctrl-C to quit");
+    #[cfg(any(feature = "video", feature = "screen-capture"))]
+    println!("commands: \"share\" to start sharing, \"stop\" to stop it");
     let why = conn.closed().await;
     println!("connection closed: {why}");
     Ok(())

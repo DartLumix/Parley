@@ -9,7 +9,7 @@ edition.workspace = true
 #   cargo run -p parley-client --features audio-device -- ...
 audio-device = ["dep:cpal", "parley-core/audio-device", "dep:webrtc-audio-processing"]
 video = ["parley-core/video"]
-screen-capture = ["dep:ashpd", "dep:pipewire", "video"]
+screen-capture = ["dep:ashpd", "dep:pipewire", "dep:futures-util", "video"]
 
 [dependencies]
 parley-core = { workspace = true }
@@ -25,3 +25,4 @@ webrtc-audio-processing = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
 ashpd = { workspace = true, optional = true, features = ["screencast"] }
 pipewire = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }

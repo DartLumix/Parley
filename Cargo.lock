@@ -1092,6 +1092,7 @@ version = "0.1.0"
 dependencies = [
  "ashpd",
  "cpal",
+ "futures-util",
  "hex",
  "openh264",
  "parley-core",

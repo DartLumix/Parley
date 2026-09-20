@@ -83,6 +83,25 @@ message VoiceStateList {
   repeated VoiceState states = 1;
 }
 
+// --- Loss feedback (4d) ---
+
+message ReceiverReport {
+  uint32 gap_rate_permille = 1;
+  // Server-stamped authenticated reporter id (clients send 0) —
+  // lets a sender ignore its own report echoed by the broadcast.
+  uint32 reporter_id = 2;
+}
+
+// --- Screen share lifecycle (6a) ---
+
+message StopShare {}
+
+message ShareStopped {
+  // Server-stamped authenticated sharer id — viewers match it against
+  // the sender_id on video datagrams; the sharer ignores its own echo.
+  uint32 user_id = 1;
+}
+
 // --- Envelopes ---
 
 message ClientMessage {
@@ -96,6 +115,7 @@ message ClientMessage {
     LeaveVoice leave_voice = 7;
     VoiceStatesRequest voice_states_request = 8;
     ReceiverReport receiver_report = 9;
+    StopShare stop_share = 10;
   }
 }
 
@@ -109,14 +129,6 @@ message ServerMessage {
     VoiceState voice_state = 6;
     VoiceStateList voice_state_list = 7;
     ReceiverReport receiver_report = 8;
+    ShareStopped share_stopped = 9;
   }
-}
-
-// --- Loss feedback (4d) ---
-
-message ReceiverReport {
-  uint32 gap_rate_permille = 1;
-  // Server-stamped authenticated reporter id (clients send 0) —
-  // lets a sender ignore its own report echoed by the broadcast.
-  uint32 reporter_id = 2;
 }

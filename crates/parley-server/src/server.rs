@@ -18,7 +18,7 @@ use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ClientBody, ClientMessage,
     HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser, ReceiverReport,
-    ServerBody, ServerMessage, VoiceState as PbVoiceState, VoiceStateList,
+    ServerBody, ServerMessage, ShareStopped, VoiceState as PbVoiceState, VoiceStateList,
 };
 
 pub struct Server {
@@ -450,10 +450,21 @@ async fn handle_client_message(
             }
         }
 
+        Some(ClientBody::StopShare(_)) => {
+            // 6a: broadcast-wide like VoiceState (6b narrows to channel
+            // members once report routing lands). Viewers tear down on
+            // it; the sharer ignores its own echo by user_id.
+            registry.broadcast(ServerMessage {
+                body: Some(ServerBody::ShareStopped(ShareStopped { user_id: info.id })),
+            });
+        }
+
         None => {
-            return Err(Error::Session(parley_core::Error::Protocol(
-                "empty message body",
-            )));
+            // body: None is what prost decodes UNKNOWN oneof variants
+            // to (a newer client's message on this older server). The
+            // protocol is additive by design — ignore, don't kill the
+            // session.
+            warn!(user_id = info.id, "ignoring empty/unknown message body");
         }
     }
     Ok(true)

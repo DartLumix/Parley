@@ -12,9 +12,11 @@
 //!   [8]       flags: u8            (bit 0 = keyframe)
 //!   [9..]     data
 //!
-//! Media datagram `seq` is shared between audio and video from the same
-//! sender; receivers discriminate on FLAG_VIDEO before consulting seq.
-//! Audio jitter/loss paths never see video datagrams.
+//! Media datagram `seq` counters are per-path (audio lives inside the
+//! client's send pipeline; video senders keep a local counter starting
+//! at 0x8000) — receivers discriminate on FLAG_VIDEO before consulting
+//! seq, so the two spaces never interact. Audio jitter/loss paths
+//! never see video datagrams.
 
 use crate::media::MAX_DATAGRAM_SIZE;
 
@@ -189,6 +191,11 @@ impl VideoAssembler {
                     self.start_frame(&frag);
                     self.store_fragment(frag);
                 } else {
+                    // Hygiene: drop the partial frame's fragments so
+                    // nothing of it lingers (start_frame also clears,
+                    // but only when a keyframe eventually arrives).
+                    self.current.clear();
+                    self.current_frame_id = None;
                     self.waiting_for_keyframe = true;
                     self.fragments_skipped += 1;
                 }
@@ -381,5 +388,34 @@ mod tests {
         assert_eq!(asm.frames_completed, 0);
         assert_eq!(asm.frames_dropped, 0);
         assert_eq!(asm.fragments_skipped, 0);
+    }
+
+    #[test]
+    fn partial_frame_cleared_on_abort() {
+        // Frame 0 (keyframe) starts but never completes; a delta for
+        // frame 1 arrives: the partial frame's fragments must be
+        // discarded, not left lingering.
+        let key_part: Vec<u8> = vec![0x77; 2 * MAX_FRAGMENT_PAYLOAD + 100]; // 3 fragments
+        let dgs = fragments(0, true, &key_part, 0);
+        let mut frags = decode_all(&dgs);
+        frags.retain(|f| f.frag_idx != 2); // drop the last: frame 0 incomplete
+
+        let delta: Vec<u8> = vec![0x88; 500];
+        let delta_dgs = fragments(1, false, &delta, 10);
+        frags.extend(decode_all(&delta_dgs));
+
+        let mut asm = VideoAssembler::new();
+        for f in frags {
+            asm.push_fragment(f);
+        }
+
+        assert_eq!(asm.frames_dropped, 1);
+        assert!(asm.waiting_for_keyframe);
+        // Same module: private state is visible. This is the regression
+        // assertion — without the clear, the two stored fragments of
+        // frame 0 would still be here.
+        assert!(asm.current.is_empty());
+        assert!(asm.current_frame_id.is_none());
+        assert!(asm.pop_frame().is_none());
     }
 }

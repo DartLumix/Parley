@@ -1,20 +1,24 @@
-//! Phase 5c/5d: screen-share over the media datagram path.
+//! Phase 5c/5d/6a: screen-share over the media datagram path.
 //!
-//! Send side: `--share` with the `video` feature sends the synthetic
-//! moving-bar pattern; with `screen-capture` (5d) it sends the real
-//! screen via the portal (see screen.rs). Both fragment + send with
-//! FLAG_VIDEO, paced so a keyframe doesn't burst datagrams into quinn.
+//! Send side: `--share` (or the "share" stdin command) with the `video`
+//! feature sends the synthetic moving-bar pattern; with
+//! `screen-capture` (5d) it sends the real screen via the portal (see
+//! screen.rs). Both fragment + send with FLAG_VIDEO, paced so a
+//! keyframe doesn't burst datagrams into quinn.
 //!
 //! Receive side (any client): video datagrams are detected by flag,
-//! assembled per sender, decoded, and piped as raw RGB24 into a
-//! spawned mpv (one per sender). mpv is spawned lazily on the first
-//! decoded frame and sized from the H.264 SPS — the sender's
-//! negotiated resolution (720p synthetic, native monitor for real
-//! capture), never a client-side guess. Video never touches the audio
-//! mixer or the jitter buffer; the paths share only the seq space,
+//! assembled per sender, decoded, and piped as raw RGB24 into a spawned
+//! mpv (one per sender). mpv is spawned lazily on the first decoded
+//! frame and sized from the H.264 SPS — the sender's negotiated
+//! resolution (720p synthetic, native monitor for real capture), never
+//! a client-side guess. Video never touches the audio mixer or the
+//! jitter buffer; seq counters are per-path (video's starts at 0x8000),
 //! and receivers discriminate on FLAG_VIDEO before anything else.
+//!
+//! 6a: the stopped set closes the datagram-vs-stream ordering race at
+//! share stop — see `ViewerTable`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,22 +87,23 @@ fn test_frame_bgra(t: usize) -> Vec<u8> {
 
 // ---- send side (synthetic; real capture lives in screen.rs) ----
 
-/// Owns the encoder, frame_id, and the seq counter shared with the
-/// sender's audio path (same 16-bit space, discrimininated by flag).
+/// Owns the encoder, frame_id, and the video seq counter (local:
+/// receivers demux on FLAG_VIDEO, never seq — audio's counter lives in
+/// its own pipeline and the two never interact).
 pub struct ShareSender {
     encoder: Box<dyn VideoEncoder>,
     frame_id: u32,
-    /// Next media seq to use. Shared with the audio encode task via
-    /// the mutex — both paths allocate from one wrapping counter.
-    seq: Arc<Mutex<u16>>,
+    seq: u16,
 }
 
 impl ShareSender {
-    pub fn new(seq: Arc<Mutex<u16>>) -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> {
         Ok(Self {
             encoder: create_encoder(VIDEO_WIDTH, VIDEO_HEIGHT).map_err(|e| e.to_string())?,
             frame_id: 0,
-            seq,
+            // Video seq space sits above audio's low range purely as a
+            // diagnostic aid.
+            seq: 0x8000,
         })
     }
 
@@ -107,19 +112,15 @@ impl ShareSender {
     pub fn next_frame(&mut self, t: usize) -> Result<(Vec<Vec<u8>>, bool), String> {
         let bgra = test_frame_bgra(t);
         let (frame, keyframe) = self.encoder.encode_bgra(&bgra).map_err(|e| e.to_string())?;
-        let first_seq = {
-            let mut s = self.seq.lock().unwrap();
-            let start = *s;
-            // Advance by the fragment count (computed the same way the
-            // fragmenter does) so audio never reuses these seqs.
-            *s = s.wrapping_add(
-                frame
-                    .len()
-                    .div_ceil(parley_proto::video::MAX_FRAGMENT_PAYLOAD)
-                    .max(1) as u16,
-            );
-            start
-        };
+        let first_seq = self.seq;
+        // Advance by the fragment count (computed the same way the
+        // fragmenter does).
+        self.seq = self.seq.wrapping_add(
+            frame
+                .len()
+                .div_ceil(parley_proto::video::MAX_FRAGMENT_PAYLOAD)
+                .max(1) as u16,
+        );
         let timestamp = (t as f32 * VIDEO_FPS.recip() * 48_000.0) as u32;
         let dgs = fragment_frame(
             self.frame_id,
@@ -212,11 +213,28 @@ impl Drop for Viewer {
     }
 }
 
-/// Shared receiver map. Keyed by sender_id (server-stamped).
-pub type Viewers = Arc<Mutex<HashMap<u32, Viewer>>>;
+/// Shared receiver state: per-sender viewers plus the stopped set.
+///
+/// The stopped set exists because QUIC gives NO ordering between
+/// datagrams and stream bytes: a straggler video datagram can land
+/// AFTER the client processes the ShareStopped control message, and
+/// without the set the datagram reader would spawn a fresh viewer
+/// showing one frozen frame. Entries clear on the sender's next
+/// KEYFRAME fragment — every new share starts with an encoder-fresh
+/// IDR, and an IDR whose datagram was lost is followed by another IDR
+/// at the intra period, so un-stop never depends on a specific
+/// frame_id arriving.
+#[derive(Default)]
+pub struct ViewerTable {
+    viewers: HashMap<u32, Viewer>,
+    stopped: HashSet<u32>,
+}
+
+/// Shared receiver map.
+pub type Viewers = Arc<Mutex<ViewerTable>>;
 
 pub fn new_viewers() -> Viewers {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(ViewerTable::default()))
 }
 
 /// Route one video datagram payload. Called from the media datagram
@@ -225,8 +243,14 @@ pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, payload: &[u8]) 
     let Ok(frag) = decode_fragment(payload) else {
         return; // malformed video fragment: drop, stats live in assembler
     };
-    let mut viewers = viewers.lock().unwrap();
-    if let Some(v) = viewers.get_mut(&sender_id) {
+    let mut table = viewers.lock().unwrap();
+    if table.stopped.contains(&sender_id) {
+        if !frag.keyframe {
+            return; // straggler from the stopped share
+        }
+        table.stopped.remove(&sender_id); // new share begins
+    }
+    if let Some(v) = table.viewers.get_mut(&sender_id) {
         v.feed_fragment(frag);
         return;
     }
@@ -235,19 +259,28 @@ pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, payload: &[u8]) 
     match Viewer::new(sender_id) {
         Ok(mut v) => {
             v.feed_fragment(frag);
-            viewers.insert(sender_id, v);
+            table.viewers.insert(sender_id, v);
         }
         Err(e) => eprintln!("video: viewer init failed: {e}"),
     }
 }
 
+/// A sender stopped sharing: kill their viewer (Drop kills mpv) and
+/// remember the stop so late datagrams can't resurrect it.
+pub fn mark_stopped(viewers: &Viewers, sender_id: u32) {
+    let mut table = viewers.lock().unwrap();
+    table.viewers.remove(&sender_id);
+    table.stopped.insert(sender_id);
+}
+
 /// Print + reset per-sender stats. Called from a slow ticker.
 pub fn stats_line(viewers: &Viewers) -> String {
-    let mut viewers = viewers.lock().unwrap();
-    if viewers.is_empty() {
+    let mut table = viewers.lock().unwrap();
+    if table.viewers.is_empty() {
         return "video: no active shares".to_string();
     }
-    let parts: Vec<String> = viewers
+    let parts: Vec<String> = table
+        .viewers
         .iter_mut()
         .map(|(&id, v)| {
             let s = format!(
@@ -261,17 +294,22 @@ pub fn stats_line(viewers: &Viewers) -> String {
     format!("video: {}", parts.join(" | "))
 }
 
-/// Drop a departed sender's viewer (kills their mpv).
+/// Drop a departed sender's viewer (kills their mpv) and forget their
+/// stopped-state — they left voice, nothing more can arrive.
 pub fn remove_viewer(viewers: &Viewers, sender_id: u32) {
-    viewers.lock().unwrap().remove(&sender_id);
+    let mut table = viewers.lock().unwrap();
+    table.viewers.remove(&sender_id);
+    table.stopped.remove(&sender_id);
 }
 
 // ---- send-side task (synthetic pattern) ----
 
-/// The `--share` loop: encode at ~30 fps, pace fragments, send.
+/// The share loop: encode at ~30 fps, pace fragments, send.
 /// `pace` sleeps between fragments so a ~200-datagram keyframe doesn't
-/// hit quinn's buffers as one burst.
-pub async fn share_task(conn: quinn::Connection, sender: Arc<Mutex<ShareSender>>) {
+/// hit quinn's buffers as one burst. Stopped by aborting the task
+/// (6a): a mid-frame abort leaves at most a partial frame on the wire,
+/// which receivers' drop-until-IDR absorbs.
+pub async fn share_task(conn: quinn::Connection, mut sender: ShareSender) {
     let frame_ms = (1000.0 / VIDEO_FPS) as u64;
     let mut interval = tokio::time::interval(Duration::from_millis(frame_ms));
     // A frame that overruns its slot skips the next tick rather than
@@ -281,14 +319,11 @@ pub async fn share_task(conn: quinn::Connection, sender: Arc<Mutex<ShareSender>>
     println!("share: sending {VIDEO_WIDTH}x{VIDEO_HEIGHT}@{VIDEO_FPS} test pattern");
     loop {
         interval.tick().await;
-        let (dgs, _keyframe) = {
-            let mut s = sender.lock().unwrap();
-            match s.next_frame(t) {
-                Ok(x) => x,
-                Err(e) => {
-                    eprintln!("share encode failed: {e}");
-                    return;
-                }
+        let (dgs, _keyframe) = match sender.next_frame(t) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("share encode failed: {e}");
+                return;
             }
         };
         for (i, dg) in dgs.iter().enumerate() {

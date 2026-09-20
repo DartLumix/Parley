@@ -14,3 +14,17 @@ pub mod mixer;
 pub mod screen;
 #[cfg(feature = "video")]
 pub mod video;
+
+/// Share lifecycle events (6a), reported by the capture supervisor (or
+/// the synthetic sender) back to the client's command task. Which
+/// variants get constructed depends on build features — hence the allow.
+#[allow(dead_code)]
+pub enum ShareEvent {
+    /// Capture pipeline is up and streaming.
+    Started,
+    /// Start failed (portal denied/cancelled, pipewire error).
+    StartFailed(String),
+    /// Share fully torn down; the client may now signal StopShare.
+    /// `external` = the desktop closed it from its sharing indicator.
+    Ended { external: bool },
+}
