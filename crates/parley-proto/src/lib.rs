@@ -16,5 +16,6 @@ pub use pb::{
     AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChannelMode, ChatMessage, ClientMessage,
     FetchHistory, Heartbeat, HeartbeatAck, Hello, HelloAck, HistoryResult, JoinVoice, LeaveVoice,
     ListChannels, PresenceList, PresenceRequest, PresenceUser, ReceiverReport, SendChat,
-    ServerMessage, ShareStopped, StopShare, VoiceState, VoiceStateList, VoiceStatesRequest,
+    ServerMessage, ShareStopped, StopShare, VideoReport, VoiceState, VoiceStateList,
+    VoiceStatesRequest,
 };

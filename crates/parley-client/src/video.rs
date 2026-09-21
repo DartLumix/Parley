@@ -1,4 +1,4 @@
-//! Phase 5c/5d/6a: screen-share over the media datagram path.
+//! Phase 5c/5d/6a/6e: screen-share over the media datagram path.
 //!
 //! Send side: `--share` (or the "share" stdin command) with the `video`
 //! feature sends the synthetic moving-bar pattern; with
@@ -17,14 +17,21 @@
 //!
 //! 6a: the stopped set closes the datagram-vs-stream ordering race at
 //! share stop — see `ViewerTable`.
+//!
+//! 6e: the loss-driven video bitrate ladder (`VideoLadder`) mirrors
+//! 4d's audio controller — viewers report assembler gap rates, senders
+//! switch between Clean (2.5 Mbps) and Robust (1 Mbps) on an EMA with
+//! hysteresis.
 
 use std::collections::{HashMap, HashSet};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use parley_core::video::{
-    VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoDecoder, VideoEncoder, create_encoder,
+    VIDEO_BITRATE_BPS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoDecoder, VideoEncoder,
+    create_encoder,
 };
 use parley_proto::video::{VideoAssembler, decode_fragment, fragment_frame};
 
@@ -85,6 +92,99 @@ fn test_frame_bgra(t: usize) -> Vec<u8> {
     bgra
 }
 
+// ---- 6e: loss-driven video bitrate ladder ----
+
+/// Robust rung: ~4 fragments/frame at typical screen-content frame
+/// sizes vs ~9 at Clean — frame survival under 10% datagram loss
+/// roughly doubles (0.9⁴ ≈ 66% vs 0.9⁹ ≈ 39%).
+pub const VIDEO_ROBUST_BITRATE_BPS: u32 = 1_000_000;
+
+/// Mirrors 4d's audio controller on the video path: EMA over viewer
+/// video-gap reports, hysteresis, cooldown. Down at EMA > 30‰, back up
+/// after 20 s below 10‰, 5 s switch cooldown. Stepped at most 1 Hz
+/// (per-frame callers are fine — the gate is internal) so the EMA time
+/// constant matches 4d's. The set_bitrate it triggers recreates the
+/// encoder: the next frame is a standalone IDR, which receivers'
+/// drop-until-IDR absorbs by design.
+pub struct VideoLadder {
+    ema_permille: f32,
+    robust: bool,
+    last_switch: std::time::Instant,
+    low_since: Option<std::time::Instant>,
+    last_step: std::time::Instant,
+    last_kf_poke: std::time::Instant,
+}
+
+impl VideoLadder {
+    pub fn new() -> Self {
+        Self {
+            ema_permille: 0.0,
+            robust: false,
+            last_switch: std::time::Instant::now(),
+            low_since: None,
+            last_step: std::time::Instant::now(),
+            last_kf_poke: std::time::Instant::now(),
+        }
+    }
+
+    /// Feed the latest viewer report (permille). Returns Some(bps) when
+    /// the ladder switched rungs — the caller applies it via
+    /// set_bitrate.
+    pub fn step(&mut self, observed_permille: u32) -> Option<u32> {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_step) < Duration::from_secs(1) {
+            return None;
+        }
+        self.last_step = now;
+        self.ema_permille = 0.7 * self.ema_permille + 0.3 * observed_permille as f32;
+        if !self.robust {
+            if self.ema_permille > 30.0 && now.duration_since(self.last_switch).as_secs() >= 5 {
+                self.robust = true;
+                self.last_switch = now;
+                self.low_since = None;
+                return Some(VIDEO_ROBUST_BITRATE_BPS);
+            }
+        } else if self.ema_permille < 10.0 {
+            let since = *self.low_since.get_or_insert(now);
+            if now.duration_since(since).as_secs() >= 20
+                && now.duration_since(self.last_switch).as_secs() >= 5
+            {
+                self.robust = false;
+                self.last_switch = now;
+                self.low_since = None;
+                return Some(VIDEO_BITRATE_BPS);
+            }
+        } else {
+            self.low_since = None;
+        }
+        None
+    }
+
+    /// 6e: during a sustained loss epoch, re-poke IDRs at the intra
+    /// period — drop-until-IDR recovery is a per-IDR lottery (a 1080p
+    /// IDR is dozens of fragments; every one must arrive), so buy a
+    /// ticket every 2 s until the epoch ends. Expected recovery: ~30 s
+    /// at sustained 10% loss, seconds at 5%, immediate once loss clears.
+    pub fn should_force_keyframe(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if !self.robust || self.ema_permille <= 30.0 {
+            return false;
+        }
+        if now.duration_since(self.last_kf_poke) >= Duration::from_secs(2) {
+            self.last_kf_poke = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for VideoLadder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---- send side (synthetic; real capture lives in screen.rs) ----
 
 /// Owns the encoder, frame_id, and the video seq counter (local:
@@ -105,6 +205,17 @@ impl ShareSender {
             // diagnostic aid.
             seq: 0x8000,
         })
+    }
+
+    /// 6e: ladder-driven bitrate change (encoder recreation; next frame
+    /// is a standalone IDR with in-band SPS/PPS).
+    pub fn set_bitrate(&mut self, bps: u32) {
+        self.encoder.set_bitrate(bps);
+    }
+
+    /// 6e: IDR re-poke during loss epochs (ladder-driven).
+    pub fn force_keyframe(&mut self) {
+        self.encoder.force_keyframe();
     }
 
     /// Encode + fragment + return the datagrams for frame `t`.
@@ -302,23 +413,52 @@ pub fn remove_viewer(viewers: &Viewers, sender_id: u32) {
     table.stopped.remove(&sender_id);
 }
 
+/// 6e: worst per-sender video gap rate since the last call (resets
+/// each sender's window). None when no viewers are active.
+pub fn video_gap_rates(viewers: &Viewers) -> Option<u32> {
+    let mut table = viewers.lock().unwrap();
+    if table.viewers.is_empty() {
+        return None;
+    }
+    table
+        .viewers
+        .values_mut()
+        .map(|v| v.assembler.gap_rate_permille())
+        .max()
+}
+
 // ---- send-side task (synthetic pattern) ----
 
-/// The share loop: encode at ~30 fps, pace fragments, send.
+/// The share loop: encode at ~30 fps, pace fragments, send, and step
+/// the loss ladder once per frame (internally gated to 1 Hz).
 /// `pace` sleeps between fragments so a ~200-datagram keyframe doesn't
 /// hit quinn's buffers as one burst. Stopped by aborting the task
 /// (6a): a mid-frame abort leaves at most a partial frame on the wire,
 /// which receivers' drop-until-IDR absorbs.
-pub async fn share_task(conn: quinn::Connection, mut sender: ShareSender) {
+pub async fn share_task(
+    conn: quinn::Connection,
+    mut sender: ShareSender,
+    video_loss: Arc<AtomicU32>,
+) {
     let frame_ms = (1000.0 / VIDEO_FPS) as u64;
     let mut interval = tokio::time::interval(Duration::from_millis(frame_ms));
     // A frame that overruns its slot skips the next tick rather than
     // bursting catch-up encodes — real-time pacing, not catch-up.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ladder = VideoLadder::new();
     let mut t: usize = 0;
     println!("share: sending {VIDEO_WIDTH}x{VIDEO_HEIGHT}@{VIDEO_FPS} test pattern");
     loop {
         interval.tick().await;
+        if let Some(bps) = ladder.step(video_loss.load(Ordering::Relaxed)) {
+            sender.set_bitrate(bps);
+            println!("share: bitrate → {bps} bps (video loss ladder)");
+        }
+
+        if ladder.should_force_keyframe() {
+            sender.force_keyframe();
+            println!("share: IDR re-poke (loss epoch)");
+        }
         let (dgs, _keyframe) = match sender.next_frame(t) {
             Ok(x) => x,
             Err(e) => {

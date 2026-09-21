@@ -110,6 +110,14 @@ message ShareStopped {
   uint32 user_id = 1;
 }
 
+// --- Video loss feedback (6e) ---
+
+message VideoReport {
+  uint32 gap_rate_permille = 1;
+  // Server-stamped authenticated reporter id (clients send 0).
+  uint32 reporter_id = 2;
+}
+
 // --- Envelopes ---
 
 message ClientMessage {
@@ -124,6 +132,7 @@ message ClientMessage {
     VoiceStatesRequest voice_states_request = 8;
     ReceiverReport receiver_report = 9;
     StopShare stop_share = 10;
+    VideoReport video_report = 11;
   }
 }
 
@@ -138,5 +147,6 @@ message ServerMessage {
     VoiceStateList voice_state_list = 7;
     ReceiverReport receiver_report = 8;
     ShareStopped share_stopped = 9;
+    VideoReport video_report = 10;
   }
 }

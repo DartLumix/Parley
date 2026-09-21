@@ -54,6 +54,8 @@ use parley_client::{aec, audio, mixer};
 use parley_core::audio::pipeline::SendPipeline;
 #[cfg(feature = "audio-device")]
 use parley_proto::ReceiverReport;
+#[cfg(feature = "video")]
+use parley_proto::VideoReport;
 
 struct Args {
     server: String,
@@ -306,6 +308,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // control reader, polled by the bitrate controller in the encode task.
     let loss_state = Arc::new(AtomicU32::new(0));
 
+    // 6e: last video loss report seen from a peer, permille. Written by
+    // the control reader, polled by the share senders' ladder.
+    let video_loss = Arc::new(AtomicU32::new(0));
+
     // 5d: keyframe-on-join — filled by the share command task once the
     // capture pipeline is up; the control reader pokes it when a
     // viewer joins our voice channel.
@@ -387,6 +393,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 6e: video loss reporter — worst per-sender video gap rate every
+    // 5 s, routed by the server to channel members (the sharer reads
+    // it through video_loss). NOT music-gated: screen share in a music
+    // channel still needs its ladder.
+    #[cfg(feature = "video")]
+    {
+        let rep_viewers = video_viewers.clone();
+        let rep_outbound = _outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let Some(worst) = video::video_gap_rates(&rep_viewers) else {
+                    continue; // no active viewers: nothing to report
+                };
+                let _ = rep_outbound.send(ClientMessage {
+                    body: Some(ClientBody::VideoReport(VideoReport {
+                        gap_rate_permille: worst,
+                        reporter_id: 0, // server stamps the authenticated id
+                    })),
+                });
+            }
+        });
+    }
+
     // --- writer: heartbeats + anything the audio side posts ---
     let hb_ms = if ack.heartbeat_ms == 0 {
         5000
@@ -429,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "screen-capture")]
     let ctrl_poke = keyframe_poke.clone();
     let ctrl_loss_state = loss_state.clone();
+    let ctrl_video_loss = video_loss.clone();
     let measure_flag = args.measure;
     tokio::spawn(async move {
         let mut deltas: Vec<i64> = Vec::new();
@@ -516,6 +548,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Skip our own echo and unstamped reports.
                         if rep.reporter_id != 0 && rep.reporter_id != ok.user_id {
                             ctrl_loss_state.store(rep.gap_rate_permille, Ordering::Relaxed);
+                        }
+                    }
+
+                    Some(ServerBody::VideoReport(rep)) => {
+                        // 6e: a viewer's video loss report steers our
+                        // share bitrate. Skip own echo and unstamped.
+                        if rep.reporter_id != 0 && rep.reporter_id != ok.user_id {
+                            ctrl_video_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
                         }
                     }
                     Some(ServerBody::HeartbeatAck(a)) if measure_flag => {
@@ -852,6 +892,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let share_conn = conn.clone();
     #[cfg(any(feature = "video", feature = "screen-capture"))]
     let share_events = _events_tx.clone();
+    #[cfg(any(feature = "video", feature = "screen-capture"))]
+    let share_vloss = video_loss.clone();
     #[cfg(feature = "screen-capture")]
     let mut share_starting = false;
     #[cfg(all(feature = "video", not(feature = "screen-capture")))]
@@ -878,8 +920,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let poke = share_poke.clone();
                                     let ctrl_slot = share_ctrl.clone();
                                     let events = share_events.clone();
+                                    let vloss = share_vloss.clone();
                                     tokio::spawn(async move {
-                                        match screen::start(conn, events.clone()).await {
+                                        match screen::start(conn, vloss, events.clone()).await {
                                             Ok((handle, ctrl)) => {
                                                 *poke.lock().unwrap() = Some(handle);
                                                 *ctrl_slot.lock().unwrap() = Some(ctrl);
@@ -899,7 +942,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     match video::ShareSender::new() {
                                         Ok(sender) => {
-                                            let task = tokio::spawn(video::share_task(share_conn.clone(), sender));
+                                            let task = tokio::spawn(video::share_task(
+                                                share_conn.clone(),
+                                                sender,
+                                                share_vloss.clone(),
+                                            ));
                                             synth_share = Some(task.abort_handle());
                                             let _ = share_events.send(ShareEvent::Started);
                                         }

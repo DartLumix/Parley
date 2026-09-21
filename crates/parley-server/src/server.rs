@@ -18,8 +18,8 @@ use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ChannelMode, ClientBody,
     ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser,
-    ReceiverReport, ServerBody, ServerMessage, ShareStopped, VoiceState as PbVoiceState,
-    VoiceStateList,
+    ReceiverReport, ServerBody, ServerMessage, ShareStopped, VideoReport,
+    VoiceState as PbVoiceState, VoiceStateList,
 };
 
 pub struct Server {
@@ -64,6 +64,14 @@ impl Server {
                 .try_into()
                 .expect("10 s is a valid IdleTimeout"),
         ));
+
+        // 6e: outgoing datagram headroom — quinn's default send buffer
+        // is small relative to 2.5 Mbps video; a full buffer runs the
+        // drop-oldest path, whose accounting has a known panic under
+        // saturation on 0.11.17 (see §8). 2 MiB ≈ 6 s at Clean, ~16 s
+        // at Robust — the drop path becomes unreachable short of a
+        // pathological stall.
+        transport.datagram_send_buffer_size(2 * 1024 * 1024);
         quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
@@ -480,6 +488,24 @@ async fn handle_client_message(
             if let Some(channel_id) = voice.channel_of(info.id) {
                 let msg = ServerMessage {
                     body: Some(ServerBody::ShareStopped(ShareStopped { user_id: info.id })),
+                };
+                for member in voice.members_of(channel_id) {
+                    if member != info.id {
+                        registry.send_to_user(member, msg.clone());
+                    }
+                }
+            }
+        }
+
+        Some(ClientBody::VideoReport(rep)) => {
+            // 6e: video loss feedback, routed exactly like ReceiverReport
+            // — reporter's channel members, reporter excluded.
+            if let Some(channel_id) = voice.channel_of(info.id) {
+                let msg = ServerMessage {
+                    body: Some(ServerBody::VideoReport(VideoReport {
+                        reporter_id: info.id,
+                        gap_rate_permille: rep.gap_rate_permille,
+                    })),
                 };
                 for member in voice.members_of(channel_id) {
                     if member != info.id {

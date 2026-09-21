@@ -19,7 +19,7 @@ use parley_proto::{AuthDenied, AuthOk, AuthRequest};
 
 use parley_proto::{
     ClientBody, ClientMessage, Heartbeat, PresenceRequest, ReceiverReport, ServerBody,
-    ServerMessage, StopShare,
+    ServerMessage, StopShare, VideoReport,
 };
 
 use parley_proto::{FetchHistory, ListChannels, SendChat};
@@ -1453,5 +1453,49 @@ async fn music_channel_stereo_survives_the_chain() {
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+// ---- Phase 6e: video loss feedback routing ----
+
+#[tokio::test]
+async fn video_report_routed_to_channel_members_only() {
+    let (mut a, mut b, mut c, _ch2, config) = setup_two_channels("vreport").await;
+
+    send_client_msg(
+        &mut a.1,
+        ClientBody::VideoReport(VideoReport {
+            gap_rate_permille: 77,
+            reporter_id: 0, // server stamps
+        }),
+    )
+    .await;
+
+    let msg = read_server_msg(&mut b.2).await;
+    match msg.body {
+        Some(ServerBody::VideoReport(rep)) => {
+            assert_eq!(rep.reporter_id, 1, "stamped with authenticated id");
+            assert_eq!(rep.gap_rate_permille, 77);
+        }
+        other => panic!("expected video report, got {other:?}"),
+    }
+
+    let echo = timeout(
+        Duration::from_millis(300),
+        session::read_message::<ServerMessage>(&mut a.2),
+    )
+    .await;
+    assert!(echo.is_err(), "reporter must not receive own echo");
+
+    let leak = timeout(
+        Duration::from_millis(300),
+        session::read_message::<ServerMessage>(&mut c.2),
+    )
+    .await;
+    assert!(leak.is_err(), "video report leaked across channels");
+
+    a.0.close(0u32.into(), b"done");
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }

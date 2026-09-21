@@ -143,9 +143,17 @@ pub fn build_endpoint(pinned: Option<String>) -> (quinn::Endpoint, Arc<Mutex<Opt
     // fails the handshake loudly, never silently.
     crypto.alpn_protocols = vec![format!("parley/{PROTOCOL_VERSION}").into_bytes()];
 
-    let config = quinn::ClientConfig::new(Arc::new(
+    let mut transport = quinn::TransportConfig::default();
+    // 6e: outgoing datagram headroom for 2.5 Mbps video under
+    // congestion backpressure — a full buffer runs quinn's drop-oldest
+    // path, whose accounting has a known panic under saturation on
+    // quinn-proto 0.11.17 (§8). 2 MiB ≈ 6 s at Clean, ~16 s at Robust.
+    // Mirrors the server's Server::bind transport config.
+    transport.datagram_send_buffer_size(2 * 1024 * 1024);
+    let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("valid client config"),
     ));
+    config.transport_config(Arc::new(transport));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid bind addr"))
         .expect("bind client endpoint");
     endpoint.set_default_client_config(config);

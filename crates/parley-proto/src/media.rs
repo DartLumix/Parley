@@ -13,6 +13,17 @@ pub const MEDIA_VERSION: u8 = 0;
 /// Keep whole datagrams under the typical QUIC path MTU budget.
 pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
+/// Largest datagram total that survives a connection whose path-MTU
+/// estimate has COLLAPSED to the 1200-byte floor — quinn's black-hole
+/// detection does this after sustained loss (observed live in the 6e
+/// netem run: 1199-byte datagrams rejected with TooLarge minutes into
+/// 10% loss). 1200 minus QUIC packet overhead (short header + CID +
+/// PN + 16-byte AEAD tag, ~35B) minus the DATAGRAM frame size bound.
+/// Video fragments are sized from THIS, not MAX_DATAGRAM_SIZE: a
+/// datagram that only fits while the MTU estimate is healthy dies the
+/// moment it collapses. Audio packets (~60–660 B) fit naturally.
+pub const MTU_SAFE_DATAGRAM_SIZE: usize = 1150;
+
 /// Set when the sender's voice activity detection fired.
 pub const FLAG_SPEAKING: u8 = 1 << 0;
 

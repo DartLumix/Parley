@@ -51,10 +51,11 @@
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::Duration;
 
+use crate::video::VideoLadder;
 use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
@@ -415,8 +416,16 @@ fn negotiate(
 ///    keep only the latest capture — encoding a stale frame while a
 ///    fresher one sits behind it is pure added latency.
 /// 3. Encode + fragment + send with inter-fragment pacing.
-fn encoder_thread(rx: Receiver<ToEncoder>, conn: quinn::Connection, force_idr: Arc<AtomicBool>) {
+fn encoder_thread(
+    rx: Receiver<ToEncoder>,
+    conn: quinn::Connection,
+    force_idr: Arc<AtomicBool>,
+    video_loss: Arc<AtomicU32>,
+    die: tokio::sync::mpsc::UnboundedSender<()>,
+) {
     let mut encoder: Option<Box<dyn VideoEncoder>> = None;
+    // 6e: loss-driven bitrate ladder (viewer reports → video_loss).
+    let mut ladder = VideoLadder::new();
     let mut frame_id: u32 = 0;
     // Video seq space: local to this sender (receivers demux on
     // FLAG_VIDEO, never seq — audio's counter never interacts).
@@ -475,6 +484,14 @@ fn encoder_thread(rx: Receiver<ToEncoder>, conn: quinn::Connection, force_idr: A
                 let Some(enc) = encoder.as_mut() else {
                     continue;
                 };
+                if let Some(bps) = ladder.step(video_loss.load(Ordering::Relaxed)) {
+                    enc.set_bitrate(bps);
+                    println!("share: bitrate → {bps} bps (video loss ladder)");
+                }
+                if ladder.should_force_keyframe() {
+                    enc.force_keyframe();
+                    println!("share: IDR re-poke (loss epoch)");
+                }
                 if force_idr.swap(false, Ordering::Relaxed) {
                     enc.force_keyframe();
                     println!("share: forced keyframe (viewer joined)");
@@ -497,8 +514,12 @@ fn encoder_thread(rx: Receiver<ToEncoder>, conn: quinn::Connection, force_idr: A
                 frame_id = frame_id.wrapping_add(1);
                 let total = dgs.len();
                 for (i, dg) in dgs.iter().enumerate() {
-                    if conn.send_datagram(dg.clone().into()).is_err() {
-                        println!("share: connection closed");
+                    if let Err(e) = conn.send_datagram(dg.clone().into()) {
+                        // Real reason, not a guess: TooLarge (MTU estimate
+                        // collapsed under loss) and ConnectionLost are very
+                        // different diagnoses.
+                        println!("share: send_datagram failed: {e}");
+                        let _ = die.send(());
                         return;
                     }
                     if i + 1 < total {
@@ -529,6 +550,7 @@ fn encoder_thread(rx: Receiver<ToEncoder>, conn: quinn::Connection, force_idr: A
 /// ShareEvent::Ended on `events` — only after full teardown.
 pub async fn start(
     conn: quinn::Connection,
+    video_loss: Arc<AtomicU32>,
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
 ) -> Result<(ShareHandle, ShareController), String> {
     let proxy = Screencast::new()
@@ -596,7 +618,14 @@ pub async fn start(
     let pw_handle = std::thread::spawn(move || {
         pw_thread(node_id, fd, frame_tx, stop_for_thread, setup_tx);
     });
-    let enc_handle = std::thread::spawn(move || encoder_thread(frame_rx, conn, force_idr));
+    // Encoder-death signal: the encoder thread owns the only sender, so
+    // it fires on send failure AND on any exit (pw death → rx closes →
+    // return → drop). Either way the supervisor must tear everything
+    // down — a dead connection must not leave a portal session and pw
+    // loop running (found in the 6e netem run: endless "encoder behind").
+    let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let enc_handle =
+        std::thread::spawn(move || encoder_thread(frame_rx, conn, force_idr, video_loss, die_tx));
 
     // Surface pw setup failures (and close the session on them).
     let setup = tokio::time::timeout(Duration::from_secs(5), setup_rx).await;
@@ -634,10 +663,13 @@ pub async fn start(
                 biased;
                 _ = stop_rx.recv() => false, // user "stop" (or all controllers dropped)
                 _ = signals.next() => true,  // desktop closed the session
+                _ = die_rx.recv() => false,  // encoder thread died (send failure / pw death)
             },
             None => {
-                let _ = stop_rx.recv().await;
-                false
+                tokio::select! {
+                    _ = stop_rx.recv() => false,
+                    _ = die_rx.recv() => false,
+                }
             }
         };
 

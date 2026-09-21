@@ -18,14 +18,16 @@
 //! seq, so the two spaces never interact. Audio jitter/loss paths
 //! never see video datagrams.
 
-use crate::media::MAX_DATAGRAM_SIZE;
+use crate::media::MTU_SAFE_DATAGRAM_SIZE;
 
 /// Video fragment sub-header length.
 pub const VIDEO_HEADER_LEN: usize = 9;
 
 /// Maximum payload bytes per video fragment (after both headers).
+/// Sized for MTU_SAFE_DATAGRAM_SIZE — fragments must survive a
+/// collapsed path-MTU estimate, not just a healthy loopback (6e).
 pub const MAX_FRAGMENT_PAYLOAD: usize =
-    MAX_DATAGRAM_SIZE - crate::media::HEADER_LEN - VIDEO_HEADER_LEN;
+    MTU_SAFE_DATAGRAM_SIZE - crate::media::HEADER_LEN - VIDEO_HEADER_LEN;
 
 /// Video fragment flags.
 pub const FRAG_KEYFRAME: u8 = 1 << 0;
@@ -138,6 +140,14 @@ pub struct VideoAssembler {
     pub frames_dropped: u64,
     /// Fragments dropped because we're waiting for a keyframe (stat).
     pub fragments_skipped: u64,
+    /// 6e window counters for gap_rate_permille: frames displayed /
+    /// frames known-missed since the last read.
+    win_completed: u64,
+    win_missed: u64,
+    /// Frame ids already counted as missed in the current loss epoch —
+    /// dedupe: one count per frame despite many skipped fragments.
+    /// Cleared whenever a keyframe fragment begins a frame (new epoch).
+    missed_ids: std::collections::HashSet<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +169,9 @@ impl VideoAssembler {
             frames_completed: 0,
             frames_dropped: 0,
             fragments_skipped: 0,
+            win_completed: 0,
+            win_missed: 0,
+            missed_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -178,16 +191,18 @@ impl VideoAssembler {
                 self.store_fragment(frag);
             } else {
                 self.fragments_skipped += 1;
+                self.note_missed(frag.frame_id);
             }
             return;
         }
 
         match self.current_frame_id {
             Some(id) if id == frag.frame_id => self.store_fragment(frag),
-            Some(_) => {
+            Some(old) => {
                 // New frame started before the current completed: loss.
                 self.frames_dropped += 1;
                 if frag.keyframe {
+                    self.note_missed(old);
                     self.start_frame(&frag);
                     self.store_fragment(frag);
                 } else {
@@ -198,6 +213,8 @@ impl VideoAssembler {
                     self.current_frame_id = None;
                     self.waiting_for_keyframe = true;
                     self.fragments_skipped += 1;
+                    self.note_missed(old);
+                    self.note_missed(frag.frame_id);
                 }
             }
             None => {
@@ -212,10 +229,23 @@ impl VideoAssembler {
     }
 
     fn start_frame(&mut self, frag: &VideoFragment<'_>) {
+        // A keyframe fragment begins a new loss epoch: the dedupe set
+        // resets (its counts are already banked in win_missed).
+        if frag.keyframe {
+            self.missed_ids.clear();
+        }
         self.current.clear();
         self.current_frame_id = Some(frag.frame_id);
         self.current_frag_count = frag.frag_count;
         self.current_is_keyframe = frag.keyframe;
+    }
+
+    /// Count a frame as never-displayable, deduped by frame_id within
+    /// the current loss epoch.
+    fn note_missed(&mut self, frame_id: u32) {
+        if self.missed_ids.insert(frame_id) {
+            self.win_missed += 1;
+        }
     }
 
     fn store_fragment(&mut self, frag: VideoFragment<'_>) {
@@ -234,6 +264,7 @@ impl VideoAssembler {
             };
             self.output.push_back(frame);
             self.frames_completed += 1;
+            self.win_completed += 1;
             self.current.clear();
             self.current_frame_id = None;
         }
@@ -242,6 +273,24 @@ impl VideoAssembler {
     /// Pop one completed frame, if any.
     pub fn pop_frame(&mut self) -> Option<AssembledFrame> {
         self.output.pop_front()
+    }
+
+    /// 6e: video loss signal for the sender's bitrate ladder — the
+    /// share of frames that could NOT be displayed over the window
+    /// (aborted frames + skip cascades, deduped by frame_id), in
+    /// permille. Resets the window on read. Frames whose fragments
+    /// were ALL lost are invisible to the assembler — the metric
+    /// undercounts true loss, never overcounts.
+    pub fn gap_rate_permille(&mut self) -> u32 {
+        let total = self.win_completed + self.win_missed;
+        let rate = if total == 0 {
+            0
+        } else {
+            ((self.win_missed as f64 / total as f64) * 1000.0).round() as u32
+        };
+        self.win_completed = 0;
+        self.win_missed = 0;
+        rate
     }
 }
 
@@ -411,11 +460,53 @@ mod tests {
 
         assert_eq!(asm.frames_dropped, 1);
         assert!(asm.waiting_for_keyframe);
-        // Same module: private state is visible. This is the regression
-        // assertion — without the clear, the two stored fragments of
-        // frame 0 would still be here.
         assert!(asm.current.is_empty());
         assert!(asm.current_frame_id.is_none());
         assert!(asm.pop_frame().is_none());
+    }
+
+    #[test]
+    fn gap_rate_counts_abort_and_cascade() {
+        // key0 completes; frame1 assembles 2 of 3 fragments then aborts
+        // (frame2 arrives mid-assembly); frames 2-5 are skipped while
+        // waiting; key6 recovers. Window: 2 completed, 5 missed → 714‰.
+        let key: Vec<u8> = vec![0x11; 1000];
+        let big: Vec<u8> = vec![0x22; 2400]; // 3 fragments
+        let small: Vec<u8> = vec![0x33; 500]; // 1 fragment
+
+        let mut dgs = fragments(0, true, &key, 0);
+        let f1 = fragments(1, false, &big, 5);
+        dgs.extend([f1[0].clone(), f1[1].clone()]); // frag 2 lost → incomplete
+        dgs.extend(fragments(2, false, &small, 10)); // aborts frame 1
+        dgs.extend(fragments(3, false, &small, 12));
+        dgs.extend(fragments(4, false, &small, 14));
+        dgs.extend(fragments(5, false, &small, 16));
+        dgs.extend(fragments(6, true, &key, 20)); // recovery keyframe
+
+        let frags = decode_all(&dgs);
+        let mut asm = VideoAssembler::new();
+        for f in frags {
+            asm.push_fragment(f);
+        }
+
+        assert_eq!(asm.frames_completed, 2);
+        assert_eq!(asm.gap_rate_permille(), 714, "5 missed of 7 total frames");
+        assert_eq!(asm.gap_rate_permille(), 0, "window resets on read");
+    }
+
+    #[test]
+    fn gap_rate_zero_on_clean_stream() {
+        let key: Vec<u8> = vec![0x11; 1000];
+        let delta: Vec<u8> = vec![0x22; 900];
+        let mut dgs = fragments(0, true, &key, 0);
+        dgs.extend(fragments(1, false, &delta, 5));
+        dgs.extend(fragments(2, false, &delta, 10));
+
+        let frags = decode_all(&dgs);
+        let mut asm = VideoAssembler::new();
+        for f in frags {
+            asm.push_fragment(f);
+        }
+        assert_eq!(asm.gap_rate_permille(), 0);
     }
 }
