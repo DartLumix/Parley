@@ -64,7 +64,7 @@ Voice is the product; everything else grows later.
 | UI | **Flutter** + `flutter_rust_bridge` | UI only; all performance-critical code stays in Rust |
 | Transport | **QUIC** (quinn) | TLS 1.3 built in · streams for control, datagrams for media · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
 | Voice | **SFU, no transcoding** | Server forwards packets; clients mix — per-user volume, near-zero server CPU |
-| Audio codec | **Opus** | 64 kbps speech ↔ 24 kbps + in-band FEC under loss · adaptive via receiver gap-rate feedback |
+| Audio codec | Opus | Speech: 64 kbps ↔ 24 kbps + in-band FEC, adaptive via gap-rate feedback · Music channels: 256 kbps stereo (Application::Audio) |
 | Video codec | **H.264** | openh264 (software, universal fallback) behind an encoder trait — hardware backends (VAAPI/MediaCodec/VideoToolbox) slot in per-platform · fragmented datagrams + drop-until-IDR loss recovery |
 | AEC / NS | **WebRTC APM** | Echo cancellation + noise suppression on the mic path; far-end reference from the render mix |
 | Auth | **Argon2id** | Per-server username + password · TOFU cert pinning (share the fingerprint with the invite) |
@@ -137,7 +137,7 @@ Every message carries version + capability bits — later features are additive,
       the real client owns this budget from here
 - [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug — handoff §8)
 - [ ] 1440p60 / 1080p60 (parked: software ceiling ~32 fps @ 1080p; needs hardware)
-- [ ] Loss-driven video bitrate ladder → Phase 6
+- [x] Loss-driven video bitrate ladder — landed in 6e
 
 ### Phase 6 — Backend Hardening & Client-Readiness (current)
 Goal: every open/parked backend item closed — a stable, complete backend the
@@ -146,8 +146,8 @@ Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] 6b Multi-channel correctness + per-channel report routing
 - [x] 6c Session-token relogin + reconnect hardening
 - [x] 6d Music channels — 256 kbps stereo end-to-end
-- [ ] 6e Loss-driven video bitrate ladder (mirror 4d)
-- [ ] 6f Device-vanishing mitigations
+- [x] 6e Loss-driven video bitrate ladder (mirror 4d)
+- [x] 6f Device-vanishing mitigations (bounded pcm channel)
 - [ ] 6g Performance budgets verified (RSS / 10 talkers / login / binary)
 - [ ] 6h Robustness — restart persistence, malformed input, netem matrix
 
@@ -190,6 +190,8 @@ cargo run --release -p parley-client --features audio-device,screen-capture -- \
 #    sender: type "share" / "stop" to start/stop without restarting
 cargo run --release -p parley-client --features video -- \
     --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens; video-only build)
+    # token relogin: password login prints a token — rerun with --token <tok> instead of --user/--password
+# music channels: add a channel with mode=1 (sqlite) — clients auto-profile; --music sends synthetic L/R test tones
 # synthetic test pattern (no portal): build the sender with --features audio-device,video
 ```
 

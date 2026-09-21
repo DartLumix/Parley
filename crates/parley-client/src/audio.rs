@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use webrtc_audio_processing::Processor;
 
@@ -40,7 +40,7 @@ const REPORT_COOLDOWN_US: u64 = 400_000;
 const PERIOD_FRAMES: u32 = 1024;
 
 pub struct Audio {
-    pub pcm_rx: UnboundedReceiver<Vec<f32>>,
+    pub pcm_rx: Receiver<Vec<f32>>,
     _in: cpal::Stream,
     _out: cpal::Stream,
 }
@@ -55,7 +55,9 @@ fn now_micros() -> u64 {
 // ---- capture callback: downmix, inject clicks, hand off ----
 
 struct InputState {
-    pcm_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+    pcm_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+    /// Frames dropped because the bounded pcm channel was full (6f).
+    drops: u64,
     inject: Option<Arc<Mutex<Vec<u64>>>>,
     channels: usize,
     first: bool,
@@ -90,7 +92,15 @@ fn input_cb(state: &mut InputState, data: &[f32]) {
         }
     }
     // f32 mono; i16 conversion happens after AEC in the encoder task.
-    let _ = state.pcm_tx.send(mono);
+    if state.pcm_tx.try_send(mono).is_err() {
+        state.drops += 1;
+        if state.drops.is_multiple_of(128) {
+            eprintln!(
+                "audio: encoder behind — {} frames dropped so far",
+                state.drops
+            );
+        }
+    }
 }
 
 // ---- render callback: mix, AEC reference, detect clicks, duplicate ----
@@ -203,7 +213,11 @@ pub fn start(
     let in_channels = in_cfg.channels() as usize;
     let out_channels = out_cfg.channels() as usize;
 
-    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+    // 6f: bounded — if the encoder task stalls, the RT callback drops
+    // frames instead of accumulating unbounded memory/latency. 16 slots
+    // ≈ 85 ms at the typical 256-frame capture period: generous
+    // scheduling slack, no latency ramp.
+    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(16);
 
     // Two configs per direction: explicit quantum-aligned period first,
     // device default as fallback. Each build attempt gets a fresh
@@ -217,6 +231,7 @@ pub fn start(
     let build_input = |cfg: &cpal::StreamConfig| {
         let mut state = InputState {
             pcm_tx: pcm_tx.clone(),
+            drops: 0,
             inject: inject.clone(),
             channels: in_channels,
             first: true,
@@ -282,7 +297,7 @@ pub fn start(
 
     let measuring = inject.is_some();
     let reporting = report.is_some();
-    println!("audio: capture \"{in_name}\" 48 kHz {in_channels}ch f32 → opus 64 kbps");
+    println!("audio: capture \"{in_name}\" 48 kHz {in_channels}ch f32 → opus");
     println!("audio: render \"{out_name}\" 48 kHz {out_channels}ch (stereo mix)");
     if measuring {
         println!("measure: injecting a click every 2 s");
