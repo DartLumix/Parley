@@ -35,7 +35,7 @@ Voice is the product; everything else grows later.
 | 5c | Synthetic 720p30 sender + mpv display | ✅ |
 | 5d | Portal screen capture (ashpd + PipeWire) | ✅ |
 | 5e | Encoder trait, rate pacing, glass-to-glass measured | ✅ |
-| 6 | Backend hardening & client-readiness | ⏳ |
+| 6 | Backend hardening & client-readiness | ✅ |
 | 7+ | Flutter client, camera, platforms | ⏳ |
 
 ---

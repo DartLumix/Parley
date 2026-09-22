@@ -7,6 +7,21 @@
 //! self-adjusts its target depth from measured inter-arrival jitter
 //! (RFC 3550-style estimator).
 //!
+//! 6h latency-shed (SKIP flavor): burst absorption and sender/receiver
+//! clock drift ratchet depth toward MAX_BUFFERED with nothing pulling
+//! it back — permanently baked-in latency. When a CONTIGUOUS buffer
+//! (head == next expected: backlog, not loss) exceeds 2x target depth,
+//! the head packet is consumed WITHOUT being emitted: the pop returns
+//! the successor instead, so one pop drains two packets from the
+//! buffer. Playback content skips forward one frame (a 20 ms skip of
+//! stale audio, rate-limited to one per 8 pops — a crude cousin of
+//! NetEQ's "accelerate"). A PLC-flavored shed was tried first and is
+//! PROVABLY useless here: a concealed frame occupies a playback slot,
+//! so under rate-equal arrival the depth never drains (a failing test
+//! proved it — see the drift test). Sustained arrival ABOVE the
+//! consumption rate is not this mechanism's problem: that's the
+//! overflow cap's job, by design.
+//!
 //! Audio frames are copied into small buffers (an Opus packet is a few
 //! hundred bytes); overflow beyond the 16-bit sequence window is a
 //! protocol violation and rejected.
@@ -19,6 +34,11 @@ pub const DEFAULT_TARGET_DEPTH: usize = 1;
 const MAX_BUFFERED: usize = 64;
 /// Target depth grows above measured jitter by this many frames.
 const HEADROOM_FRAMES: f32 = 2.0;
+/// 6h: shed only when a contiguous buffer exceeds target by this multiple.
+const SHED_FACTOR: usize = 2;
+/// 6h: at most one shed per this many pops (rate limit — convergence
+/// over ~1-2 s, one 20 ms skip each, not a burst of skips).
+const SHED_EVERY_POPS: u64 = 8;
 
 /// Outcome of a `pop` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,12 +63,20 @@ pub struct JitterBuffer {
     /// Monotonic frame counter of arrival times.
     clock_frames: f32,
     started_at: Option<std::time::Instant>,
+    /// 6h: pops since the last shed (rate limiter). Starts DISARMED: a
+    /// fresh playhead (lock-on, or right after overflow dropped a
+    /// batch) must not shed — that backlog is pre-accounted. Arms after
+    /// 8 pops of established consumer pace.
+    pops_since_shed: u64,
     /// Packets dropped because they were too old.
     pub late_dropped: u64,
     /// Packets dropped as duplicates.
     pub dup_dropped: u64,
     /// Packets dropped for buffer overflow.
     pub overflow_dropped: u64,
+    /// 6h: packets deliberately skipped (consumed, never emitted) to
+    /// drain baked-in latency.
+    pub sheds: u64,
 }
 
 impl JitterBuffer {
@@ -60,9 +88,11 @@ impl JitterBuffer {
             jitter_frames: 0.0,
             clock_frames: 0.0,
             started_at: None,
+            pops_since_shed: 0,
             late_dropped: 0,
             dup_dropped: 0,
             overflow_dropped: 0,
+            sheds: 0,
         }
     }
 
@@ -104,9 +134,10 @@ impl JitterBuffer {
 
     /// Pop the next frame.
     ///
-    /// - `(Packet, Some(p))`: next in-order packet.
-    /// - `(Gap, None)`: gap confirmed (next_seq missing but later packets
-    ///   buffered past the target depth) — caller runs PLC, pops again.
+    /// - `(Packet, Some(p))`: next in-order packet (or, after a shed,
+    ///   its successor — one pop may have silently consumed the head).
+    /// - `(Gap, None)`: gap confirmed (next_seq missing, later packets
+    ///   buffered past target) — caller runs PLC, pops again.
     /// - `(Empty, None)`: nothing ready — caller waits.
     pub fn pop(&mut self) -> (PopOutcome, Option<Vec<u8>>) {
         // Lock-on: adopt the oldest buffered seq on first pop.
@@ -117,7 +148,28 @@ impl JitterBuffer {
             self.fresh = false;
         }
 
-        // Case 1: head is exactly the expected seq.
+        self.pops_since_shed = self.pops_since_shed.saturating_add(1);
+
+        // Case 1: head is exactly the expected seq. A deep CONTIGUOUS
+        // buffer here is baked-in latency (burst absorption / clock
+        // drift — no loss involved). Skip-shed: consume the head
+        // without emitting it and let the recursion return whatever
+        // follows (the successor, or a Gap if a hole follows) — one
+        // pop then drains two packets.
+        if let Some((seq, _)) = self.pending.front()
+            && *seq == self.next_seq
+            && self.pending.len() >= self.target_depth() * SHED_FACTOR
+            && self.pops_since_shed >= SHED_EVERY_POPS
+        {
+            self.pending.pop_front();
+            self.next_seq = self.next_seq.wrapping_add(1);
+            self.pops_since_shed = 0;
+            self.sheds += 1;
+            // Recurse for this pop's result. pops_since_shed just reset
+            // (the increment inside is harmless), so no shed chaining.
+            return self.pop();
+        }
+
         if let Some((seq, _)) = self.pending.front()
             && *seq == self.next_seq
         {
@@ -126,8 +178,9 @@ impl JitterBuffer {
             return (PopOutcome::Packet, Some(packet));
         }
 
-        // Case 2: holding packets beyond a missing one. The gap-skip
-        // decision uses depth vs target.
+        // Case 2: holding packets beyond a missing one — genuine loss.
+        // Declared once depth reaches the target; the playhead walks
+        // through the missing range at the consumer's natural pace.
         if let Some((seq, _)) = self.pending.front() {
             let buffered = self.pending.len();
             let target = self.target_depth();
@@ -155,8 +208,8 @@ impl JitterBuffer {
     }
 
     /// The immediate successor packet, if buffered, without consuming it.
-    /// During a declared gap this is the packet whose in-band FEC (if any)
-    /// can reconstruct the lost frame.
+    /// During a declared gap this is the packet whose in-band FEC (if
+    /// any) can reconstruct the lost frame.
     pub fn peek(&self) -> Option<(u16, &[u8])> {
         self.pending
             .front()
@@ -294,7 +347,8 @@ mod tests {
             jb.push(seq, &pkt(seq as u8));
         }
         assert_eq!(jb.overflow_dropped, (70 - MAX_BUFFERED) as u64);
-        // The playhead advanced past the dropped ones.
+        // The playhead advanced past the dropped ones; the rate limiter
+        // is DISARMED after a fresh lock-on, so this first pop plays.
         let (o, out) = jb.pop();
         assert_eq!(o, PopOutcome::Packet);
         assert_eq!(out, Some(pkt((70 - MAX_BUFFERED) as u8)));
@@ -313,5 +367,134 @@ mod tests {
         let (o, p) = jb.pop();
         assert_eq!((o, p), (PopOutcome::Packet, Some(pkt(2))));
         assert_eq!(jb.peek(), Some((3, pkt(3).as_slice())));
+    }
+
+    // ---- 6h: latency-shed (skip flavor) ----
+
+    #[test]
+    fn one_shot_burst_plays_out_unshed() {
+        // A one-shot contiguous burst with no further arrivals just
+        // plays out at the natural rate — nothing is sustained, so
+        // nothing needs draining, and concealment/skipping here would
+        // degrade audio for nothing. The rate limiter (disarmed until
+        // 8 pops) plus the shrinking depth keep it below threshold
+        // anyway.
+        let mut jb = JitterBuffer::new();
+        let burst = 10;
+        for seq in 0..burst as u16 {
+            jb.push(seq, &pkt(seq as u8));
+        }
+        let mut played = 0;
+        let mut gaps = 0;
+        for _ in 0..200 {
+            match jb.pop().0 {
+                PopOutcome::Packet => played += 1,
+                PopOutcome::Gap => gaps += 1,
+                PopOutcome::Empty => break,
+            }
+        }
+        assert_eq!(played, burst, "every packet plays");
+        assert_eq!(gaps, 0);
+        assert_eq!(jb.sheds, 0, "a one-shot burst must not shed");
+        assert_eq!(jb.depth(), 0);
+    }
+
+    #[test]
+    fn rate_equal_backlog_drains_to_target() {
+        // THE baked-latency scenario: a burst left depth at 10, then
+        // arrival and consumption run at EQUAL rates (50 pps each) —
+        // without a shed, depth is invariant at 10 forever (200 ms of
+        // permanent latency). The skip-shed must drain it to the
+        // target and hold it there.
+        //
+        // NOTE: this is the test that falsified the PLC-flavored shed:
+        // concealment occupies a playback slot, so under rate-equal
+        // arrival the depth never moves. Only consuming-without-emitting
+        // (skip) drains.
+        let mut jb = JitterBuffer::new();
+        let backlog = 10;
+        for seq in 0..backlog as u16 {
+            jb.push(seq, &pkt(seq as u8));
+        }
+        // Rate-equal from here: 1 push per pop.
+        let iterations = 400;
+        let total_pushed = backlog + iterations;
+        let mut seq = backlog as u16;
+        let mut played = 0;
+        let mut gaps = 0;
+        for _ in 0..iterations {
+            jb.push(seq, &pkt((seq % 256) as u8));
+            seq = seq.wrapping_add(1);
+            match jb.pop().0 {
+                PopOutcome::Packet => played += 1,
+                PopOutcome::Gap => gaps += 1,
+                PopOutcome::Empty => {}
+            }
+        }
+        // Drained: depth settled at/near the target (2), far below the
+        // 10 it would sit at forever without the shed.
+        assert!(
+            jb.depth() <= 4,
+            "backlog must drain to ~target, depth {}",
+            jb.depth()
+        );
+        assert!(
+            jb.sheds >= 5,
+            "draining 10→~2 needs several sheds, got {}",
+            jb.sheds
+        );
+        assert_eq!(
+            jb.overflow_dropped, 0,
+            "rate-equal arrival must never hit the overflow cap"
+        );
+        // Conservation: every pushed packet was emitted, skipped
+        // (shed), or remains buffered. Nothing vanished.
+        assert_eq!(
+            played + gaps + jb.sheds as usize + jb.depth(),
+            total_pushed,
+            "conservation: {played} emitted, {} gapped, {} shed, {} buffered",
+            gaps,
+            jb.sheds,
+            jb.depth()
+        );
+    }
+
+    #[test]
+    fn steady_state_never_sheds() {
+        // Producer and consumer at the same rate, shallow: depth stays
+        // at the target, far under the 2x shed threshold.
+        let mut jb = JitterBuffer::new();
+        let mut seq: u16 = 0;
+        for i in 0..500 {
+            let sheds_before = jb.sheds;
+            while jb.depth() < 2 {
+                jb.push(seq, &pkt((seq % 256) as u8));
+                seq = seq.wrapping_add(1);
+            }
+            let (o, _) = jb.pop();
+            assert_eq!(o, PopOutcome::Packet, "iteration {i}");
+            assert_eq!(jb.sheds, sheds_before, "steady state must never shed");
+        }
+    }
+
+    #[test]
+    fn shallow_reorder_is_loss_not_drift() {
+        // A single missing packet at low depth (target 2): the gap is
+        // declared as ordinary loss via Case 2 — never mistaken for
+        // drift, never shed.
+        let mut jb = JitterBuffer::new();
+        jb.push(0, &pkt(0));
+        jb.push(2, &pkt(2)); // 1 missing
+        jb.push(3, &pkt(3));
+        let (o, _) = jb.pop(); // play 0
+        assert_eq!(o, PopOutcome::Packet);
+        let (o, _) = jb.pop(); // depth 2 >= target → ordinary gap for seq 1
+        assert_eq!(o, PopOutcome::Gap);
+        assert_eq!(jb.sheds, 0, "shallow loss must never shed");
+        let (o, _) = jb.pop(); // play 2
+        assert_eq!(o, PopOutcome::Packet);
+        let (o, _) = jb.pop(); // play 3
+        assert_eq!(o, PopOutcome::Packet);
+        assert_eq!(jb.sheds, 0);
     }
 }

@@ -28,6 +28,8 @@ use parley_proto::{JoinVoice, LeaveVoice, VoiceStatesRequest};
 use std::time::Duration;
 use tokio::time::timeout;
 
+use parley_proto::frame;
+
 use parley_core::audio::jitter::PopOutcome;
 
 async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientBody) {
@@ -1497,5 +1499,141 @@ async fn video_report_routed_to_channel_members_only() {
     a.0.close(0u32.into(), b"done");
     b.0.close(0u32.into(), b"done");
     c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+// ---- Phase 6h: robustness ----
+
+#[tokio::test]
+async fn restart_persistence_end_to_end() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("restart-persist");
+    // A music channel must survive the restart with its mode.
+    {
+        let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+        let _music_id = db.create_channel("stage", true).unwrap();
+        drop(db);
+    }
+    let addr = server.local_addr();
+    let fp1 = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(fp1.clone());
+    let (conn_a, _tx_a, _rx_a) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    conn_a.close(0u32.into(), b"done"); // silence unused in this scope
+    conn_a.close(0u32.into(), b"done");
+
+    // --- restart: drop the endpoint (closes conns), rebind on same data dir ---
+    drop(endpoint);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let server2 = Server::bind(&config).unwrap();
+    let fp2 = server2.fingerprint().to_string();
+    assert_eq!(fp1, fp2, "fingerprint must survive restart");
+    let addr2 = server2.local_addr();
+    tokio::spawn(server2.run());
+
+    // Accounts survive: same password works.
+    let endpoint2 = client_endpoint(fp2);
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint2, addr2, "testuser", "testpass").await;
+
+    // Channels survive, including music mode.
+    send_client_msg(&mut tx_b, ClientBody::ListChannels(ListChannels {})).await;
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(ServerBody::ChannelList(list)) => {
+            let general = list.channels.iter().find(|c| c.id == 1).expect("general");
+            assert_eq!(general.mode, 0, "general stays speech");
+            let stage = list
+                .channels
+                .iter()
+                .find(|c| c.name == "stage")
+                .expect("music channel survived restart");
+            assert_eq!(stage.mode, 1, "music mode survived restart");
+        }
+        other => panic!("expected channel list, got {other:?}"),
+    }
+
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn malformed_input_never_kills_the_server() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("malformed");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn, mut tx, mut rx) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+
+    // Heartbeat helper: the session must still work after each attack.
+    async fn alive(tx: &mut quinn::SendStream, rx: &mut quinn::RecvStream, n: u64) {
+        send_client_msg(tx, ClientBody::Heartbeat(Heartbeat { client_time_ms: n })).await;
+        let msg = read_server_msg(rx).await;
+        match msg.body {
+            Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, n),
+            other => panic!("session died: expected heartbeat ack, got {other:?}"),
+        }
+    }
+
+    // --- hostile datagrams: empty, garbage, bad version, truncated
+    // video header. Server must drop them and keep serving. (An
+    // oversized-media case is unreachable: client endpoints cap
+    // datagrams at ~1200 B, so >MTU media can't enter the network.)
+    conn.send_datagram(Vec::new().into()).unwrap();
+    conn.send_datagram(vec![0u8; 5].into()).unwrap();
+    // Valid framing, version bits = 7 (unsupported).
+    let mut bad_ver = parley_proto::media::encode(0, 1, 0, 1, &[0xAA; 20]);
+    bad_ver[0] = 0xFF;
+    conn.send_datagram(bad_ver.into()).unwrap();
+    // FLAG_VIDEO with a payload shorter than the video sub-header.
+    conn.send_datagram(
+        parley_proto::media::encode(
+            parley_proto::media::FLAG_VIDEO,
+            2,
+            0,
+            1,
+            &[0xBB; 4], // < 9-byte video header
+        )
+        .into(),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    alive(&mut tx, &mut rx, 1).await;
+
+    // --- hostile stream bytes: random garbage as a "protobuf frame". ---
+    tx.write_all(&frame::encode(&[0xDE, 0xAD, 0xBE, 0xEF, 0x99]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A decode failure ends THIS session by design (the stream is
+    // desynchronized — recovery is impossible); the assert is that it
+    // ends cleanly, and the SERVER lives on for the next client.
+    let ended = session::read_message::<ServerMessage>(&mut rx).await;
+    assert!(
+        ended.is_err(),
+        "garbage protobuf must end the session (cleanly)"
+    );
+
+    // --- the server must still accept a FRESH session after all that. ---
+    let (conn2, mut tx2, mut rx2) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    alive(&mut tx2, &mut rx2, 2).await;
+
+    // --- oversized length prefix: rejected before allocation (64 KiB
+    // cap), ends the session cleanly, no panic. ---
+    tx2.write_all(&0x7FFF_FFFFu32.to_be_bytes()).await.unwrap();
+    let ended2 = session::read_message::<ServerMessage>(&mut rx2).await;
+    assert!(
+        ended2.is_err(),
+        "oversized frame must end the session (cleanly)"
+    );
+
+    conn.close(0u32.into(), b"done");
+    conn2.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
