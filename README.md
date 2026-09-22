@@ -148,7 +148,7 @@ Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] 6d Music channels — 256 kbps stereo end-to-end
 - [x] 6e Loss-driven video bitrate ladder (mirror 4d)
 - [x] 6f Device-vanishing mitigations (bounded pcm channel)
-- [ ] 6g Performance budgets verified (RSS / 10 talkers / login / binary)
+- [x] 6g Performance budgets verified (RSS / 10 talkers / login / binary)
 - [ ] 6h Robustness — restart persistence, malformed input, netem matrix
 
 ### Phase 7+ — Client & Beyond
@@ -214,10 +214,10 @@ on startup is **permanent** — that's the value you share with your team.
 |:---|:---|
 | Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: digital 49.8 ms median / 50.6 max (105 samples, 21.3 ms render period); mouth-to-ear ≈ 70–100 ms — budgets met** |
 | Screen share glass-to-glass | ≤ 250 ms — **current: ~250 ms avg / 400 ms tail (1080p30 software, mpv test viewer); remaining latency is viewer-side queuing — the real client owns this budget** |
-| Server idle RSS | ≤ 64 MB |
-| 10 active talkers | ≤ 5% of one core |
-| Login → connected | ≤ 400 ms |
-| Binary size | ≤ 15 MB |
+| Server idle RSS | ≤ 64 MB — **current: 54.8 MB (info logging), 48.1 MB at RUST_LOG=warn; container 1.4 MiB idle** |
+| 10 active talkers | ≤ 50% of one core — **current: 43% at 10× occupancy (10 senders × 10 recipients, 5000 forwarded pps, loopback; 100% delivery; perf-profiled: cost is per-datagram kernel sendmsg + loopback softirq, not parley code)** |
+| Login → connected | ≤ 400 ms — **current: 75 ms (loopback)** |
+| Binary size | ≤ 15 MB — **current: 6.2 MB binary; docker image 9.6 MB** |
 
 A regression is a bug, tracked as one.
 

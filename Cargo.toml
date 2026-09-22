@@ -44,3 +44,11 @@ pipewire = "0.10"
 [profile.release]
 strip = true
 lto = "thin"
+
+
+# For profiling: release optimization + symbols. Used for perf work
+# (6g CPU investigation; see HANDOFF §8 when it concludes).
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
