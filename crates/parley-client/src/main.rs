@@ -165,6 +165,7 @@ async fn read_frame(rx: &mut quinn::RecvStream) -> Result<Vec<u8>, String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
+    let started = std::time::Instant::now();
     let addr: SocketAddr = args.server.parse().map_err(|_| {
         format!(
             "--server must be IP:port for now (got \"{}\") — DNS names come with the real client",
@@ -296,8 +297,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "connected to {} as \"{}\" (id {}), voice channel {}",
-        args.server, args.user, ok.user_id, args.channel_id
+        "connected to {} as \"{}\" (id {}), voice channel {} — {} ms",
+        args.server,
+        args.user,
+        ok.user_id,
+        args.channel_id,
+        started.elapsed().as_millis()
     );
 
     // Outbound control channel: heartbeats, click reports and loss
