@@ -139,7 +139,7 @@ Every message carries version + capability bits — later features are additive,
 - [ ] 1440p60 / 1080p60 (parked: software ceiling ~32 fps @ 1080p; needs hardware)
 - [x] Loss-driven video bitrate ladder — landed in 6e
 
-### Phase 6 — Backend Hardening & Client-Readiness (current)
+### Phase 6 — Backend Hardening & Client-Readiness 
 Goal: every open/parked backend item closed — a stable, complete backend the
 Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] 6a Share lifecycle — stop/start without process exit; viewer cleanup
@@ -149,14 +149,14 @@ Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] 6e Loss-driven video bitrate ladder (mirror 4d)
 - [x] 6f Device-vanishing mitigations (bounded pcm channel)
 - [x] 6g Performance budgets verified (RSS / 10 talkers / login / binary)
-- [ ] 6h Robustness — restart persistence, malformed input, netem matrix
+- [x] 6h Robustness — restart persistence, malformed input, netem matrix
 
 ### Phase 7+ — Client & Beyond
 - [ ] Flutter client bring-up (app/, flutter_rust_bridge over parley-core)
-- [ ] Camera video (deferred from old Phase 6 — needs client UI for preview;
-      same pipeline, A/V sync ≤ 40 ms)
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
+
+**Parked indefinitely** : camera video — returns after the client has adecent foundation (it needs UI preview; the pipeline exists).
 
 ---
 
