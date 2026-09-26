@@ -1,4 +1,4 @@
-//! Phase 5c/5d/6a/6e: screen-share over the media datagram path.
+//! Phase 5c/5d/6a/6e/6.9: screen-share over the media datagram path.
 //!
 //! Send side: `--share` (or the "share" stdin command) with the `video`
 //! feature sends the synthetic moving-bar pattern; with
@@ -6,17 +6,13 @@
 //! screen.rs). Both fragment + send with FLAG_VIDEO, paced so a
 //! keyframe doesn't burst datagrams into quinn.
 //!
-//! Receive side (any client): video datagrams are detected by flag,
-//! assembled per sender, decoded, and piped as raw RGB24 into a spawned
-//! mpv (one per sender). mpv is spawned lazily on the first decoded
-//! frame and sized from the H.264 SPS — the sender's negotiated
-//! resolution (720p synthetic, native monitor for real capture), never
-//! a client-side guess. Video never touches the audio mixer or the
-//! jitter buffer; seq counters are per-path (video's starts at 0x8000),
-//! and receivers discriminate on FLAG_VIDEO before anything else.
-//!
-//! 6a: the stopped set closes the datagram-vs-stream ordering race at
-//! share stop — see `ViewerTable`.
+//! Receive side (6.9): everything protocol lives in
+//! parley-core's `VideoReceiveHub` (assembler, decoder, stopped-set,
+//! gap rates, bounded frame queue). This file is a DISPLAY consumer:
+//! one std thread drains decoded frames and feeds a spawned mpv per
+//! sender (lazily, sized from the decoded frame). The Phase 7 Flutter
+//! client becomes a second consumer of the same hub — no mpv knowledge
+//! anywhere near the protocol path.
 //!
 //! 6e: the loss-driven video bitrate ladder (`VideoLadder`) mirrors
 //! 4d's audio controller — viewers report assembler gap rates, senders
@@ -30,10 +26,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use parley_core::video::{
-    VIDEO_BITRATE_BPS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoDecoder, VideoEncoder,
-    create_encoder,
+    VIDEO_BITRATE_BPS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoEncoder, create_encoder,
 };
-use parley_proto::video::{VideoAssembler, decode_fragment, fragment_frame};
+use parley_core::video_receive::{SharedVideoReceiveHub, VideoReceiveHub};
+use parley_proto::video::fragment_frame;
 
 /// Spawn an mpv that reads raw RGB24 from our stdin pipe, sized to the
 /// decoded stream. One per remote sender, named after them in the title.
@@ -246,185 +242,162 @@ impl ShareSender {
     }
 }
 
-// ---- receive side ----
+// ---- receive side: hub + mpv display consumer (6.9) ----
 
-/// Per-sender receive state: assembler + decoder + mpv child.
-/// mpv spawns lazily on the first decoded frame — its size comes from
-/// the H.264 SPS, so any sender resolution displays correctly.
-pub struct Viewer {
-    sender_id: u32,
-    assembler: VideoAssembler,
-    decoder: VideoDecoder,
-    mpv: Option<Child>,
-    /// mpv died (window closed / exited)? Stop feeding, keep consuming
-    /// datagrams so the stream stays accounted for.
-    dead: bool,
-    /// Frames shown since last stats print.
-    shown: u64,
+/// The client-side receive state: the protocol hub plus the display
+/// consumer's shared bookkeeping. Public API is unchanged from the
+/// pre-6.9 ViewerTable era — main.rs needs no changes.
+pub struct ClientViewers {
+    hub: SharedVideoReceiveHub,
+    /// Per-sender frames fed to mpv since the last stats read.
+    shown: Arc<Mutex<HashMap<u32, u64>>>,
+    /// mpv died for this sender (window closed): don't respawn until
+    /// they stop-and-restart or leave-and-return.
+    dead: Arc<Mutex<HashSet<u32>>>,
+    /// One-shot kill requests (stop/leave): the consumer thread reaps
+    /// the mpv child. Drained every loop iteration.
+    retire: Arc<Mutex<HashSet<u32>>>,
 }
 
-impl Viewer {
-    fn new(sender_id: u32) -> Result<Self, String> {
-        Ok(Self {
-            sender_id,
-            assembler: VideoAssembler::new(),
-            decoder: VideoDecoder::new().map_err(|e| e.to_string())?,
-            mpv: None,
-            dead: false,
-            shown: 0,
-        })
-    }
-
-    fn feed_fragment(&mut self, frag: parley_proto::video::VideoFragment<'_>) {
-        self.assembler.push_fragment(frag);
-        while let Some(frame) = self.assembler.pop_frame() {
-            if self.dead {
-                continue; // keep consuming, don't decode for a dead viewer
-            }
-            match self.decoder.decode_with_dims(&frame.data) {
-                Ok(Some((rgb, w, h))) => {
-                    if self.mpv.is_none() {
-                        println!("video: user {} sharing {w}x{h}", self.sender_id);
-                        match spawn_mpv(self.sender_id, w, h) {
-                            Ok(child) => self.mpv = Some(child),
-                            Err(e) => {
-                                eprintln!("video: {e}");
-                                self.dead = true;
-                                return;
-                            }
-                        }
-                    }
-                    let Some(mpv) = self.mpv.as_mut() else {
-                        return;
-                    };
-                    if feed_mpv(mpv, &rgb) {
-                        self.shown += 1;
-                    } else {
-                        self.dead = true;
-                        let _ = mpv.try_wait(); // reap if already exited
-                        println!(
-                            "video: viewer for user {} exited — not displaying (window closed?)",
-                            self.sender_id
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("video decode error: {e}"),
-            }
-        }
-    }
-}
-
-impl Drop for Viewer {
-    fn drop(&mut self) {
-        if let Some(mut mpv) = self.mpv.take() {
-            let _ = mpv.kill();
-            let _ = mpv.wait();
-        }
-    }
-}
-
-/// Shared receiver state: per-sender viewers plus the stopped set.
-///
-/// The stopped set exists because QUIC gives NO ordering between
-/// datagrams and stream bytes: a straggler video datagram can land
-/// AFTER the client processes the ShareStopped control message, and
-/// without the set the datagram reader would spawn a fresh viewer
-/// showing one frozen frame. Entries clear on the sender's next
-/// KEYFRAME fragment — every new share starts with an encoder-fresh
-/// IDR, and an IDR whose datagram was lost is followed by another IDR
-/// at the intra period, so un-stop never depends on a specific
-/// frame_id arriving.
-#[derive(Default)]
-pub struct ViewerTable {
-    viewers: HashMap<u32, Viewer>,
-    stopped: HashSet<u32>,
-}
-
-/// Shared receiver map.
-pub type Viewers = Arc<Mutex<ViewerTable>>;
+/// Shared receiver handle (name preserved from the ViewerTable era).
+pub type Viewers = Arc<ClientViewers>;
 
 pub fn new_viewers() -> Viewers {
-    Arc::new(Mutex::new(ViewerTable::default()))
+    let hub = VideoReceiveHub::shared();
+    let shown: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let dead: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+    let retire: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+    std::thread::spawn({
+        // mpv feeding is blocking IO (write_all to a child's stdin) —
+        // a dedicated std thread, never a tokio worker. Runs for the
+        // process lifetime; on client exit the stdin pipe closes and
+        // mpv self-terminates on EOF (verified in the 6.9 acceptance).
+        let hub = hub.clone();
+        let shown = shown.clone();
+        let dead = dead.clone();
+        let retire = retire.clone();
+        move || mpv_consumer(hub, shown, dead, retire)
+    });
+    Arc::new(ClientViewers {
+        hub,
+        shown,
+        dead,
+        retire,
+    })
+}
+
+/// The display consumer: drain decoded frames from the hub, spawn one
+/// mpv per sender (lazily, sized from the first decoded frame — the
+/// sender's real resolution), feed it. This is the ONLY place in the
+/// client that knows mpv exists; Phase 7's Flutter consumer replaces
+/// exactly this function against the same hub.
+fn mpv_consumer(
+    hub: SharedVideoReceiveHub,
+    shown: Arc<Mutex<HashMap<u32, u64>>>,
+    dead: Arc<Mutex<HashSet<u32>>>,
+    retire: Arc<Mutex<HashSet<u32>>>,
+) {
+    let mut mpvs: HashMap<u32, Child> = HashMap::new();
+    loop {
+        // Reap requests first: stop/leave kill their window.
+        for id in retire.lock().unwrap().drain() {
+            if let Some(mut c) = mpvs.remove(&id) {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        let Some(frame) = hub.pop_frame(Duration::from_secs(1)) else {
+            continue;
+        };
+        if dead.lock().unwrap().contains(&frame.sender_id) {
+            continue; // window closed earlier: keep draining, display nothing
+        }
+        if let std::collections::hash_map::Entry::Vacant(e) = mpvs.entry(frame.sender_id) {
+            println!("video: starting viewer for user {}", frame.sender_id);
+            match spawn_mpv(frame.sender_id, frame.width, frame.height) {
+                Ok(child) => {
+                    println!(
+                        "video: user {} sharing {}x{}",
+                        frame.sender_id, frame.width, frame.height
+                    );
+                    e.insert(child);
+                }
+                Err(e) => {
+                    eprintln!("video: {e}");
+                    dead.lock().unwrap().insert(frame.sender_id);
+                    continue;
+                }
+            }
+        }
+        let Some(mpv) = mpvs.get_mut(&frame.sender_id) else {
+            continue;
+        };
+        if feed_mpv(mpv, &frame.rgb) {
+            *shown.lock().unwrap().entry(frame.sender_id).or_insert(0) += 1;
+        } else {
+            dead.lock().unwrap().insert(frame.sender_id);
+            let _ = mpv.try_wait(); // reap if already exited
+            println!(
+                "video: viewer for user {} exited — not displaying (window closed?)",
+                frame.sender_id
+            );
+            if let Some(mut c) = mpvs.remove(&frame.sender_id) {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
 }
 
 /// Route one video datagram payload. Called from the media datagram
-/// reader for any datagram with FLAG_VIDEO set.
+/// reader for any datagram with FLAG_VIDEO set. Protocol handling
+/// (stopped-set, assembly, decode) lives in the hub; display happens
+/// on the consumer thread.
 pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, payload: &[u8]) {
-    let Ok(frag) = decode_fragment(payload) else {
-        return; // malformed video fragment: drop, stats live in assembler
-    };
-    let mut table = viewers.lock().unwrap();
-    if table.stopped.contains(&sender_id) {
-        if !frag.keyframe {
-            return; // straggler from the stopped share
-        }
-        table.stopped.remove(&sender_id); // new share begins
-    }
-    if let Some(v) = table.viewers.get_mut(&sender_id) {
-        v.feed_fragment(frag);
-        return;
-    }
-    // First video from this sender: spawn a viewer.
-    println!("video: starting viewer for user {sender_id}");
-    match Viewer::new(sender_id) {
-        Ok(mut v) => {
-            v.feed_fragment(frag);
-            table.viewers.insert(sender_id, v);
-        }
-        Err(e) => eprintln!("video: viewer init failed: {e}"),
-    }
+    viewers.hub.push_datagram(sender_id, payload);
 }
 
-/// A sender stopped sharing: kill their viewer (Drop kills mpv) and
-/// remember the stop so late datagrams can't resurrect it.
+/// A sender stopped sharing: the hub suppresses stragglers, the
+/// consumer kills their mpv. A later keyframe (new share) spawns a
+/// fresh window — so `dead` clears here too.
 pub fn mark_stopped(viewers: &Viewers, sender_id: u32) {
-    let mut table = viewers.lock().unwrap();
-    table.viewers.remove(&sender_id);
-    table.stopped.insert(sender_id);
-}
-
-/// Print + reset per-sender stats. Called from a slow ticker.
-pub fn stats_line(viewers: &Viewers) -> String {
-    let mut table = viewers.lock().unwrap();
-    if table.viewers.is_empty() {
-        return "video: no active shares".to_string();
-    }
-    let parts: Vec<String> = table
-        .viewers
-        .iter_mut()
-        .map(|(&id, v)| {
-            let s = format!(
-                "user {id}: {} shown, {} dropped, {} skipped",
-                v.shown, v.assembler.frames_dropped, v.assembler.fragments_skipped
-            );
-            v.shown = 0;
-            s
-        })
-        .collect();
-    format!("video: {}", parts.join(" | "))
+    viewers.hub.mark_stopped(sender_id);
+    viewers.retire.lock().unwrap().insert(sender_id);
+    viewers.dead.lock().unwrap().remove(&sender_id);
 }
 
 /// Drop a departed sender's viewer (kills their mpv) and forget their
 /// stopped-state — they left voice, nothing more can arrive.
 pub fn remove_viewer(viewers: &Viewers, sender_id: u32) {
-    let mut table = viewers.lock().unwrap();
-    table.viewers.remove(&sender_id);
-    table.stopped.remove(&sender_id);
+    viewers.hub.remove(sender_id);
+    viewers.retire.lock().unwrap().insert(sender_id);
+    viewers.dead.lock().unwrap().remove(&sender_id);
 }
 
-/// 6e: worst per-sender video gap rate since the last call (resets
-/// each sender's window). None when no viewers are active.
-pub fn video_gap_rates(viewers: &Viewers) -> Option<u32> {
-    let mut table = viewers.lock().unwrap();
-    if table.viewers.is_empty() {
-        return None;
+/// Print + reset per-sender stats. Called from a slow ticker.
+pub fn stats_line(viewers: &Viewers) -> String {
+    let stats = viewers.hub.stats();
+    if stats.is_empty() {
+        return "video: no active shares".to_string();
     }
-    table
-        .viewers
-        .values_mut()
-        .map(|v| v.assembler.gap_rate_permille())
-        .max()
+    let mut shown = viewers.shown.lock().unwrap();
+    let parts: Vec<String> = stats
+        .iter()
+        .map(|&(id, _completed, dropped, skipped)| {
+            format!(
+                "user {id}: {} shown, {dropped} dropped, {skipped} skipped",
+                shown.get(&id).copied().unwrap_or(0)
+            )
+        })
+        .collect();
+    shown.clear();
+    format!("video: {}", parts.join(" | "))
+}
+
+/// 6e: worst per-sender video gap rate since the last call. None when
+/// no streams are active.
+pub fn video_gap_rates(viewers: &Viewers) -> Option<u32> {
+    viewers.hub.gap_rate_permille()
 }
 
 // ---- send-side task (synthetic pattern) ----
@@ -467,8 +440,10 @@ pub async fn share_task(
             }
         };
         for (i, dg) in dgs.iter().enumerate() {
-            if conn.send_datagram(dg.clone().into()).is_err() {
-                println!("share: connection closed");
+            if let Err(e) = conn.send_datagram(dg.clone().into()) {
+                // Real reason, not a guess (the 6e lesson: TooLarge and
+                // ConnectionLost are very different diagnoses).
+                println!("share: send_datagram failed: {e}");
                 return;
             }
             // Pace: ~500 µs between fragments ≈ 2 MB/s ceiling, well
