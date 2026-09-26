@@ -37,6 +37,9 @@ impl Server {
         let db = Db::open(&config.data_dir.join("parley.db"))?;
         db.bootstrap_admin()?;
 
+        db.bootstrap_admin()?;
+        db.purge_stale_sessions()?;
+
         let (identity, _new) = tls::load_or_generate(&config.data_dir)?;
         let fingerprint = tls::fingerprint(&identity.cert);
 
@@ -564,6 +567,6 @@ fn route_datagram(
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

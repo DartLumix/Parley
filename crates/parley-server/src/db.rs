@@ -103,6 +103,21 @@ impl Db {
         Ok(())
     }
 
+    /// GC old session tokens (B-bucket): the sessions table grows one
+    /// row per login forever otherwise. 30 days is generous — tokens
+    /// are re-issued on every password login, so losing an old one
+    /// costs a password prompt at worst.
+    pub fn purge_stale_sessions(&self) -> Result<(), Error> {
+        let n = self.conn.execute(
+            "DELETE FROM sessions WHERE created_at < datetime('now', '-30 days')",
+            [],
+        )?;
+        if n > 0 {
+            info!("purged {n} stale session tokens");
+        }
+        Ok(())
+    }
+
     pub fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<(), Error> {
         let hash = hash_password(password)?;
         self.conn.execute(
@@ -204,8 +219,8 @@ impl Db {
     ) -> Result<(u64, u64, String), Error> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         self.conn.execute(
             "INSERT INTO messages (channel_id, user_id, text, timestamp_ms) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![channel_id as i64, user_id, text, ts],

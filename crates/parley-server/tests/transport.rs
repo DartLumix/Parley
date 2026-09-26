@@ -1637,3 +1637,106 @@ async fn malformed_input_never_kills_the_server() {
     conn2.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
+
+#[tokio::test]
+async fn video_routing_is_order_robust() {
+    // The .16-era investigation promised this hardening: collect ALL
+    // fragments before feeding the assembler, then sort by
+    // (frame_id, frag_idx). What's under test is ROUTING (every
+    // fragment arrives exactly once, correctly stamped) — not the
+    // assembler's tolerance for cross-frame reordering, which is a
+    // documented limitation (drop-until-IDR recovers within ~2 s).
+    init_logs();
+
+    let (config, server) = setup_server_with_user("video-order");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // Three frames with distinctive content: key + 2 deltas.
+    let key: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+    let d1: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let d2: Vec<u8> = (0..2400u32).map(|i| (i % 247) as u8).collect();
+    let dgs = parley_proto::video::fragment_frame(0, true, &key, 0, 0, 0);
+    let dgs1 = parley_proto::video::fragment_frame(1, false, &d1, 100, 960, 0);
+    let dgs2 = parley_proto::video::fragment_frame(2, false, &d2, 200, 1920, 0);
+    let total = dgs.len() + dgs1.len() + dgs2.len();
+    for dg in dgs.iter().chain(dgs1.iter()).chain(dgs2.iter()) {
+        conn_a.send_datagram(dg.clone().into()).unwrap();
+    }
+
+    // Collect every fragment (owned data — lifetime-free until feed
+    // time), verify identity + stamp, THEN sort and feed — arrival
+    // order must not matter.
+    #[derive(Clone)]
+    struct OwnedFrag {
+        frame_id: u32,
+        frag_idx: u16,
+        frag_count: u16,
+        keyframe: bool,
+        data: Vec<u8>,
+    }
+    let mut frags: Vec<OwnedFrag> = Vec::new();
+    for _ in 0..total {
+        let d = timeout(Duration::from_secs(2), conn_b.read_datagram())
+            .await
+            .expect("datagram should arrive")
+            .unwrap();
+        let m = parley_proto::media::decode(&d).unwrap();
+        assert!(m.flags & parley_proto::media::FLAG_VIDEO != 0);
+        assert_eq!(m.sender_id, 1, "server stamps sender id");
+        let frag = parley_proto::video::decode_fragment(m.payload).unwrap();
+        frags.push(OwnedFrag {
+            frame_id: frag.frame_id,
+            frag_idx: frag.frag_idx,
+            frag_count: frag.frag_count,
+            keyframe: frag.keyframe,
+            data: m.payload[parley_proto::video::VIDEO_HEADER_LEN..].to_vec(),
+        });
+    }
+    frags.sort_by_key(|f| (f.frame_id, f.frag_idx));
+
+    let mut asm = parley_proto::video::VideoAssembler::new();
+    for f in &frags {
+        asm.push_fragment(parley_proto::video::VideoFragment {
+            frame_id: f.frame_id,
+            frag_idx: f.frag_idx,
+            frag_count: f.frag_count,
+            keyframe: f.keyframe,
+            data: &f.data,
+        });
+    }
+    let f0 = asm.pop_frame().expect("keyframe");
+    assert_eq!(f0.data, key);
+    assert!(f0.keyframe);
+    let f1 = asm.pop_frame().expect("delta 1");
+    assert_eq!(f1.data, &d1[..]);
+    let f2 = asm.pop_frame().expect("delta 2");
+    assert_eq!(f2.data, &d2[..]);
+    assert_eq!(asm.frames_completed, 3);
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
