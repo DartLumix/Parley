@@ -99,7 +99,15 @@ impl VideoReceiveHub {
             if !frag.keyframe {
                 return; // straggler from the stopped share
             }
-            stopped.remove(&sender_id); // a new share begins
+            // A NEW share always begins with an encoder-fresh IDR at
+            // frame_id 0 (6a restart: fresh encoder, frame_id resets).
+            // A straggler IDR from the DYING share carries a high
+            // frame_id — it must not resurrect a stopped viewer (the
+            // "frozen frame after stop" bug, caught in the 6.9 run).
+            if frag.frame_id != 0 {
+                return; // late keyframe from the old share
+            }
+            stopped.remove(&sender_id); // a new share genuinely begins
         }
         if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(sender_id) {
             match VideoDecoder::new() {
@@ -297,9 +305,12 @@ mod tests {
             "straggler datagrams must not produce frames"
         );
 
-        // A new share's keyframe un-stops and decodes standalone
-        // (mark_stopped dropped the old decoder state).
-        for p in payloads(&fragment_frame(2, true, &c, 20, 1920, 42)) {
+        // A new share's keyframe un-stops and decodes standalone —
+        // and per the 6.9 straggler fix, a new share ALWAYS begins at
+        // frame_id 0 (fresh encoder; the sender resets the counter).
+        // Un-stopping on a high frame_id would resurrect the viewer on
+        // a dying share's late IDR (the "frozen frame after stop" bug).
+        for p in payloads(&fragment_frame(0, true, &c, 20, 1920, 42)) {
             hub.push_datagram(5, &p);
         }
         assert!(hub.pop_frame(Duration::from_millis(500)).is_some());
@@ -365,5 +376,40 @@ mod tests {
             (200..=450).contains(&rate),
             "expected ~333 permille, got {rate}"
         );
+    }
+
+    #[test]
+    fn stopped_viewer_not_resurrected_by_straggler_idr() {
+        // The 6.9 bug: an IDR straggler arriving AFTER ShareStopped
+        // must not spawn a fresh viewer showing one frozen frame. Only
+        // a NEW share's first IDR (frame_id 0) un-stops.
+        let mut enc = crate::video::create_encoder(320, 240).unwrap();
+        let (a, _) = enc.encode_bgra(&noisy_bgra(320, 240, 0)).unwrap();
+        enc.force_keyframe();
+        let (late_idr, _) = enc.encode_bgra(&noisy_bgra(320, 240, 5)).unwrap();
+        enc.force_keyframe();
+        // A fresh share's first IDR — same encoder, but frame_id 0 on
+        // the wire (the sender resets frame_id per share).
+        let hub = VideoReceiveHub::new();
+        // First share runs (frame 0 decodes).
+        for p in payloads(&fragment_frame(0, true, &a, 0, 0, 42)) {
+            hub.push_datagram(6, &p);
+        }
+        assert!(hub.pop_frame(Duration::from_millis(500)).is_some());
+        // Stop, then a LATE IDR straggler at a high frame_id: the hub
+        // must suppress it entirely.
+        hub.mark_stopped(6);
+        for p in payloads(&fragment_frame(17, true, &late_idr, 0, 0, 42)) {
+            hub.push_datagram(6, &p);
+        }
+        assert!(
+            hub.pop_frame(Duration::from_millis(200)).is_none(),
+            "straggler IDR at frame_id 17 must not resurrect the viewer"
+        );
+        // A new share's frame_id-0 keyframe DOES un-stop.
+        for p in payloads(&fragment_frame(0, true, &a, 0, 0, 42)) {
+            hub.push_datagram(6, &p);
+        }
+        assert!(hub.pop_frame(Duration::from_millis(500)).is_some());
     }
 }

@@ -1,5 +1,5 @@
-//! Phase 5d/6a: real screen capture through the XDG ScreenCast portal,
-//! with a full stop/restart lifecycle.
+//! Phase 5d/6a/6.9: real screen capture through the XDG ScreenCast
+//! portal, with a full stop/restart lifecycle — plus share audio.
 //!
 //! ashpd drives the portal (user picks a monitor or window in the
 //! compositor's picker) and hands back a PipeWire node id + fd. A
@@ -48,6 +48,15 @@
 //! the BGRA input the encoders take. The wire format is untouched;
 //! the negotiated size is whatever the compositor serves (the viewer
 //! sizes itself from the H.264 SPS).
+//!
+//! Share audio (6.9): `--share-audio` captures the DEFAULT OUTPUT via
+//! PipeWire's native `stream.capture.sink` (no portal involvement —
+//! the xdg ScreenCast spec has no audio; see the handoff ledger). The
+//! capture is THIS OUTPUT'S audio, not a specific window's (PipeWire
+//! monitor scope; documented product behavior). It rides the music
+//! profile: stereo, 256 kbps, no FEC/ladder — share audio is
+//! fidelity-class content. The mux ([system + mic] → one stream) lives
+//! here too; main.rs routes the mic to it via a tee while sharing.
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
@@ -61,6 +70,7 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
 use futures_util::StreamExt;
+use parley_core::audio::pipeline::SendPipeline;
 use parley_core::video::{VIDEO_FPS, VideoEncoder, create_encoder};
 use parley_proto::video::{MAX_FRAGMENT_PAYLOAD, fragment_frame};
 use pipewire as pw;
@@ -543,15 +553,397 @@ fn encoder_thread(
     println!("share: capture ended");
 }
 
+// ---- 6.9: share audio (default-output capture + mux) ----
+
+/// Listener user data for the audio capture stream.
+struct AudioState {
+    stop: Arc<AtomicBool>,
+    accepted: bool,
+    channels: u32,
+    rate: u32,
+    tx: SyncSender<Vec<f32>>,
+    drops: u64,
+}
+
+/// Start capture of the DEFAULT OUTPUT (PipeWire `stream.capture.sink`)
+/// on its own thread/loop. Bounded channel + try_send: never block the
+/// pw thread (the 6f discipline); a slow consumer drops stale audio —
+/// correct for live content. Failures surface on stderr; the video
+/// share proceeds regardless.
+fn start_audio_capture(stop: Arc<AtomicBool>, sys_tx: SyncSender<Vec<f32>>) {
+    std::thread::spawn(move || {
+        if let Err(e) = audio_capture_thread(stop, sys_tx) {
+            eprintln!("share-audio: {e}");
+        }
+    });
+}
+
+fn audio_capture_thread(
+    stop: Arc<AtomicBool>,
+    sys_tx: SyncSender<Vec<f32>>,
+) -> Result<(), pw::Error> {
+    // Native connection (NOT the portal's connect_fd): this stream is
+    // our own client on the user's PipeWire instance.
+    let mainloop = pw::main_loop::MainLoopBox::new(None)?;
+    let context = pw::context::ContextBox::new(mainloop.loop_(), None)?;
+    let core = context.connect(None)?;
+
+    let state = AudioState {
+        stop: stop.clone(),
+        accepted: false,
+        channels: 2,
+        rate: 48_000,
+        tx: sys_tx,
+        drops: 0,
+    };
+
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        "parley-share-audio",
+        properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Music",
+            // THE mechanism: capture the default sink's monitor. No
+            // registry, no node targeting — PipeWire routes it. Scope:
+            // this output's audio (documented product behavior).
+            *pw::keys::STREAM_CAPTURE_SINK => "true",
+        },
+    )?;
+
+    let _listener = stream
+        .add_local_listener_with_user_data(state)
+        .state_changed(|_, _, old, new| {
+            println!("share-audio: pw stream {:?} -> {:?}", old, new);
+        })
+        .param_changed(|_, user_data, id, param| {
+            let Some(param) = param else { return };
+            if id != spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let (media_type, media_subtype) = match spa::param::format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if media_type != spa::param::format::MediaType::Audio
+                || media_subtype != spa::param::format::MediaSubtype::Raw
+            {
+                return;
+            }
+            let mut info = spa::param::audio::AudioInfoRaw::default();
+            if info.parse(param).is_err() {
+                return;
+            }
+            let fmt = info.format().as_raw();
+            if fmt != spa::param::audio::AudioFormat::F32LE.as_raw() {
+                user_data.accepted = false;
+                user_data.stop.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "share-audio: negotiated a non-F32 format — refusing (v1 supports F32 only)"
+                );
+                return;
+            }
+            user_data.channels = info.channels();
+            user_data.rate = info.rate();
+            if user_data.rate != 48_000 {
+                user_data.accepted = false;
+                user_data.stop.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "share-audio: graph rate is {} Hz, pipeline is 48k-only — refusing",
+                    user_data.rate
+                );
+                return;
+            }
+            if user_data.channels != 2 {
+                user_data.accepted = false;
+                user_data.stop.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "share-audio: negotiated {}ch, mux expects stereo — refusing",
+                    user_data.channels
+                );
+                return;
+            }
+            user_data.accepted = true;
+            println!(
+                "share-audio: negotiated F32 {}ch @ {} Hz (default-output monitor)",
+                user_data.channels, user_data.rate
+            );
+        })
+        .process(|stream, user_data| {
+            if !user_data.accepted {
+                return;
+            }
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            let chunk = data.chunk();
+            let size = chunk.size() as usize;
+            if size == 0 {
+                return;
+            }
+            let offset = chunk.offset() as usize;
+            let Some(mapped) = data.data() else { return };
+            let samples = size / 4;
+            let Some(bytes) = mapped.get(offset..offset + samples * 4) else {
+                return; // truncated buffer: skip
+            };
+            let interleaved: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            if user_data.tx.try_send(interleaved).is_err() {
+                user_data.drops += 1;
+                if user_data.drops.is_multiple_of(128) {
+                    eprintln!(
+                        "share-audio: mux behind — {} buffers dropped",
+                        user_data.drops
+                    );
+                }
+            }
+        })
+        .register()?;
+
+    // EnumFormat: exactly F32LE / 48 kHz / 2ch. The pod property!
+    // macro CANNOT express Int-valued choices (its $type_ must be a
+    // utils:: struct; ints are plain i32 — no path). The Id properties
+    // and the two Int ranges are built with Property::new — the
+    // crate's own AudioInfoRaw idiom (raw.rs From<...> impl).
+    use spa::pod::{ChoiceValue, Object, Property, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
+    let obj = Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: vec![
+            Property::new(
+                spa::param::format::FormatProperties::MediaType.as_raw(),
+                Value::Id(Id(spa::param::format::MediaType::Audio.as_raw())),
+            ),
+            Property::new(
+                spa::param::format::FormatProperties::MediaSubtype.as_raw(),
+                Value::Id(Id(spa::param::format::MediaSubtype::Raw.as_raw())),
+            ),
+            Property::new(
+                spa::param::format::FormatProperties::AudioFormat.as_raw(),
+                Value::Id(Id(spa::param::audio::AudioFormat::F32LE.as_raw())),
+            ),
+            Property::new(
+                spa::param::format::FormatProperties::AudioRate.as_raw(),
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 48_000,
+                        min: 48_000,
+                        max: 48_000,
+                    },
+                ))),
+            ),
+            Property::new(
+                spa::param::format::FormatProperties::AudioChannels.as_raw(),
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 2,
+                        min: 2,
+                        max: 2,
+                    },
+                ))),
+            ),
+        ],
+    };
+    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(obj),
+    )
+    .expect("static pod serialization cannot fail")
+    .0
+    .into_inner();
+    let mut params = [spa::pod::Pod::from_bytes(&values).expect("serialized pod is valid")];
+
+    stream.connect(
+        spa::utils::Direction::Input,
+        None, // STREAM_CAPTURE_SINK decides the target
+        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        &mut params,
+    )?;
+    println!("share-audio: capturing the default output (native PipeWire, stream.capture.sink)");
+
+    // Same iterate-loop discipline as the video pw thread.
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
+    }
+    let _ = stream.disconnect();
+    println!("share-audio: capture stopped");
+    Ok(())
+}
+
+/// The share-audio mux: [default-output stereo + mic mono→center] →
+/// ONE music-profile stream (stereo 256 kbps, FLAG_STEREO). While it
+/// runs it owns the mic route (the tee in main.rs watches `mic_route`).
+///
+/// MIC IS THE CLOCK (design settled by second-opinion review after two
+/// falsified alternatives): PipeWire SUSPENDS capture when the desktop
+/// is silent, so blocking on sys_rx stalls the mux AND the mic (the
+/// "instant burst": mic chunks pile up while blocked, then flush on
+/// the first system sound). The mic (cpal) never suspends — blocking
+/// on it keeps real-time pacing unconditionally. System audio is
+/// buffered and consumed at mic pace; a 100 ms cap bounds staleness
+/// (sustained surplus = rate mismatch; the cap drops OLDEST and
+/// counts).
+///
+/// Without a mic (mixed-feature edge), degrades to sys-only at the
+/// sys delivery pace — the same shape as a music channel.
+///
+/// Runs on a dedicated std thread. Exits when both inputs close or a
+/// send fails; on EVERY exit it flips `mic_route` back so the mic
+/// returns to the speech path. Returns the mic receiver for reuse.
+pub fn spawn_share_audio_mux(
+    mic_rx: Option<tokio::sync::mpsc::Receiver<Vec<f32>>>,
+    sys_rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    conn: quinn::Connection,
+    mic_route: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Option<tokio::sync::mpsc::Receiver<Vec<f32>>>> {
+    std::thread::spawn(move || {
+        let mut mic_rx = mic_rx;
+        mic_route.store(true, Ordering::Relaxed);
+        let mut send = match SendPipeline::new_music(256_000) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("share-audio: music encoder init failed: {e}");
+                mic_route.store(false, Ordering::Relaxed);
+                return mic_rx;
+            }
+        };
+        let flags = parley_proto::media::FLAG_SPEAKING | parley_proto::media::FLAG_STEREO;
+        let mut sys_buffer: Vec<f32> = Vec::new();
+        let mut sys_alive = true;
+        let mut capped: u64 = 0; // frames dropped by the drift cap
+        // 100 ms of stereo = 4800 frames = 9600 interleaved samples.
+        const SYS_CAP_SAMPLES: usize = 9_600;
+
+        loop {
+            // --- clock source ---
+            let mut mic_flat: Vec<f32> = Vec::new();
+            if let Some(rx) = mic_rx.as_mut() {
+                match rx.blocking_recv() {
+                    Some(chunk) => {
+                        mic_flat.extend(chunk);
+                        while let Ok(more) = rx.try_recv() {
+                            mic_flat.extend(more);
+                        }
+                    }
+                    None => {
+                        // Mic channel closed (client teardown): finish
+                        // with sys-only at delivery pace, below.
+                        mic_rx = None;
+                    }
+                }
+            }
+
+            // --- sys: drain everything available, non-blocking ---
+            if sys_alive {
+                loop {
+                    match sys_rx.try_recv() {
+                        Ok(chunk) => sys_buffer.extend(chunk),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            sys_alive = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // No mic, no sys, nothing buffered: the share is over.
+            if mic_rx.is_none() && !sys_alive && sys_buffer.is_empty() {
+                println!("share-audio: ended");
+                break;
+            }
+
+            // --- frame the step ---
+            // Mic-clocked: one step = mic_frames (mic never suspends ⇒
+            // real-time pace). Sys-only: one quantum per delivery.
+            let sys_frames_available = sys_buffer.len() / 2;
+            let mix_frames = if !mic_flat.is_empty() {
+                mic_flat.len()
+            } else if sys_frames_available > 0 {
+                sys_frames_available.min(4800) // cap a step at 100 ms
+            } else {
+                // No input this round (mic gone, sys suspended+empty):
+                // park briefly so we don't spin.
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+
+            let mut pcm: Vec<i16> = Vec::with_capacity(mix_frames * 2);
+            for i in 0..mix_frames {
+                let m = if i < mic_flat.len() { mic_flat[i] } else { 0.0 };
+                let (l, r) = if i < sys_frames_available {
+                    (sys_buffer[i * 2], sys_buffer[i * 2 + 1])
+                } else {
+                    (0.0, 0.0) // sys suspended/underrun — mic rides alone
+                };
+                pcm.push(((l + m).clamp(-1.0, 1.0) * 32767.0) as i16);
+                pcm.push(((r + m).clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
+
+            // Consume what the step used; cap the remainder.
+            let consumed = mix_frames.min(sys_frames_available);
+            if consumed > 0 {
+                sys_buffer.drain(0..(consumed * 2));
+            }
+            if sys_buffer.len() > SYS_CAP_SAMPLES {
+                let excess = sys_buffer.len() - SYS_CAP_SAMPLES;
+                sys_buffer.drain(0..excess);
+                capped += (excess / 2) as u64;
+                if capped.is_multiple_of(4800) {
+                    eprintln!(
+                        "share-audio: drift cap dropped {} frames total (pw/cpal rate mismatch?)",
+                        capped
+                    );
+                }
+            }
+
+            let mut packets = Vec::new();
+            if send.push_pcm(&pcm, &mut packets).is_err() {
+                eprintln!("share-audio: encode failed");
+                break;
+            }
+            for (seq, ts, pkt) in packets {
+                let dg = parley_proto::media::encode(flags, seq, ts, 0, &pkt);
+                if conn.send_datagram(dg.into()).is_err() {
+                    println!("share-audio: connection closed");
+                    mic_route.store(false, Ordering::Relaxed);
+                    return mic_rx;
+                }
+            }
+        }
+        mic_route.store(false, Ordering::Relaxed);
+        mic_rx
+    })
+}
+
 /// Entry point: portal dance → threads → supervisor.
 ///
-/// Returns the keyframe handle + stop controller. Completion of a stop
-/// (user-initiated or desktop-initiated) is reported as
-/// ShareEvent::Ended on `events` — only after full teardown.
+/// `sys_tx` = Some ⇒ share WITH audio (the default-output capture
+/// starts alongside video, same stop flag). Returns the keyframe
+/// handle + stop controller. Completion of a stop (user-initiated or
+/// desktop-initiated) is reported as ShareEvent::Ended on `events` —
+/// only after full teardown.
 pub async fn start(
     conn: quinn::Connection,
     video_loss: Arc<AtomicU32>,
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
+    sys_tx: Option<SyncSender<Vec<f32>>>,
 ) -> Result<(ShareHandle, ShareController), String> {
     let proxy = Screencast::new()
         .await
@@ -644,6 +1036,14 @@ pub async fn start(
             let _ = session.close().await;
             return Err("pipewire setup timeout".to_string());
         }
+    }
+
+    // 6.9: audio capture starts only after video setup succeeded — an
+    // early return must never strand an audio thread. Same stop flag:
+    // teardown kills both; the capture's channel-sender dropping is
+    // what tells the mux the share ended.
+    if let Some(sys_tx) = sys_tx {
+        start_audio_capture(stop_flag.clone(), sys_tx);
     }
 
     // Supervisor: the single owner of the portal session. One select,

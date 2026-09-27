@@ -150,6 +150,11 @@ pub fn build_endpoint(pinned: Option<String>) -> (quinn::Endpoint, Arc<Mutex<Opt
     // quinn-proto 0.11.17 (§8). 2 MiB ≈ 6 s at Clean, ~16 s at Robust.
     // Mirrors the server's Server::bind transport config.
     transport.datagram_send_buffer_size(2 * 1024 * 1024);
+    // 6.9: the 6e lesson's missing half — the RECEIVE side. Default
+    // (STREAM_RWND) overflows under video+audio load; overflow drops
+    // inbound datagrams, and bursty small audio packets suffer most
+    // (observed: 26% gap rate on loopback → PLC distortion).
+    transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("valid client config"),
     ));

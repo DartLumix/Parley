@@ -75,6 +75,10 @@ impl Server {
         // at Robust — the drop path becomes unreachable short of a
         // pathological stall.
         transport.datagram_send_buffer_size(2 * 1024 * 1024);
+        // 6.9: receive side of the 6e buffer fix — the server receives
+        // the sharer's firehose and forwards it; default overflows
+        // under load.
+        transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
         quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;

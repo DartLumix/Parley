@@ -29,6 +29,12 @@
 //! or music (stereo interleaved, 256 kbps, no FEC, no ladder, no AEC).
 //! --music replaces the mic with synthetic 440 Hz L / 880 Hz R test
 //! tones so stereo separation is audible and measurable.
+//!
+//! Share audio (6.9): --share-audio captures the default output
+//! (native PipeWire monitor; the portal spec has no audio) and muxes
+//! it with the mic into one stereo 256 kbps stream while sharing. A
+//! tee routes the mic: normal encoder when idle, the share-audio mux
+//! while sharing. Mic + system audio both ride FLAG_STEREO per-packet.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -69,6 +75,7 @@ struct Args {
     music: bool,
     volumes: Vec<(u32, f32)>,
     share: bool,
+    share_audio: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -80,7 +87,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut measure, mut report, mut noaec, mut music) = (false, false, false, false);
     let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
-    let mut share = false;
+    let (mut share, mut share_audio) = (false, false);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--server" => server = it.next(),
@@ -104,6 +111,7 @@ fn parse_args() -> Result<Args, String> {
                 volumes.push((id, gain.clamp(0.0, 4.0)));
             }
             "--share" => share = true,
+            "--share-audio" => share_audio = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -132,6 +140,7 @@ fn parse_args() -> Result<Args, String> {
         music,
         volumes,
         share,
+        share_audio,
     })
 }
 
@@ -177,6 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split_once(':')
         .map(|(h, _)| h.to_string())
         .unwrap_or_else(|| args.server.clone());
+
+    if args.share_audio && args.music {
+        eprintln!("--share-audio and --music are mutually exclusive; share-audio disabled");
+    }
 
     // --- connect (TOFU) ---
     let (pin, hosts_path) = cert::load_pin(&args.server)?;
@@ -329,18 +342,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_viewers = parley_client::video::new_viewers();
 
     // Feature-mismatch warnings, split per feature so every Args field
-    // stays read in every feature combination (dead_code is per-build:
-    // audio-device-only never reads `share`; video-only never reads
-    // report/noaec/music/volumes — both fired under -D warnings).
+    // stays read in every feature combination (dead_code is per-build).
     #[cfg(not(feature = "audio-device"))]
-    if args.measure || args.report || args.noaec || args.music || !args.volumes.is_empty() {
+    if args.measure
+        || args.report
+        || args.noaec
+        || args.music
+        || args.share_audio
+        || !args.volumes.is_empty()
+    {
         eprintln!(
-            "--measure/--report/--volume/--no-aec/--music need the audio-device feature; ignoring"
+            "--measure/--report/--volume/--no-aec/--music/--share-audio need the audio-device feature; ignoring"
         );
     }
     #[cfg(not(feature = "video"))]
-    if args.share {
-        eprintln!("--share needs the video feature; ignoring");
+    if args.share || args.share_audio {
+        eprintln!("--share/--share-audio need the video feature; ignoring");
     }
 
     // --- audio (feature-gated) ---
@@ -386,6 +403,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.report.then(|| _outbound_tx.clone()),
         aec_proc.clone(),
     )?;
+
+    // 6.9: share-audio plumbing — the mic tee routes mic chunks to the
+    // normal encoder, or to the share-audio mux while sharing (the mux
+    // owns the route flag; it flips back on every mux exit).
+    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+    let (mic_mux_tx, mic_mux_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(64);
+    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+    let mic_to_mux: Arc<std::sync::atomic::AtomicBool> =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+    let mic_mux_slot: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<Vec<f32>>>>> =
+        Arc::new(Mutex::new(Some(mic_mux_rx)));
+
     #[cfg(feature = "video")]
     {
         let v = video_viewers.clone();
@@ -555,7 +585,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ctrl_loss_state.store(rep.gap_rate_permille, Ordering::Relaxed);
                         }
                     }
-
                     Some(ServerBody::VideoReport(rep)) => {
                         // 6e: a viewer's video loss report steers our
                         // share bitrate. Skip own echo and unstamped.
@@ -579,10 +608,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- media: mic → [AEC/NS] → SendPipeline → datagrams ---
+    // --- media: mic → tee → [AEC/NS] → SendPipeline → datagrams ---
+    // 6.9: the tee (below) owns the capture receiver; the encoder task
+    // consumes the tee's encoder-side channel. While a share with audio
+    // runs, the tee routes mic chunks to the mux instead — the encoder
+    // task simply goes quiet (its channel empties), no teardown.
     #[cfg(feature = "audio-device")]
     {
-        let mut pcm_rx = runtime.pcm_rx;
+        // The mic tee. Encoder side is bounded(16) + try_send: a slow
+        // encoder drops stale mic chunks (live-audio discipline — same
+        // semantics the pre-tee bounded channel had).
+        let (tee_enc_tx, tee_enc_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(16);
+        {
+            let mut pcm_rx = runtime.pcm_rx;
+            #[cfg(feature = "screen-capture")]
+            let mux_tx = mic_mux_tx.clone();
+            #[cfg(feature = "screen-capture")]
+            let route = mic_to_mux.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Some(chunk) = pcm_rx.recv().await else {
+                        break;
+                    };
+                    #[cfg(feature = "screen-capture")]
+                    if route.load(Ordering::Relaxed) {
+                        let _ = mux_tx.try_send(chunk);
+                        continue;
+                    }
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                        tee_enc_tx.try_send(chunk)
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        let mut pcm_rx = tee_enc_rx;
         let conn_send = conn.clone();
         let enc_loss_state = loss_state.clone();
         let synth_music = args.music;
@@ -860,6 +921,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
     let (_events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ShareEvent>();
 
+    // 6.9: the starter task hands the share's system-audio receiver
+    // back to the command task through this channel (the starter runs
+    // in its own task around the portal dialog).
+    let (mux_spawn_tx, mut mux_spawn_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Option<std::sync::mpsc::Receiver<Vec<f32>>>>();
+    #[cfg(not(feature = "screen-capture"))]
+    {
+        drop(mux_spawn_tx);
+    }
+
     // stdin reader thread. On EOF (Ctrl-D) the sender drops and the
     // command task stops reading commands — but keeps share state
     // alive until the connection ends (a share must not die with the
@@ -905,6 +976,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut synth_share: Option<tokio::task::AbortHandle> = None;
     let share_outbound = _outbound_tx.clone();
 
+    // 6.9: share-audio state for the command task.
+    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+    let cmd_mic_mux_slot = mic_mux_slot.clone();
+    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+    let cmd_mic_route = mic_to_mux.clone();
+    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+    let mut cmd_mux_handle: Option<
+        std::thread::JoinHandle<Option<tokio::sync::mpsc::Receiver<Vec<f32>>>>,
+    > = None;
+    // 6.9: share-audio needs BOTH the mux (audio-device) and the
+    // capture plumbing (screen-capture); missing either forces it off.
+    // The binding exists only when screen-capture (its only reader)
+    // is compiled — featureless builds have no binding, no warning.
+    #[cfg(all(feature = "screen-capture", feature = "audio-device"))]
+    let cmd_share_audio = args.share_audio && !args.music;
+    #[cfg(all(feature = "screen-capture", not(feature = "audio-device")))]
+    let cmd_share_audio = false;
+
     let mut cmd_open = true;
     tokio::spawn(async move {
         loop {
@@ -926,11 +1015,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let ctrl_slot = share_ctrl.clone();
                                     let events = share_events.clone();
                                     let vloss = share_vloss.clone();
+                                    let share_audio = cmd_share_audio;
+                                    let mux_spawn = mux_spawn_tx.clone();
                                     tokio::spawn(async move {
-                                        match screen::start(conn, vloss, events.clone()).await {
+                                        let (sys_tx, sys_rx) = if share_audio {
+                                                                                    let (tx, rx) =
+                                                                                        std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+                                                                                    (
+                                                                                        Some(tx),
+                                                                                        Some(rx),
+                                                                                    )
+                                                                                } else {
+                                                                                    (None, None)
+                                                                                };
+                                        match screen::start(conn, vloss, events.clone(), sys_tx).await {
                                             Ok((handle, ctrl)) => {
                                                 *poke.lock().unwrap() = Some(handle);
                                                 *ctrl_slot.lock().unwrap() = Some(ctrl);
+                                                // The mux spawns in the command
+                                                // task (it owns the mic slot).
+                                                let _ = mux_spawn.send(sys_rx);
                                                 let _ = events.send(ShareEvent::Started);
                                             }
                                             Err(e) => {
@@ -991,6 +1095,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => cmd_open = false,
                     }
                 }
+                sys = mux_spawn_rx.recv() => {
+                    // 6.9: a share with audio started — spawn the mux
+                    // with the mic (routed to it by the tee via the
+                    // mux-owned flag).
+                    // 6.9: a share with audio started — spawn the mux
+                                        // with the mic (routed to it by the tee via the
+                                        // mux-owned flag). The collapse is split by feature
+                                        // combo so the ungated arm never touches the
+                                        // pair-gated mux types.
+                                        #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+                                        if let Some(Some(sys_rx)) = sys {
+                                            let mic_rx = cmd_mic_mux_slot.lock().unwrap().take();
+                                            cmd_mux_handle = Some(screen::spawn_share_audio_mux(
+                                                mic_rx,
+                                                sys_rx,
+                                                share_conn.clone(),
+                                                cmd_mic_route.clone(),
+                                            ));
+                                            println!("share-audio: mic + system audio mux running");
+                                            println!("share-audio: capturing the DEFAULT OUTPUT — any client playing to it on this machine (e.g. a local test listener) creates a feedback loop; route listeners to another sink");
+                                        }
+                                        #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
+                                        if let Some(sys_rx) = sys {
+                                            let _ = sys_rx;
+                                        }
+                }
                 e = events_rx.recv() => {
                     match e {
                         Some(ev) => match ev {
@@ -1020,6 +1150,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 #[cfg(all(feature = "video", not(feature = "screen-capture")))]
                                 {
                                     synth_share = None;
+                                }
+                                // 6.9: reclaim the mic from the mux (it
+                                // exits when the capture channel dropped —
+                                // the supervisor tears that down before
+                                // Ended) and hand it back for reuse.
+                                #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+                                {
+                                    if let Some(h) = cmd_mux_handle.take()
+                                                                            && let Ok(Some(rx)) = h.join()
+                                                                        {
+                                                                            *cmd_mic_mux_slot.lock().unwrap() = Some(rx);
+                                                                        }
                                 }
                                 // Only now — after the supervisor joined the
                                 // threads — can no more video datagrams exist.
