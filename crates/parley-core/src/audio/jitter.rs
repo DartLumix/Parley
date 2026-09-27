@@ -77,6 +77,8 @@ pub struct JitterBuffer {
     /// 6h: packets deliberately skipped (consumed, never emitted) to
     /// drain baked-in latency.
     pub sheds: u64,
+    /// 6.9: stream resets detected (large seq discontinuity).
+    pub resets: u64,
 }
 
 impl JitterBuffer {
@@ -93,6 +95,7 @@ impl JitterBuffer {
             dup_dropped: 0,
             overflow_dropped: 0,
             sheds: 0,
+            resets: 0,
         }
     }
 
@@ -100,7 +103,31 @@ impl JitterBuffer {
     pub fn push(&mut self, seq: u16, packet: &[u8]) {
         let now = self.tick();
         self.update_jitter(seq, now);
-
+        // 6.9: stream-reset detection. One sender_id can carry two
+        // encoding pipelines with independent seq counters — the
+        // share-audio mux and the speech encoder hand the mic between
+        // them at share start/stop. A displacement beyond the buffer's
+        // own horizon (MAX_BUFFERED packets) cannot be reorder or late
+        // delivery; it is a new stream. Re-anchor the playhead to it
+        // instead of late-dropping the whole incoming stream (share
+        // start: dead air for the connect→share gap) or PLC-walking
+        // thousands of frames to reach it (share stop, long outages).
+        if !self.fresh {
+            let ahead = seq.wrapping_sub(self.next_seq);
+            let behind = self.next_seq.wrapping_sub(seq);
+            // Serial arithmetic: exactly one of these is a true
+            // displacement (< 0x8000) unless the seqs are equal.
+            if (ahead < 0x8000 && ahead > MAX_BUFFERED as u16)
+                || (behind < 0x8000 && behind > MAX_BUFFERED as u16)
+            {
+                self.pending.clear();
+                self.next_seq = seq;
+                // Fresh playhead: disarm the shed limiter so the
+                // post-reset stream is never mistaken for backlog.
+                self.pops_since_shed = 0;
+                self.resets += 1;
+            }
+        }
         // Duplicate of a still-buffered packet: keep the newest copy.
         if let Some(entry) = self.pending.iter_mut().find(|(s, _)| *s == seq) {
             entry.1 = packet.to_vec();
@@ -496,5 +523,81 @@ mod tests {
         let (o, _) = jb.pop(); // play 3
         assert_eq!(o, PopOutcome::Packet);
         assert_eq!(jb.sheds, 0);
+    }
+
+    // ---- 6.9: stream reset on large seq discontinuity ----
+
+    #[test]
+    fn backwards_jump_resets_stream() {
+        // Share-audio start: the speech encoder ran to seq 300, the
+        // fresh mux pipeline restarts at seq 0. Pre-fix every mux
+        // packet was late-dropped for ~300 frames (6 s of dead air).
+        let mut jb = JitterBuffer::new();
+        let mut seq: u16 = 0;
+        for _ in 0..300 {
+            jb.push(seq, &pkt((seq % 256) as u8));
+            seq = seq.wrapping_add(1);
+            let _ = jb.pop();
+        }
+        assert_eq!(jb.resets, 0);
+        jb.push(0, &pkt(0));
+        assert_eq!(jb.resets, 1, "large backwards jump = new stream");
+        assert_eq!(
+            jb.late_dropped, 0,
+            "the new stream must not be eaten as late"
+        );
+        let (o, p) = jb.pop();
+        assert_eq!((o, p), (PopOutcome::Packet, Some(pkt(0))));
+        jb.push(1, &pkt(1));
+        let (o, _) = jb.pop();
+        assert_eq!(o, PopOutcome::Packet);
+    }
+
+    #[test]
+    fn forward_jump_resets_stream() {
+        // The inverted hole (share stop, or a loss burst wider than
+        // the buffer's horizon): skip to the new stream instead of
+        // PLC-walking through seconds of nothing.
+        let mut jb = JitterBuffer::new();
+        let mut seq: u16 = 0;
+        for _ in 0..100 {
+            jb.push(seq, &pkt((seq % 256) as u8));
+            seq = seq.wrapping_add(1);
+            let _ = jb.pop();
+        }
+        jb.push(5000, &pkt(0));
+        assert_eq!(jb.resets, 1);
+        let (o, p) = jb.pop();
+        assert_eq!((o, p), (PopOutcome::Packet, Some(pkt(0))));
+    }
+
+    #[test]
+    fn modest_late_packet_still_late_dropped() {
+        // Reorder/lateness within the buffer's horizon keeps the old
+        // semantics: late-drop, never a reset.
+        let mut jb = JitterBuffer::new();
+        for seq in 0..10u16 {
+            jb.push(seq, &pkt(seq as u8));
+            let _ = jb.pop();
+        }
+        jb.push(3, &pkt(3)); // next_seq = 10; 7 behind
+        assert_eq!(jb.resets, 0);
+        assert_eq!(jb.late_dropped, 1);
+    }
+
+    #[test]
+    fn reset_flushes_stale_pending() {
+        // Packets buffered past a gap (future seqs) must not survive a
+        // reset — post-re-anchor they'd be misordered garbage.
+        let mut jb = JitterBuffer::new();
+        jb.push(0, &pkt(0));
+        let _ = jb.pop(); // next_seq = 1
+        jb.push(5, &pkt(5)); // future packet, buffered
+        assert_eq!(jb.depth(), 1);
+        jb.push(1000, &pkt(9)); // far ahead → reset
+        assert_eq!(jb.resets, 1);
+        let (o, p) = jb.pop();
+        assert_eq!((o, p), (PopOutcome::Packet, Some(pkt(9))));
+        assert_eq!(jb.depth(), 0, "stale seq-5 packet must not survive");
     }
 }

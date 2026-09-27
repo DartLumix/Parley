@@ -995,6 +995,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd_share_audio = false;
 
     let mut cmd_open = true;
+    // 6.9 fix: without screen-capture the mux_spawn sender is dropped at
+    // boot and mux_spawn_rx.recv() resolves Ready(None) forever — an
+    // unguarded select arm spins this loop hot (~160% CPU across two
+    // tokio workers; hits every non-screen-capture build, i.e. viewers).
+    // Latch it exactly like cmd_open below.
+    let mut mux_open = true;
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -1095,31 +1101,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => cmd_open = false,
                     }
                 }
-                sys = mux_spawn_rx.recv() => {
-                    // 6.9: a share with audio started — spawn the mux
-                    // with the mic (routed to it by the tee via the
-                    // mux-owned flag).
-                    // 6.9: a share with audio started — spawn the mux
-                                        // with the mic (routed to it by the tee via the
-                                        // mux-owned flag). The collapse is split by feature
-                                        // combo so the ungated arm never touches the
-                                        // pair-gated mux types.
-                                        #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
-                                        if let Some(Some(sys_rx)) = sys {
-                                            let mic_rx = cmd_mic_mux_slot.lock().unwrap().take();
-                                            cmd_mux_handle = Some(screen::spawn_share_audio_mux(
-                                                mic_rx,
-                                                sys_rx,
-                                                share_conn.clone(),
-                                                cmd_mic_route.clone(),
-                                            ));
-                                            println!("share-audio: mic + system audio mux running");
-                                            println!("share-audio: capturing the DEFAULT OUTPUT — any client playing to it on this machine (e.g. a local test listener) creates a feedback loop; route listeners to another sink");
-                                        }
-                                        #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
-                                        if let Some(sys_rx) = sys {
-                                            let _ = sys_rx;
-                                        }
+                sys = mux_spawn_rx.recv(), if mux_open => {
+                    // 6.9: a share with audio started — spawn the mux with
+                    // the mic (routed to it by the tee via the mux-owned
+                    // flag). The collapse is split by feature combo so the
+                    // ungated arm never touches the pair-gated mux types.
+                    match sys {
+                        Some(sys) => {
+                            #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+                            if let Some(sys_rx) = sys {
+                                let mic_rx = cmd_mic_mux_slot.lock().unwrap().take();
+                                cmd_mux_handle = Some(screen::spawn_share_audio_mux(
+                                    mic_rx,
+                                    sys_rx,
+                                    share_conn.clone(),
+                                    cmd_mic_route.clone(),
+                                ));
+                                println!("share-audio: mic + system audio mux running");
+                                println!("share-audio: capturing the DEFAULT OUTPUT — any client playing to it on this machine (e.g. a local test listener) creates a feedback loop; route listeners to another sink");
+                            }
+                            #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
+                            {
+                                let _ = sys;
+                            }
+                        }
+                        // Closed: non-screen-capture builds drop the sender
+                        // at boot; screen-capture builds hold it inside this
+                        // task for the session. Either way, disable the arm.
+                        None => mux_open = false,
+                    }
                 }
                 e = events_rx.recv() => {
                     match e {
@@ -1156,12 +1166,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // the supervisor tears that down before
                                 // Ended) and hand it back for reuse.
                                 #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
-                                {
-                                    if let Some(h) = cmd_mux_handle.take()
-                                                                            && let Ok(Some(rx)) = h.join()
-                                                                        {
-                                                                            *cmd_mic_mux_slot.lock().unwrap() = Some(rx);
-                                                                        }
+                                if let Some(h) = cmd_mux_handle.take() {
+                                    // Never block the command task indefinitely on
+                                    // the mux: with the sys-lifetime exit fix it ends
+                                    // within ~one mic chunk of teardown, but a stuck
+                                    // mux must wedge nothing but itself.
+                                    // Pattern layers: timeout → spawn_blocking →
+                                    // std join (panic) → Option<mic rx>.
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        tokio::task::spawn_blocking(move || h.join()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(Ok(Some(rx)))) => {
+                                            *cmd_mic_mux_slot.lock().unwrap() = Some(rx);
+                                        }
+                                        Ok(Ok(Ok(None))) => {} // mux ran without a mic
+                                        Ok(Ok(Err(_))) => eprintln!(
+                                            "share-audio: mux thread panicked — mic route may be stuck"
+                                        ),
+                                        Ok(Err(_)) => eprintln!("share-audio: mux join task failed"),
+                                        Err(_) => {
+                                            // Stuck mux: at least return the mic to
+                                            // the speech path; the thread leaks parked.
+                                            cmd_mic_route.store(false, Ordering::Relaxed);
+                                            eprintln!(
+                                                "share-audio: mux did not exit within 2 s — mic restored to speech, mux leaked"
+                                            );
+                                        }
+                                    }
                                 }
                                 // Only now — after the supervisor joined the
                                 // threads — can no more video datagrams exist.

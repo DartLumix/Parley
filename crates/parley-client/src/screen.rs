@@ -863,8 +863,17 @@ pub fn spawn_share_audio_mux(
                 }
             }
 
-            // No mic, no sys, nothing buffered: the share is over.
-            if mic_rx.is_none() && !sys_alive && sys_buffer.is_empty() {
+            // The share is over when sys is gone and its tail drained.
+            // 6.9 fix: the old condition also required the mic channel
+            // closed — but the mic outlives the share (it's the client's
+            // capture), so after `stop` the mux ran forever on mic-only
+            // audio: mic_route stayed hijacked and the Ended handler's
+            // join wedged the command task (StopShare never sent, mpv
+            // never closed). sys_rx's sender is the audio capture thread,
+            // whose lifetime IS the share's (shared stop flag); PipeWire
+            // suspend is Empty, not Disconnected, so silence can't end
+            // it. The tail drains at mic pace first — clean audio outro.
+            if !sys_alive && sys_buffer.is_empty() {
                 println!("share-audio: ended");
                 break;
             }
