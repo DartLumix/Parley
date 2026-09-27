@@ -865,6 +865,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         #[cfg(feature = "audio-device")]
         let dg_mixer = shared_mixer.clone();
+        #[cfg(feature = "video")]
+        let (vdg_tx, mut vdg_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+        #[cfg(feature = "video")]
+        {
+            let v = video_viewers.clone();
+            // 3b: video decode off the datagram reader. Laptop perf:
+            // 39% of client CPU was openh264 decode, inline on the
+            // reader's worker — every IDR (tens of ms) sat between
+            // datagram arrival and the audio mixer (the rhythmic voice
+            // stutter). The reader now only hands payloads over
+            // (unbounded send is sync, never blocks; arrival rate ==
+            // wire rate == 30 fps, and the hub's consumer-side caps
+            // bound staleness). Decode runs here, on its own task.
+            tokio::spawn(async move {
+                while let Some((sender_id, payload)) = vdg_rx.recv().await {
+                    video::handle_video_datagram(&v, sender_id, &payload);
+                }
+            });
+        }
         let my_id = ok.user_id;
         let conn_recv = conn.clone();
         tokio::spawn(async move {
@@ -878,11 +897,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if m.flags & parley_proto::media::FLAG_VIDEO != 0 {
                             // server never loops a sender's own video back
                             if m.sender_id != 0 && m.sender_id != my_id {
-                                video::handle_video_datagram(
-                                    &video_viewers,
-                                    m.sender_id,
-                                    m.payload,
-                                );
+                                // 3b: hand off, never decode here (the
+                                // video task above owns decode).
+                                let _ = vdg_tx.send((m.sender_id, m.payload.to_vec()));
                             }
                             continue;
                         }

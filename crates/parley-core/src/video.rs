@@ -217,7 +217,7 @@ mod tests {
             let x = i % w;
             let y = i / w;
             let bar_x = ((t * 13) % w) as i32;
-            let in_bar = (x as i32 - bar_x).abs() < 24 && y % 4 == 0;
+            let in_bar = (x as i32 - bar_x).abs() < 24 && y.is_multiple_of(4);
             px[0] = (x * 255 / w) as u8; // B
             px[1] = (y * 255 / h) as u8; // G
             px[2] = if in_bar { 255 } else { 64 }; // R

@@ -275,6 +275,26 @@ impl VideoAssembler {
         self.output.pop_front()
     }
 
+    /// 6.9 3b: completed frames currently awaiting the decode drain.
+    pub fn output_len(&self) -> usize {
+        self.output.len()
+    }
+
+    /// 6.9 3b: index of the LAST keyframe in the completed-frame
+    /// output, if any. Pre-decode skip gate: when the display consumer
+    /// is behind, frames older than this keyframe are safe to discard
+    /// undecoded — the keyframe rebases every reference they'd need.
+    pub fn last_keyframe_output_index(&self) -> Option<usize> {
+        self.output.iter().rposition(|f| f.keyframe)
+    }
+
+    /// 6.9 3b: count a frame discarded pre-decode into the gap window —
+    /// a receiver too slow to decode IS loss signal for the sender's
+    /// ladder (Robust = smaller frames + IDR re-pokes, both help).
+    pub fn note_missed_frame(&mut self, frame_id: u32) {
+        self.note_missed(frame_id);
+    }
+
     /// 6e: video loss signal for the sender's bitrate ladder — the
     /// share of frames that could NOT be displayed over the window
     /// (aborted frames + skip cascades, deduped by frame_id), in
@@ -508,5 +528,26 @@ mod tests {
             asm.push_fragment(f);
         }
         assert_eq!(asm.gap_rate_permille(), 0);
+    }
+
+    #[test]
+    fn keyframe_output_index_tracks_backlog() {
+        let mut asm = VideoAssembler::new();
+        assert_eq!(asm.output_len(), 0);
+        assert_eq!(asm.last_keyframe_output_index(), None);
+        for f in decode_all(&fragments(0, true, &[0x11; 1000], 0)) {
+            asm.push_fragment(f);
+        }
+        for f in decode_all(&fragments(1, false, &[0x22; 900], 5)) {
+            asm.push_fragment(f);
+        }
+        for f in decode_all(&fragments(2, true, &[0x33; 900], 10)) {
+            asm.push_fragment(f);
+        }
+        assert_eq!(asm.output_len(), 3);
+        assert_eq!(asm.last_keyframe_output_index(), Some(2));
+        asm.note_missed_frame(1);
+        // 3 completed + 1 externally noted missed → 250 permille.
+        assert_eq!(asm.gap_rate_permille(), 250);
     }
 }

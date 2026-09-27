@@ -1,4 +1,4 @@
-//! Display-agnostic video receive hub (6.9 client-prep).
+//! Display-agnostic video receive hub (6.9 client-prep; 3b hardened).
 //!
 //! Owns everything PROTOCOL about receiving video: per-sender
 //! assembler + decoder, the stopped-set (straggler suppression after
@@ -8,12 +8,32 @@
 //! client's mpv feeder today, a Flutter texture bridge in Phase 7.
 //! No process spawning, no mpv, no UI in here.
 //!
+//! 3b decode discipline:
+//! - Decode runs inside `drain_streams`, called by the video task
+//!   (via push_datagram) and the display consumer (via pop_frame) —
+//!   NEVER by the datagram reader that also feeds the audio mixer: a
+//!   1080p IDR decode is tens of ms and must not sit between datagram
+//!   arrival and the jitter buffers (the laptop's rhythmic voice
+//!   stutter; perf showed 39% of client CPU in openh264 decode on the
+//!   reader's worker).
+//! - Pre-decode skip: while the display consumer is behind (decoded
+//!   queue at cap), assembled frames DEFER in the assembler's output
+//!   instead of decoding immediately. When a keyframe lands in the
+//!   backlog, everything older than the LAST keyframe is discarded
+//!   UNDECODED — the keyframe rebases every reference those P-frames
+//!   would need, and decode is the expensive part. Skips count into
+//!   the gap window: a receiver too slow to decode is real signal for
+//!   the sender's ladder (Robust = smaller frames + IDR re-pokes,
+//!   both help it catch up). Latency is bounded by the intra period,
+//!   not memory: every IDR forces a skip-drain.
+//! - Dead viewers stop paying decode: the display consumer marks the
+//!   hub stopped when a window dies — suppression holds until that
+//!   sender's next share restart (frame_id-0 keyframe).
+//!
 //! Frame queue: bounded (cap 3), drop-OLDEST on overflow — a live
 //! stream must never accumulate stale frames; a slow consumer loses
-//! the past, never the present. This is also what bounds the
-//! viewer-side queuing that dominated the 5e glass-to-glass tail.
-//! Decode happens inline at push time (called from the client's
-//! datagram reader), same cost profile as the pre-6.9 Viewer.
+//! the past, never the present. This also bounds the viewer-side
+//! queuing that dominated the 5e glass-to-glass tail.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
@@ -38,6 +58,8 @@ const FRAME_QUEUE_CAP: usize = 3;
 struct RecvStream {
     assembler: VideoAssembler,
     decoder: VideoDecoder,
+    /// 3b: frames discarded assembled-but-undecoded (consumer behind).
+    predecode_skipped: u64,
 }
 
 #[derive(Default)]
@@ -51,8 +73,8 @@ struct HubInner {
 }
 
 /// Multi-sender video receive hub. Shared as `SharedVideoReceiveHub`;
-/// `push_datagram` from the datagram reader, `pop_frame` from exactly
-/// one consumer thread.
+/// `push_datagram` from the video task, `pop_frame` from exactly one
+/// consumer thread.
 pub struct VideoReceiveHub {
     inner: Mutex<HubInner>,
     frame_ready: Condvar,
@@ -83,79 +105,131 @@ impl VideoReceiveHub {
     /// Feed one FLAG_VIDEO datagram payload (the media header already
     /// stripped — same contract the old Viewer had). Malformed
     /// fragments drop silently; the assembler's stats carry the
-    /// accounting.
+    /// accounting. Assembly is cheap; decode happens in
+    /// `drain_streams`, on the caller's thread — the client calls this
+    /// from a dedicated video task, never the audio datagram reader.
     pub fn push_datagram(&self, sender_id: u32, payload: &[u8]) {
         let Ok(frag) = decode_fragment(payload) else {
             return;
         };
         let mut inner = self.inner.lock().unwrap();
-        // Split borrows: streams / stopped / queue are used concurrently.
-        let HubInner {
-            streams,
-            stopped,
-            queue,
-        } = &mut *inner;
-        if stopped.contains(&sender_id) {
-            if !frag.keyframe {
-                return; // straggler from the stopped share
-            }
-            // A NEW share always begins with an encoder-fresh IDR at
-            // frame_id 0 (6a restart: fresh encoder, frame_id resets).
-            // A straggler IDR from the DYING share carries a high
-            // frame_id — it must not resurrect a stopped viewer (the
-            // "frozen frame after stop" bug, caught in the 6.9 run).
-            if frag.frame_id != 0 {
-                return; // late keyframe from the old share
-            }
-            stopped.remove(&sender_id); // a new share genuinely begins
-        }
-        if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(sender_id) {
-            match VideoDecoder::new() {
-                Ok(decoder) => {
-                    e.insert(RecvStream {
-                        assembler: VideoAssembler::new(),
-                        decoder,
-                    });
+        {
+            let HubInner {
+                streams, stopped, ..
+            } = &mut *inner;
+            if stopped.contains(&sender_id) {
+                if !frag.keyframe {
+                    return; // straggler from the stopped share
                 }
-                Err(e) => {
-                    eprintln!("video: decoder init failed for user {sender_id}: {e}");
-                    return;
+                // A NEW share always begins with an encoder-fresh IDR at
+                // frame_id 0 (6a restart: fresh encoder, frame_id resets).
+                // A straggler IDR from the DYING share carries a high
+                // frame_id — it must not resurrect a stopped viewer (the
+                // "frozen frame after stop" bug, caught in the 6.9 run).
+                if frag.frame_id != 0 {
+                    return; // late keyframe from the old share
                 }
+                stopped.remove(&sender_id); // a new share genuinely begins
             }
-        }
-        let stream = streams.get_mut(&sender_id).expect("just inserted");
-        stream.assembler.push_fragment(frag);
-        let mut pushed = false;
-        while let Some(frame) = stream.assembler.pop_frame() {
-            match stream.decoder.decode_with_dims(&frame.data) {
-                Ok(Some((rgb, w, h))) => {
-                    queue.push_back(VideoFrame {
-                        sender_id,
-                        rgb,
-                        width: w,
-                        height: h,
-                    });
-                    while queue.len() > FRAME_QUEUE_CAP {
-                        queue.pop_front();
+            if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(sender_id) {
+                match VideoDecoder::new() {
+                    Ok(decoder) => {
+                        e.insert(RecvStream {
+                            assembler: VideoAssembler::new(),
+                            decoder,
+                            predecode_skipped: 0,
+                        });
                     }
-                    pushed = true;
+                    Err(e) => {
+                        eprintln!("video: decoder init failed for user {sender_id}: {e}");
+                        return;
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => eprintln!("video decode error: {e}"),
             }
+            let stream = streams.get_mut(&sender_id).expect("just inserted");
+            stream.assembler.push_fragment(frag);
         }
+        let pushed = Self::drain_streams(&mut inner);
         drop(inner);
         if pushed {
             self.frame_ready.notify_one();
         }
     }
 
+    /// Decode drain (3b): pull assembled frames through the decoders
+    /// into the bounded display queue, honoring deferral and the
+    /// pre-decode skip. Returns true when any frame was decoded (the
+    /// caller notifies the consumer).
+    ///
+    /// Rules, per stream:
+    /// - Consumer behind (queue at cap) + backlog ≤ 1 → DEFER: the
+    ///   frame waits in the assembler output; one frame of latency,
+    ///   decode off the critical path until it matters.
+    /// - Multi-frame backlog (we fell behind) + a keyframe in it →
+    ///   everything older than the LAST keyframe is discarded
+    ///   undecoded and counted into the gap window; decode resumes at
+    ///   the keyframe.
+    /// - Multi-frame backlog without a keyframe → decode in order
+    ///   (references must be preserved); the queue's drop-oldest is
+    ///   the backstop. Bounded: the next IDR forces a skip-drain.
+    /// - Consumer keeping up → decode everything in order (identical
+    ///   to the pre-3b behavior).
+    fn drain_streams(inner: &mut HubInner) -> bool {
+        let HubInner { streams, queue, .. } = &mut *inner;
+        let mut pushed = false;
+        for (&sender_id, stream) in streams.iter_mut() {
+            loop {
+                if queue.len() >= FRAME_QUEUE_CAP && stream.assembler.output_len() <= 1 {
+                    break; // deferred: consumer behind, nothing to judge yet
+                }
+                if stream.assembler.output_len() > 1
+                    && let Some(k) = stream.assembler.last_keyframe_output_index()
+                    && k > 0
+                {
+                    for _ in 0..k {
+                        if let Some(f) = stream.assembler.pop_frame() {
+                            stream.predecode_skipped += 1;
+                            stream.assembler.note_missed_frame(f.frame_id);
+                        }
+                    }
+                }
+                let Some(frame) = stream.assembler.pop_frame() else {
+                    break;
+                };
+                match stream.decoder.decode_with_dims(&frame.data) {
+                    Ok(Some((rgb, w, h))) => {
+                        queue.push_back(VideoFrame {
+                            sender_id,
+                            rgb,
+                            width: w,
+                            height: h,
+                        });
+                        while queue.len() > FRAME_QUEUE_CAP {
+                            queue.pop_front();
+                        }
+                        pushed = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("video decode error: {e}"),
+                }
+            }
+        }
+        pushed
+    }
+
     /// Next decoded frame, waiting up to `timeout`. The consumer's
-    /// heartbeat: wake, drain, repeat.
+    /// heartbeat: wake, drain, repeat. Freed queue space resumes a
+    /// deferred backlog — the drain's skip gate sheds it to its newest
+    /// keyframe, so a recovered consumer does not inherit the stall as
+    /// permanent latency (the video analog of 6h's audio skip-shed,
+    /// gated on keyframes because P-frames cannot be merged).
     pub fn pop_frame(&self, timeout: Duration) -> Option<VideoFrame> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(f) = inner.queue.pop_front() {
+                if inner.queue.len() < FRAME_QUEUE_CAP {
+                    let _ = Self::drain_streams(&mut inner);
+                }
                 return Some(f);
             }
             let (guard, status) = self.frame_ready.wait_timeout(inner, timeout).unwrap();
@@ -168,6 +242,8 @@ impl VideoReceiveHub {
 
     /// ShareStopped seen for this sender: drop their receive state and
     /// suppress stragglers until their next keyframe (a new share).
+    /// Also used by the display consumer for a dead viewer (3b): a
+    /// closed window stops paying decode until the sender restarts.
     pub fn mark_stopped(&self, sender_id: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.streams.remove(&sender_id);
@@ -197,10 +273,10 @@ impl VideoReceiveHub {
             .max()
     }
 
-    /// Cumulative per-sender assembler stats, sorted by sender id:
-    /// (sender_id, frames_completed, frames_dropped, fragments_skipped)
-    /// — for the client's stats line.
-    pub fn stats(&self) -> Vec<(u32, u64, u64, u64)> {
+    /// Cumulative per-sender stats, sorted by sender id:
+    /// (sender_id, frames_completed, frames_dropped, fragments_skipped,
+    /// predecode_skipped) — for the client's stats line.
+    pub fn stats(&self) -> Vec<(u32, u64, u64, u64, u64)> {
         let inner = self.inner.lock().unwrap();
         let mut v: Vec<_> = inner
             .streams
@@ -211,6 +287,7 @@ impl VideoReceiveHub {
                     s.assembler.frames_completed,
                     s.assembler.frames_dropped,
                     s.assembler.fragments_skipped,
+                    s.predecode_skipped,
                 )
             })
             .collect();
@@ -317,9 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn slow_consumer_loses_past_not_present() {
-        // Five keyframes pushed with no consumer: cap 3 → the queue
-        // holds the LAST three. Frames are color-coded to prove it.
+    fn slow_consumer_sheds_to_newest_keyframe() {
+        // 3b: consumer absent — the queue fills to cap; further frames
+        // defer; the next keyframe's drain SKIPS the stale past
+        // undecoded (a slow consumer loses the past, never the present,
+        // and pays no decode for what it cannot display). The queue
+        // ends holding frames [1, 2, 4]: frame 3 was shed pre-decode at
+        // frame 4's keyframe, frame 0 drop-oldest'd.
         let mut enc = crate::video::create_encoder(320, 240).unwrap();
         let hub = VideoReceiveHub::new();
         for i in 0..5u8 {
@@ -329,7 +410,7 @@ mod tests {
                 hub.push_datagram(3, &p);
             }
         }
-        for expect in [2u8, 3, 4] {
+        for expect in [1u8, 2, 4] {
             let f = hub.pop_frame(Duration::from_millis(500)).expect("frame");
             // write_rgb8 output order: R, G, B — channel 0 is RED
             // (5b ledger). Flat color v → (R,G,B) = (3v mod 256, v, v);
@@ -342,6 +423,57 @@ mod tests {
             );
         }
         assert!(hub.pop_frame(Duration::from_millis(50)).is_none());
+        let &(_, completed, _dropped, _frags, predecode) = &hub.stats()[0];
+        assert_eq!(completed, 5);
+        assert_eq!(predecode, 1, "frame 3 must be shed undecoded");
+    }
+
+    #[test]
+    fn predecode_skip_when_consumer_behind() {
+        // Queue at cap; a P-frame defers; a keyframe completing behind
+        // it triggers the drain, which discards the P-frame UNDECODED
+        // (rebased at the keyframe) and counts it into the gap window —
+        // the slow-receiver signal the sender's ladder consumes.
+        let mut enc = crate::video::create_encoder(320, 240).unwrap();
+        let hub = VideoReceiveHub::new();
+        // Fill the decoded queue to cap: three standalone keyframes.
+        for i in 0..3u32 {
+            enc.force_keyframe();
+            let (annexb, _) = enc
+                .encode_bgra(&flat_bgra(320, 240, (i * 40) as u8))
+                .unwrap();
+            for p in payloads(&fragment_frame(i, true, &annexb, 0, 0, 42)) {
+                hub.push_datagram(3, &p);
+            }
+        }
+        // P-frame: queue full, single-frame backlog → deferred.
+        let (p, _) = enc.encode_bgra(&noisy_bgra(320, 240, 9)).unwrap();
+        for p in payloads(&fragment_frame(3, false, &p, 0, 0, 42)) {
+            hub.push_datagram(3, &p);
+        }
+        // Keyframe behind it: multi-frame backlog + keyframe → the P
+        // is skipped undecoded; the keyframe decodes (drop-oldest).
+        enc.force_keyframe();
+        let (k, _) = enc.encode_bgra(&flat_bgra(320, 240, 200)).unwrap();
+        for p in payloads(&fragment_frame(4, true, &k, 0, 0, 42)) {
+            hub.push_datagram(3, &p);
+        }
+        let stats = hub.stats();
+        assert_eq!(stats.len(), 1);
+        let &(_, completed, dropped, frag_skipped, predecode) = &stats[0];
+        assert_eq!(completed, 5, "all five frames assembled");
+        assert_eq!(dropped, 0);
+        assert_eq!(frag_skipped, 0);
+        assert_eq!(
+            predecode, 1,
+            "the stale P-frame must be discarded undecoded"
+        );
+        // Gap window: 5 completed + 1 noted-missed → ~167 permille.
+        let rate = hub.gap_rate_permille().expect("active stream");
+        assert!(
+            (100..=250).contains(&rate),
+            "expected ~167 permille, got {rate}"
+        );
     }
 
     #[test]

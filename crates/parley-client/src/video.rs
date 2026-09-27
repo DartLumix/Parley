@@ -335,6 +335,10 @@ fn mpv_consumer(
         if feed_mpv(mpv, &frame.rgb) {
             *shown.lock().unwrap().entry(frame.sender_id).or_insert(0) += 1;
         } else {
+            // 3b: a dead viewer stops paying decode too — hub-side
+            // suppression holds until the sender's next share restart
+            // (frame_id-0 keyframe), so a closed window costs nothing.
+            hub.mark_stopped(frame.sender_id);
             dead.lock().unwrap().insert(frame.sender_id);
             let _ = mpv.try_wait(); // reap if already exited
             println!(
@@ -378,14 +382,15 @@ pub fn remove_viewer(viewers: &Viewers, sender_id: u32) {
 pub fn stats_line(viewers: &Viewers) -> String {
     let stats = viewers.hub.stats();
     if stats.is_empty() {
+        viewers.shown.lock().unwrap().clear();
         return "video: no active shares".to_string();
     }
     let mut shown = viewers.shown.lock().unwrap();
     let parts: Vec<String> = stats
         .iter()
-        .map(|&(id, _completed, dropped, skipped)| {
+        .map(|&(id, _completed, dropped, skipped, shed)| {
             format!(
-                "user {id}: {} shown, {dropped} dropped, {skipped} skipped",
+                "user {id}: {} shown, {dropped} dropped, {skipped} skipped, {shed} shed",
                 shown.get(&id).copied().unwrap_or(0)
             )
         })
