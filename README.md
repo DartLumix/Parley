@@ -36,6 +36,7 @@ Voice is the product; everything else grows later.
 | 5d | Portal screen capture (ashpd + PipeWire) | ✅ |
 | 5e | Encoder trait, rate pacing, glass-to-glass measured | ✅ |
 | 6 | Backend hardening & client-readiness | ✅ |
+| 6.9 | Client-prep — share audio, receiver hardening, latency re-measure | ✅ |
 | 7+ | Flutter client, camera, platforms | ⏳ |
 
 ---
@@ -151,6 +152,13 @@ Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] 6g Performance budgets verified (RSS / 10 talkers / login / binary)
 - [x] 6h Robustness — restart persistence, malformed input, netem matrix
 
+
+### Phase 6.9 — Client-Prep: Share Audio & Receiver Hardening
+- [x] Share audio — default-output capture (native PipeWire `stream.capture.sink`), mic-clocked mux into one stereo 256 kbps stream
+- [x] Handover correctness — jitter stream-reset on seq discontinuity; mux lifetime = sys-capture lifetime
+- [x] Receiver hardening — decode off the audio datagram reader, pre-decode skip-shed, dead-viewer suppression (the recorded "95% CPU / three defects" verdict was four stacked bugs, not a CPU floor)
+- [x] Latency re-measured — glass-to-glass ~250 ms LAN (budget met, tail bounded); share-audio 138.5 ms median via a foreign-VPS internet path
+
 ### Phase 7+ — Client & Beyond
 - [ ] Flutter client bring-up (app/, flutter_rust_bridge over parley-core)
 - [ ] Android / Windows / iOS bring-up
@@ -188,6 +196,7 @@ cargo run -p parley-client --features audio-device -- --server 127.0.0.1:4443 \
 cargo run --release -p parley-client --features audio-device,screen-capture -- \
     --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender: portal picker pops up
 #    sender: type "share" / "stop" to start/stop without restarting
+#    share audio: append --share-audio (captures the DEFAULT OUTPUT — a local listener must play to another sink, else feedback)
 cargo run --release -p parley-client --features video -- \
     --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens; video-only build)
     # token relogin: password login prints a token — rerun with --token <tok> instead of --user/--password
@@ -213,10 +222,12 @@ on startup is **permanent** — that's the value you share with your team.
 | Metric | Budget |
 |:---|:---|
 | Voice mouth-to-ear | ≤ 150 ms / 80 ms LAN — **current: digital 49.8 ms median / 50.6 max (105 samples, 21.3 ms render period); mouth-to-ear ≈ 70–100 ms — budgets met** |
-| Screen share glass-to-glass | ≤ 250 ms — **current: ~250 ms avg / 400 ms tail (1080p30 software, mpv test viewer); remaining latency is viewer-side queuing — the real client owns this budget** |
+| Screen share glass-to-glass | ≤ 250 ms — **met: ~250 ms avg LAN (stopwatch method, 1080p30 software, mpv test viewer); tail bounded by the frame-queue cap + pre-decode shed (310 ms median / 350 max via a foreign-VPS internet path, both ends home Wi-Fi); Phase 7's real display owns this budget from here** |
+| Share-audio tap-to-speaker | ≤ 250 ms — **met: 138.5 ms median / 187 ms max (default-output monitor → laptop speaker, foreign-VPS internet path)** |
+| Low-end receiver (full 1080p30 + stereo + AEC) | ≤ 1 core — **current: ~0.5 core client + ~0.1 core mpv on the 2-core laptop** |
 | Server idle RSS | ≤ 64 MB — **current: 54.8 MB (info logging), 48.1 MB at RUST_LOG=warn; container 1.4 MiB idle** |
 | 10 active talkers | ≤ 50% of one core — **current: 43% at 10× occupancy (10 senders × 10 recipients, 5000 forwarded pps, loopback; 100% delivery; perf-profiled: cost is per-datagram kernel sendmsg + loopback softirq, not parley code)** |
-| Login → connected | ≤ 400 ms — **current: 75 ms (loopback)** |
+| Login → connected | ≤ 400 ms — **current: 70 ms (loopback); 1.0–2.2 s laptop first join over Wi-Fi/internet (re-login with --token is faster)** |
 | Binary size | ≤ 15 MB — **current: 6.2 MB binary; docker image 9.6 MB** |
 
 A regression is a bug, tracked as one.
