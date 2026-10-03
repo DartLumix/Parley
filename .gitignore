@@ -1,3 +1,5 @@
 /target
 /data
 .env
+app/build/
+app/.dart_tool/

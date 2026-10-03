@@ -5,6 +5,7 @@ members = [
     "crates/parley-core",
     "crates/parley-server",
     "crates/parley-client",
+    "app/rust"
 ]
 
 

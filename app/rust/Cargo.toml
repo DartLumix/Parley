@@ -1,0 +1,13 @@
+[package]
+name = "parley_flutter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.13.0"
+parley-core = { path = "../../crates/parley-core", default-features = false }
+parley-proto = { path = "../../crates/parley-proto" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
