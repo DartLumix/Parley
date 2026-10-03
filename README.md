@@ -136,8 +136,8 @@ Every message carries version + capability bits — later features are additive,
 - [x] Glass-to-glass measured — **~250 ms avg / 400 ms tail** (1080p30 software, mpv
       test viewer). Budget straddled: the remaining latency is viewer-side queuing —
       the real client owns this budget from here
-- [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug — handoff §8)
-- [ ] 1440p60 / 1080p60 (parked: software ceiling ~32 fps @ 1080p; needs hardware)
+- [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug — re-verified on current kernel/mesa, test-encode hangs the GPU; retried on hardware change or driver fix — handoff §8)
+- [ ] 1440p60 / 1080p60 (parked: blocked on hardware encode; software ceiling ~32 fps @ 1080p)
 - [x] Loss-driven video bitrate ladder — landed in 6e
 
 ### Phase 6 — Backend Hardening & Client-Readiness 
