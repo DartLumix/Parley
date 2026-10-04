@@ -7,9 +7,9 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `connect_async`, `now_ms`, `read_frame`, `rt`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LiveSession`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
+// These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `now_ms`, `read_frame`, `rt`, `send_command`, `to_client_body`, `to_event`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// Connect + authenticate. Blocks until the handshake completes (runs
 /// on an FRB worker thread; Dart sees a Future).
@@ -23,7 +23,12 @@ Future<SessionInfo> connect({
   password: password,
 );
 
-/// Liveness: the drain reader's flag (control stream still open).
+/// Register a Dart-side event stream for this session. The Dart
+/// wrapper exposes this as a Stream — every SessionEvent flows to it.
+Stream<SessionEvent> events({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionEvents(sessionId: sessionId);
+
+/// Liveness: the reader task's flag (control stream still open).
 Future<bool> isConnected({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionIsConnected(sessionId: sessionId);
 
@@ -33,7 +38,201 @@ Future<bool> isConnected({required int sessionId}) =>
 Future<void> disconnect({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionDisconnect(sessionId: sessionId);
 
-/// Connected-session snapshot returned to Dart.
+/// Request the channel listing (response: "channel_list" event).
+Future<void> listChannels({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionListChannels(sessionId: sessionId);
+
+/// Join a voice channel (self-confirmation: "voice_state" event).
+Future<void> joinVoice({required int sessionId, required BigInt channelId}) =>
+    RustLib.instance.api.crateApiSessionJoinVoice(
+      sessionId: sessionId,
+      channelId: channelId,
+    );
+
+/// Leave the current voice channel.
+Future<void> leaveVoice({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionLeaveVoice(sessionId: sessionId);
+
+/// Send a chat message (echo confirmation: "chat" event).
+Future<void> sendChat({
+  required int sessionId,
+  required BigInt channelId,
+  required String text,
+}) => RustLib.instance.api.crateApiSessionSendChat(
+  sessionId: sessionId,
+  channelId: channelId,
+  text: text,
+);
+
+/// Fetch chat history (response: "history" event, newest-last).
+Future<void> fetchHistory({
+  required int sessionId,
+  required BigInt channelId,
+  required int limit,
+  required BigInt beforeMessageId,
+}) => RustLib.instance.api.crateApiSessionFetchHistory(
+  sessionId: sessionId,
+  channelId: channelId,
+  limit: limit,
+  beforeMessageId: beforeMessageId,
+);
+
+/// Request the presence listing (response: "presence" event).
+Future<void> requestPresence({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionRequestPresence(sessionId: sessionId);
+
+/// One row of a channel listing.
+class ChannelInfo {
+  final BigInt id;
+  final String name;
+
+  /// "speech" | "music" (ChannelMode mapped to a string: plain types
+  /// only across the bridge).
+  final String mode;
+
+  const ChannelInfo({required this.id, required this.name, required this.mode});
+
+  @override
+  int get hashCode => id.hashCode ^ name.hashCode ^ mode.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ChannelInfo &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          name == other.name &&
+          mode == other.mode;
+}
+
+/// One chat row (live or history).
+class ChatEntry {
+  final BigInt messageId;
+  final BigInt channelId;
+  final int userId;
+  final String username;
+  final String text;
+  final BigInt timestampMs;
+
+  const ChatEntry({
+    required this.messageId,
+    required this.channelId,
+    required this.userId,
+    required this.username,
+    required this.text,
+    required this.timestampMs,
+  });
+
+  @override
+  int get hashCode =>
+      messageId.hashCode ^
+      channelId.hashCode ^
+      userId.hashCode ^
+      username.hashCode ^
+      text.hashCode ^
+      timestampMs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ChatEntry &&
+          runtimeType == other.runtimeType &&
+          messageId == other.messageId &&
+          channelId == other.channelId &&
+          userId == other.userId &&
+          username == other.username &&
+          text == other.text &&
+          timestampMs == other.timestampMs;
+}
+
+/// One row of a presence listing.
+class PresenceEntry {
+  final int userId;
+  final String username;
+
+  const PresenceEntry({required this.userId, required this.username});
+
+  @override
+  int get hashCode => userId.hashCode ^ username.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PresenceEntry &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          username == other.username;
+}
+
+/// Everything the server can tell the UI, as one flat event struct.
+/// `kind` is one of: "channel_list", "presence", "chat", "history",
+/// "voice_state", "voice_states", "session_closed".
+class SessionEvent {
+  final int sessionId;
+  final String kind;
+
+  /// channel_list
+  final List<ChannelInfo> channels;
+
+  /// presence
+  final List<PresenceEntry> users;
+
+  /// chat / history
+  final List<ChatEntry> messages;
+
+  /// voice_state / voice_states (the single-row fields)
+  final int userId;
+  final String username;
+  final BigInt channelId;
+  final bool joined;
+
+  /// voice_states (the full snapshot)
+  final List<VoiceEntry> states;
+
+  const SessionEvent({
+    required this.sessionId,
+    required this.kind,
+    required this.channels,
+    required this.users,
+    required this.messages,
+    required this.userId,
+    required this.username,
+    required this.channelId,
+    required this.joined,
+    required this.states,
+  });
+
+  @override
+  int get hashCode =>
+      sessionId.hashCode ^
+      kind.hashCode ^
+      channels.hashCode ^
+      users.hashCode ^
+      messages.hashCode ^
+      userId.hashCode ^
+      username.hashCode ^
+      channelId.hashCode ^
+      joined.hashCode ^
+      states.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SessionEvent &&
+          runtimeType == other.runtimeType &&
+          sessionId == other.sessionId &&
+          kind == other.kind &&
+          channels == other.channels &&
+          users == other.users &&
+          messages == other.messages &&
+          userId == other.userId &&
+          username == other.username &&
+          channelId == other.channelId &&
+          joined == other.joined &&
+          states == other.states;
+}
+
+/// Connected-session snapshot returned at connect time.
 class SessionInfo {
   final int sessionId;
   final int userId;
@@ -67,4 +266,29 @@ class SessionInfo {
           sessionToken == other.sessionToken &&
           server == other.server &&
           fingerprint == other.fingerprint;
+}
+
+/// One voice-state snapshot row.
+class VoiceEntry {
+  final int userId;
+  final BigInt channelId;
+  final bool joined;
+
+  const VoiceEntry({
+    required this.userId,
+    required this.channelId,
+    required this.joined,
+  });
+
+  @override
+  int get hashCode => userId.hashCode ^ channelId.hashCode ^ joined.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VoiceEntry &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          channelId == other.channelId &&
+          joined == other.joined;
 }

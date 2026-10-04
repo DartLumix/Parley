@@ -25,13 +25,45 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   });
 
   @protected
+  AnyhowException dco_decode_AnyhowException(dynamic raw);
+
+  @protected
+  RustStreamSink<SessionEvent> dco_decode_StreamSink_session_event_Sse(
+    dynamic raw,
+  );
+
+  @protected
   String dco_decode_String(dynamic raw);
 
   @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  ChannelInfo dco_decode_channel_info(dynamic raw);
+
+  @protected
+  ChatEntry dco_decode_chat_entry(dynamic raw);
+
+  @protected
+  List<ChannelInfo> dco_decode_list_channel_info(dynamic raw);
+
+  @protected
+  List<ChatEntry> dco_decode_list_chat_entry(dynamic raw);
+
+  @protected
+  List<PresenceEntry> dco_decode_list_presence_entry(dynamic raw);
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<VoiceEntry> dco_decode_list_voice_entry(dynamic raw);
+
+  @protected
+  PresenceEntry dco_decode_presence_entry(dynamic raw);
+
+  @protected
+  SessionEvent dco_decode_session_event(dynamic raw);
 
   @protected
   SessionInfo dco_decode_session_info(dynamic raw);
@@ -40,10 +72,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int dco_decode_u_32(dynamic raw);
 
   @protected
+  BigInt dco_decode_u_64(dynamic raw);
+
+  @protected
   int dco_decode_u_8(dynamic raw);
 
   @protected
   void dco_decode_unit(dynamic raw);
+
+  @protected
+  VoiceEntry dco_decode_voice_entry(dynamic raw);
+
+  @protected
+  AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer);
+
+  @protected
+  RustStreamSink<SessionEvent> sse_decode_StreamSink_session_event_Sse(
+    SseDeserializer deserializer,
+  );
 
   @protected
   String sse_decode_String(SseDeserializer deserializer);
@@ -52,7 +98,33 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  ChannelInfo sse_decode_channel_info(SseDeserializer deserializer);
+
+  @protected
+  ChatEntry sse_decode_chat_entry(SseDeserializer deserializer);
+
+  @protected
+  List<ChannelInfo> sse_decode_list_channel_info(SseDeserializer deserializer);
+
+  @protected
+  List<ChatEntry> sse_decode_list_chat_entry(SseDeserializer deserializer);
+
+  @protected
+  List<PresenceEntry> sse_decode_list_presence_entry(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  List<VoiceEntry> sse_decode_list_voice_entry(SseDeserializer deserializer);
+
+  @protected
+  PresenceEntry sse_decode_presence_entry(SseDeserializer deserializer);
+
+  @protected
+  SessionEvent sse_decode_session_event(SseDeserializer deserializer);
 
   @protected
   SessionInfo sse_decode_session_info(SseDeserializer deserializer);
@@ -61,13 +133,31 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int sse_decode_u_32(SseDeserializer deserializer);
 
   @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_u_8(SseDeserializer deserializer);
 
   @protected
   void sse_decode_unit(SseDeserializer deserializer);
 
   @protected
+  VoiceEntry sse_decode_voice_entry(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer);
+
+  @protected
+  void sse_encode_AnyhowException(
+    AnyhowException self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_StreamSink_session_event_Sse(
+    RustStreamSink<SessionEvent> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_String(String self, SseSerializer serializer);
@@ -76,10 +166,46 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_channel_info(ChannelInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_chat_entry(ChatEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_channel_info(
+    List<ChannelInfo> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_chat_entry(
+    List<ChatEntry> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_presence_entry(
+    List<PresenceEntry> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_list_voice_entry(
+    List<VoiceEntry> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_presence_entry(PresenceEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_session_event(SessionEvent self, SseSerializer serializer);
 
   @protected
   void sse_encode_session_info(SessionInfo self, SseSerializer serializer);
@@ -88,10 +214,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
   void sse_encode_u_8(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_voice_entry(VoiceEntry self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);

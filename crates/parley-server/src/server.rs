@@ -36,8 +36,6 @@ impl Server {
 
         let db = Db::open(&config.data_dir.join("parley.db"))?;
         db.bootstrap_admin()?;
-
-        db.bootstrap_admin()?;
         db.purge_stale_sessions()?;
 
         let (identity, _new) = tls::load_or_generate(&config.data_dir)?;
@@ -201,6 +199,12 @@ async fn serve(
         session: 0, // assigned by register()
     });
 
+    // Presence push on join. The new client's own copy queues in
+    // event_rx and is only written by the session loop below — which
+    // starts after AuthOk — so its wire ordering stays auth-then-
+    // presence; everyone else gets it immediately.
+    registry.broadcast(presence_message(registry));
+
     session::write_message(
         &mut tx,
         &AuthOk {
@@ -278,6 +282,12 @@ async fn serve(
     // and voice.leave would be booted from voice; coupling the two
     // locks isn't worth it.)
     let still_current = registry.unregister_if(info.id, session_gen);
+    if still_current {
+        // Presence push on leave: the fresh list (dying user already
+        // unregistered) reaches the survivors. Generation-guarded — a
+        // replaced session's death must not un-list its successor.
+        registry.broadcast(presence_message(registry));
+    }
     if still_current && voice.leave(info.id).is_some() {
         registry.broadcast(ServerMessage {
             body: Some(ServerBody::VoiceState(PbVoiceState {
@@ -320,22 +330,7 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::PresenceRequest(_)) => {
-            let users = registry.online_users();
-            session::write_message(
-                tx,
-                &ServerMessage {
-                    body: Some(ServerBody::PresenceList(PresenceList {
-                        users: users
-                            .into_iter()
-                            .map(|(id, name)| PresenceUser {
-                                user_id: id,
-                                username: name,
-                            })
-                            .collect(),
-                    })),
-                },
-            )
-            .await?;
+            session::write_message(tx, &presence_message(registry)).await?;
         }
 
         Some(ClientBody::ListChannels(_)) => {
@@ -565,6 +560,25 @@ fn route_datagram(
         if member != sender.id {
             registry.send_datagram(member, forwarded.clone());
         }
+    }
+}
+
+/// Presence push: the PresenceList for the current online set,
+/// broadcast on every session start/end so connected clients never
+/// hold a stale user list. Presence was pull-only until the Flutter
+/// app became the first consumer and found the gap.
+fn presence_message(registry: &SessionRegistry) -> ServerMessage {
+    let users = registry.online_users();
+    ServerMessage {
+        body: Some(ServerBody::PresenceList(PresenceList {
+            users: users
+                .into_iter()
+                .map(|(id, name)| PresenceUser {
+                    user_id: id,
+                    username: name,
+                })
+                .collect(),
+        })),
     }
 }
 

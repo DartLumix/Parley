@@ -38,8 +38,37 @@ async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientB
         .unwrap();
 }
 
+/// Read the next server message, skipping ambient presence pushes
+/// (the server broadcasts PresenceList on every session start/end —
+/// 7.x presence-push). Pushes are lifecycle noise like HeartbeatAcks;
+/// the one test that inspects presence reads raw.
 async fn read_server_msg(rx: &mut quinn::RecvStream) -> parley_proto::ServerMessage {
-    session::read_message(rx).await.unwrap()
+    loop {
+        let msg: ServerMessage = session::read_message(rx).await.unwrap();
+        match msg.body {
+            Some(ServerBody::PresenceList(_)) => continue,
+            _ => return msg,
+        }
+    }
+}
+
+/// Assert that nothing but ambient presence pushes arrives within
+/// `dur`. Used where tests previously wrapped a bare read in
+/// `timeout(...)` + `assert!(is_err())` — the presence-push broadcast
+/// made that pattern false-positive on session churn mid-test.
+async fn expect_silence(rx: &mut quinn::RecvStream, dur: Duration) {
+    let deadline = tokio::time::Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, session::read_message::<ServerMessage>(rx)).await {
+            Err(_) => return, // deadline hit: silence confirmed
+            Ok(Err(e)) => panic!("stream error during silence check: {e}"),
+            Ok(Ok(msg)) => match msg.body {
+                Some(ServerBody::PresenceList(_)) => continue, // ambient
+                other => panic!("expected silence, got {other:?}"),
+            },
+        }
+    }
 }
 
 async fn expect_voice_state(
@@ -306,7 +335,7 @@ async fn heartbeat_roundtrip() {
     .await
     .unwrap();
 
-    let response: ServerMessage = session::read_message(&mut rx).await.unwrap();
+    let response: ServerMessage = read_server_msg(&mut rx).await;
     match response.body {
         Some(ServerBody::HeartbeatAck(ack)) => {
             assert_eq!(ack.client_time_ms, sent_at);
@@ -343,7 +372,10 @@ async fn presence_shows_connected_users() {
     let (conn_a, mut tx_a, mut rx_a) = connect_and_auth(&endpoint, addr, "alice", "pass_a").await;
     let (conn_b, _tx_b, _rx_b) = connect_and_auth(&endpoint, addr, "bob", "pass_b").await;
 
-    // Alice requests presence
+    // Alice requests presence. The pull response and the join-pushes
+    // are indistinguishable by type, so read raw PresenceLists until
+    // one carries the full online set — pushes converge to it and the
+    // pull confirms it.
     session::write_message(
         &mut tx_a,
         &ClientMessage {
@@ -353,15 +385,29 @@ async fn presence_shows_connected_users() {
     .await
     .unwrap();
 
-    let response: ServerMessage = session::read_message(&mut rx_a).await.unwrap();
-    match response.body {
-        Some(ServerBody::PresenceList(list)) => {
-            assert_eq!(list.users.len(), 2, "both alice and bob should be online");
-            let names: Vec<&str> = list.users.iter().map(|u| u.username.as_str()).collect();
-            assert!(names.contains(&"alice"));
-            assert!(names.contains(&"bob"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "presence list with both users never arrived"
+        );
+        let response: ServerMessage =
+            tokio::time::timeout(remaining, session::read_message(&mut rx_a))
+                .await
+                .expect("presence message should arrive")
+                .unwrap();
+        match response.body {
+            Some(ServerBody::PresenceList(list)) => {
+                let names: Vec<&str> = list.users.iter().map(|u| u.username.as_str()).collect();
+                if names.contains(&"alice") && names.contains(&"bob") {
+                    assert_eq!(list.users.len(), 2, "both alice and bob should be online");
+                    break;
+                }
+                // an earlier push (pre-bob): keep reading
+            }
+            other => panic!("expected presence list, got {other:?}"),
         }
-        _ => panic!("expected presence list"),
     }
 
     conn_a.close(0u32.into(), b"done");
@@ -1230,16 +1276,12 @@ async fn second_login_replaces_session() {
     conn_a.close(0u32.into(), b"replaced");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // B saw no leave for user 1.
-    let ghost = timeout(
-        Duration::from_millis(500),
-        session::read_message::<ServerMessage>(&mut rx_b),
-    )
-    .await;
-    assert!(
-        ghost.is_err(),
-        "replaced session must not broadcast a departure"
-    );
+    // B saw no leave for user 1. expect_silence, not a bare timeout:
+    // a2's registration legitimately pushed a PresenceList to B —
+    // ambient, tolerated — but nothing else may arrive (no departure,
+    // no voice state: the replaced session's cleanup is
+    // generation-guarded).
+    expect_silence(&mut rx_b, Duration::from_millis(500)).await;
 
     // User 1 is still in voice — membership outlived the swap.
     send_client_msg(

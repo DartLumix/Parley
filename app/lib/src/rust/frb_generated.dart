@@ -68,7 +68,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1661491588;
+  int get rustContentHash => -1413269887;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -88,9 +88,35 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiSessionDisconnect({required int sessionId});
 
+  Stream<SessionEvent> crateApiSessionEvents({required int sessionId});
+
+  Future<void> crateApiSessionFetchHistory({
+    required int sessionId,
+    required BigInt channelId,
+    required int limit,
+    required BigInt beforeMessageId,
+  });
+
   Future<bool> crateApiSessionIsConnected({required int sessionId});
 
+  Future<void> crateApiSessionJoinVoice({
+    required int sessionId,
+    required BigInt channelId,
+  });
+
+  Future<void> crateApiSessionLeaveVoice({required int sessionId});
+
+  Future<void> crateApiSessionListChannels({required int sessionId});
+
   Future<String> crateApiSimplePing();
+
+  Future<void> crateApiSessionRequestPresence({required int sessionId});
+
+  Future<void> crateApiSessionSendChat({
+    required int sessionId,
+    required BigInt channelId,
+    required String text,
+  });
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -166,6 +192,78 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "disconnect", argNames: ["sessionId"]);
 
   @override
+  Stream<SessionEvent> crateApiSessionEvents({required int sessionId}) {
+    final sink = RustStreamSink<SessionEvent>();
+    unawaited(
+      handler.executeNormal(
+        NormalTask(
+          callFfi: (port_) {
+            final serializer = SseSerializer(generalizedFrbRustBinding);
+            sse_encode_u_32(sessionId, serializer);
+            sse_encode_StreamSink_session_event_Sse(sink, serializer);
+            pdeCallFfi(
+              generalizedFrbRustBinding,
+              serializer,
+              funcId: 3,
+              port: port_,
+            );
+          },
+          codec: SseCodec(
+            decodeSuccessData: sse_decode_unit,
+            decodeErrorData: sse_decode_String,
+          ),
+          constMeta: kCrateApiSessionEventsConstMeta,
+          argValues: [sessionId, sink],
+          apiImpl: this,
+        ),
+      ),
+    );
+    return sink.stream;
+  }
+
+  TaskConstMeta get kCrateApiSessionEventsConstMeta =>
+      const TaskConstMeta(debugName: "events", argNames: ["sessionId", "sink"]);
+
+  @override
+  Future<void> crateApiSessionFetchHistory({
+    required int sessionId,
+    required BigInt channelId,
+    required int limit,
+    required BigInt beforeMessageId,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(sessionId, serializer);
+          sse_encode_u_64(channelId, serializer);
+          sse_encode_u_32(limit, serializer);
+          sse_encode_u_64(beforeMessageId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 4,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSessionFetchHistoryConstMeta,
+        argValues: [sessionId, channelId, limit, beforeMessageId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionFetchHistoryConstMeta =>
+      const TaskConstMeta(
+        debugName: "fetch_history",
+        argNames: ["sessionId", "channelId", "limit", "beforeMessageId"],
+      );
+
+  @override
   Future<bool> crateApiSessionIsConnected({required int sessionId}) {
     return handler.executeNormal(
       NormalTask(
@@ -175,7 +273,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 5,
             port: port_,
           );
         },
@@ -194,6 +292,96 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "is_connected", argNames: ["sessionId"]);
 
   @override
+  Future<void> crateApiSessionJoinVoice({
+    required int sessionId,
+    required BigInt channelId,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(sessionId, serializer);
+          sse_encode_u_64(channelId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSessionJoinVoiceConstMeta,
+        argValues: [sessionId, channelId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionJoinVoiceConstMeta => const TaskConstMeta(
+    debugName: "join_voice",
+    argNames: ["sessionId", "channelId"],
+  );
+
+  @override
+  Future<void> crateApiSessionLeaveVoice({required int sessionId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(sessionId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 7,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSessionLeaveVoiceConstMeta,
+        argValues: [sessionId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionLeaveVoiceConstMeta =>
+      const TaskConstMeta(debugName: "leave_voice", argNames: ["sessionId"]);
+
+  @override
+  Future<void> crateApiSessionListChannels({required int sessionId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(sessionId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSessionListChannelsConstMeta,
+        argValues: [sessionId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionListChannelsConstMeta =>
+      const TaskConstMeta(debugName: "list_channels", argNames: ["sessionId"]);
+
+  @override
   Future<String> crateApiSimplePing() {
     return handler.executeNormal(
       NormalTask(
@@ -202,7 +390,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 9,
             port: port_,
           );
         },
@@ -220,6 +408,87 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSimplePingConstMeta =>
       const TaskConstMeta(debugName: "ping", argNames: []);
 
+  @override
+  Future<void> crateApiSessionRequestPresence({required int sessionId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(sessionId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 10,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSessionRequestPresenceConstMeta,
+        argValues: [sessionId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionRequestPresenceConstMeta =>
+      const TaskConstMeta(
+        debugName: "request_presence",
+        argNames: ["sessionId"],
+      );
+
+  @override
+  Future<void> crateApiSessionSendChat({
+    required int sessionId,
+    required BigInt channelId,
+    required String text,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(sessionId, serializer);
+          sse_encode_u_64(channelId, serializer);
+          sse_encode_String(text, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 11,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSessionSendChatConstMeta,
+        argValues: [sessionId, channelId, text],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionSendChatConstMeta => const TaskConstMeta(
+    debugName: "send_chat",
+    argNames: ["sessionId", "channelId", "text"],
+  );
+
+  @protected
+  AnyhowException dco_decode_AnyhowException(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return AnyhowException(raw as String);
+  }
+
+  @protected
+  RustStreamSink<SessionEvent> dco_decode_StreamSink_session_event_Sse(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    throw UnimplementedError();
+  }
+
   @protected
   String dco_decode_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -233,9 +502,94 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ChannelInfo dco_decode_channel_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return ChannelInfo(
+      id: dco_decode_u_64(arr[0]),
+      name: dco_decode_String(arr[1]),
+      mode: dco_decode_String(arr[2]),
+    );
+  }
+
+  @protected
+  ChatEntry dco_decode_chat_entry(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return ChatEntry(
+      messageId: dco_decode_u_64(arr[0]),
+      channelId: dco_decode_u_64(arr[1]),
+      userId: dco_decode_u_32(arr[2]),
+      username: dco_decode_String(arr[3]),
+      text: dco_decode_String(arr[4]),
+      timestampMs: dco_decode_u_64(arr[5]),
+    );
+  }
+
+  @protected
+  List<ChannelInfo> dco_decode_list_channel_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_channel_info).toList();
+  }
+
+  @protected
+  List<ChatEntry> dco_decode_list_chat_entry(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_chat_entry).toList();
+  }
+
+  @protected
+  List<PresenceEntry> dco_decode_list_presence_entry(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_presence_entry).toList();
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  List<VoiceEntry> dco_decode_list_voice_entry(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_voice_entry).toList();
+  }
+
+  @protected
+  PresenceEntry dco_decode_presence_entry(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return PresenceEntry(
+      userId: dco_decode_u_32(arr[0]),
+      username: dco_decode_String(arr[1]),
+    );
+  }
+
+  @protected
+  SessionEvent dco_decode_session_event(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 10)
+      throw Exception('unexpected arr length: expect 10 but see ${arr.length}');
+    return SessionEvent(
+      sessionId: dco_decode_u_32(arr[0]),
+      kind: dco_decode_String(arr[1]),
+      channels: dco_decode_list_channel_info(arr[2]),
+      users: dco_decode_list_presence_entry(arr[3]),
+      messages: dco_decode_list_chat_entry(arr[4]),
+      userId: dco_decode_u_32(arr[5]),
+      username: dco_decode_String(arr[6]),
+      channelId: dco_decode_u_64(arr[7]),
+      joined: dco_decode_bool(arr[8]),
+      states: dco_decode_list_voice_entry(arr[9]),
+    );
   }
 
   @protected
@@ -260,6 +614,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt dco_decode_u_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeU64(raw);
+  }
+
+  @protected
   int dco_decode_u_8(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
@@ -269,6 +629,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void dco_decode_unit(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return;
+  }
+
+  @protected
+  VoiceEntry dco_decode_voice_entry(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return VoiceEntry(
+      userId: dco_decode_u_32(arr[0]),
+      channelId: dco_decode_u_64(arr[1]),
+      joined: dco_decode_bool(arr[2]),
+    );
+  }
+
+  @protected
+  AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_String(deserializer);
+    return AnyhowException(inner);
+  }
+
+  @protected
+  RustStreamSink<SessionEvent> sse_decode_StreamSink_session_event_Sse(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    throw UnimplementedError('Unreachable ()');
   }
 
   @protected
@@ -285,10 +673,123 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ChannelInfo sse_decode_channel_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_id = sse_decode_u_64(deserializer);
+    var var_name = sse_decode_String(deserializer);
+    var var_mode = sse_decode_String(deserializer);
+    return ChannelInfo(id: var_id, name: var_name, mode: var_mode);
+  }
+
+  @protected
+  ChatEntry sse_decode_chat_entry(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_messageId = sse_decode_u_64(deserializer);
+    var var_channelId = sse_decode_u_64(deserializer);
+    var var_userId = sse_decode_u_32(deserializer);
+    var var_username = sse_decode_String(deserializer);
+    var var_text = sse_decode_String(deserializer);
+    var var_timestampMs = sse_decode_u_64(deserializer);
+    return ChatEntry(
+      messageId: var_messageId,
+      channelId: var_channelId,
+      userId: var_userId,
+      username: var_username,
+      text: var_text,
+      timestampMs: var_timestampMs,
+    );
+  }
+
+  @protected
+  List<ChannelInfo> sse_decode_list_channel_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <ChannelInfo>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_channel_info(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<ChatEntry> sse_decode_list_chat_entry(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <ChatEntry>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_chat_entry(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<PresenceEntry> sse_decode_list_presence_entry(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <PresenceEntry>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_presence_entry(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  List<VoiceEntry> sse_decode_list_voice_entry(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <VoiceEntry>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_voice_entry(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  PresenceEntry sse_decode_presence_entry(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_userId = sse_decode_u_32(deserializer);
+    var var_username = sse_decode_String(deserializer);
+    return PresenceEntry(userId: var_userId, username: var_username);
+  }
+
+  @protected
+  SessionEvent sse_decode_session_event(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_sessionId = sse_decode_u_32(deserializer);
+    var var_kind = sse_decode_String(deserializer);
+    var var_channels = sse_decode_list_channel_info(deserializer);
+    var var_users = sse_decode_list_presence_entry(deserializer);
+    var var_messages = sse_decode_list_chat_entry(deserializer);
+    var var_userId = sse_decode_u_32(deserializer);
+    var var_username = sse_decode_String(deserializer);
+    var var_channelId = sse_decode_u_64(deserializer);
+    var var_joined = sse_decode_bool(deserializer);
+    var var_states = sse_decode_list_voice_entry(deserializer);
+    return SessionEvent(
+      sessionId: var_sessionId,
+      kind: var_kind,
+      channels: var_channels,
+      users: var_users,
+      messages: var_messages,
+      userId: var_userId,
+      username: var_username,
+      channelId: var_channelId,
+      joined: var_joined,
+      states: var_states,
+    );
   }
 
   @protected
@@ -315,6 +816,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getBigUint64();
+  }
+
+  @protected
   int sse_decode_u_8(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint8();
@@ -326,9 +833,48 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VoiceEntry sse_decode_voice_entry(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_userId = sse_decode_u_32(deserializer);
+    var var_channelId = sse_decode_u_64(deserializer);
+    var var_joined = sse_decode_bool(deserializer);
+    return VoiceEntry(
+      userId: var_userId,
+      channelId: var_channelId,
+      joined: var_joined,
+    );
+  }
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getInt32();
+  }
+
+  @protected
+  void sse_encode_AnyhowException(
+    AnyhowException self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.message, serializer);
+  }
+
+  @protected
+  void sse_encode_StreamSink_session_event_Sse(
+    RustStreamSink<SessionEvent> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(
+      self.setupAndSerialize(
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_session_event,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+      ),
+      serializer,
+    );
   }
 
   @protected
@@ -344,6 +890,61 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_channel_info(ChannelInfo self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self.id, serializer);
+    sse_encode_String(self.name, serializer);
+    sse_encode_String(self.mode, serializer);
+  }
+
+  @protected
+  void sse_encode_chat_entry(ChatEntry self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self.messageId, serializer);
+    sse_encode_u_64(self.channelId, serializer);
+    sse_encode_u_32(self.userId, serializer);
+    sse_encode_String(self.username, serializer);
+    sse_encode_String(self.text, serializer);
+    sse_encode_u_64(self.timestampMs, serializer);
+  }
+
+  @protected
+  void sse_encode_list_channel_info(
+    List<ChannelInfo> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_channel_info(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_chat_entry(
+    List<ChatEntry> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_chat_entry(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_presence_entry(
+    List<PresenceEntry> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_presence_entry(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
     SseSerializer serializer,
@@ -351,6 +952,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_list_voice_entry(
+    List<VoiceEntry> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_voice_entry(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_presence_entry(PresenceEntry self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.userId, serializer);
+    sse_encode_String(self.username, serializer);
+  }
+
+  @protected
+  void sse_encode_session_event(SessionEvent self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.sessionId, serializer);
+    sse_encode_String(self.kind, serializer);
+    sse_encode_list_channel_info(self.channels, serializer);
+    sse_encode_list_presence_entry(self.users, serializer);
+    sse_encode_list_chat_entry(self.messages, serializer);
+    sse_encode_u_32(self.userId, serializer);
+    sse_encode_String(self.username, serializer);
+    sse_encode_u_64(self.channelId, serializer);
+    sse_encode_bool(self.joined, serializer);
+    sse_encode_list_voice_entry(self.states, serializer);
   }
 
   @protected
@@ -370,6 +1005,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putBigUint64(self);
+  }
+
+  @protected
   void sse_encode_u_8(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint8(self);
@@ -378,6 +1019,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+  }
+
+  @protected
+  void sse_encode_voice_entry(VoiceEntry self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.userId, serializer);
+    sse_encode_u_64(self.channelId, serializer);
+    sse_encode_bool(self.joined, serializer);
   }
 
   @protected
