@@ -67,7 +67,7 @@ enum Command {
 }
 
 impl Command {
-    fn to_client_body(self) -> ClientBody {
+    fn into_client_body(self) -> ClientBody {
         match self {
             Command::ListChannels => ClientBody::ListChannels(ListChannels {}),
             Command::JoinVoice { channel_id } => ClientBody::JoinVoice(JoinVoice { channel_id }),
@@ -468,7 +468,7 @@ async fn connect_async(
                             Some(c) => {
                                 if session::write_message(
                                     &mut tx,
-                                    &ClientMessage { body: Some(c.to_client_body()) },
+                                    &ClientMessage { body: Some(c.into_client_body()) },
                                 )
                                 .await
                                 .is_err()
