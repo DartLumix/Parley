@@ -57,12 +57,32 @@ pub fn save_pin(path: &Path, server: &str, fingerprint: &str) -> Result<(), Stri
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    let mut text = std::fs::read_to_string(path).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
+    // Replace the host's line (deduping any stale duplicates) —
+    // append-only + load_pin's first-match-wins meant a stale first
+    // line could never be displaced by a legitimate re-pin.
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    let mut replaced = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some(server) {
+            if !replaced {
+                out.push_str(&format!("{server} {fingerprint}\n"));
+                replaced = true;
+            }
+            continue; // drop duplicate/stale lines for this host
+        }
+        out.push_str(line);
+        out.push('\n');
     }
-    text.push_str(&format!("{server} {fingerprint}\n"));
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+    if !replaced {
+        out.push_str(&format!("{server} {fingerprint}\n"));
+    }
+    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Pin when we have a stored fingerprint; trust-on-first-use (and record

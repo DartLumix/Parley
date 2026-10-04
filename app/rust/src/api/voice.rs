@@ -9,35 +9,45 @@
 //! rate). Mixer/jitter/PLC are parley-core's (ungated since the 6.9
 //! piece-2 promotion — exactly the bridge surface it was built to be).
 //!
-//! BRIDGE RULE (the step-3 lesson): nothing but plain types crosses
-//! to Dart. This module's entry points are pub(crate) — SharedMixer
-//! and quinn::Connection in a pub signature made codegen wrap them as
-//! opaque objects and emit unresolvable references. session.rs's
-//! voice_start(session_id) is the only bridge surface.
+//! BRIDGE RULE: nothing but plain types crosses to Dart. This module's
+//! entry points are pub(crate) — non-plain types in a pub signature
+//! made codegen wrap them as opaque objects and emit unresolvable
+//! references (the step-3 lesson).
+//!
+//! FEATURE GATE: cpal (and alsa-sys below it) compiles ONLY with
+//! `audio-device` — default-off keeps workspace-wide CI clippy and the
+//! server's musl Docker build clean (the §11 convention). The bridge
+//! surface (session.rs's voice_start/voice_stop) is ungated and
+//! stable; without the feature it errors clearly.
 //!
 //! Ownership: join/leave own VOICE MEMBERSHIP server-side;
 //! voice_start/voice_stop own the LOCAL DEVICE. The mixer is the
 //! session's, shared both ways.
 //!
-//! cpal::Stream is !Send/!Sync (cpal 0.15 platform wrapper) — it
-//! lives on the device thread's stack, never in the static. The
-//! static holds only Send+Sync control. The reader task's stop signal
-//! is a tokio channel (selectable — a flag checked between datagrams
-//! would sleep forever on idle, and a lingering reader after a stop
-//! would split datagrams with its restart successor).
+//! cpal::Stream is !Send/!Sync (cpal 0.15 platform wrapper) — it lives
+//! on the device thread's stack, never in the static. The reader
+//! task's stop signal is a tokio channel (selectable); the reader's
+//! OWN death (connection gone) also flips the device stop flag — the
+//! UI tears down the Stop button on connection-lost, so nobody else
+//! would ever signal the device (the step-3 leak fix).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-use parley_core::audio::device::{preferred_output_config, PREFERRED_RATE};
 use parley_core::audio::mixer::SharedMixer;
+
+#[cfg(feature = "audio-device")]
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(feature = "audio-device")]
+use parley_core::audio::device::{preferred_output_config, PREFERRED_RATE};
+#[cfg(feature = "audio-device")]
 use parley_proto::media::FLAG_STEREO;
+#[cfg(feature = "audio-device")]
+use std::time::Duration;
 
 /// Device period: 1024 frames ≈ 21.3 ms — one PipeWire graph quantum
 /// (same value and rationale as the terminal client's audio.rs).
+#[cfg(feature = "audio-device")]
 const PERIOD_FRAMES: u32 = 1024;
 
 struct VoiceControl {
@@ -46,17 +56,34 @@ struct VoiceControl {
     stop: Arc<AtomicBool>,
     /// Reader-task stop signal (tokio mpsc: selectable).
     reader_stop: tokio::sync::mpsc::UnboundedSender<()>,
+    #[cfg(feature = "audio-device")]
     _device_thread: std::thread::JoinHandle<()>,
 }
 
 static VOICE: Mutex<Option<VoiceControl>> = Mutex::new(None);
 
 /// Start listening (receive-only). Called by session::voice_start.
+/// Without the audio-device feature: a clear error, nothing started.
 pub(crate) fn voice_start(
     mixer: SharedMixer,
     conn: quinn::Connection,
     my_id: u32,
 ) -> Result<(), String> {
+    #[cfg(not(feature = "audio-device"))]
+    {
+        let _ = (mixer, conn, my_id);
+        Err(
+            "parley_flutter built without the audio-device feature — rebuild with --features audio-device"
+                .to_string(),
+        )
+    }
+    #[cfg(feature = "audio-device")]
+    voice_start_impl(mixer, conn, my_id)
+}
+
+/// The real implementation (feature on).
+#[cfg(feature = "audio-device")]
+fn voice_start_impl(mixer: SharedMixer, conn: quinn::Connection, my_id: u32) -> Result<(), String> {
     let mut guard = VOICE.lock().unwrap();
     // Harvest a stale listening session (connection died, UI tore down
     // before the button could stop it): the reader's death signal set
@@ -117,13 +144,13 @@ pub(crate) fn voice_start(
                         }
                         Err(_) => {
                             // Connection death reaches the reader FIRST
-                            // (datagram stream errors). The device
-                            // thread and its cpal stream have no other
-                            // path to shutdown — the UI tears down the
-                            // Stop button on connection-lost, so nobody
-                            // would ever signal them. The reader IS the
-                            // death signal: flip the same stop flag the
-                            // button uses.
+                            // (datagram stream errors). The device thread
+                            // and its cpal stream have no other path to
+                            // shutdown — the UI tears down the Stop
+                            // button on connection-lost, so nobody would
+                            // ever signal them. The reader IS the death
+                            // signal: flip the same stop flag the button
+                            // uses.
                             reader_stop_flag.store(true, Ordering::Relaxed);
                             break;
                         }
@@ -174,6 +201,7 @@ pub(crate) fn voice_start(
 /// Open the default output at 48 kHz (refuse-not-degrade), quantum-
 /// aligned period with device-default fallback — the terminal
 /// client's two-attempt discipline.
+#[cfg(feature = "audio-device")]
 fn build_output_stream(mixer: &SharedMixer) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let device = host

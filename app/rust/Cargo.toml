@@ -6,12 +6,20 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# Device I/O (cpal) — default OFF so workspace-wide CI clippy and the
+# server's musl Docker build never touch alsa-sys (the §11 convention,
+# extended to the bridge crate). The Flutter app builds with
+# --features audio-device; without it, voice_start returns an error
+# and everything else works.
+audio-device = ["dep:cpal", "parley-core/audio-device"]
+
 [dependencies]
 flutter_rust_bridge = "=2.13.0"
-parley-core = { path = "../../crates/parley-core", default-features = false, features = ["audio-device"] }
+parley-core = { path = "../../crates/parley-core", default-features = false }
 parley-proto = { path = "../../crates/parley-proto" }
 parley-client = { path = "../../crates/parley-client", default-features = false }
 quinn = { workspace = true }
 prost = { workspace = true }
-cpal = { workspace = true }
+cpal = { workspace = true, optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
