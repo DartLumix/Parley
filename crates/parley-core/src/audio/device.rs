@@ -61,49 +61,6 @@ pub fn default_output_config() -> Result<(String, cpal::SupportedStreamConfig), 
     Ok((name, config))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// These tests touch real hardware — only meaningful on a desktop
-    /// session, and they break headless CI. Gated behind PARLEY_AUDIO=1.
-    fn hardware_enabled() -> bool {
-        std::env::var("PARLEY_AUDIO")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    }
-
-    #[test]
-    fn lists_devices_when_hardware_enabled() {
-        if !hardware_enabled() {
-            eprintln!("skipping (set PARLEY_AUDIO=1 to enable)");
-            return;
-        }
-        let (inputs, outputs) = list_devices().unwrap();
-        eprintln!("inputs:  {inputs:?}");
-        eprintln!("outputs: {outputs:?}");
-        assert!(
-            !outputs.is_empty(),
-            "a machine running this test has audio output"
-        );
-    }
-
-    #[test]
-    fn default_configs_when_hardware_enabled() {
-        if !hardware_enabled() {
-            eprintln!("skipping (set PARLEY_AUDIO=1 to enable)");
-            return;
-        }
-        if let Ok((name, config)) = default_input_config() {
-            eprintln!("input:  {name} {:?}", config);
-        } else {
-            eprintln!("no input device (headless server?) — fine");
-        }
-        let (name, config) = default_output_config().unwrap();
-        eprintln!("output: {name} {:?}", config);
-    }
-}
-
 /// All device streams open here: Opus is 48 kHz and this machine's PipeWire
 /// graph is 48k-only, so nothing resamples anywhere.
 pub const PREFERRED_RATE: u32 = 48_000;
@@ -177,4 +134,47 @@ pub fn preferred_input_config(
         }
     };
     Ok(preferred_from(default, &ranges, "input"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These tests touch real hardware — only meaningful on a desktop
+    /// session, and they break headless CI. Gated behind PARLEY_AUDIO=1.
+    fn hardware_enabled() -> bool {
+        std::env::var("PARLEY_AUDIO")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn lists_devices_when_hardware_enabled() {
+        if !hardware_enabled() {
+            eprintln!("skipping (set PARLEY_AUDIO=1 to enable)");
+            return;
+        }
+        let (inputs, outputs) = list_devices().unwrap();
+        eprintln!("inputs:  {inputs:?}");
+        eprintln!("outputs: {outputs:?}");
+        assert!(
+            !outputs.is_empty(),
+            "a machine running this test has audio output"
+        );
+    }
+
+    #[test]
+    fn default_configs_when_hardware_enabled() {
+        if !hardware_enabled() {
+            eprintln!("skipping (set PARLEY_AUDIO=1 to enable)");
+            return;
+        }
+        if let Ok((name, config)) = default_input_config() {
+            eprintln!("input:  {name} {:?}", config);
+        } else {
+            eprintln!("no input device (headless server?) — fine");
+        }
+        let (name, config) = default_output_config().unwrap();
+        eprintln!("output: {name} {:?}", config);
+    }
 }

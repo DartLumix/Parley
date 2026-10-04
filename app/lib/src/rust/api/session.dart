@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `now_ms`, `read_frame`, `rt`, `send_command`, `to_client_body`, `to_event`
+// These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `into_client_body`, `now_ms`, `read_frame`, `rt`, `send_command`, `to_event`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
@@ -80,6 +80,14 @@ Future<void> fetchHistory({
 /// Request the presence listing (response: "presence" event).
 Future<void> requestPresence({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionRequestPresence(sessionId: sessionId);
+
+/// Start listening (voice receive): open the output device on the
+/// session's mixer + spawn the media reader. Requires the session.
+Future<void> voiceStart({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionVoiceStart(sessionId: sessionId);
+
+/// Stop listening (drop the device; reader exits with the connection).
+Future<void> voiceStop() => RustLib.instance.api.crateApiSessionVoiceStop();
 
 /// One row of a channel listing.
 class ChannelInfo {

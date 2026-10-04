@@ -1455,6 +1455,7 @@ dependencies = [
 name = "parley_flutter"
 version = "0.1.0"
 dependencies = [
+ "cpal",
  "flutter_rust_bridge",
  "parley-client",
  "parley-core",

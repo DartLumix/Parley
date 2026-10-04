@@ -16,6 +16,7 @@
 //! channel list) are issued by the DART side after subscribing —
 //! issuing them from connect() races sink registration.
 
+use parley_core::audio::mixer::{self as core_mixer, SharedMixer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -39,7 +40,7 @@ use crate::frb_generated::StreamSink;
 /// One tokio runtime for the whole bridge (FRB calls run on their own
 /// worker threads; block_on there never touches the UI isolate).
 static RT: OnceLock<Runtime> = OnceLock::new();
-fn rt() -> &'static Runtime {
+pub(crate) fn rt() -> &'static Runtime {
     RT.get_or_init(|| Runtime::new().expect("tokio runtime"))
 }
 
@@ -102,6 +103,12 @@ struct LiveSession {
     /// Event sinks, shared with the forwarder task (events() registers
     /// through this handle).
     sinks: SinkList,
+    /// The session's voice mixer — shared with the voice module's
+    /// device reader/callback (voice_start takes it; membership events
+    /// below add/remove voices).
+    mixer: SharedMixer,
+    /// Authenticated user id (media reader's self-echo filter).
+    user_id: u32,
 }
 
 static SESSIONS: LazyLock<Mutex<HashMap<u32, LiveSession>>> =
@@ -293,6 +300,14 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
             Some(e)
         }
         ServerBody::VoiceState(v) => {
+            // A departed user's decoder state drops (the terminal
+            // client's mixer::remove — done here so the event path and
+            // the mix stay consistent).
+            if !v.joined {
+                if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                    s.mixer.lock().unwrap().remove(v.user_id);
+                }
+            }
             let mut e = ev("voice_state");
             e.user_id = v.user_id;
             e.channel_id = v.channel_id;
@@ -394,6 +409,9 @@ async fn connect_async(
     // onto every event.
     let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
+    // The voice mixer: created here, shared with voice_start's device
+    // path. Voice membership lives server-side; the mixer follows.
+    let session_mixer: SharedMixer = core_mixer::new();
     // --- event path: reader → channel → forwarder → sinks ---
     let sinks: SinkList = Arc::new(Mutex::new(Vec::new()));
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
@@ -491,10 +509,12 @@ async fn connect_async(
         session_id,
         LiveSession {
             _endpoint: endpoint,
-            _conn: conn,
+            _conn: conn.clone(),
             cmd_tx,
             alive,
             sinks,
+            mixer: session_mixer.clone(),
+            user_id: ok.user_id,
         },
     );
 
@@ -586,4 +606,24 @@ pub fn fetch_history(
 /// Request the presence listing (response: "presence" event).
 pub fn request_presence(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::Presence)
+}
+
+/// Start listening (voice receive): open the output device on the
+/// session's mixer + spawn the media reader. Requires the session.
+pub fn voice_start(session_id: u32) -> Result<(), String> {
+    let sessions = SESSIONS.lock().unwrap();
+    let s = sessions
+        .get(&session_id)
+        .ok_or(format!("no session {session_id}"))?;
+    let mixer = s.mixer.clone();
+    let conn = s._conn.clone();
+    let my_id = s.user_id;
+    drop(sessions);
+    crate::api::voice::voice_start(mixer, conn, my_id)
+}
+
+/// Stop listening (drop the device; reader exits with the connection).
+pub fn voice_stop() -> Result<(), String> {
+    crate::api::voice::voice_stop();
+    Ok(())
 }

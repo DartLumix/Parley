@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'src/rust/frb_generated.dart';
-import 'src/rust/api/simple.dart';
 import 'src/rust/api/session.dart';
 
 Future<void> main() async {
@@ -387,6 +386,36 @@ class _DevHomePageState extends State<DevHomePage> {
                     ),
                     backgroundColor: Colors.white10,
                   ),
+              ],
+            ),
+            // --- voice (receive-only, step 3) ---
+            const Divider(height: 32),
+            Row(
+              children: [
+                ElevatedButton(
+                  onPressed: _session != null && _joinedChannelId == null
+                      ? null
+                      : () async {
+                          if (_session == null) return;
+                          try {
+                            await voiceStart(sessionId: _session!.sessionId);
+                            setState(() => _status = 'listening');
+                          } catch (e) {
+                            setState(() => _status = 'voice start failed: $e');
+                          }
+                        },
+                  child: const Text('Start Listening'),
+                ),
+                const SizedBox(width: 12),
+                ElevatedButton(
+                  onPressed: _session == null
+                      ? null
+                      : () async {
+                          await voiceStop();
+                          setState(() => _status = 'connected');
+                        },
+                  child: const Text('Stop Listening'),
+                ),
               ],
             ),
             const Divider(height: 32),
