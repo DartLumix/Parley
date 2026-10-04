@@ -1456,8 +1456,11 @@ name = "parley_flutter"
 version = "0.1.0"
 dependencies = [
  "flutter_rust_bridge",
+ "parley-client",
  "parley-core",
  "parley-proto",
+ "prost",
+ "quinn",
  "tokio",
 ]
 

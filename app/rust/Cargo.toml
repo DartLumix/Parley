@@ -10,4 +10,7 @@ crate-type = ["cdylib", "staticlib"]
 flutter_rust_bridge = "=2.13.0"
 parley-core = { path = "../../crates/parley-core", default-features = false }
 parley-proto = { path = "../../crates/parley-proto" }
+parley-client = { path = "../../crates/parley-client", default-features = false }
+quinn = { workspace = true }
+prost = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
