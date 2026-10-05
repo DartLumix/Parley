@@ -37,7 +37,11 @@ Voice is the product; everything else grows later.
 | 5e | Encoder trait, rate pacing, glass-to-glass measured | ✅ |
 | 6 | Backend hardening & client-readiness | ✅ |
 | 6.9 | Client-prep — share audio, receiver hardening, latency re-measure | ✅ |
-| 7+ | Flutter client, camera, platforms | ⏳ |
+| 7a | Flutter shell + bridge verified (pong) | ✅ |
+| 7b | Session — connect/auth/TOFU/heartbeat/events | ✅ |
+| 7c | Channels, presence (push), join, chat, history | ✅ |
+| 7d | Voice receive — mixer + cpal output through the bridge | ✅ |
+| 7+ | Voice send + AEC, video receive, share send, platforms | ⏳ |
 
 ---
 
@@ -159,8 +163,25 @@ Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
 - [x] Receiver hardening — decode off the audio datagram reader, pre-decode skip-shed, dead-viewer suppression (the recorded "95% CPU / three defects" verdict was four stacked bugs, not a CPU floor)
 - [x] Latency re-measured — glass-to-glass ~250 ms LAN (budget met, tail bounded); share-audio 138.5 ms median via a foreign-VPS internet path
 
-### Phase 7+ — Client & Beyond
-- [ ] Flutter client bring-up (app/, flutter_rust_bridge over parley-core)
+### Phase 7 — Flutter Client (in progress; Linux first)
+The dev client: `app/` — a plain dark-theme test bench exercising every
+backend feature through `flutter_rust_bridge` before any real UI design.
+- [x] 7a Shell + bridge — flutter_rust_bridge scaffold, `.so` bundled via
+      CMake `install()` (POST_BUILD copies into the build tree, which the
+      bundle assembly never reads — install() runs in the bundle pass)
+- [x] 7b Session — connect/auth/TOFU (shared known_hosts with the terminal
+      client), heartbeat, liveness, `session_closed` event
+- [x] 7c Channels / presence / join / chat / history — event stream
+      (StreamSink → Dart `Stream`); **presence push landed server-side
+      after the app exposed presence as pull-only since 1e** (first
+      backend bug found by the Flutter client)
+- [x] 7d Voice receive — media datagram reader + parley-core mixer + cpal
+      output (device in the bridge crate, feature-gated `audio-device`,
+      default off: workspace CI clippy and the musl Docker build never
+      touch alsa-sys)
+- [ ] 7e Voice send + AEC — capture, SendPipeline, speech/music profiles
+- [ ] 7f Video receive — VideoReceiveHub → Flutter texture bridge
+- [ ] 7g Screen-share send — portal capture through the bridge
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
 
@@ -202,6 +223,17 @@ cargo run --release -p parley-client --features video -- \
     # token relogin: password login prints a token — rerun with --token <tok> instead of --user/--password
 # music channels: add a channel with mode=1 (sqlite) — clients auto-profile; --music sends synthetic L/R test tones
 # synthetic test pattern (no portal): build the sender with --features audio-device,video
+# Flutter dev client (app/): bridge surface is plain types only — session_id
+# handles; non-plain types in pub signatures get wrapped as opaque objects
+# and the generated code stops resolving (the 7d lesson)
+cd app
+cargo build -p parley_flutter --features audio-device   # Rust (audio needs the feature)
+flutter_rust_bridge_codegen generate                    # API changed → regenerate Dart
+cargo build -p parley_flutter --features audio-device   # rebuild with generated wiring
+flutter run -d linux                                    # CMake install() re-bundles the .so
+# dev-server CWD determines the cert identity (data/ is relative) — always
+# run T1 from the repo root, else TOFU hard-fails on a fresh app/data/ cert
+
 ```
 
 Config (`config.toml`, auto-created with defaults):
@@ -258,6 +290,6 @@ crates/
   parley-core/          # shared session I/O + audio pipeline + encoder trait & H.264 codec (server + clients)
   parley-server/        # binary: QUIC listener, TLS, config, routing (+ parley-adduser bin)
   parley-client/        # test client: TOFU pinning, 48k audio, AEC/NS, mix, portal screen capture + share/view
-app/                    # Flutter client (future)
+app/                    # Flutter dev client: rust/ (parley_flutter bridge crate) + lib/
 docs/adr/               # one file per architectural decision
 ```

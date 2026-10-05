@@ -3,3 +3,5 @@
 .env
 app/build/
 app/.dart_tool/
+.freebuff/
+app/data/
