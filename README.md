@@ -41,7 +41,9 @@ Voice is the product; everything else grows later.
 | 7b | Session — connect/auth/TOFU/heartbeat/events | ✅ |
 | 7c | Channels, presence (push), join, chat, history | ✅ |
 | 7d | Voice receive — mixer + cpal output through the bridge | ✅ |
-| 7+ | Voice send + AEC, video receive, share send, platforms | ⏳ |
+| 7e | Voice send + AEC — join-driven devices, reconnect gap closed | ✅ |
+| 7e2 | 4d loss ladder in the app — receiver reports + two-profile send controller | ✅ |
+| 7+ | Video receive, share send, platforms | ⏳ |
 
 ---
 
@@ -179,7 +181,20 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       output (device in the bridge crate, feature-gated `audio-device`,
       default off: workspace CI clippy and the musl Docker build never
       touch alsa-sys)
-- [ ] 7e Voice send + AEC — capture, SendPipeline, speech/music profiles
+- [x] 7e Voice send + AEC — capture (bounded-channel RT discipline), SendPipeline,
+      WebRTC AEC3/NS with the played mix as far-end reference, speech/music
+      profiles off the channel mode; **voice is owned by the session** — join =
+      listen + transmit (TeamSpeak shape), leaving/disconnecting drops the
+      VoiceControl (Drop = teardown), which closes the 7d
+      voice-state-across-reconnects gap structurally. Start/Stop Listening
+      retired from the dev UI
+- [x] 7e2 Loss ladder (4d in the app) — per-session 5 s worst-peer
+      ReceiverReport through the session writer (server routes + stamps);
+      peer reports steer the speech encoder's two-profile controller: EMA
+      0.7/0.3 stepped at 1 Hz, → Robust (24 kbps + FEC) above 30‰, → Clean
+      (64 kbps) after 20 s below 10‰, 5 s switch cooldown — the ladder math
+      is a pure struct unit-tested under `--features audio-device`. Music
+      channels ignore reports by design
 - [ ] 7f Video receive — VideoReceiveHub → Flutter texture bridge
 - [ ] 7g Screen-share send — portal capture through the bridge
 - [ ] Android / Windows / iOS bring-up

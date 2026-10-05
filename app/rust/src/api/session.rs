@@ -47,6 +47,8 @@ use crate::api::voice::VoiceControl;
 
 use parley_client::cert;
 use parley_core::session;
+#[cfg(feature = "audio-device")]
+use parley_proto::ReceiverReport;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
     Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
@@ -71,9 +73,10 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static VOICE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Commands the session writer accepts (the heartbeat it generates
-/// itself).
+/// itself). pub(crate): the voice module's loss reporter (7e2) sends
+/// ReceiverReport through the same writer path as every other command.
 #[derive(Debug)]
-enum Command {
+pub(crate) enum Command {
     ListChannels,
     JoinVoice {
         channel_id: u64,
@@ -89,6 +92,15 @@ enum Command {
         before_message_id: u64,
     },
     Presence,
+    /// 7e2 (4d): our loss report — one aggregate worst-peer permille,
+    /// sent every 5 s in speech channels. reporter_id: 0 — the server
+    /// stamps the authenticated id and routes the report to the other
+    /// voice-channel members (never back to us). Gated with the voice
+    /// path: without audio-device nothing constructs it.
+    #[cfg(feature = "audio-device")]
+    ReceiverReport {
+        gap_rate_permille: u32,
+    },
 }
 
 impl Command {
@@ -110,6 +122,13 @@ impl Command {
                 before_message_id,
             }),
             Command::Presence => ClientBody::PresenceRequest(PresenceRequest {}),
+            #[cfg(feature = "audio-device")]
+            Command::ReceiverReport { gap_rate_permille } => {
+                ClientBody::ReceiverReport(ReceiverReport {
+                    gap_rate_permille,
+                    reporter_id: 0, // server stamps the authenticated id
+                })
+            }
         }
     }
 }
@@ -138,6 +157,11 @@ struct LiveSession {
     /// picks speech (mono + AEC) vs music (stereo 256 kbps, no AEC).
     /// Channels joined before any listing default to speech.
     channels: Vec<(u64, String)>,
+    /// 7e2: the latest peer loss report (permille) for the send
+    /// ladder. Written by to_event (reader task), read by the voice
+    /// encoder's 1 Hz tick. 0 = no loss reported (yet).
+    #[cfg(feature = "audio-device")]
+    loss_report: Arc<AtomicU32>,
     /// 7e: the session's voice (devices + reader + encoder). Some
     /// while the user is in a voice channel; dropping it tears
     /// everything down — voice can never outlive its session.
@@ -382,6 +406,29 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
             e.joined = v.joined;
             Some(e)
         }
+        ServerBody::ReceiverReport(rep) => {
+            // 7e2 (4d): a peer's loss report steers OUR send ladder —
+            // it describes what that peer received (worst voice in
+            // its mix). Skip unstamped reports and our own echo (the
+            // server excludes the reporter from routing;
+            // belt-and-suspenders, the terminal client's filter).
+            // Stored for the voice encoder's 1 Hz tick — not a UI
+            // event: the ladder is invisible by design. Featureless
+            // builds have no voice path; reports are simply dropped.
+            #[cfg(feature = "audio-device")]
+            {
+                let is_echo = rep.reporter_id == 0 || rep.reporter_id == own_user_id(session_id);
+                if !is_echo {
+                    if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                        s.loss_report
+                            .store(rep.gap_rate_permille, Ordering::Relaxed);
+                    }
+                }
+            }
+            #[cfg(not(feature = "audio-device"))]
+            let _ = rep;
+            None
+        }
         ServerBody::VoiceStateList(l) => {
             let mut e = ev("voice_states");
             e.states = l
@@ -395,8 +442,8 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                 .collect();
             Some(e)
         }
-        // HeartbeatAck / ReceiverReport / ShareStopped / VideoReport:
-        // later steps surface these (share lifecycle, loss ladders).
+        // HeartbeatAck / ShareStopped / VideoReport: later steps
+        // surface these (share lifecycle).
         _ => None,
     }
 }
@@ -431,7 +478,9 @@ fn channel_is_music(session_id: u32, channel_id: u64) -> bool {
 fn enable_voice(session_id: u32, channel_id: u64) {
     let music = channel_is_music(session_id, channel_id);
     // Snapshot what the voice path needs; drop the lock immediately.
-    let (mixer, conn, my_id) = {
+    // (7e2 adds the loss-report slot — reader task writes, encoder
+    // ladder reads — and the command sender for the loss reporter.)
+    let (mixer, conn, my_id, loss_report, cmd_tx) = {
         let sessions = SESSIONS.lock().unwrap();
         let Some(s) = sessions.get(&session_id) else {
             return;
@@ -443,12 +492,18 @@ fn enable_voice(session_id: u32, channel_id: u64) {
                 return;
             }
         }
-        (s.mixer.clone(), s._conn.clone(), s.user_id)
+        (
+            s.mixer.clone(),
+            s._conn.clone(),
+            s.user_id,
+            s.loss_report.clone(),
+            s.cmd_tx.clone(),
+        )
     };
 
     let epoch = VOICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     tokio::task::spawn_blocking(move || {
-        match crate::api::voice::start_voice(mixer, conn, my_id, music) {
+        match crate::api::voice::start_voice(mixer, conn, my_id, music, loss_report, cmd_tx) {
             Ok(ctrl) => {
                 // Install only if this epoch is still the newest —
                 // else Drop the (already live) devices immediately.
@@ -681,6 +736,8 @@ async fn connect_async(
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
             channels: Vec::new(),
+            #[cfg(feature = "audio-device")]
+            loss_report: Arc::new(AtomicU32::new(0)),
             #[cfg(feature = "audio-device")]
             voice: None,
         },

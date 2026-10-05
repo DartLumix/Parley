@@ -35,6 +35,17 @@
 //! (the terminal client's exact music-channel behavior) + AEC OFF
 //! (music channels favor transparency; AEC is a speech tool).
 //!
+//! LOSS LADDER (7e2 — the 4d controller): speech channels run a 1 Hz
+//! EMA (0.7/0.3) over the latest peer loss report; above 30‰ the
+//! encoder drops to Robust (24 kbps + loss hint 30 — SILK + LBRR, FEC
+//! live), back to Clean (64 kbps, hint 5) after 20 s below 10‰, with
+//! a 5 s switch cooldown. A separate 5 s reporter sends the worst
+//! receive gap-rate of our mix back through the session writer (the
+//! server routes + stamps it, never back to us). Music does neither —
+//! reports ignored by design. The ladder math is a pure struct
+//! (Ladder) unit-tested below; the state machine mirrors
+//! crates/parley-client/src/main.rs.
+//!
 //! BRIDGE RULE: nothing but plain types crosses to Dart. This
 //! module's items are pub(crate) — codegen ignores them (the 7d
 //! lesson: a pub signature with non-plain types made codegen emit
@@ -61,13 +72,20 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "audio-device")]
 use parley_core::audio::device::{preferred_input_config, preferred_output_config, PREFERRED_RATE};
 #[cfg(feature = "audio-device")]
+use parley_core::audio::pipeline::SendPipeline;
+#[cfg(feature = "audio-device")]
 use parley_proto::media::FLAG_STEREO;
 #[cfg(feature = "audio-device")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(feature = "audio-device")]
 use std::sync::Arc;
 #[cfg(feature = "audio-device")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
+#[cfg(feature = "audio-device")]
+use tokio::sync::mpsc::UnboundedSender;
+
+#[cfg(feature = "audio-device")]
+use crate::api::session::Command;
 
 /// Device period: 1024 frames ≈ 21.3 ms — one PipeWire graph quantum
 /// (same value and rationale as the terminal client's audio.rs).
@@ -90,6 +108,9 @@ pub(crate) struct VoiceControl {
     /// The encoder task's abort handle: Drop aborts it deterministically
     /// (it would also exit on its own when the capture channel closes).
     encoder_abort: tokio::task::AbortHandle,
+    /// The 5 s loss reporter task's abort handle (7e2; None for music
+    /// channels — they send no reports). Drop aborts it.
+    reporter_abort: Option<tokio::task::AbortHandle>,
     /// Both cpal streams live on this thread's stack; the thread parks
     /// until the stop flag, then scope exit drops the streams. NOT
     /// joined on Drop: join can block, and Drop runs under the
@@ -115,24 +136,113 @@ impl Drop for VoiceControl {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.reader_stop.send(());
         self.encoder_abort.abort();
+        if let Some(reporter) = &self.reporter_abort {
+            reporter.abort();
+        }
     }
 }
 
-/// Build the whole voice path for one session: media reader (feed:
-/// mixer), output + input device streams, AEC, encoder task. Blocks
-/// until the devices report readiness (device build is ~100 ms
-/// typical) — the caller MUST run this off the registry lock (see the
-/// module docs). Returns the control whose Drop tears everything down.
+/// 4d's two-profile bitrate controller state (pure — no device or
+/// codec deps, unit-tested below). Stepped at 1 Hz by the encoder
+/// task with the latest peer loss report.
 ///
-/// A partial failure tears its own parts down: the encoder aborts and
-/// reader_stop drops when this fn returns Err, and the device thread
-/// (if it started) holds no stream past its scope exit.
+/// Profiles (apply_profile): Clean = 64 kbps + loss hint 5 (CELT, max
+/// quality, FEC inert); Robust = 24 kbps + hint 30 (SILK + LBRR, FEC
+/// live). EMA over receiver gap-rate reports (0.7/0.3 per step);
+/// down when the EMA exceeds 30‰, back up after 20 s below 10‰; a
+/// 5 s switch cooldown prevents flapping.
+#[cfg(feature = "audio-device")]
+struct Ladder {
+    ema_permille: f32,
+    robust: bool,
+    last_switch: Instant,
+    low_since: Option<Instant>,
+}
+
+#[cfg(feature = "audio-device")]
+impl Ladder {
+    /// Fresh ladder, Clean, clock zeroed at `now` (injectable for the
+    /// tests' deterministic timelines).
+    fn new(now: Instant) -> Self {
+        Self {
+            ema_permille: 0.0,
+            robust: false,
+            last_switch: now,
+            low_since: None,
+        }
+    }
+
+    /// Current EMA in permille (for the switch log line).
+    fn ema_permille(&self) -> f32 {
+        self.ema_permille
+    }
+
+    /// Step the EMA with one observation; Some(new_robust) on a
+    /// profile switch, None otherwise.
+    fn step(&mut self, observed_permille: u32, now: Instant) -> Option<bool> {
+        self.ema_permille = 0.7 * self.ema_permille + 0.3 * observed_permille as f32;
+        if !self.robust {
+            if self.ema_permille > 30.0 && now.duration_since(self.last_switch).as_secs() >= 5 {
+                self.robust = true;
+                self.last_switch = now;
+                self.low_since = None;
+                Some(true)
+            } else {
+                None
+            }
+        } else if self.ema_permille < 10.0 {
+            let since = *self.low_since.get_or_insert(now);
+            if now.duration_since(since).as_secs() >= 20
+                && now.duration_since(self.last_switch).as_secs() >= 5
+            {
+                self.robust = false;
+                self.last_switch = now;
+                self.low_since = None;
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            self.low_since = None;
+            None
+        }
+    }
+}
+
+/// 4d's profile application: lock-free bitrate + FEC-hint flip on the
+/// live SendPipeline (the encoder task owns it mutably).
+#[cfg(feature = "audio-device")]
+fn apply_profile(send: &mut SendPipeline, robust: bool) {
+    let (rate, loss) = if robust { (24_000, 30) } else { (64_000, 5) };
+    send.set_bitrate(rate);
+    send.set_loss_hint(loss);
+}
+
+/// Build the whole voice path for one session: media reader (feed:
+/// mixer), output + input device streams, AEC, encoder task, and — in
+/// speech channels — the 5 s loss reporter and the send-side bitrate
+/// ladder (7e2). Blocks until the devices report readiness (device
+/// build is ~100 ms typical) — the caller MUST run this off the
+/// registry lock (see the module docs). Returns the control whose
+/// Drop tears everything down.
+///
+/// `loss_report` is the session's slot for the latest peer loss
+/// report (to_event writes it; the ladder's 1 Hz tick reads it);
+/// `cmd_tx` feeds the reporter's ReceiverReport through the session
+/// writer.
+///
+/// A partial failure tears its own parts down: the encoder and
+/// reporter abort and reader_stop drops when this fn returns Err, and
+/// the device thread (if it started) holds no stream past its scope
+/// exit.
 #[cfg(feature = "audio-device")]
 pub(crate) fn start_voice(
     mixer: SharedMixer,
     conn: quinn::Connection,
     my_id: u32,
     music: bool,
+    loss_report: Arc<AtomicU32>,
+    cmd_tx: UnboundedSender<Command>,
 ) -> Result<VoiceControl, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (reader_stop_tx, mut reader_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -219,7 +329,7 @@ pub(crate) fn start_voice(
         let aec = aec.clone();
         crate::api::session::rt().spawn(async move {
             let mut send = if music {
-                match parley_core::audio::pipeline::SendPipeline::new_music(256_000) {
+                match SendPipeline::new_music(256_000) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("voice: music encoder init failed: {e}");
@@ -227,7 +337,7 @@ pub(crate) fn start_voice(
                     }
                 }
             } else {
-                match parley_core::audio::pipeline::SendPipeline::new(64_000) {
+                match SendPipeline::new(64_000) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("voice: encoder init failed: {e}");
@@ -236,55 +346,124 @@ pub(crate) fn start_voice(
                 }
             };
             let mut asm = parley_client::aec::FrameAssembler::new();
+            // 7e2 (4d): the ladder lives IN the encoder task because
+            // this task owns `send` mutably — no locks on the encode
+            // path. Music: the tick arm never runs its body (no
+            // profile flips; reports are never sent either).
+            let mut ladder = Ladder::new(Instant::now());
+            let mut ladder_tick = tokio::time::interval(Duration::from_secs(1));
+            if !music {
+                apply_profile(&mut send, false); // explicit Clean at startup (4d)
+            }
             loop {
-                let Some(chunk) = pcm_rx.recv().await else {
-                    break; // capture sender dropped → teardown
-                };
-                let processed: Vec<f32> = match aec.as_ref() {
-                    Some(ap) => {
-                        let mut out = Vec::new();
-                        parley_client::aec::process_capture(ap, &mut asm, &chunk, &mut out);
-                        out
+                tokio::select! {
+                    chunk = pcm_rx.recv() => {
+                        let Some(chunk) = chunk else {
+                            break; // capture sender dropped → teardown
+                        };
+                        let processed: Vec<f32> = match aec.as_ref() {
+                            Some(ap) => {
+                                let mut out = Vec::new();
+                                parley_client::aec::process_capture(ap, &mut asm, &chunk, &mut out);
+                                out
+                            }
+                            None => chunk,
+                        };
+                        if processed.is_empty() {
+                            continue;
+                        }
+                        let pcm: Vec<i16> = if music {
+                            // Mono mic → centered stereo (the terminal
+                            // client's music-channel behavior).
+                            processed
+                                .iter()
+                                .flat_map(|&s| {
+                                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                    [v, v]
+                                })
+                                .collect()
+                        } else {
+                            processed
+                                .iter()
+                                .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                                .collect()
+                        };
+                        let mut packets = Vec::new();
+                        if send.push_pcm(&pcm, &mut packets).is_err() {
+                            eprintln!("voice: encode failed");
+                            break;
+                        }
+                        let flags = if music {
+                            parley_proto::media::FLAG_SPEAKING | FLAG_STEREO
+                        } else {
+                            parley_proto::media::FLAG_SPEAKING
+                        };
+                        for (seq, ts, pkt) in packets {
+                            let dg = parley_proto::media::encode(flags, seq, ts, 0, &pkt);
+                            if conn.send_datagram(dg.into()).is_err() {
+                                return; // connection gone
+                            }
+                        }
                     }
-                    None => chunk,
-                };
-                if processed.is_empty() {
-                    continue;
-                }
-                let pcm: Vec<i16> = if music {
-                    // Mono mic → centered stereo (the terminal
-                    // client's music-channel behavior).
-                    processed
-                        .iter()
-                        .flat_map(|&s| {
-                            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                            [v, v]
-                        })
-                        .collect()
-                } else {
-                    processed
-                        .iter()
-                        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                        .collect()
-                };
-                let mut packets = Vec::new();
-                if send.push_pcm(&pcm, &mut packets).is_err() {
-                    eprintln!("voice: encode failed");
-                    break;
-                }
-                let flags = if music {
-                    parley_proto::media::FLAG_SPEAKING | FLAG_STEREO
-                } else {
-                    parley_proto::media::FLAG_SPEAKING
-                };
-                for (seq, ts, pkt) in packets {
-                    let dg = parley_proto::media::encode(flags, seq, ts, 0, &pkt);
-                    if conn.send_datagram(dg.into()).is_err() {
-                        return; // connection gone
+                    _ = ladder_tick.tick() => {
+                        if music {
+                            continue; // 4d: music ignores reports by design
+                        }
+                        let observed = loss_report.load(Ordering::Relaxed);
+                        if let Some(robust) = ladder.step(observed, Instant::now()) {
+                            apply_profile(&mut send, robust);
+                            println!(
+                                "voice: bitrate → {} — loss {:.1}%",
+                                if robust {
+                                    "Robust (24 kbps + FEC)"
+                                } else {
+                                    "Clean (64 kbps)"
+                                },
+                                ladder.ema_permille() / 10.0
+                            );
+                        }
                     }
                 }
             }
         })
+    };
+
+    // --- 4d loss reporter (speech only): one aggregate worst-peer
+    // report per 5 s window; the server routes it to the voice
+    // channel's other members, stamped with our authenticated id and
+    // never back to us. Music channels send nothing — there is no
+    // ladder to steer (4d's rule). Exits when the session writer
+    // dies; VoiceControl::Drop aborts it.
+    let reporter_abort = if music {
+        None
+    } else {
+        let rep_mixer = mixer.clone();
+        let rep_cmd = cmd_tx.clone();
+        Some(
+            crate::api::session::rt()
+                .spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(5));
+                    loop {
+                        tick.tick().await;
+                        let worst = {
+                            let rates = rep_mixer.lock().unwrap().gap_rates();
+                            if rates.is_empty() {
+                                continue; // no active voices: nothing to report
+                            }
+                            rates.iter().map(|&(_, r)| r).max().unwrap_or(0)
+                        };
+                        if rep_cmd
+                            .send(Command::ReceiverReport {
+                                gap_rate_permille: worst,
+                            })
+                            .is_err()
+                        {
+                            break; // writer gone: session over
+                        }
+                    }
+                })
+                .abort_handle(),
+        )
     };
 
     // --- device thread: OWNS both cpal streams (they must never leave
@@ -317,13 +496,16 @@ pub(crate) fn start_voice(
         }
     });
     // Build outcome surfaces to the caller; a failure also drops
-    // reader_stop_tx and aborts the encoder (this fn returns Err →
-    // VoiceControl never constructed). No orphans.
+    // reader_stop_tx and aborts the encoder + reporter (this fn
+    // returns Err → VoiceControl never constructed). No orphans.
     if let Err(e) = ready_rx
         .recv()
         .map_err(|e| format!("device thread died: {e}"))?
     {
         encoder_task.abort();
+        if let Some(reporter) = &reporter_abort {
+            reporter.abort();
+        }
         return Err(e);
     }
 
@@ -331,6 +513,7 @@ pub(crate) fn start_voice(
         stop,
         reader_stop: reader_stop_tx,
         encoder_abort: encoder_task.abort_handle(),
+        reporter_abort,
         _device_thread: device_thread,
     })
 }
@@ -496,4 +679,96 @@ fn build_streams(
     println!("voice: render \"{out_name}\" 48 kHz {out_channels}ch (stereo mix)");
 
     Ok(AudioStreams { input, output })
+}
+
+/// 7e2: the ladder's pure state machine — the two thresholds, both
+/// cooldowns, the EMA smoothing, and the low-window reset, on
+/// deterministic timelines (no devices, no codec, no async).
+#[cfg(all(test, feature = "audio-device"))]
+mod ladder_tests {
+    use super::Ladder;
+    use std::time::{Duration, Instant};
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    /// A single 10% blip must not flip the profile: the EMA lands at
+    /// ~30‰ and decays back below the threshold before the cooldown
+    /// even elapses.
+    #[test]
+    fn single_loss_blip_does_not_switch() {
+        let t = t0();
+        let mut l = Ladder::new(t);
+        assert_eq!(l.step(100, t), None);
+        assert_eq!(l.step(0, t + Duration::from_secs(5)), None);
+    }
+
+    /// Sustained loss above 30‰ switches to Robust — but only once
+    /// the 5 s switch cooldown has elapsed.
+    #[test]
+    fn clean_to_robust_needs_threshold_and_cooldown() {
+        let t = t0();
+        let mut l = Ladder::new(t);
+        assert_eq!(l.step(100, t + Duration::from_secs(1)), None); // ema ~30, cooldown
+        assert_eq!(l.step(100, t + Duration::from_secs(4)), None); // ema ~51, cooldown
+        assert_eq!(l.step(100, t + Duration::from_secs(5)), Some(true)); // ema ~65.7
+    }
+
+    /// The threshold is strict: 29.7‰ is not enough even with the
+    /// cooldown long elapsed.
+    #[test]
+    fn threshold_is_strictly_above_30() {
+        let t = t0();
+        let mut l = Ladder::new(t);
+        assert_eq!(l.step(99, t + Duration::from_secs(10)), None); // ema 29.7
+        assert_eq!(l.step(99, t + Duration::from_secs(11)), Some(true)); // ema ~50.5
+    }
+
+    /// Recovery needs 20 s CONTINUOUSLY below 10‰ (plus the 5 s
+    /// cooldown, long since satisfied here).
+    #[test]
+    fn robust_to_clean_needs_20s_below_10() {
+        let t = t0();
+        let mut l = Ladder::new(t);
+        assert_eq!(l.step(100, t), None);
+        assert_eq!(l.step(100, t + Duration::from_secs(5)), Some(true)); // ema ~51.0
+                                                                         // Clean reports decay the EMA below 10‰ on the 5th step —
+                                                                         // the low window just started, no switch yet.
+        for i in 1..=6 {
+            assert_eq!(l.step(0, t + Duration::from_secs(5 + i)), None);
+        }
+        assert_eq!(l.step(0, t + Duration::from_secs(29)), None); // 19 s below
+        assert_eq!(l.step(0, t + Duration::from_secs(30)), Some(false)); // 20 s below
+    }
+
+    /// A loss burst mid-recovery restarts the 20 s clock: 20 s past
+    /// the ORIGINAL low point must not switch.
+    #[test]
+    fn rising_ema_resets_the_low_window() {
+        let t = t0();
+        let mut l = Ladder::new(t);
+        assert_eq!(l.step(100, t), None);
+        assert_eq!(l.step(100, t + Duration::from_secs(5)), Some(true)); // ema ~65.7
+        for i in 1..=6 {
+            l.step(0, t + Duration::from_secs(5 + i)); // ema ~6.0 at t+11 s; low_since = t+10
+        }
+        assert_eq!(l.step(30, t + Duration::from_secs(12)), None); // ema ~13.2 → reset
+        assert_eq!(l.step(0, t + Duration::from_secs(13)), None); // ema ~9.2 → new low_since
+        assert_eq!(l.step(0, t + Duration::from_secs(14)), None); // ema ~6.5 — window continues
+        assert_eq!(l.step(0, t + Duration::from_secs(31)), None); // 18 s on the NEW clock
+                                                                  // (21 s past the original — proves the reset.)
+        assert_eq!(l.step(0, t + Duration::from_secs(34)), Some(false)); // 21 s on it
+    }
+
+    /// A clean channel never leaves Clean, no matter how long.
+    #[test]
+    fn zero_loss_never_leaves_clean() {
+        let t = t0();
+        let mut l = Ladder::new(t);
+        for i in 1..=10 {
+            assert_eq!(l.step(0, t + Duration::from_secs(i)), None);
+        }
+        assert!(l.ema_permille().abs() < 0.001);
+    }
 }
