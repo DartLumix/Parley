@@ -68,7 +68,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1473752976;
+  int get rustContentHash => -1413269887;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -117,10 +117,6 @@ abstract class RustLibApi extends BaseApi {
     required BigInt channelId,
     required String text,
   });
-
-  Future<void> crateApiSessionVoiceStart({required int sessionId});
-
-  Future<void> crateApiSessionVoiceStop();
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -478,61 +474,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     debugName: "send_chat",
     argNames: ["sessionId", "channelId", "text"],
   );
-
-  @override
-  Future<void> crateApiSessionVoiceStart({required int sessionId}) {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_u_32(sessionId, serializer);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 12,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSessionVoiceStartConstMeta,
-        argValues: [sessionId],
-        apiImpl: this,
-      ),
-    );
-  }
-
-  TaskConstMeta get kCrateApiSessionVoiceStartConstMeta =>
-      const TaskConstMeta(debugName: "voice_start", argNames: ["sessionId"]);
-
-  @override
-  Future<void> crateApiSessionVoiceStop() {
-    return handler.executeNormal(
-      NormalTask(
-        callFfi: (port_) {
-          final serializer = SseSerializer(generalizedFrbRustBinding);
-          pdeCallFfi(
-            generalizedFrbRustBinding,
-            serializer,
-            funcId: 13,
-            port: port_,
-          );
-        },
-        codec: SseCodec(
-          decodeSuccessData: sse_decode_unit,
-          decodeErrorData: sse_decode_String,
-        ),
-        constMeta: kCrateApiSessionVoiceStopConstMeta,
-        argValues: [],
-        apiImpl: this,
-      ),
-    );
-  }
-
-  TaskConstMeta get kCrateApiSessionVoiceStopConstMeta =>
-      const TaskConstMeta(debugName: "voice_stop", argNames: []);
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {

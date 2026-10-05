@@ -15,10 +15,25 @@
 //! and echoes chat to the sender). Bootstrap requests (presence,
 //! channel list) are issued by the DART side after subscribing —
 //! issuing them from connect() races sink registration.
+//!
+//! 7e VOICE OWNERSHIP: each LiveSession owns its voice state
+//! (devices + media reader + encoder) as Option<VoiceControl>. The
+//! session's OWN VoiceState events drive it — join enables (listen +
+//! transmit, TeamSpeak shape; channel mode picks the encoder
+//! profile), leave disables. Registry removal (disconnect / death
+//! teardown) drops it too, so voice can never outlive its session —
+//! the structural closure of the 7d voice-state-across-reconnects
+//! gap. The enable path spawns on the blocking pool (device build
+//! blocks ~100 ms) and installs the control via an epoch-guarded
+//! async block: the SESSIONS lock is NEVER held across device
+//! startup, and a leave/disconnect landing mid-install still wins
+//! (the install checks the epoch under the lock at the end).
 
 use parley_core::audio::mixer::{self as core_mixer, SharedMixer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+#[cfg(feature = "audio-device")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +41,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use prost::Message as _;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedSender;
+
+#[cfg(feature = "audio-device")]
+use crate::api::voice::VoiceControl;
 
 use parley_client::cert;
 use parley_core::session;
@@ -45,6 +63,12 @@ pub(crate) fn rt() -> &'static Runtime {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// Monotonic enable epoch (7e): guards the async install path. Each
+/// start_voice attempt takes a ticket; only the CURRENT ticket may
+/// install — a leave/disconnect/newer-join landing mid-install
+/// invalidates the older one.
+#[cfg(feature = "audio-device")]
+static VOICE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Commands the session writer accepts (the heartbeat it generates
 /// itself).
@@ -104,11 +128,21 @@ struct LiveSession {
     /// through this handle).
     sinks: SinkList,
     /// The session's voice mixer — shared with the voice module's
-    /// device reader/callback (voice_start takes it; membership events
+    /// device reader/callback (start_voice takes it; membership events
     /// below add/remove voices).
     mixer: SharedMixer,
     /// Authenticated user id (media reader's self-echo filter).
     user_id: u32,
+    /// The channel listing as seen by the last channel_list event —
+    /// 7e profile selection: the mode of the channel being joined
+    /// picks speech (mono + AEC) vs music (stereo 256 kbps, no AEC).
+    /// Channels joined before any listing default to speech.
+    channels: Vec<(u64, String)>,
+    /// 7e: the session's voice (devices + reader + encoder). Some
+    /// while the user is in a voice channel; dropping it tears
+    /// everything down — voice can never outlive its session.
+    #[cfg(feature = "audio-device")]
+    voice: Option<VoiceControl>,
 }
 
 static SESSIONS: LazyLock<Mutex<HashMap<u32, LiveSession>>> =
@@ -239,6 +273,23 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
     };
     match msg.body.as_ref()? {
         ServerBody::ChannelList(list) => {
+            // Cache for the voice profile lookup below (7e).
+            if let Some(s) = SESSIONS.lock().unwrap().get_mut(&session_id) {
+                s.channels = list
+                    .channels
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.id,
+                            match c.mode() {
+                                ChannelMode::Music => "music",
+                                ChannelMode::Speech => "speech",
+                            }
+                            .to_string(),
+                        )
+                    })
+                    .collect();
+            }
             let mut e = ev("channel_list");
             e.channels = list
                 .channels
@@ -308,6 +359,23 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                     s.mixer.lock().unwrap().remove(v.user_id);
                 }
             }
+            // 7e: own join/leave DRIVES the local voice (join = listen
+            // + transmit; TeamSpeak shape). Music profile iff the
+            // joined channel's cached mode says music. Failures log;
+            // the voice_state event still flows (the UI shows
+            // membership truth). Featureless builds (CI): no local
+            // voice exists — membership events stay pure UI state.
+            if v.user_id == own_user_id(session_id) {
+                if v.joined {
+                    #[cfg(feature = "audio-device")]
+                    enable_voice(session_id, v.channel_id);
+                    #[cfg(not(feature = "audio-device"))]
+                    let _ = v.channel_id;
+                } else {
+                    #[cfg(feature = "audio-device")]
+                    disable_voice(session_id);
+                }
+            }
             let mut e = ev("voice_state");
             e.user_id = v.user_id;
             e.channel_id = v.channel_id;
@@ -332,6 +400,103 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
         _ => None,
     }
 }
+
+fn own_user_id(session_id: u32) -> u32 {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| s.user_id)
+        .unwrap_or(0)
+}
+
+/// 7e: the profile for a channel, from the cached listing. Unknown
+/// channels default to speech (the conservative choice: AEC on).
+#[cfg(feature = "audio-device")]
+fn channel_is_music(session_id: u32, channel_id: u64) -> bool {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .and_then(|s| s.channels.iter().find(|(id, _)| *id == channel_id))
+        .map(|(_, mode)| mode == "music")
+        .unwrap_or(false)
+}
+
+/// 7e: enable voice for this session's own join. Runs entirely on the
+/// blocking pool — the SESSIONS lock is never held across device
+/// startup. Epoch-guarded: a newer epoch (re-join, leave, disconnect)
+/// invalidates an in-flight install.
+#[cfg(feature = "audio-device")]
+fn enable_voice(session_id: u32, channel_id: u64) {
+    let music = channel_is_music(session_id, channel_id);
+    // Snapshot what the voice path needs; drop the lock immediately.
+    let (mixer, conn, my_id) = {
+        let sessions = SESSIONS.lock().unwrap();
+        let Some(s) = sessions.get(&session_id) else {
+            return;
+        };
+        // Double-join with a LIVE control: short-circuit. A STOPPED
+        // one (reader saw connection death) is replaced.
+        if let Some(ctrl) = s.voice.as_ref() {
+            if !ctrl.is_stopped() {
+                return;
+            }
+        }
+        (s.mixer.clone(), s._conn.clone(), s.user_id)
+    };
+
+    let epoch = VOICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    tokio::task::spawn_blocking(move || {
+        match crate::api::voice::start_voice(mixer, conn, my_id, music) {
+            Ok(ctrl) => {
+                // Install only if this epoch is still the newest —
+                // else Drop the (already live) devices immediately.
+                let mut sessions = SESSIONS.lock().unwrap();
+                let current = VOICE_EPOCH.load(Ordering::SeqCst);
+                match sessions.get_mut(&session_id) {
+                    Some(s) if current == epoch => {
+                        s.voice = Some(ctrl);
+                        println!("voice: enabled for session {session_id}");
+                    }
+                    _ => {
+                        drop(ctrl); // superseded: tear down what just started
+                        println!(
+                            "voice: enable for session {session_id} superseded mid-install — torn down"
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("voice: enable failed: {e}"),
+        }
+    });
+}
+
+/// 7e: disable voice (own leave / session teardown). Bumps the epoch
+/// FIRST so any in-flight enable's install is invalidated, then drops
+/// the control — Drop flips the device stop flag, signals the reader,
+/// aborts the encoder; the device thread self-terminates within
+/// ~100 ms.
+#[cfg(feature = "audio-device")]
+fn disable_voice(session_id: u32) {
+    VOICE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let ctrl = SESSIONS
+        .lock()
+        .unwrap()
+        .get_mut(&session_id)
+        .and_then(|s| s.voice.take());
+    drop(ctrl); // Drop = teardown signal
+}
+
+/// Session teardown, used by disconnect (and valid at any death
+/// point): voice first, then the registry entry.
+#[cfg(feature = "audio-device")]
+fn teardown_voice(session_id: u32) {
+    disable_voice(session_id);
+}
+
+#[cfg(not(feature = "audio-device"))]
+fn teardown_voice(_session_id: u32) {}
 
 /// Connect + authenticate. Blocks until the handshake completes (runs
 /// on an FRB worker thread; Dart sees a Future).
@@ -409,8 +574,8 @@ async fn connect_async(
     // onto every event.
     let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-    // The voice mixer: created here, shared with voice_start's device
-    // path. Voice membership lives server-side; the mixer follows.
+    // The voice mixer: created here, shared with the voice path.
+    // Voice membership lives server-side; the mixer follows.
     let session_mixer: SharedMixer = core_mixer::new();
     // --- event path: reader → channel → forwarder → sinks ---
     let sinks: SinkList = Arc::new(Mutex::new(Vec::new()));
@@ -515,6 +680,9 @@ async fn connect_async(
             sinks,
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
+            channels: Vec::new(),
+            #[cfg(feature = "audio-device")]
+            voice: None,
         },
     );
 
@@ -556,10 +724,12 @@ pub fn is_connected(session_id: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Disconnect: dropping the registry entry closes the streams (and the
-/// endpoint's socket) — the server ends the session on control-stream
-/// close (§5 semantics). Writer/reader tasks error out and exit.
+/// Disconnect: voice devices die FIRST (deterministic teardown), then
+/// the registry entry drops — closing the streams (and the endpoint's
+/// socket). The server ends the session on control-stream close (§5
+/// semantics). Writer/reader tasks error out and exit.
 pub fn disconnect(session_id: u32) -> Result<(), String> {
+    teardown_voice(session_id);
     match SESSIONS.lock().unwrap().remove(&session_id) {
         Some(_) => Ok(()),
         None => Err(format!("no session {session_id}")),
@@ -571,12 +741,14 @@ pub fn list_channels(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::ListChannels)
 }
 
-/// Join a voice channel (self-confirmation: "voice_state" event).
+/// Join a voice channel (self-confirmation: "voice_state" event —
+/// which then enables the local voice devices; 7e).
 pub fn join_voice(session_id: u32, channel_id: u64) -> Result<(), String> {
     send_command(session_id, Command::JoinVoice { channel_id })
 }
 
-/// Leave the current voice channel.
+/// Leave the current voice channel (self-confirmation: "voice_state"
+/// event — which then disables the local voice devices; 7e).
 pub fn leave_voice(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::LeaveVoice)
 }
@@ -606,24 +778,4 @@ pub fn fetch_history(
 /// Request the presence listing (response: "presence" event).
 pub fn request_presence(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::Presence)
-}
-
-/// Start listening (voice receive): open the output device on the
-/// session's mixer + spawn the media reader. Requires the session.
-pub fn voice_start(session_id: u32) -> Result<(), String> {
-    let sessions = SESSIONS.lock().unwrap();
-    let s = sessions
-        .get(&session_id)
-        .ok_or(format!("no session {session_id}"))?;
-    let mixer = s.mixer.clone();
-    let conn = s._conn.clone();
-    let my_id = s.user_id;
-    drop(sessions);
-    crate::api::voice::voice_start(mixer, conn, my_id)
-}
-
-/// Stop listening (drop the device; reader exits with the connection).
-pub fn voice_stop() -> Result<(), String> {
-    crate::api::voice::voice_stop();
-    Ok(())
 }

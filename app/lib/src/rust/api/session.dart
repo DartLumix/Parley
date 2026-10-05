@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `into_client_body`, `now_ms`, `read_frame`, `rt`, `send_command`, `to_event`
+// These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `teardown_voice`, `to_event`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
@@ -32,9 +32,10 @@ Stream<SessionEvent> events({required int sessionId}) =>
 Future<bool> isConnected({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionIsConnected(sessionId: sessionId);
 
-/// Disconnect: dropping the registry entry closes the streams (and the
-/// endpoint's socket) — the server ends the session on control-stream
-/// close (§5 semantics). Writer/reader tasks error out and exit.
+/// Disconnect: voice devices die FIRST (deterministic teardown), then
+/// the registry entry drops — closing the streams (and the endpoint's
+/// socket). The server ends the session on control-stream close (§5
+/// semantics). Writer/reader tasks error out and exit.
 Future<void> disconnect({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionDisconnect(sessionId: sessionId);
 
@@ -42,14 +43,16 @@ Future<void> disconnect({required int sessionId}) =>
 Future<void> listChannels({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionListChannels(sessionId: sessionId);
 
-/// Join a voice channel (self-confirmation: "voice_state" event).
+/// Join a voice channel (self-confirmation: "voice_state" event —
+/// which then enables the local voice devices; 7e).
 Future<void> joinVoice({required int sessionId, required BigInt channelId}) =>
     RustLib.instance.api.crateApiSessionJoinVoice(
       sessionId: sessionId,
       channelId: channelId,
     );
 
-/// Leave the current voice channel.
+/// Leave the current voice channel (self-confirmation: "voice_state"
+/// event — which then disables the local voice devices; 7e).
 Future<void> leaveVoice({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionLeaveVoice(sessionId: sessionId);
 
@@ -80,14 +83,6 @@ Future<void> fetchHistory({
 /// Request the presence listing (response: "presence" event).
 Future<void> requestPresence({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionRequestPresence(sessionId: sessionId);
-
-/// Start listening (voice receive): open the output device on the
-/// session's mixer + spawn the media reader. Requires the session.
-Future<void> voiceStart({required int sessionId}) =>
-    RustLib.instance.api.crateApiSessionVoiceStart(sessionId: sessionId);
-
-/// Stop listening (drop the device; reader exits with the connection).
-Future<void> voiceStop() => RustLib.instance.api.crateApiSessionVoiceStop();
 
 /// One row of a channel listing.
 class ChannelInfo {

@@ -78,6 +78,10 @@ class _DevHomePageState extends State<DevHomePage> {
   final Map<int, String> _usernames = {}; // user_id → username
   final List<ChatEntry> _chat = [];
   BigInt? _joinedChannelId;
+  // 7e: join = listen + transmit (TeamSpeak shape) — the Rust side
+  // opens/closes the devices on the own join/leave events. The UI only
+  // reflects membership; there is no listen toggle.
+  bool _voiceUp = false;
 
   late final Timer _liveness;
 
@@ -120,6 +124,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _session = null;
       _status = 'connection lost';
       _joinedChannelId = null;
+      _voiceUp = false;
       _channels.clear();
       _presence.clear();
       _chat.clear();
@@ -183,6 +188,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _session = null;
       _status = 'disconnected';
       _joinedChannelId = null;
+      _voiceUp = false;
       _channels.clear();
       _presence.clear();
       _chat.clear();
@@ -193,7 +199,6 @@ class _DevHomePageState extends State<DevHomePage> {
   void _onEvent(SessionEvent ev) {
     switch (ev.kind) {
       case 'channel_list':
-        _usernames[ev.sessionId] = _usernames[ev.sessionId] ?? '';
         setState(
           () => _channels
             ..clear()
@@ -219,10 +224,14 @@ class _DevHomePageState extends State<DevHomePage> {
         setState(() => _chat.insertAll(0, ev.messages));
       case 'voice_state':
         setState(() {
-          if (ev.joined && ev.userId == _session?.userId) {
-            _joinedChannelId = ev.channelId;
-          } else if (!ev.joined && ev.userId == _session?.userId) {
-            _joinedChannelId = null;
+          if (ev.userId == _session?.userId) {
+            // 7e: the own join/leave IS the voice lifecycle — the Rust
+            // side already opened/closed the devices on this event.
+            _joinedChannelId = ev.joined ? ev.channelId : null;
+            _voiceUp = ev.joined;
+            _status = ev.joined
+                ? 'in voice — mic + speakers live'
+                : 'connected';
           }
         });
       case 'voice_states':
@@ -230,6 +239,7 @@ class _DevHomePageState extends State<DevHomePage> {
           for (final st in ev.states) {
             if (st.userId == _session?.userId) {
               _joinedChannelId = st.joined ? st.channelId : null;
+              _voiceUp = st.joined;
             }
           }
         });
@@ -368,53 +378,20 @@ class _DevHomePageState extends State<DevHomePage> {
               ),
             const Divider(height: 32),
 
-            // --- presence ---
-            Text(
-              'Online (${_presence.length})',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 4),
-            Wrap(
-              spacing: 8,
-              runSpacing: 4,
-              children: [
-                for (final u in _presence)
-                  Chip(
-                    label: Text(
-                      '${u.username} (${u.userId})',
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    backgroundColor: Colors.white10,
-                  ),
-              ],
-            ),
-            // --- voice (receive-only, step 3) ---
-            const Divider(height: 32),
+            // --- voice (7e: join-driven; no listen toggle) ---
             Row(
               children: [
-                ElevatedButton(
-                  onPressed: _session != null && _joinedChannelId == null
-                      ? null
-                      : () async {
-                          if (_session == null) return;
-                          try {
-                            await voiceStart(sessionId: _session!.sessionId);
-                            setState(() => _status = 'listening');
-                          } catch (e) {
-                            setState(() => _status = 'voice start failed: $e');
-                          }
-                        },
-                  child: const Text('Start Listening'),
+                Icon(
+                  _voiceUp ? Icons.mic : Icons.mic_off,
+                  size: 18,
+                  color: _voiceUp ? Colors.deepPurpleAccent : Colors.white38,
                 ),
-                const SizedBox(width: 12),
-                ElevatedButton(
-                  onPressed: _session == null
-                      ? null
-                      : () async {
-                          await voiceStop();
-                          setState(() => _status = 'connected');
-                        },
-                  child: const Text('Stop Listening'),
+                const SizedBox(width: 8),
+                Text(
+                  _voiceUp
+                      ? 'voice live${joinedName != null ? ' · $joinedName' : ''}'
+                      : 'voice idle (join a channel to talk & listen)',
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
                 ),
               ],
             ),
