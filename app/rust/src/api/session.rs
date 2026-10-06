@@ -45,10 +45,16 @@ use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "audio-device")]
 use crate::api::voice::VoiceControl;
 
+#[cfg(feature = "video")]
+use crate::api::video;
 use parley_client::cert;
 use parley_core::session;
+#[cfg(feature = "video")]
+use parley_core::video_receive::SharedVideoReceiveHub;
 #[cfg(feature = "audio-device")]
 use parley_proto::ReceiverReport;
+#[cfg(feature = "video")]
+use parley_proto::VideoReport;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
     Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
@@ -101,6 +107,14 @@ pub(crate) enum Command {
     ReceiverReport {
         gap_rate_permille: u32,
     },
+    /// 7f (6e): OUR video report as a VIEWER — worst per-sender gap
+    /// rate, every 5 s while streams are active. Feeds the sharer's
+    /// video bitrate ladder (VideoLadder), exactly as 7e2 feeds the
+    /// audio ladder. Gated with the video path.
+    #[cfg(feature = "video")]
+    VideoReport {
+        gap_rate_permille: u32,
+    },
 }
 
 impl Command {
@@ -125,6 +139,13 @@ impl Command {
             #[cfg(feature = "audio-device")]
             Command::ReceiverReport { gap_rate_permille } => {
                 ClientBody::ReceiverReport(ReceiverReport {
+                    gap_rate_permille,
+                    reporter_id: 0, // server stamps the authenticated id
+                })
+            }
+            #[cfg(feature = "video")]
+            Command::VideoReport { gap_rate_permille } => {
+                ClientBody::VideoReport(VideoReport {
                     gap_rate_permille,
                     reporter_id: 0, // server stamps the authenticated id
                 })
@@ -162,6 +183,12 @@ struct LiveSession {
     /// encoder's 1 Hz tick. 0 = no loss reported (yet).
     #[cfg(feature = "audio-device")]
     loss_report: Arc<AtomicU32>,
+    /// 7f: the display bridge — consumer thread + per-sender Flutter
+    /// textures, plus the receive hub they drain. Session-owned like
+    /// the voice rig (7e rule): dropped with the registry entry,
+    /// textures destroyed on the platform thread (see api/video.rs).
+    #[cfg(feature = "video")]
+    display: Option<video::DisplayBridge>,
     /// 7e: the session's voice (devices + reader + encoder). Some
     /// while the user is in a voice channel; dropping it tears
     /// everything down — voice can never outlive its session.
@@ -212,6 +239,17 @@ pub struct VoiceEntry {
     pub joined: bool,
 }
 
+/// 7f: one remote share's display surface. `texture_id` feeds a plain
+/// Flutter `Texture` widget (pixels come from the Rust side); width /
+/// height are the decoded stream's dimensions.
+#[derive(Debug, Clone)]
+pub struct VideoSurfaceInfo {
+    pub user_id: u32,
+    pub width: u64,
+    pub height: u64,
+    pub texture_id: i64,
+}
+
 /// Everything the server can tell the UI, as one flat event struct.
 /// `kind` is one of: "channel_list", "presence", "chat", "history",
 /// "voice_state", "voice_states", "session_closed".
@@ -232,6 +270,8 @@ pub struct SessionEvent {
     pub joined: bool,
     /// voice_states (the full snapshot)
     pub states: Vec<VoiceEntry>,
+    /// 7f: video_started / video_stopped (the surface)
+    pub surface: Option<VideoSurfaceInfo>,
 }
 
 /// Connected-session snapshot returned at connect time.
@@ -277,12 +317,18 @@ fn closed_event(session_id: u32) -> SessionEvent {
         channel_id: 0,
         joined: false,
         states: Vec::new(),
+        surface: None,
     }
 }
 
-/// Map one ServerMessage to a SessionEvent (with empty defaults for
-/// the fields this kind doesn't use).
-fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
+/// Map one ServerMessage to SessionEvents (with empty defaults for
+/// the fields a kind doesn't use). Returns a Vec because one message
+/// can carry two UI facts (7f: a voice-leave is both a voice_state
+/// AND a video_stopped).
+fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
+    let mut extra = Vec::new();
+    // (The `?` below became a plain early-return: a body-less message
+    // maps to zero events.)
     let ev = |kind: &str| SessionEvent {
         session_id,
         kind: kind.to_string(),
@@ -294,8 +340,12 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
         channel_id: 0,
         joined: false,
         states: Vec::new(),
+        surface: None,
     };
-    match msg.body.as_ref()? {
+    let Some(body) = msg.body.as_ref() else {
+        return Vec::new();
+    };
+    match body {
         ServerBody::ChannelList(list) => {
             // Cache for the voice profile lookup below (7e).
             if let Some(s) = SESSIONS.lock().unwrap().get_mut(&session_id) {
@@ -328,7 +378,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                     .to_string(),
                 })
                 .collect();
-            Some(e)
+            vec![e]
         }
         ServerBody::PresenceList(list) => {
             let mut e = ev("presence");
@@ -340,7 +390,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                     username: u.username.clone(),
                 })
                 .collect();
-            Some(e)
+            vec![e]
         }
         ServerBody::ChatMessage(m) => {
             let mut e = ev("chat");
@@ -355,7 +405,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                 text: m.text.clone(),
                 timestamp_ms: m.timestamp_ms,
             });
-            Some(e)
+            vec![e]
         }
         ServerBody::HistoryResult(r) => {
             let mut e = ev("history");
@@ -372,15 +422,38 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                     timestamp_ms: m.timestamp_ms,
                 })
                 .collect();
-            Some(e)
+            vec![e]
         }
         ServerBody::VoiceState(v) => {
             // A departed user's decoder state drops (the terminal
             // client's mixer::remove — done here so the event path and
-            // the mix stay consistent).
+            // the mix stay consistent). 7f: their video surface is
+            // hidden too (hub forgets them; a re-join re-announces the
+            // texture on their next frame). Emits video_stopped BEFORE
+            // voice_state (the Vec return carries both).
             if !v.joined {
+                #[cfg(feature = "video")]
                 if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
                     s.mixer.lock().unwrap().remove(v.user_id);
+                    if let Some(d) = s.display.as_ref() {
+                        d.sender_stopped(v.user_id, true);
+                    }
+                }
+                #[cfg(not(feature = "video"))]
+                if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                    s.mixer.lock().unwrap().remove(v.user_id);
+                }
+                #[cfg(feature = "video")]
+                {
+                    let mut e = ev("video_stopped");
+                    e.user_id = v.user_id;
+                    e.surface = Some(VideoSurfaceInfo {
+                        user_id: v.user_id,
+                        width: 0,
+                        height: 0,
+                        texture_id: 0,
+                    });
+                    extra.push(e);
                 }
             }
             // 7e: own join/leave DRIVES the local voice (join = listen
@@ -404,7 +477,8 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
             e.user_id = v.user_id;
             e.channel_id = v.channel_id;
             e.joined = v.joined;
-            Some(e)
+            extra.push(e);
+            extra
         }
         ServerBody::ReceiverReport(rep) => {
             // 7e2 (4d): a peer's loss report steers OUR send ladder —
@@ -427,7 +501,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
             }
             #[cfg(not(feature = "audio-device"))]
             let _ = rep;
-            None
+            Vec::new()
         }
         ServerBody::VoiceStateList(l) => {
             let mut e = ev("voice_states");
@@ -440,11 +514,43 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Option<SessionEvent> {
                     joined: v.joined,
                 })
                 .collect();
-            Some(e)
+            vec![e]
         }
-        // HeartbeatAck / ShareStopped / VideoReport: later steps
-        // surface these (share lifecycle).
-        _ => None,
+        ServerBody::ShareStopped(s) => {
+            // 7f: a sharer stopped (own echo filtered — the server
+            // excludes the reporter from routing, but be defensive,
+            // the terminal client's rule). Hub suppresses stragglers
+            // until their next frame_id-0 keyframe; the display hides
+            // the surface (kept, re-announced on a re-share — see
+            // api/video.rs).
+            #[cfg(not(feature = "video"))]
+            {
+                let _ = s;
+                Vec::new()
+            }
+            #[cfg(feature = "video")]
+            {
+                if s.user_id != own_user_id(session_id) {
+                    if let Some(sess) = SESSIONS.lock().unwrap().get(&session_id) {
+                        if let Some(d) = sess.display.as_ref() {
+                            d.sender_stopped(s.user_id, false);
+                        }
+                    }
+                }
+                let mut e = ev("video_stopped");
+                e.user_id = s.user_id;
+                e.surface = Some(VideoSurfaceInfo {
+                    user_id: s.user_id,
+                    width: 0,
+                    height: 0,
+                    texture_id: 0,
+                });
+                vec![e]
+            }
+        }
+        // HeartbeatAck / VideoReport (sender-side feedback): nothing
+        // to surface in the UI.
+        _ => Vec::new(),
     }
 }
 
@@ -470,6 +576,31 @@ fn channel_is_music(session_id: u32, channel_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// 7f: the per-session video wire — reader feeds it, a dedicated task
+/// drains it into the hub (3b: decode never on the datagram reader).
+#[cfg(feature = "video")]
+fn start_video_task(session_id: u32, hub: SharedVideoReceiveHub) {
+    // Unbounded: the hub itself bounds memory via its frame queue and
+    // assembler caps; a burst of fragments just queues briefly.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+    rt().spawn(async move {
+        while let Some((sender_id, payload)) = rx.recv().await {
+            hub.push_datagram(sender_id, &payload);
+        }
+    });
+    VIDEO_FEEDS.lock().unwrap().insert(session_id, tx);
+}
+
+/// 7f: one session's video wire (reader → hub task).
+#[cfg(feature = "video")]
+type VideoFeed = tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>;
+
+/// 7f: feeds parked per session; enable_voice snapshots the one for
+/// its session and hands it to start_voice.
+#[cfg(feature = "video")]
+static VIDEO_FEEDS: LazyLock<Mutex<HashMap<u32, VideoFeed>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// 7e: enable voice for this session's own join. Runs entirely on the
 /// blocking pool — the SESSIONS lock is never held across device
 /// startup. Epoch-guarded: a newer epoch (re-join, leave, disconnect)
@@ -479,8 +610,8 @@ fn enable_voice(session_id: u32, channel_id: u64) {
     let music = channel_is_music(session_id, channel_id);
     // Snapshot what the voice path needs; drop the lock immediately.
     // (7e2 adds the loss-report slot — reader task writes, encoder
-    // ladder reads — and the command sender for the loss reporter.)
-    let (mixer, conn, my_id, loss_report, cmd_tx) = {
+    // ladder reads; 7f adds the video feed for the same media path.)
+    let (mixer, conn, my_id, loss_report, cmd_tx, video_tx) = {
         let sessions = SESSIONS.lock().unwrap();
         let Some(s) = sessions.get(&session_id) else {
             return;
@@ -498,12 +629,24 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             s.user_id,
             s.loss_report.clone(),
             s.cmd_tx.clone(),
+            #[cfg(feature = "video")]
+            VIDEO_FEEDS.lock().unwrap().get(&session_id).cloned(),
+            #[cfg(not(feature = "video"))]
+            None,
         )
     };
 
     let epoch = VOICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     tokio::task::spawn_blocking(move || {
-        match crate::api::voice::start_voice(mixer, conn, my_id, music, loss_report, cmd_tx) {
+        match crate::api::voice::start_voice(
+            mixer,
+            conn,
+            my_id,
+            music,
+            loss_report,
+            cmd_tx,
+            video_tx,
+        ) {
             Ok(ctrl) => {
                 // Install only if this epoch is still the newest —
                 // else Drop the (already live) devices immediately.
@@ -632,6 +775,10 @@ async fn connect_async(
     // The voice mixer: created here, shared with the voice path.
     // Voice membership lives server-side; the mixer follows.
     let session_mixer: SharedMixer = core_mixer::new();
+    // 7f: the video receive hub — always on while connected (the
+    // display bridge and the FLAG_VIDEO datagram feed gate on it).
+    #[cfg(feature = "video")]
+    let session_hub: SharedVideoReceiveHub = parley_core::video_receive::VideoReceiveHub::shared();
     // --- event path: reader → channel → forwarder → sinks ---
     let sinks: SinkList = Arc::new(Mutex::new(Vec::new()));
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
@@ -663,7 +810,7 @@ async fn connect_async(
             loop {
                 match session::read_message::<ServerMessage>(&mut rx).await {
                     Ok(msg) => {
-                        if let Some(ev) = to_event(session_id, &msg) {
+                        for ev in to_event(session_id, &msg) {
                             let _ = event_tx.send(ev);
                         }
                     }
@@ -685,7 +832,7 @@ async fn connect_async(
     };
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
     {
-        let event_tx = event_tx;
+        let event_tx = event_tx.clone();
         tokio::spawn(async move {
             let mut tx = tx;
             let mut tick = tokio::time::interval(Duration::from_millis(hb_ms));
@@ -725,6 +872,15 @@ async fn connect_async(
         });
     }
 
+    // 7f: hub + display bridge + the video wire + the viewer-side
+    // VideoReport reporter. The display (and its textures) is
+    // session-owned; the wire task and reporter end when the command
+    // channel / hub drop (registry removal).
+    #[cfg(feature = "video")]
+    start_video_task(session_id, session_hub.clone());
+    #[cfg(feature = "video")]
+    start_video_reporter(session_hub.clone(), cmd_tx.clone());
+
     SESSIONS.lock().unwrap().insert(
         session_id,
         LiveSession {
@@ -738,6 +894,12 @@ async fn connect_async(
             channels: Vec::new(),
             #[cfg(feature = "audio-device")]
             loss_report: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "video")]
+            display: Some(video::DisplayBridge::start(
+                session_hub.clone(),
+                event_tx.clone(),
+                session_id,
+            )),
             #[cfg(feature = "audio-device")]
             voice: None,
         },
@@ -787,6 +949,17 @@ pub fn is_connected(session_id: u32) -> bool {
 /// semantics). Writer/reader tasks error out and exit.
 pub fn disconnect(session_id: u32) -> Result<(), String> {
     teardown_voice(session_id);
+    // 7f: the display bridge tears down OUTSIDE the registry lock —
+    // its Drop waits (bounded) for the consumer thread and posts work
+    // to the platform thread; neither belongs under the lock.
+    #[cfg(feature = "video")]
+    let display = SESSIONS
+        .lock()
+        .unwrap()
+        .get_mut(&session_id)
+        .and_then(|s| s.display.take());
+    #[cfg(feature = "video")]
+    drop(display);
     match SESSIONS.lock().unwrap().remove(&session_id) {
         Some(_) => Ok(()),
         None => Err(format!("no session {session_id}")),
@@ -835,4 +1008,30 @@ pub fn fetch_history(
 /// Request the presence listing (response: "presence" event).
 pub fn request_presence(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::Presence)
+}
+
+/// 7f (6e): start the viewer-side VideoReport reporter — worst
+/// per-sender video gap rate every 5 s while streams are active;
+/// feeds the sharer's VideoLadder. Runs for the session lifetime;
+/// exits when the writer dies. (The hub returns None with no active
+/// streams — nothing is sent then.)
+#[cfg(feature = "video")]
+fn start_video_reporter(hub: SharedVideoReceiveHub, cmd_tx: UnboundedSender<Command>) {
+    rt().spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let Some(worst) = hub.gap_rate_permille() else {
+                continue; // no active streams: nothing to report
+            };
+            if cmd_tx
+                .send(Command::VideoReport {
+                    gap_rate_permille: worst,
+                })
+                .is_err()
+            {
+                break; // writer gone: session over
+            }
+        }
+    });
 }

@@ -41,6 +41,13 @@ webrtc-audio-processing = "2.1"
 openh264 = "0.9"
 ashpd = "0.13"
 pipewire = "0.10"
+# 7f: Flutter external textures from Rust (app display bridge for video
+# receive). irondash_texture 0.5.0 is the latest stable (the 0.6 line
+# is pre-release dev); irondash_engine_context provides the engine
+# handle the texture machinery needs (the Dart side needs the matching
+# pub package irondash_engine_context — app/pubspec.yaml).
+irondash_texture = "0.5"
+irondash_engine_context = "0.5"
 
 [profile.release]
 strip = true

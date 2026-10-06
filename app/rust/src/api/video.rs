@@ -1,0 +1,395 @@
+//! Video receive display bridge (7f). The protocol half lives in
+//! parley-core's `VideoReceiveHub` (assembler, decoder, stopped-set,
+//! bounded frame queue — the 3b/6.9 hardening); this module is the
+//! SECOND display consumer the hub was built for (6.9: "Phase 7's
+//! Flutter consumer replaces exactly this function against the same
+//! hub" — the terminal client's mpv feeder being the first).
+//!
+//! SHAPE: one consumer thread per session drains decoded RGB frames
+//! from the hub; per sender it lazily creates an `irondash_texture`
+//! external texture whose payload provider serves the LATEST frame
+//! (latest-frame-wins — the queue's drop-oldest discipline continues
+//! through the bridge), converts RGB24 → RGBA (the Linux embedder's
+//! expected pixel order — `PixelData::FORMAT`), and pings
+//! `mark_frame_available`; Flutter's raster thread pulls pixels at
+//! its own pace. Dart learns the texture id through a `video_started`
+//! SessionEvent and renders a plain `Texture` widget; `video_stopped`
+//! (ShareStopped / peer voice-leave) removes it. A stopped view is
+//! re-ANNOUNCED (same texture id) when the sender's next share
+//! starts — no mid-session texture teardown, no widget churn.
+//!
+//! THREADING (load-bearing — all verified against irondash 0.5
+//! sources):
+//! - Texture creation and destruction MUST run on the Flutter
+//!   platform thread: `EngineContext::get()` asserts the main thread,
+//!   and `SendableTexture`'s inner `Capsule` PANICS if dropped
+//!   off-thread (Capsule::new has no sender hop). Both hops go
+//!   through `EngineContext::perform_on_main_thread`; creation waits
+//!   on a channel for the texture id, destruction is fire-and-forget
+//!   (the closure owns the map and drops it there) but AFTER the
+//!   consumer thread has exited (Drop waits ≤ 2 s for its done
+//!   signal) — so the consumer can never be the last owner of a
+//!   texture dropped off the platform thread.
+//! - `mark_frame_available` goes through `SendableTexture`, which
+//!   routes to the platform thread internally — safe from the
+//!   consumer thread.
+//! - The engine handle comes from Dart
+//!   (`irondash_engine_context`'s `EngineContext.instance
+//!   .getEngineHandle()`) via `video_prepare`, called once at app
+//!   startup. The pub package registers the native plugin whose
+//!   symbols the Rust side resolves via dlsym.
+//!
+//! LIFECYCLE: the bridge is session-owned (the 7e ownership rule —
+//! one rig per LiveSession, dropped with it). Shares are routed to
+//! voice-channel members, so membership is exactly the receive
+//! domain; the hub persists across channel joins within a session and
+//! per-sender state follows the voice_state / ShareStopped events.
+//! disconnect() drops the LiveSession outside the registry lock —
+//! the bridge's bounded teardown wait must never sit under it.
+//!
+//! FEATURE GATE: only `video_prepare` is ungated (the bridge surface
+//! must compile featureless — the 7d voice_start convention); every
+//! other item lives behind `video` (openh264 + irondash_texture).
+
+/// One-time startup: validate the engine-context plugin (a main-thread
+/// hop to `EngineContext::get()`) and store the engine handle for the
+/// texture machinery. Dart calls this right after `RustLib.init()`.
+/// Featureless builds return the 7d-convention error string.
+pub fn video_prepare(engine_handle: i64) -> Result<(), String> {
+    #[cfg(feature = "video")]
+    {
+        imp::prepare(engine_handle)
+    }
+    #[cfg(not(feature = "video"))]
+    {
+        let _ = engine_handle;
+        Err("video feature off".into())
+    }
+}
+
+/// Session-owned display bridge (consumer thread + per-sender
+/// textures). Re-exported for session.rs; the type itself is opaque
+/// to codegen (never in a pub fn signature).
+#[cfg(feature = "video")]
+pub(crate) use imp::DisplayBridge;
+
+#[cfg(feature = "video")]
+mod imp {
+    use irondash_engine_context::EngineContext;
+    use irondash_texture::{BoxedPixelData, PayloadProvider, SendableTexture, SimplePixelData};
+    use parley_core::video_receive::{SharedVideoReceiveHub, VideoFrame};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    use crate::api::session::{SessionEvent, VideoSurfaceInfo};
+
+    static ENGINE_HANDLE: OnceLock<i64> = OnceLock::new();
+
+    pub(super) fn prepare(engine_handle: i64) -> Result<(), String> {
+        // Plugin-presence check must run on the platform thread; hop
+        // there once and wait, so failures surface to Dart NOW instead
+        // of at first frame.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        EngineContext::perform_on_main_thread(move || {
+            let res = EngineContext::get()
+                .map(|_| ())
+                .map_err(|e| format!("engine context: {e}"));
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("main-thread hop: {e}"))?;
+        rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|e| format!("engine context check: {e}"))??;
+        ENGINE_HANDLE
+            .set(engine_handle)
+            .map_err(|_| "video_prepare called twice".to_string())
+    }
+
+    /// Latest-frame slot behind the texture's payload provider. The
+    /// raster thread clones the buffer out (one frame copy per
+    /// displayed frame — dev-client acceptable; the hub bounds the
+    /// queue upstream).
+    struct FrameProvider(Mutex<Option<(i32, i32, Vec<u8>)>>);
+
+    impl PayloadProvider<BoxedPixelData> for FrameProvider {
+        fn get_payload(&self) -> BoxedPixelData {
+            let slot = self.0.lock().unwrap();
+            match &*slot {
+                Some((w, h, rgba)) => SimplePixelData::new_boxed(*w, *h, rgba.clone()),
+                None => SimplePixelData::new_boxed(1, 1, vec![0, 0, 0, 255]),
+            }
+        }
+    }
+
+    /// Per-sender display state. Created ON the platform thread (the
+    /// texture inside); the map entry is only ever destroyed on the
+    /// platform thread (bridge teardown) — no mid-session drops, ever
+    /// (see the module docs).
+    struct SenderView {
+        texture: Arc<SendableTexture<BoxedPixelData>>,
+        provider: Arc<FrameProvider>,
+        /// The texture id (captured at creation; SendableTexture does
+        /// not re-expose it) — re-sent on re-announce.
+        texture_id: i64,
+        /// Last displayed dimensions (a resolution change is logged;
+        /// SimplePixelData carries its own dims so Flutter scales).
+        dims: (usize, usize),
+    }
+
+    /// One session's video display bridge. Drop = stop flag → consumer
+    /// exit (waited, bounded) → texture map cleared on the platform
+    /// thread (unregisters every texture — Drop-based unregister only
+    /// works there).
+    ///
+    /// `pub` within this PRIVATE module (capped by it) so the
+    /// `pub(crate) use` re-export below is legal.
+    pub struct DisplayBridge {
+        stop: Arc<AtomicBool>,
+        done_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+        views: Arc<Mutex<HashMap<u32, SenderView>>>,
+        /// Senders whose display is currently hidden (ShareStopped /
+        /// voice-leave). Re-announced on their next frame.
+        hidden: Arc<Mutex<HashSet<u32>>>,
+        hub: SharedVideoReceiveHub,
+    }
+
+    // (SenderView is private to this module; session.rs only ever
+    // calls DisplayBridge::start / sender_stopped / Drop.)
+
+    impl DisplayBridge {
+        /// Spawn the consumer thread. `events` is the session's event
+        /// channel (video_started flows through it); `hub` the receive
+        /// hub the session's video task feeds.
+        pub fn start(
+            hub: SharedVideoReceiveHub,
+            events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+            session_id: u32,
+        ) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let views: Arc<Mutex<HashMap<u32, SenderView>>> = Arc::new(Mutex::new(HashMap::new()));
+            let hidden: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            {
+                let stop = stop.clone();
+                let views = views.clone();
+                let hidden = hidden.clone();
+                let hub_for_thread = hub.clone();
+                std::thread::Builder::new()
+                    .name("parley-video-display".into())
+                    .spawn(move || {
+                        consumer_loop(hub_for_thread, events, session_id, stop, views, hidden);
+                        let _ = done_tx.send(()); // no texture clones exist past this
+                    })
+                    .expect("spawn video display thread");
+            }
+            Self {
+                stop,
+                done_rx: Mutex::new(done_rx),
+                views,
+                hidden,
+                hub,
+            }
+        }
+
+        /// A sender stopped sharing (`forget = false`: hub suppresses
+        /// stragglers until their next frame_id-0 keyframe) or left
+        /// voice entirely (`forget = true`: hub forgets them). The
+        /// view is KEPT and marked hidden — re-announced on their next
+        /// frame — so textures are only ever destroyed at teardown.
+        pub fn sender_stopped(&self, sender_id: u32, forget: bool) {
+            if forget {
+                self.hub.remove(sender_id);
+            } else {
+                self.hub.mark_stopped(sender_id);
+            }
+            self.hidden.lock().unwrap().insert(sender_id);
+        }
+    }
+
+    impl Drop for DisplayBridge {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // Bounded wait for the consumer to exit: afterwards no
+            // texture clones exist outside the map, so clearing the
+            // map ON the platform thread is the only drop site.
+            let _ = self
+                .done_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2));
+            let views = self.views.clone();
+            let _ = EngineContext::perform_on_main_thread(move || {
+                views.lock().unwrap().clear();
+            });
+        }
+    }
+
+    /// RGB24 → RGBA (the Linux embedder's pixel order).
+    fn rgb24_to_rgba(rgb: &[u8]) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+        for px in rgb.chunks_exact(3) {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+        rgba
+    }
+
+    /// The display consumer: hub frames → per-sender textures. Same
+    /// skeleton as the terminal client's mpv_consumer (1 s poll, dead
+    /// set), minus mpv: instead of a child process, a texture + frame
+    /// slot. Exits when `stop` flips (checked around the ≤1 s pop).
+    fn consumer_loop(
+        hub: SharedVideoReceiveHub,
+        events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+        session_id: u32,
+        stop: Arc<AtomicBool>,
+        views: Arc<Mutex<HashMap<u32, SenderView>>>,
+        hidden: Arc<Mutex<HashSet<u32>>>,
+    ) {
+        // Senders whose texture creation failed — no retry until the
+        // bridge dies (the terminal client's dead-set rule; spam-free).
+        let mut dead: HashSet<u32> = HashSet::new();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(frame) = hub.pop_frame(Duration::from_secs(1)) else {
+                continue; // idle poll; also the stop-flag heartbeat
+            };
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let sender = frame.sender_id;
+            if dead.contains(&sender) {
+                continue; // keep draining, display nothing
+            }
+            // A previously-hidden sender sending frames again = a NEW
+            // share (the hub only un-suppresses on a frame_id-0
+            // keyframe): re-announce the SAME texture.
+            let reannounce = hidden.lock().unwrap().remove(&sender);
+            // Ensure the sender has a texture (lazy, sized from the
+            // first decoded frame — the sender's real resolution).
+            let existing = views
+                .lock()
+                .unwrap()
+                .get(&sender)
+                .map(|v| (v.texture.clone(), v.provider.clone(), v.dims, v.texture_id));
+            let first_view = existing.is_none();
+            let (texture, provider, dims, texture_id) = match existing {
+                Some(x) => x,
+                None => match create_texture(&frame) {
+                    Ok((texture, provider, id)) => {
+                        println!(
+                            "video: texture for user {sender}: {}x{} (id {id})",
+                            frame.width, frame.height
+                        );
+                        let v = SenderView {
+                            texture: texture.clone(),
+                            provider: provider.clone(),
+                            texture_id: id,
+                            dims: (frame.width, frame.height),
+                        };
+                        views.lock().unwrap().insert(sender, v);
+                        (texture, provider, (frame.width, frame.height), id)
+                    }
+                    Err(e) => {
+                        eprintln!("video: texture creation failed for user {sender}: {e}");
+                        dead.insert(sender);
+                        continue;
+                    }
+                },
+            };
+            if reannounce || first_view {
+                let _ = events.send(SessionEvent {
+                    session_id,
+                    kind: "video_started".into(),
+                    channels: Vec::new(),
+                    users: Vec::new(),
+                    messages: Vec::new(),
+                    user_id: sender,
+                    username: String::new(),
+                    channel_id: 0,
+                    joined: false,
+                    states: Vec::new(),
+                    surface: Some(VideoSurfaceInfo {
+                        user_id: sender,
+                        width: frame.width as u64,
+                        height: frame.height as u64,
+                        texture_id,
+                    }),
+                });
+            }
+            if (frame.width, frame.height) != dims {
+                println!(
+                    "video: user {sender} resolution changed to {}x{}",
+                    frame.width, frame.height
+                );
+                views.lock().unwrap().get_mut(&sender).unwrap().dims = (frame.width, frame.height);
+            }
+            // Latest-frame-wins into the slot, then ping Flutter to
+            // pull at its next raster (routed to the platform thread
+            // by SendableTexture).
+            *provider.0.lock().unwrap() = Some((
+                frame.width as i32,
+                frame.height as i32,
+                rgb24_to_rgba(&frame.rgb),
+            ));
+            texture.mark_frame_available();
+        }
+    }
+
+    /// What texture creation hands back: the sendable handle (for
+    /// mark_frame_available), the frame slot, and the Flutter texture
+    /// id (for the video_started event).
+    type CreatedTexture = (
+        Arc<SendableTexture<BoxedPixelData>>,
+        Arc<FrameProvider>,
+        i64,
+    );
+
+    /// Create one texture for `frame`'s sender: provider seeded with
+    /// the frame, texture built on the platform thread (waiting for
+    /// the id), converted to a SendableTexture for the consumer loop.
+    fn create_texture(frame: &VideoFrame) -> Result<CreatedTexture, String> {
+        let handle = *ENGINE_HANDLE
+            .get()
+            .ok_or("video_prepare was never called")?;
+        let provider = Arc::new(FrameProvider(Mutex::new(Some((
+            frame.width as i32,
+            frame.height as i32,
+            rgb24_to_rgba(&frame.rgb),
+        )))));
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Result<(i64, Arc<SendableTexture<BoxedPixelData>>), String>,
+        >();
+        let provider_for_main = provider.clone();
+        EngineContext::perform_on_main_thread(move || {
+            // Asserts the platform thread — true inside this hop.
+            if let Err(e) = EngineContext::get() {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+            let texture =
+                match irondash_texture::Texture::new_with_provider(handle, provider_for_main) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+            let id = texture.id();
+            // into_sendable_texture already returns Arc<SendableTexture>.
+            let sendable = texture.into_sendable_texture();
+            // The SendableTexture's RunLoopSender is bound to THIS
+            // (platform) thread — constructing it here is what makes
+            // later mark_frame_available calls safe from any thread.
+            let _ = tx.send(Ok((id, sendable)));
+        })
+        .map_err(|e| format!("main-thread hop: {e}"))?;
+        let (id, sendable) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| format!("texture creation: {e}"))?
+            .map_err(|e| format!("texture creation: {e}"))?;
+        Ok((sendable, provider, id))
+    }
+}

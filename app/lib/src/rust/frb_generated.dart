@@ -5,6 +5,7 @@
 
 import 'api/session.dart';
 import 'api/simple.dart';
+import 'api/video.dart';
 
 import 'dart:async';
 import 'dart:convert';
@@ -68,7 +69,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -1413269887;
+  int get rustContentHash => 1443966080;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -117,6 +118,8 @@ abstract class RustLibApi extends BaseApi {
     required BigInt channelId,
     required String text,
   });
+
+  Future<void> crateApiVideoVideoPrepare({required PlatformInt64 engineHandle});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -475,6 +478,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     argNames: ["sessionId", "channelId", "text"],
   );
 
+  @override
+  Future<void> crateApiVideoVideoPrepare({
+    required PlatformInt64 engineHandle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_i_64(engineHandle, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 12,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiVideoVideoPrepareConstMeta,
+        argValues: [engineHandle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVideoVideoPrepareConstMeta => const TaskConstMeta(
+    debugName: "video_prepare",
+    argNames: ["engineHandle"],
+  );
+
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -499,6 +534,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   bool dco_decode_bool(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as bool;
+  }
+
+  @protected
+  VideoSurfaceInfo dco_decode_box_autoadd_video_surface_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_video_surface_info(raw);
   }
 
   @protected
@@ -528,6 +569,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       text: dco_decode_String(arr[4]),
       timestampMs: dco_decode_u_64(arr[5]),
     );
+  }
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeI64(raw);
   }
 
   @protected
@@ -561,6 +608,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoSurfaceInfo? dco_decode_opt_box_autoadd_video_surface_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_video_surface_info(raw);
+  }
+
+  @protected
   PresenceEntry dco_decode_presence_entry(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -576,8 +629,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   SessionEvent dco_decode_session_event(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 10)
-      throw Exception('unexpected arr length: expect 10 but see ${arr.length}');
+    if (arr.length != 11)
+      throw Exception('unexpected arr length: expect 11 but see ${arr.length}');
     return SessionEvent(
       sessionId: dco_decode_u_32(arr[0]),
       kind: dco_decode_String(arr[1]),
@@ -589,6 +642,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       channelId: dco_decode_u_64(arr[7]),
       joined: dco_decode_bool(arr[8]),
       states: dco_decode_list_voice_entry(arr[9]),
+      surface: dco_decode_opt_box_autoadd_video_surface_info(arr[10]),
     );
   }
 
@@ -629,6 +683,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void dco_decode_unit(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return;
+  }
+
+  @protected
+  VideoSurfaceInfo dco_decode_video_surface_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return VideoSurfaceInfo(
+      userId: dco_decode_u_32(arr[0]),
+      width: dco_decode_u_64(arr[1]),
+      height: dco_decode_u_64(arr[2]),
+      textureId: dco_decode_i_64(arr[3]),
+    );
   }
 
   @protected
@@ -673,6 +741,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoSurfaceInfo sse_decode_box_autoadd_video_surface_info(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_video_surface_info(deserializer));
+  }
+
+  @protected
   ChannelInfo sse_decode_channel_info(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_id = sse_decode_u_64(deserializer);
@@ -698,6 +774,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       text: var_text,
       timestampMs: var_timestampMs,
     );
+  }
+
+  @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getPlatformInt64();
   }
 
   @protected
@@ -758,6 +840,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoSurfaceInfo? sse_decode_opt_box_autoadd_video_surface_info(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_video_surface_info(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   PresenceEntry sse_decode_presence_entry(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_userId = sse_decode_u_32(deserializer);
@@ -778,6 +873,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_channelId = sse_decode_u_64(deserializer);
     var var_joined = sse_decode_bool(deserializer);
     var var_states = sse_decode_list_voice_entry(deserializer);
+    var var_surface = sse_decode_opt_box_autoadd_video_surface_info(
+      deserializer,
+    );
     return SessionEvent(
       sessionId: var_sessionId,
       kind: var_kind,
@@ -789,6 +887,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       channelId: var_channelId,
       joined: var_joined,
       states: var_states,
+      surface: var_surface,
     );
   }
 
@@ -830,6 +929,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_decode_unit(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+  }
+
+  @protected
+  VideoSurfaceInfo sse_decode_video_surface_info(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_userId = sse_decode_u_32(deserializer);
+    var var_width = sse_decode_u_64(deserializer);
+    var var_height = sse_decode_u_64(deserializer);
+    var var_textureId = sse_decode_i_64(deserializer);
+    return VideoSurfaceInfo(
+      userId: var_userId,
+      width: var_width,
+      height: var_height,
+      textureId: var_textureId,
+    );
   }
 
   @protected
@@ -890,6 +1004,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_video_surface_info(
+    VideoSurfaceInfo self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_video_surface_info(self, serializer);
+  }
+
+  @protected
   void sse_encode_channel_info(ChannelInfo self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_u_64(self.id, serializer);
@@ -906,6 +1029,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.username, serializer);
     sse_encode_String(self.text, serializer);
     sse_encode_u_64(self.timestampMs, serializer);
+  }
+
+  @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putPlatformInt64(self);
   }
 
   @protected
@@ -967,6 +1096,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_video_surface_info(
+    VideoSurfaceInfo? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_video_surface_info(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_presence_entry(PresenceEntry self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_u_32(self.userId, serializer);
@@ -986,6 +1128,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_64(self.channelId, serializer);
     sse_encode_bool(self.joined, serializer);
     sse_encode_list_voice_entry(self.states, serializer);
+    sse_encode_opt_box_autoadd_video_surface_info(self.surface, serializer);
   }
 
   @protected
@@ -1019,6 +1162,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+  }
+
+  @protected
+  void sse_encode_video_surface_info(
+    VideoSurfaceInfo self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.userId, serializer);
+    sse_encode_u_64(self.width, serializer);
+    sse_encode_u_64(self.height, serializer);
+    sse_encode_i_64(self.textureId, serializer);
   }
 
   @protected

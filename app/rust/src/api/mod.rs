@@ -2,4 +2,5 @@
 
 pub mod session;
 pub mod simple;
+pub mod video;
 pub mod voice;

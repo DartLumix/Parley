@@ -19,6 +19,11 @@ audio-device = [
     "parley-core/audio-device",
     "parley-client/audio-device",
 ]
+# 7f: video receive (openh264 decode via parley-core/video) + the
+# Flutter texture display bridge (irondash_texture). Default off: CI
+# and the musl server build never touch openh264 or the texture glue.
+# The app builds with --features audio-device,video.
+video = ["dep:irondash_texture", "dep:irondash_engine_context", "parley-core/video"]
 
 [dependencies]
 flutter_rust_bridge = "=2.13.0"
@@ -33,4 +38,7 @@ cpal = { workspace = true, optional = true }
 # Arc<Processor>, and storing it needs the crate in this manifest.
 # Same workspace-pinned 2.1 as parley-client's own dep: unified.
 webrtc-audio-processing = { workspace = true, optional = true }
+# 7f texture bridge (see the video feature above).
+irondash_texture = { workspace = true, optional = true }
+irondash_engine_context = { workspace = true, optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

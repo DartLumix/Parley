@@ -243,13 +243,18 @@ pub(crate) fn start_voice(
     music: bool,
     loss_report: Arc<AtomicU32>,
     cmd_tx: UnboundedSender<Command>,
+    // 7f: the session's video feed — video datagrams land on this
+    // same media path, and the session's video task consumes the
+    // channel (3b: decode never on this reader). None in featureless
+    // builds (video datagrams are dropped).
+    video_tx: Option<tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>>,
 ) -> Result<VoiceControl, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (reader_stop_tx, mut reader_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     // --- media datagram reader (async: quinn's read_datagram is
     // await-only). Runs on the session module's runtime. Feed: mixer
-    // (audio) — video datagrams are skipped (7f's seam). Reader death
+    // (audio) + video task (FLAG_VIDEO payloads — 7f). Reader death
     // (connection gone) flips the SAME stop flag the devices poll —
     // with membership semantics the UI tears down on connection-lost
     // and would never signal the devices itself (the 7d death-signal
@@ -273,9 +278,15 @@ pub(crate) fn start_voice(
                             if m.sender_id == 0 || m.sender_id == my_id {
                                 continue;
                             }
-                            // Video rides the same datagrams — the hub
-                            // is 7f's seam; skip for now.
+                            // 7f: video rides the same datagrams —
+                            // hand the payload to the session's video
+                            // task (the hub assembles + decodes there,
+                            // never on this reader). No video feature:
+                            // dropped.
                             if m.flags & parley_proto::media::FLAG_VIDEO != 0 {
+                                if let Some(tx) = &video_tx {
+                                    let _ = tx.send((m.sender_id, m.payload.to_vec()));
+                                }
                                 continue;
                             }
                             let stereo = m.flags & FLAG_STEREO != 0;

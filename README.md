@@ -43,7 +43,8 @@ Voice is the product; everything else grows later.
 | 7d | Voice receive — mixer + cpal output through the bridge | ✅ |
 | 7e | Voice send + AEC — join-driven devices, reconnect gap closed | ✅ |
 | 7e2 | 4d loss ladder in the app — receiver reports + two-profile send controller | ✅ |
-| 7+ | Video receive, share send, platforms | ⏳ |
+| 7f | Video receive — VideoReceiveHub → Flutter texture bridge | ✅ |
+| 7+ | Share send, platforms | ⏳ |
 
 ---
 
@@ -195,7 +196,15 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       (64 kbps) after 20 s below 10‰, 5 s switch cooldown — the ladder math
       is a pure struct unit-tested under `--features audio-device`. Music
       channels ignore reports by design
-- [ ] 7f Video receive — VideoReceiveHub → Flutter texture bridge
+- [x] 7f Video receive — the app is the second display consumer of
+      parley-core's VideoReceiveHub (the seam 6.9 built it for): media
+      reader forwards FLAG_VIDEO payloads to a dedicated hub task (3b:
+      decode never on the reader), one irondash_texture external texture
+      per sender (RGB24→RGBA, latest-frame-wins, created/destroyed on
+      the platform thread), `video_started`/`video_stopped` events drive
+      a plain Texture widget; viewer-side VideoReport (5 s worst gap
+      rate) feeds the sharer's 6e ladder; feature `video` default-off,
+      build with `--features audio-device,video`
 - [ ] 7g Screen-share send — portal capture through the bridge
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update

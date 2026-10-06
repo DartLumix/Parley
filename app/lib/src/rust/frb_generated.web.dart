@@ -8,6 +8,7 @@
 
 import 'api/session.dart';
 import 'api/simple.dart';
+import 'api/video.dart';
 
 import 'dart:async';
 import 'dart:convert';
@@ -39,10 +40,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  VideoSurfaceInfo dco_decode_box_autoadd_video_surface_info(dynamic raw);
+
+  @protected
   ChannelInfo dco_decode_channel_info(dynamic raw);
 
   @protected
   ChatEntry dco_decode_chat_entry(dynamic raw);
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
   List<ChannelInfo> dco_decode_list_channel_info(dynamic raw);
@@ -58,6 +65,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<VoiceEntry> dco_decode_list_voice_entry(dynamic raw);
+
+  @protected
+  VideoSurfaceInfo? dco_decode_opt_box_autoadd_video_surface_info(dynamic raw);
 
   @protected
   PresenceEntry dco_decode_presence_entry(dynamic raw);
@@ -81,6 +91,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void dco_decode_unit(dynamic raw);
 
   @protected
+  VideoSurfaceInfo dco_decode_video_surface_info(dynamic raw);
+
+  @protected
   VoiceEntry dco_decode_voice_entry(dynamic raw);
 
   @protected
@@ -98,10 +111,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  VideoSurfaceInfo sse_decode_box_autoadd_video_surface_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   ChannelInfo sse_decode_channel_info(SseDeserializer deserializer);
 
   @protected
   ChatEntry sse_decode_chat_entry(SseDeserializer deserializer);
+
+  @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
   List<ChannelInfo> sse_decode_list_channel_info(SseDeserializer deserializer);
@@ -119,6 +140,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<VoiceEntry> sse_decode_list_voice_entry(SseDeserializer deserializer);
+
+  @protected
+  VideoSurfaceInfo? sse_decode_opt_box_autoadd_video_surface_info(
+    SseDeserializer deserializer,
+  );
 
   @protected
   PresenceEntry sse_decode_presence_entry(SseDeserializer deserializer);
@@ -140,6 +166,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_decode_unit(SseDeserializer deserializer);
+
+  @protected
+  VideoSurfaceInfo sse_decode_video_surface_info(SseDeserializer deserializer);
 
   @protected
   VoiceEntry sse_decode_voice_entry(SseDeserializer deserializer);
@@ -166,10 +195,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_video_surface_info(
+    VideoSurfaceInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_channel_info(ChannelInfo self, SseSerializer serializer);
 
   @protected
   void sse_encode_chat_entry(ChatEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_channel_info(
@@ -202,6 +240,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_video_surface_info(
+    VideoSurfaceInfo? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_presence_entry(PresenceEntry self, SseSerializer serializer);
 
   @protected
@@ -221,6 +265,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_video_surface_info(
+    VideoSurfaceInfo self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_voice_entry(VoiceEntry self, SseSerializer serializer);

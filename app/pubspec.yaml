@@ -10,6 +10,9 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_rust_bridge: ^2.0.0
+  # 7f: exports the engine handle the Rust texture bridge needs (its
+  # native plugin registers the symbols irondash dlsym-resolves).
+  irondash_engine_context: ^0.5.4
 
 dev_dependencies:
   flutter_test:

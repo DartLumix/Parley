@@ -9,7 +9,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `teardown_voice`, `to_event`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// Connect + authenticate. Blocks until the handshake completes (runs
 /// on an FRB worker thread; Dart sees a Future).
@@ -192,6 +192,9 @@ class SessionEvent {
   /// voice_states (the full snapshot)
   final List<VoiceEntry> states;
 
+  /// 7f: video_started / video_stopped (the surface)
+  final VideoSurfaceInfo? surface;
+
   const SessionEvent({
     required this.sessionId,
     required this.kind,
@@ -203,6 +206,7 @@ class SessionEvent {
     required this.channelId,
     required this.joined,
     required this.states,
+    this.surface,
   });
 
   @override
@@ -216,7 +220,8 @@ class SessionEvent {
       username.hashCode ^
       channelId.hashCode ^
       joined.hashCode ^
-      states.hashCode;
+      states.hashCode ^
+      surface.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -232,7 +237,8 @@ class SessionEvent {
           username == other.username &&
           channelId == other.channelId &&
           joined == other.joined &&
-          states == other.states;
+          states == other.states &&
+          surface == other.surface;
 }
 
 /// Connected-session snapshot returned at connect time.
@@ -269,6 +275,37 @@ class SessionInfo {
           sessionToken == other.sessionToken &&
           server == other.server &&
           fingerprint == other.fingerprint;
+}
+
+/// 7f: one remote share's display surface. `texture_id` feeds a plain
+/// Flutter `Texture` widget (pixels come from the Rust side); width /
+/// height are the decoded stream's dimensions.
+class VideoSurfaceInfo {
+  final int userId;
+  final BigInt width;
+  final BigInt height;
+  final PlatformInt64 textureId;
+
+  const VideoSurfaceInfo({
+    required this.userId,
+    required this.width,
+    required this.height,
+    required this.textureId,
+  });
+
+  @override
+  int get hashCode =>
+      userId.hashCode ^ width.hashCode ^ height.hashCode ^ textureId.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VideoSurfaceInfo &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          width == other.width &&
+          height == other.height &&
+          textureId == other.textureId;
 }
 
 /// One voice-state snapshot row.

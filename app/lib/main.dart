@@ -1,12 +1,27 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:irondash_engine_context/irondash_engine_context.dart';
 
 import 'src/rust/frb_generated.dart';
 import 'src/rust/api/session.dart';
+import 'src/rust/api/video.dart' as video_api;
 
 Future<void> main() async {
+  // Platform channels (EngineContext.getEngineHandle) need the services
+  // binding before runApp initializes it for us.
+  WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
+  // 7f: hand the Rust texture bridge the engine handle BEFORE any
+  // session can start receiving shares. A failure is non-fatal for
+  // the dev client (voice/chat still work; video will error later).
+  try {
+    final handle = await EngineContext.instance.getEngineHandle();
+    await video_api.videoPrepare(engineHandle: handle);
+    debugPrint('video: texture bridge ready (engine handle $handle)');
+  } catch (e, st) {
+    debugPrint('video prepare failed (video disabled): $e\n$st');
+  }
   runApp(const ParleyApp());
 }
 
@@ -82,6 +97,10 @@ class _DevHomePageState extends State<DevHomePage> {
   // opens/closes the devices on the own join/leave events. The UI only
   // reflects membership; there is no listen toggle.
   bool _voiceUp = false;
+  // 7f: active remote shares — user_id → (texture_id, w, h). Driven by
+  // the video_started / video_stopped events; textures are owned by
+  // the Rust bridge (one per sender, stable across stop/re-share).
+  final Map<int, (int, int, int)> _videos = {};
 
   late final Timer _liveness;
 
@@ -129,6 +148,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _presence.clear();
       _chat.clear();
       _usernames.clear();
+      _videos.clear();
     });
     // Clean the dead registry entry (a manual Disconnect may have
     // raced us — ignore).
@@ -193,6 +213,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _presence.clear();
       _chat.clear();
       _usernames.clear();
+      _videos.clear();
     });
   }
 
@@ -243,6 +264,26 @@ class _DevHomePageState extends State<DevHomePage> {
             }
           }
         });
+      case 'video_started':
+        final s0 = ev.surface;
+        if (s0 != null) {
+          setState(() {
+            // FRB maps u64 → BigInt and i64 → PlatformInt64: narrow
+            // for display (dev-client resolutions fit int).
+            _videos[s0.userId] = (
+              s0.textureId,
+              s0.width.toInt(),
+              s0.height.toInt(),
+            );
+            final name = _usernames[s0.userId] ?? 'user ${s0.userId}';
+            _status = '$name is sharing ${s0.width}×${s0.height}';
+          });
+        }
+      case 'video_stopped':
+        final s1 = ev.surface;
+        if (s1 != null) {
+          setState(() => _videos.remove(s1.userId));
+        }
       case 'session_closed':
         if (mounted) _handleClosed();
       default:
@@ -396,6 +437,37 @@ class _DevHomePageState extends State<DevHomePage> {
               ],
             ),
             const Divider(height: 32),
+
+            // --- 7f: remote shares (Rust-owned textures) ---
+            if (_videos.isNotEmpty) ...[
+              Text('Screens', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              for (final entry in _videos.entries)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${_usernames[entry.key] ?? 'user ${entry.key}'} · '
+                        '${entry.value.$2}×${entry.value.$3}',
+                        style: const TextStyle(color: Colors.white54, fontSize: 12),
+                      ),
+                      const SizedBox(height: 4),
+                      AspectRatio(
+                        aspectRatio: 16 / 9,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.white24),
+                          ),
+                          child: Texture(textureId: entry.value.$1),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              const Divider(height: 32),
+            ],
 
             // --- chat ---
             Text(
