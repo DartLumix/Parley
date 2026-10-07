@@ -11,6 +11,9 @@ thiserror.workspace = true
 audiopus.workspace = true
 cpal = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
+# 7g: opt-in VAAPI H.264 hardware encoder (§8: polaris VCE wedges the
+# GPU — the user must ASK for this; runtime falls back to software).
+moq-vaapi = { version = "0.1", optional = true }
 
 [features]
 default = []
@@ -18,3 +21,8 @@ default = []
 # enables this, keeping the server build free of system audio deps.
 audio-device = ["cpal"]
 video = ["dep:openh264"]
+# Opt-in hardware encode. NOT in any default chain; the client wires it
+# to --hw-encode. When enabled, create_encoder tries VAAPI first and
+# falls back to software on any init error (never mid-stream — see the
+# module docs in video_vaapi.rs).
+vaapi = ["dep:moq-vaapi", "video"]

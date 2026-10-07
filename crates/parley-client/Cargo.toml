@@ -9,6 +9,9 @@ edition.workspace = true
 #   cargo run -p parley-client --features audio-device -- ...
 audio-device = ["dep:cpal", "parley-core/audio-device", "dep:webrtc-audio-processing"]
 video = ["parley-core/video"]
+# 7g: opt-in hardware encode (--hw-encode). NOT part of any default
+# build — the server/CI configs must never link libva. §8 containment.
+vaapi = ["parley-core/vaapi", "video"]
 screen-capture = ["dep:ashpd", "dep:pipewire", "dep:futures-util", "video"]
 
 [dependencies]

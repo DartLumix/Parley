@@ -76,6 +76,10 @@ struct Args {
     volumes: Vec<(u32, f32)>,
     share: bool,
     share_audio: bool,
+    /// 7g: opt-in hardware (VAAPI) encode. §8: on the polaris desktop
+    /// this WEDGES THE GPU — the flag exists for capable machines (the
+    /// laptop's iGPU) and for re-testing after kernel/mesa updates.
+    hw_encode: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -87,7 +91,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut measure, mut report, mut noaec, mut music) = (false, false, false, false);
     let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
-    let (mut share, mut share_audio) = (false, false);
+    let (mut share, mut share_audio, mut hw_encode) = (false, false, false);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--server" => server = it.next(),
@@ -112,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--share" => share = true,
             "--share-audio" => share_audio = true,
+            "--hw-encode" => hw_encode = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -141,6 +146,7 @@ fn parse_args() -> Result<Args, String> {
         volumes,
         share,
         share_audio,
+        hw_encode,
     })
 }
 
@@ -189,6 +195,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.share_audio && args.music {
         eprintln!("--share-audio and --music are mutually exclusive; share-audio disabled");
+    }
+
+    // 7g: hardware-encode preference must be set BEFORE any encoder is
+    // created (share screen path + synthetic path both consult it).
+    #[cfg(feature = "video")]
+    if args.hw_encode {
+        parley_core::video::prefer_hw_encode();
+        eprintln!("hw-encode: VAAPI preferred (falls back to software if init fails)");
+    }
+    #[cfg(not(feature = "video"))]
+    if args.hw_encode {
+        eprintln!("--hw-encode ignored: built without the video feature");
     }
 
     // --- connect (TOFU) ---

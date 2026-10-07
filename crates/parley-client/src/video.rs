@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use parley_core::video::{
-    VIDEO_BITRATE_BPS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoEncoder, create_encoder,
+    VIDEO_BITRATE_BPS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoEncoder, create_encoder_auto,
 };
 use parley_core::video_receive::{SharedVideoReceiveHub, VideoReceiveHub};
 use parley_proto::video::fragment_frame;
@@ -195,7 +195,7 @@ pub struct ShareSender {
 impl ShareSender {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
-            encoder: create_encoder(VIDEO_WIDTH, VIDEO_HEIGHT).map_err(|e| e.to_string())?,
+            encoder: create_encoder_auto(VIDEO_WIDTH, VIDEO_HEIGHT).map_err(|e| e.to_string())?,
             frame_id: 0,
             // Video seq space sits above audio's low range purely as a
             // diagnostic aid.

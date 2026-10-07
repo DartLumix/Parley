@@ -9,5 +9,7 @@ pub mod session;
 pub mod video;
 #[cfg(feature = "video")]
 pub mod video_receive;
+#[cfg(feature = "vaapi")]
+pub mod video_vaapi;
 
 pub use error::Error;

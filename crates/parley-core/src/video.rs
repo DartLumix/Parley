@@ -15,6 +15,7 @@
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::encoder::{Encoder, EncoderConfig};
 use openh264::formats::{YUVBuffer, YUVSource};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::Error;
 
@@ -51,6 +52,24 @@ pub trait VideoEncoder: Send {
     /// stride) → (Annex-B bytes, is_keyframe).
     fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error>;
 
+    /// 7g: encode one strided BGRA frame — `stride` is the row pitch in
+    /// BYTES (≥ width*4). The buffer is borrowed for the duration of the
+    /// call only. Backends that can convert strided input without a
+    /// repack (openh264's SIMD path does) override this; the default
+    /// copies tight and delegates to [`Self::encode_bgra`]. Returns the
+    /// Annex-B bytes in the CALLER-PROVIDED `out` Vec (cleared first),
+    /// avoiding a fresh allocation per frame on the hot path.
+    fn encode_bgra_strided(
+        &mut self,
+        bgra: &[u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        strided_fallback(self, bgra, width, height, stride, out)
+    }
+
     /// Request an IDR on the next encode (keyframe-on-join).
     fn force_keyframe(&mut self);
 
@@ -66,6 +85,73 @@ pub trait VideoEncoder: Send {
 pub fn create_encoder(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
     Ok(Box::new(SoftwareEncoder::new(width, height)?))
 }
+
+/// The default strided path: repack tight, delegate to `encode_bgra`.
+/// Shared by the trait default and SoftwareEncoder's size-mismatch case
+/// (and VaapiEncoder, which uploads tight NV12 anyway).
+pub(crate) fn strided_fallback(
+    enc: &mut (impl VideoEncoder + ?Sized),
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    out: &mut Vec<u8>,
+) -> Result<bool, Error> {
+    let mut packed = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let row = bgra
+            .get(y * stride..y * stride + width * 4)
+            .ok_or_else(|| Error::Codec("strided frame truncated".into()))?;
+        packed.extend_from_slice(row);
+    }
+    let (bytes, keyframe) = enc.encode_bgra(&packed)?;
+    out.clear();
+    out.extend_from_slice(&bytes);
+    Ok(keyframe)
+}
+
+/// 7g: a borrowed, ROW-PADDED BGRA buffer (PipeWire's mapped frame)
+/// as an openh264 `RGB8Source`. `dimensions_padded` carries the row
+/// pitch so the crate's AVX2 converter walks the stride directly —
+/// no repack. Channel order (2,1,0) = BGRA, pixel_stride 4.
+struct PwStridedBgra<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    /// Row pitch in BYTES.
+    stride: usize,
+}
+
+impl openh264::formats::RGBSource for PwStridedBgra<'_> {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+    fn pixel_f32(&self, x: usize, y: usize) -> (f32, f32, f32) {
+        let o = (y * self.stride + x * 4).min(self.data.len().saturating_sub(4));
+        (
+            f32::from(self.data[o + 2]),
+            f32::from(self.data[o + 1]),
+            f32::from(self.data[o]),
+        )
+    }
+}
+
+impl openh264::formats::RGB8Source for PwStridedBgra<'_> {
+    fn dimensions_padded(&self) -> (usize, usize) {
+        (self.stride / 4, self.height)
+    }
+    fn rgb8_data(&self) -> &[u8] {
+        self.data
+    }
+    fn pixel_stride(&self) -> usize {
+        4
+    }
+    fn rgb_channel_offsets(&self) -> (usize, usize, usize) {
+        (2, 1, 0)
+    }
+}
+
+impl openh264::formats::BGRA8Source for PwStridedBgra<'_> {}
 
 /// The openh264 encoder configuration, shared by construction and
 /// bitrate changes (the latter recreates the encoder).
@@ -89,6 +175,9 @@ pub struct SoftwareEncoder {
     width: usize,
     height: usize,
     current_bitrate: u32,
+    /// 7g: reused YUV conversion buffer (saves a 1.3–2 MB alloc+copy
+    /// per frame over `YUVBuffer::from_bgra8_source`).
+    yuv: YUVBuffer,
 }
 
 impl SoftwareEncoder {
@@ -103,6 +192,7 @@ impl SoftwareEncoder {
             width,
             height,
             current_bitrate: VIDEO_BITRATE_BPS,
+            yuv: YUVBuffer::new(width, height),
         })
     }
 }
@@ -118,16 +208,60 @@ impl VideoEncoder for SoftwareEncoder {
 
     fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error> {
         let src = openh264::formats::BgraSliceU8::new(bgra, (self.width, self.height));
-        let yuv = YUVBuffer::from_bgra8_source(src);
+        self.yuv.read_bgra8(src);
         let stream = self
             .encoder
-            .encode(&yuv)
+            .encode(&self.yuv)
             .map_err(|e| Error::Codec(e.to_string()))?;
         let keyframe = matches!(
             stream.frame_type(),
             openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
         );
         Ok((stream.to_vec(), keyframe))
+    }
+
+    /// 7g hot path: feed the STRIDED pw buffer straight into openh264's
+    /// AVX2 BGRA→YUV420 converter via a custom `RGB8Source` view (the
+    /// trait's `dimensions_padded` carries the row pitch — verified
+    /// SIMD + correct against the tight-packed path in the 7g bench).
+    /// The buffer is borrowed; no repack, no per-frame YUV alloc.
+    fn encode_bgra_strided(
+        &mut self,
+        bgra: &[u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        if width != self.width || height != self.height {
+            // Renegotiated size: fall back to the copy path (encode_bgra
+            // re-derives dims from self.width/height — never mismatch).
+            return strided_fallback(self, bgra, width, height, stride, out);
+        }
+        if stride == width * 4 {
+            // Tight: use the crate's own zero-check wrapper.
+            let src = openh264::formats::BgraSliceU8::new(bgra, (width, height));
+            self.yuv.read_bgra8(src);
+        } else {
+            let src = PwStridedBgra {
+                data: bgra,
+                width,
+                height,
+                stride,
+            };
+            self.yuv.read_bgra8(src);
+        }
+        let stream = self
+            .encoder
+            .encode(&self.yuv)
+            .map_err(|e| Error::Codec(e.to_string()))?;
+        let keyframe = matches!(
+            stream.frame_type(),
+            openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
+        );
+        out.clear();
+        stream.write_vec(out);
+        Ok(keyframe)
     }
 
     fn force_keyframe(&mut self) {
@@ -337,4 +471,51 @@ mod tests {
             .expect("post-change IDR must decode standalone");
         assert_eq!(rgb.len(), w * h * 3);
     }
+}
+
+/// 7g: opt-in hardware selection state. NOT a global default — the
+/// client sets this from `--hw-encode` BEFORE creating any encoder.
+/// VAAPI is tried first; ANY error falls back to software, so a box
+/// without VAAPI (or with broken VCE) shares exactly as before.
+static HW_ENCODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable hardware-encode preference. Idempotent; call before
+/// [`create_encoder`]. See [`create_encoder`] for the fallback rules.
+pub fn prefer_hw_encode() {
+    HW_ENCODE.store(true, Ordering::Relaxed);
+}
+
+/// Whether hardware preference is on (for diagnostics).
+pub fn hw_encode_enabled() -> bool {
+    HW_ENCODE.load(Ordering::Relaxed)
+}
+
+/// Construct the best available encoder for this platform.
+///
+/// With `prefer_hw_encode()` set and the `vaapi` feature enabled, tries
+/// [`VaapiEncoder`] first and falls back to [`SoftwareEncoder`] on any
+/// init error (missing libva, no encode-capable node, driver refusal).
+/// Without either, software. Hardware is never attempted mid-stream:
+/// the decision happens once, at encoder creation (bitrate changes
+/// recreate the chosen backend only).
+pub fn create_encoder_auto(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
+    if hw_encode_enabled() {
+        #[cfg(feature = "vaapi")]
+        match crate::video_vaapi::VaapiEncoder::new(width, height) {
+            Ok(e) => {
+                eprintln!(
+                    "video: hardware (VAAPI) encoder selected — if the GPU wedges, this is why"
+                );
+                return Ok(Box::new(e));
+            }
+            Err(e) => eprintln!("video: VAAPI init failed ({e}); falling back to software"),
+        }
+        #[cfg(not(feature = "vaapi"))]
+        {
+            eprintln!(
+                "video: hw-encode requested but built without the vaapi feature; using software"
+            );
+        }
+    }
+    Ok(Box::new(SoftwareEncoder::new(width, height)?))
 }

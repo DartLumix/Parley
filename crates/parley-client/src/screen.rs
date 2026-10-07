@@ -71,7 +71,7 @@ use ashpd::desktop::{
 };
 use futures_util::StreamExt;
 use parley_core::audio::pipeline::SendPipeline;
-use parley_core::video::{VIDEO_FPS, VideoEncoder, create_encoder};
+use parley_core::video::{VIDEO_FPS, VideoEncoder, create_encoder_auto};
 use parley_proto::video::{MAX_FRAGMENT_PAYLOAD, fragment_frame};
 use pipewire as pw;
 use pw::properties::properties;
@@ -84,8 +84,10 @@ use crate::ShareEvent;
 enum ToEncoder {
     /// Negotiated stream format.
     Negotiated { width: u32, height: u32, fps: f64 },
-    /// One BGRx/BGRA frame, tightly packed (stride padding removed).
-    Frame(Vec<u8>),
+    /// 7g: one BGRx/BGRA frame AS MAPPED — row stride kept (bytes),
+    /// padding bytes included. The encoder converts in place from the
+    /// buffer via the strided SIMD path; no tight repack here.
+    Frame { data: Vec<u8>, stride: usize },
 }
 
 /// Handle for poking the capture pipeline from the control reader
@@ -277,15 +279,24 @@ fn pw_thread(
             // Row-wise repack: handles both padded strides and the
             // tightly-packed case, and never panics on short buffers.
             let stride = if stride == 0 { w * 4 } else { stride };
-            let mut packed = Vec::with_capacity(w * h * 4);
+            // 7g: copy the frame ONCE, as mapped (stride intact), then
+            // hand the padded buffer to the encoder — the strided SIMD
+            // path walks the rows directly (bench: ~2× the old path).
+            let mut data = Vec::with_capacity(stride * h);
             for y in 0..h {
                 let start = offset + y * stride;
                 let Some(row) = mapped.get(start..start + w * 4) else {
                     return; // truncated buffer: skip the frame
                 };
-                packed.extend_from_slice(row);
+                let dst = y * stride;
+                data.resize(dst + row.len(), 0);
+                data[dst..dst + row.len()].copy_from_slice(row);
             }
-            if user_data.tx.try_send(ToEncoder::Frame(packed)).is_err() {
+            if user_data
+                .tx
+                .try_send(ToEncoder::Frame { data, stride })
+                .is_err()
+            {
                 user_data.drops += 1;
                 if user_data.drops.is_multiple_of(128) {
                     eprintln!(
@@ -404,7 +415,7 @@ fn negotiate(
     f: f64,
 ) {
     *fps = f;
-    match create_encoder(width as usize, height as usize) {
+    match create_encoder_auto(width as usize, height as usize) {
         Ok(e) => {
             println!("share: encoder ready ({width}x{height})");
             *encoder = Some(e);
@@ -445,6 +456,8 @@ fn encoder_thread(
     let mut stale_skipped: u64 = 0;
     let mut window = std::time::Instant::now();
     let mut last_encode: Option<std::time::Instant> = None;
+    // 7g: reused Annex-B output buffer (no per-frame Vec alloc).
+    let mut annexb: Vec<u8> = Vec::with_capacity(1 << 20);
     while let Ok(msg) = rx.recv() {
         match msg {
             ToEncoder::Negotiated {
@@ -454,7 +467,10 @@ fn encoder_thread(
             } => {
                 negotiate(&mut encoder, &mut fps, width, height, f);
             }
-            ToEncoder::Frame(first) => {
+            ToEncoder::Frame {
+                data: first,
+                stride: first_stride,
+            } => {
                 // 1. Rate pacing (sleep, never drop).
                 let min_interval =
                     Duration::from_nanos((1_000_000_000.0 / fps.min(VIDEO_FPS as f64)) as u64);
@@ -469,11 +485,13 @@ fn encoder_thread(
                 //    (pw delivers the format before any buffer), but
                 //    stash and apply it rather than lose it.
                 let mut bgra = first;
+                let mut stride = first_stride;
                 let mut renegotiate: Option<(u32, u32, f64)> = None;
                 loop {
                     match rx.try_recv() {
-                        Ok(ToEncoder::Frame(newer)) => {
-                            bgra = newer;
+                        Ok(ToEncoder::Frame { data, stride: s }) => {
+                            bgra = data;
+                            stride = s;
                             stale_skipped += 1;
                         }
                         Ok(ToEncoder::Negotiated {
@@ -507,18 +525,23 @@ fn encoder_thread(
                     println!("share: forced keyframe (viewer joined)");
                 }
                 last_encode = Some(std::time::Instant::now());
-                let (frame, keyframe) = match enc.encode_bgra(&bgra) {
-                    Ok(x) => x,
+                // 7g: strided zero-repack encode into the reused output
+                // buffer; dims come from the last Negotiated (fps var is
+                // updated there too, and (enc_w, enc_h) tracks them).
+                let (w, h) = enc.dimensions();
+                let keyframe = match enc.encode_bgra_strided(&bgra, w, h, stride, &mut annexb) {
+                    Ok(k) => k,
                     Err(e) => {
                         eprintln!("share: encode failed: {e}");
                         continue;
                     }
                 };
+                let frame: &[u8] = &annexb;
                 let first_seq = seq;
                 seq = seq.wrapping_add(frame.len().div_ceil(MAX_FRAGMENT_PAYLOAD).max(1) as u16);
                 let timestamp = (frame_id as f64 * fps.recip() * 48_000.0) as u32;
                 let dgs = fragment_frame(
-                    frame_id, keyframe, &frame, first_seq, timestamp,
+                    frame_id, keyframe, frame, first_seq, timestamp,
                     0, // sender_id: the server stamps the authenticated id
                 );
                 frame_id = frame_id.wrapping_add(1);
