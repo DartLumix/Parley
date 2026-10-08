@@ -27,6 +27,12 @@ video = ["dep:irondash_texture", "dep:irondash_engine_context", "parley-core/vid
 # 7g: in-app screen SHARE (portal capture + encode via parley-client's
 # screen module). Builds ashpd/pipewire into the bridge .so.
 screen-capture = ["parley-client/screen-capture", "video"]
+# 7g: hardware (VAAPI) encode support — build the moq-vaapi backend in
+# and let the app's HW-encode toggle do something. Without it the
+# toggle is hidden (hw_encode_supported() = false) and encoding is
+# always software. Opt-in like the CLI's --hw-encode: CI and the musl
+# server build never touch libva.
+hw-encode = ["parley-client/vaapi", "video"]
 
 [dependencies]
 flutter_rust_bridge = "=2.13.0"

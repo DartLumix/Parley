@@ -1143,6 +1143,14 @@ pub fn hw_encode_enabled() -> bool {
     }
 }
 
+/// Whether this build can hardware-encode at all (the `hw-encode`
+/// feature pulls the VAAPI backend). The Dart side hides the HW-encode
+/// toggle when this is false — flipping the preference without the
+/// backend would silently do nothing.
+pub fn hw_encode_supported() -> bool {
+    cfg!(feature = "hw-encode")
+}
+
 /// Start sharing this machine's screen (portal dialog opens). The
 /// share runs regardless of channel membership — viewers see it when
 /// they're in the same voice channel (FLAG_VIDEO rides the media

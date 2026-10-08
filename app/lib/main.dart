@@ -104,6 +104,7 @@ class _DevHomePageState extends State<DevHomePage> {
   // 7g: our own share state (start/stop button) + the hw-encode toggle.
   bool _sharing = false;
   bool _hwEncode = false;
+  bool _hwEncodeSupported = false;
 
   late final Timer _liveness;
 
@@ -115,10 +116,18 @@ class _DevHomePageState extends State<DevHomePage> {
       (_) => _checkAlive(),
     );
     // 7g: the toggle's initial state (persisted process-wide in Rust).
-    // Best-effort: featureless builds error and stay false.
+    // Best-effort: featureless builds error and stay false. The toggle
+    // only renders when this build can hardware-encode at all.
     try {
-      hwEncodeEnabled().then((v) {
-        if (mounted) setState(() => _hwEncode = v);
+      hwEncodeSupported().then((supported) {
+        if (!mounted || !supported) return;
+        hwEncodeEnabled().then((v) {
+          if (!mounted) return;
+          setState(() {
+            _hwEncodeSupported = true;
+            _hwEncode = v;
+          });
+        });
       });
     } catch (_) {}
   }
@@ -501,17 +510,19 @@ class _DevHomePageState extends State<DevHomePage> {
                   label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
                 ),
                 const SizedBox(width: 16),
-                Switch(
-                  value: _hwEncode,
-                  onChanged: (v) async {
-                    final now = await setHwEncode(enable: v);
-                    setState(() => _hwEncode = now);
-                    _status = v
-                        ? 'hw encode: ON (next share; if the GPU wedges, this is why)'
-                        : 'hw encode: off (software)';
-                  },
-                ),
-                const Text('HW encode', style: TextStyle(fontSize: 13)),
+                if (_hwEncodeSupported) ...[
+                  Switch(
+                    value: _hwEncode,
+                    onChanged: (v) async {
+                      final now = await setHwEncode(enable: v);
+                      setState(() => _hwEncode = now);
+                      _status = v
+                          ? 'hw encode: ON (next share; if the GPU wedges, this is why)'
+                          : 'hw encode: off (software)';
+                    },
+                  ),
+                  const Text('HW encode', style: TextStyle(fontSize: 13)),
+                ],
               ],
             ),
             const Divider(height: 32),

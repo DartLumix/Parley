@@ -86,29 +86,33 @@ Future<void> requestPresence({required int sessionId}) =>
 
 /// Toggle hardware (VAAPI) encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
-/// re-share to switch. Returns the new state.
+/// re-share to switch. Returns the new state. Featureless: no-op stub
+/// (generated glue references this unconditionally).
 Future<bool> setHwEncode({required bool enable}) =>
     RustLib.instance.api.crateApiSessionSetHwEncode(enable: enable);
 
 /// Current hardware-encode preference (for the toggle's initial state).
+/// Featureless: reports off — the stub convention (video_prepare's 7d
+/// error string). Generated glue references this unconditionally.
 Future<bool> hwEncodeEnabled() =>
     RustLib.instance.api.crateApiSessionHwEncodeEnabled();
 
-/// Start sharing this machine's screen (portal dialog opens). The
-/// share runs regardless of channel membership — viewers see it when
-/// they're in the same voice channel (FLAG_VIDEO rides the media
-/// path). Acceptance: share_started event, then the peer's Screens
-/// panel shows this machine.
+/// Whether this build can hardware-encode at all (the `hw-encode`
+/// feature pulls the VAAPI backend). The Dart side hides the HW-encode
+/// toggle when this is false — flipping the preference without the
+/// backend would silently do nothing.
+Future<bool> hwEncodeSupported() =>
+    RustLib.instance.api.crateApiSessionHwEncodeSupported();
+
+/// Real impl — see the stub above.
 Future<void> startScreenShare({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionStartScreenShare(sessionId: sessionId);
 
-/// Stop an active share. Graceful: the supervisor tears down capture
-/// first, THEN StopShare rides the control stream (7a ordering rule).
+/// Real impl — see the stub above.
 Future<void> stopScreenShare({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionStopScreenShare(sessionId: sessionId);
 
-/// Poke a fresh keyframe for a newly joined viewer (the terminal
-/// client's keyframe-on-join; the app's viewer joins mid-share).
+/// Real impl — see the stub above.
 Future<void> pokeShareKeyframe({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionPokeShareKeyframe(sessionId: sessionId);
 
