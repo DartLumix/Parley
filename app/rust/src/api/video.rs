@@ -93,15 +93,15 @@ pub mod imp {
     // references Hub/Event/Sender types UNQUALIFIED at module level in
     // imp (its own items shadow the glob), so also make them visible
     // inside imp via pub use here.
+    pub use crate::api::session::SessionEvent;
     use irondash_engine_context::EngineContext;
     use irondash_texture::{BoxedPixelData, PayloadProvider, SendableTexture, SimplePixelData};
     pub use parley_core::video_receive::{SharedVideoReceiveHub, VideoFrame};
-    pub use crate::api::session::SessionEvent;
-    pub use tokio::sync::mpsc::UnboundedSender;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
+    pub use tokio::sync::mpsc::UnboundedSender;
 
     use crate::api::session::VideoSurfaceInfo;
 
@@ -111,8 +111,7 @@ pub mod imp {
     /// generated file writes `UnboundedSenderSessionEvent`). Kept
     /// name-only: codegen may or may not reference it per cfg set.
     #[allow(dead_code)]
-    pub(crate) type UnboundedSenderSessionEvent =
-        tokio::sync::mpsc::UnboundedSender<SessionEvent>;
+    pub(crate) type UnboundedSenderSessionEvent = tokio::sync::mpsc::UnboundedSender<SessionEvent>;
 
     pub(super) fn prepare(engine_handle: i64) -> Result<(), String> {
         // Plugin-presence check must run on the platform thread; hop
