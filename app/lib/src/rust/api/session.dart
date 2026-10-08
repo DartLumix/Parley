@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `share_event`, `share_failed_event`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 

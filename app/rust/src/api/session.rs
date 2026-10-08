@@ -71,6 +71,42 @@ pub(crate) fn rt() -> &'static Runtime {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// 7g share-audio mic route: the share-audio mux owns this — while the
+/// flag is set the mic tee routes mic chunks into the mux (mixed with
+/// the share's system audio at FLAG_STEREO 256 kbps), otherwise steer
+/// back to the normal voice encoder. Owned by the mux; flipped back on
+/// every mux exit (cargo-style: terminal client's `mic_route`).
+#[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+static SHARE_MIC_ROUTE: LazyLock<Arc<AtomicBool>> =
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+#[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+pub(crate) fn share_mic_route() -> &'static Arc<AtomicBool> {
+    &SHARE_MIC_ROUTE
+}
+
+/// 7g: the parked mic receiver for the share-audio mux (the tee's
+/// mux-side channel). start_voice installs it; the mux borrows it and
+/// hands it back on exit. None when voice has started without the
+/// share feature or the mux is currently holding it (sys-only
+/// degradation while).
+#[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+static SHARE_MIC_MUX_SLOT: LazyLock<Mutex<Option<tokio::sync::mpsc::Receiver<Vec<f32>>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 7g: the tee's mux-side channel for a new voice enable. Fresh every
+/// enable (the mux may still be draining an old receiver from the last
+/// share; a fresh channel drops nothing — the tee holds the only
+/// sender and it routes exclusively by the flag). The parked slot only
+/// matters for the receiver the mux RETURNS; that flow passes through
+/// SHARE_MIC_MUX_SLOT untouched here.
+#[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+fn share_mic_mux_channel() -> (
+    tokio::sync::mpsc::Sender<Vec<f32>>,
+    tokio::sync::mpsc::Receiver<Vec<f32>>,
+) {
+    tokio::sync::mpsc::channel(64)
+}
 /// Monotonic enable epoch (7e): guards the async install path. Each
 /// start_voice attempt takes a ticket; only the CURRENT ticket may
 /// install — a leave/disconnect/newer-join landing mid-install
@@ -147,15 +183,15 @@ impl Command {
                     reporter_id: 0, // server stamps the authenticated id
                 })
             }
-        #[cfg(feature = "video")]
-        Command::VideoReport { gap_rate_permille } => {
-            ClientBody::VideoReport(VideoReport {
-                gap_rate_permille,
-                reporter_id: 0, // server stamps the authenticated id
-            })
-        }
-        #[cfg(feature = "screen-capture")]
-        Command::StopShare => ClientBody::StopShare(StopShare {}),
+            #[cfg(feature = "video")]
+            Command::VideoReport { gap_rate_permille } => {
+                ClientBody::VideoReport(VideoReport {
+                    gap_rate_permille,
+                    reporter_id: 0, // server stamps the authenticated id
+                })
+            }
+            #[cfg(feature = "screen-capture")]
+            Command::StopShare => ClientBody::StopShare(StopShare {}),
         }
     }
 }
@@ -656,6 +692,8 @@ fn enable_voice(session_id: u32, channel_id: u64) {
     // Snapshot what the voice path needs; drop the lock immediately.
     // (7e2 adds the loss-report slot — reader task writes, encoder
     // ladder reads; 7f adds the video feed for the same media path.)
+    #[cfg(feature = "screen-capture")]
+    let mic_mux_tx = Some(share_mic_mux_channel().0);
     let (mixer, conn, my_id, loss_report, cmd_tx, video_tx) = {
         let sessions = SESSIONS.lock().unwrap();
         let Some(s) = sessions.get(&session_id) else {
@@ -691,6 +729,8 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             loss_report,
             cmd_tx,
             video_tx,
+            #[cfg(feature = "screen-capture")]
+            mic_mux_tx,
         ) {
             Ok(ctrl) => {
                 // Install only if this epoch is still the newest —
@@ -1091,7 +1131,9 @@ pub fn hw_encode_enabled() -> bool {
 pub fn start_screen_share(session_id: u32) -> Result<(), String> {
     let (event_tx, share_loss, conn, poke_slot, ctrl_slot) = {
         let sessions = SESSIONS.lock().unwrap();
-        let s = sessions.get(&session_id).ok_or(format!("no session {session_id}"))?;
+        let s = sessions
+            .get(&session_id)
+            .ok_or(format!("no session {session_id}"))?;
         if s.share_ctrl.lock().unwrap().is_some() {
             return Err("share already active".to_string());
         }
@@ -1110,13 +1152,51 @@ pub fn start_screen_share(session_id: u32) -> Result<(), String> {
     let ended_event_tx = event_tx.clone();
     rt().spawn(async move {
         let event_tx = event_tx;
-        let (poke_tx, mut poke_rx) = tokio::sync::mpsc::unbounded_channel::
-            <parley_client::screen::ShareHandle>();
-        let (share_event_tx, mut share_event_rx) = tokio::sync::mpsc::unbounded_channel::
-            <parley_client::ShareEvent>();
+        let (poke_tx, mut poke_rx) =
+            tokio::sync::mpsc::unbounded_channel::<parley_client::screen::ShareHandle>();
+        let (share_event_tx, mut share_event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<parley_client::ShareEvent>();
         let owner = tokio::spawn(async move {
-            match parley_client::screen::start(conn, share_loss, share_event_tx, None).await {
+            // 7g share AUDIO (the 6.9 pipeline, wired for the app): the
+            // sys capture starts alongside the video (same stop flag)
+            // and the mic mux rides the media conn on its own music
+            // stream — mic tee routes to it via SHARE_MIC_ROUTE while
+            // the mux lives.
+            #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+            let (sys_tx, sys_rx) = {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+                (Some(tx), Some(rx))
+            };
+            #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
+            let (sys_tx, sys_rx): (
+                Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+                Option<std::sync::mpsc::Receiver<Vec<f32>>>,
+            ) = (None, None);
+            match parley_client::screen::start(conn.clone(), share_loss, share_event_tx, sys_tx)
+                .await
+            {
                 Ok((handle, ctrl)) => {
+                    // Spawn the mux NOW (the terminal client's
+                    // sequencing): mic + system audio ride one music
+                    // stream on the share conn. Mic comes from the tee
+                    // via the parked channel (None when voice isn't
+                    // started yet — sys-only degradation).
+                    #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+                    if let Some(sys_rx) = sys_rx {
+                        let mic_rx = SHARE_MIC_MUX_SLOT.lock().unwrap().take();
+                        let route = share_mic_route().clone();
+                        let mux_conn = conn.clone();
+                        std::thread::spawn(move || {
+                            let returned = parley_client::screen::spawn_share_audio_mux(
+                                mic_rx, sys_rx, mux_conn, route,
+                            );
+                            // Mux exited (share over or error): park
+                            // the mic receiver back for reuse.
+                            if let Ok(Some(rx)) = returned.join() {
+                                *SHARE_MIC_MUX_SLOT.lock().unwrap() = Some(rx);
+                            }
+                        });
+                    }
                     let _ = poke_tx.send(handle);
                     let _ = ctrl_slot.lock().unwrap().insert(ctrl);
                     let _ = event_tx.send(share_event(session_id, "share_started"));

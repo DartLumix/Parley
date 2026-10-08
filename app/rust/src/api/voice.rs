@@ -117,6 +117,11 @@ pub(crate) struct VoiceControl {
     /// registry lock — the detached thread self-terminates within
     /// ~100 ms (same discipline as the 7d harvest path).
     _device_thread: std::thread::JoinHandle<()>,
+    /// 7g: the capture side's mic tee holds this too — dropping the
+    /// control doesn't strand the tee (its mux-routed channel closes
+    /// when the share ends anyway).
+    #[cfg(feature = "screen-capture")]
+    _mic_mux_tx: Option<tokio::sync::mpsc::Sender<Vec<f32>>>,
 }
 
 #[cfg(feature = "audio-device")]
@@ -236,6 +241,7 @@ fn apply_profile(send: &mut SendPipeline, robust: bool) {
 /// the device thread (if it started) holds no stream past its scope
 /// exit.
 #[cfg(feature = "audio-device")]
+#[cfg_attr(feature = "screen-capture", allow(clippy::too_many_arguments))]
 pub(crate) fn start_voice(
     mixer: SharedMixer,
     conn: quinn::Connection,
@@ -247,7 +253,14 @@ pub(crate) fn start_voice(
     // same media path, and the session's video task consumes the
     // channel (3b: decode never on this reader). None in featureless
     // builds (video datagrams are dropped).
-    video_tx: Option<tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>>,
+    #[cfg(feature = "audio-device")] video_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>,
+    >,
+    // 7g: the mic tee routes captured chunks into this mux channel
+    // while the share-audio mux owns the route flag; the mux drains it
+    // and mixes the mic with the share's system audio. None when the
+    // share feature is off (no tee → mic rides the normal encoder).
+    #[cfg(feature = "screen-capture")] mic_mux_tx: Option<tokio::sync::mpsc::Sender<Vec<f32>>>,
 ) -> Result<VoiceControl, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (reader_stop_tx, mut reader_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -331,7 +344,40 @@ pub(crate) fn start_voice(
 
     // --- capture channel (bounded 16, the 6f discipline): RT
     // callbacks try_send; a stalled encoder drops stale mic chunks.
-    let (pcm_tx, mut pcm_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(16);
+    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(16);
+
+    // 7g mic tee: while the share-audio mux owns the route flag, chunks
+    // go to the mux (it mixes mic + system audio); otherwise to the
+    // normal encoder below. Same tee shape as the terminal client's —
+    // try_send on both sides: stale chunks drop, never blocks the RT
+    // callback. Installed only when the share mux channel exists.
+    #[cfg(feature = "screen-capture")]
+    let mic_mux_tx_keep = mic_mux_tx.clone();
+    #[cfg(feature = "screen-capture")]
+    let mut pcm_rx = if let Some(mux_tx) = mic_mux_tx {
+        let route = crate::api::session::share_mic_route().clone();
+        let (tee_enc_tx, tee_enc_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(16);
+        crate::api::session::rt().spawn(async move {
+            let mut pcm_rx = pcm_rx;
+            loop {
+                let Some(chunk) = pcm_rx.recv().await else {
+                    break;
+                };
+                if route.load(Ordering::Relaxed) {
+                    let _ = mux_tx.try_send(chunk);
+                    continue;
+                }
+                if tee_enc_tx.try_send(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        tee_enc_rx
+    } else {
+        pcm_rx
+    };
+    #[cfg(not(feature = "screen-capture"))]
+    let mut pcm_rx = pcm_rx;
 
     // --- encoder task: AEC → i16 → SendPipeline → datagrams. Exits
     // when the capture sender drops (teardown) or the connection dies.
@@ -526,6 +572,8 @@ pub(crate) fn start_voice(
         encoder_abort: encoder_task.abort_handle(),
         reporter_abort,
         _device_thread: device_thread,
+        #[cfg(feature = "screen-capture")]
+        _mic_mux_tx: mic_mux_tx_keep,
     })
 }
 

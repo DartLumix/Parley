@@ -1,3 +1,11 @@
 rust_input: crate::api
 rust_root: rust/
 dart_output: lib/src/rust
+# Features the parser should treat as ENABLED: the share/volume
+# functions live behind `#[cfg(feature = "screen-capture")]` — without
+# this list codegen skips them (start_screen_share/stop_screen_share
+# vanish from session.dart). Matches the app's build features.
+rust_features:
+  - audio-device
+  - video
+  - screen-capture
