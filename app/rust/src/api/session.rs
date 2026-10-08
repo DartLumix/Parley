@@ -58,7 +58,7 @@ use parley_proto::VideoReport;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
     Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
-    ServerBody, ServerMessage, StopShare, PROTOCOL_VERSION,
+    ServerBody, ServerMessage, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -191,7 +191,7 @@ impl Command {
                 })
             }
             #[cfg(feature = "screen-capture")]
-            Command::StopShare => ClientBody::StopShare(StopShare {}),
+            Command::StopShare => ClientBody::StopShare(parley_proto::StopShare {}),
         }
     }
 }
@@ -217,6 +217,9 @@ struct LiveSession {
     user_id: u32,
     /// 7g: event stream origin for share lifecycle events (share_
     /// started / share_ended) and the share supervisor's forwarder.
+    /// Featureless builds never touch it (share fns are stubs) —
+    /// kept for the one-struct-serves-all-configs simplicity.
+    #[cfg(feature = "screen-capture")]
     event_tx: UnboundedSender<SessionEvent>,
     /// 7g share state (the in-app "Share screen" button):
     /// controller slot + keyframe-poke slot + the loss slot the share
@@ -976,6 +979,7 @@ async fn connect_async(
             sinks,
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
+            #[cfg(feature = "screen-capture")]
             event_tx: event_tx.clone(),
             #[cfg(feature = "screen-capture")]
             share_ctrl: Arc::new(Mutex::new(None)),
@@ -1111,15 +1115,32 @@ pub fn request_presence(session_id: u32) -> Result<(), String> {
 
 /// Toggle hardware (VAAPI) encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
-/// re-share to switch. Returns the new state.
+/// re-share to switch. Returns the new state. Featureless: no-op stub
+/// (generated glue references this unconditionally).
 pub fn set_hw_encode(enable: bool) -> bool {
-    parley_core::video::set_hw_encode(enable);
+    #[cfg(feature = "video")]
+    {
+        parley_core::video::set_hw_encode(enable);
+    }
+    #[cfg(not(feature = "video"))]
+    {
+        let _ = enable;
+    }
     enable
 }
 
 /// Current hardware-encode preference (for the toggle's initial state).
+/// Featureless: reports off — the stub convention (video_prepare's 7d
+/// error string). Generated glue references this unconditionally.
 pub fn hw_encode_enabled() -> bool {
-    parley_core::video::hw_encode_enabled()
+    #[cfg(feature = "video")]
+    {
+        parley_core::video::hw_encode_enabled()
+    }
+    #[cfg(not(feature = "video"))]
+    {
+        false
+    }
 }
 
 /// Start sharing this machine's screen (portal dialog opens). The
@@ -1127,6 +1148,12 @@ pub fn hw_encode_enabled() -> bool {
 /// they're in the same voice channel (FLAG_VIDEO rides the media
 /// path). Acceptance: share_started event, then the peer's Screens
 /// panel shows this machine.
+#[cfg(not(feature = "screen-capture"))]
+pub fn start_screen_share(_session_id: u32) -> Result<(), String> {
+    Err("screen-capture feature off".into())
+}
+
+/// Real impl — see the stub above.
 #[cfg(feature = "screen-capture")]
 pub fn start_screen_share(session_id: u32) -> Result<(), String> {
     let (event_tx, share_loss, conn, poke_slot, ctrl_slot) = {
@@ -1240,6 +1267,12 @@ pub fn start_screen_share(session_id: u32) -> Result<(), String> {
 
 /// Stop an active share. Graceful: the supervisor tears down capture
 /// first, THEN StopShare rides the control stream (7a ordering rule).
+#[cfg(not(feature = "screen-capture"))]
+pub fn stop_screen_share(_session_id: u32) -> Result<(), String> {
+    Err("screen-capture feature off".into())
+}
+
+/// Real impl — see the stub above.
 #[cfg(feature = "screen-capture")]
 pub fn stop_screen_share(session_id: u32) -> Result<(), String> {
     let sessions = SESSIONS.lock().unwrap();
@@ -1259,6 +1292,14 @@ pub fn stop_screen_share(session_id: u32) -> Result<(), String> {
 
 /// Poke a fresh keyframe for a newly joined viewer (the terminal
 /// client's keyframe-on-join; the app's viewer joins mid-share).
+/// Featureless: no-op stub (generated glue references this
+/// unconditionally).
+#[cfg(not(feature = "screen-capture"))]
+pub fn poke_share_keyframe(_session_id: u32) -> Result<(), String> {
+    Ok(())
+}
+
+/// Real impl — see the stub above.
 #[cfg(feature = "screen-capture")]
 pub fn poke_share_keyframe(session_id: u32) -> Result<(), String> {
     let sessions = SESSIONS.lock().unwrap();
@@ -1273,12 +1314,14 @@ pub fn poke_share_keyframe(session_id: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "screen-capture")]
 fn share_event(session_id: u32, kind: &str) -> SessionEvent {
     let mut e = closed_event(session_id);
     e.kind = kind.to_string();
     e
 }
 
+#[cfg(feature = "screen-capture")]
 fn share_failed_event(session_id: u32, err: String) -> SessionEvent {
     let mut e = share_event(session_id, "share_failed");
     e.username = err; // reuse the string slot (dev client; documented)

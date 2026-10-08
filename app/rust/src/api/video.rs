@@ -72,13 +72,53 @@ pub fn video_prepare(engine_handle: i64) -> Result<(), String> {
 /// to codegen (never in a pub fn signature).
 #[cfg(feature = "video")]
 pub use imp::DisplayBridge;
+// The generated file's top-level code references SessionEvent
+// UNQUALIFIED (via `use crate::*`), which only sees `pub` items of
+// api modules — so the event type must be re-exported here in every
+// build. (Unused in the featureless build — the glob's other members
+// cover it — hence the allow.)
+#[allow(unused_imports)]
+pub use crate::api::session::SessionEvent;
+
+/// Featureless stub: FRB's generated file glob-imports `video::imp`
+/// unconditionally AND emits wire glue naming DisplayBridge/
+/// SharedVideoReceiveHub/SessionEvent/UnboundedSender (it never sees
+/// the cfg), so the module and those names must exist in every build.
+/// The stubs are unreachable: the Dart side can only obtain opaque
+/// handles the real bridge produced, and featureless builds never
+/// construct one (video_prepare errors out; video_started events
+/// never fire). The two cfg arms are mutually exclusive.
+#[cfg(not(feature = "video"))]
+pub mod imp {
+    /// Unreachable stub — see module docs.
+    #[allow(dead_code)]
+    pub struct DisplayBridge;
+
+    #[allow(dead_code)]
+    impl DisplayBridge {
+        pub fn start(
+            _hub: SharedVideoReceiveHub,
+            _events: UnboundedSender<SessionEvent>,
+            _session_id: u32,
+        ) -> Self {
+            unreachable!("video feature off")
+        }
+        pub fn sender_stopped(&self, _sender_id: u32, _forget: bool) {
+            unreachable!("video feature off")
+        }
+    }
+
+    /// Stub type mirrors the real hub's name for the generated glue;
+    /// never constructed.
+    #[allow(dead_code)]
+    pub struct SharedVideoReceiveHub;
+    pub use crate::api::session::SessionEvent;
+    pub use tokio::sync::mpsc::UnboundedSender;
+}
 // 7g: FRB's generated file references these unqualified (its glob import
 // only sees `pub` items of `crate::api::video::imp`). Public re-exports
 // so `use crate::*` there resolves them. The glob may itself be unused
 // when no opaque signature exists — hence the allows.
-#[allow(unused_imports)]
-#[cfg(feature = "video")]
-pub use crate::api::session::SessionEvent;
 #[allow(unused_imports)]
 #[cfg(feature = "video")]
 pub use parley_core::video_receive::SharedVideoReceiveHub;
@@ -93,7 +133,7 @@ pub mod imp {
     // references Hub/Event/Sender types UNQUALIFIED at module level in
     // imp (its own items shadow the glob), so also make them visible
     // inside imp via pub use here.
-    pub use crate::api::session::SessionEvent;
+    pub use super::SessionEvent;
     use irondash_engine_context::EngineContext;
     use irondash_texture::{BoxedPixelData, PayloadProvider, SendableTexture, SimplePixelData};
     pub use parley_core::video_receive::{SharedVideoReceiveHub, VideoFrame};
