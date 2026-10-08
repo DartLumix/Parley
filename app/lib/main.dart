@@ -101,6 +101,9 @@ class _DevHomePageState extends State<DevHomePage> {
   // the video_started / video_stopped events; textures are owned by
   // the Rust bridge (one per sender, stable across stop/re-share).
   final Map<int, (int, int, int)> _videos = {};
+  // 7g: our own share state (start/stop button) + the hw-encode toggle.
+  bool _sharing = false;
+  bool _hwEncode = false;
 
   late final Timer _liveness;
 
@@ -111,6 +114,13 @@ class _DevHomePageState extends State<DevHomePage> {
       const Duration(seconds: 1),
       (_) => _checkAlive(),
     );
+    // 7g: the toggle's initial state (persisted process-wide in Rust).
+    // Best-effort: featureless builds error and stay false.
+    try {
+      hwEncodeEnabled().then((v) {
+        if (mounted) setState(() => _hwEncode = v);
+      });
+    } catch (_) {}
   }
 
   @override
@@ -149,6 +159,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _chat.clear();
       _usernames.clear();
       _videos.clear();
+      _sharing = false;
     });
     // Clean the dead registry entry (a manual Disconnect may have
     // raced us — ignore).
@@ -214,7 +225,33 @@ class _DevHomePageState extends State<DevHomePage> {
       _chat.clear();
       _usernames.clear();
       _videos.clear();
+      _sharing = false;
     });
+  }
+
+  // 7g: share lifecycle. Start: portal dialog opens (compositor's
+  // picker); share_started/share_ended events flip the button.
+  // FRB exposes these as async (even though the Rust side returns
+  // instantly) — the portal dialog blocks start for seconds.
+  Future<void> _startShare() async {
+    if (_session == null) return;
+    try {
+      await startScreenShare(sessionId: _session!.sessionId);
+      // share_started arrives as an event; the button flips there.
+    } catch (e) {
+      setState(() => _status = 'share failed: $e');
+    }
+  }
+
+  Future<void> _stopShare() async {
+    if (_session == null) return;
+    try {
+      // Returns void (graceful teardown); share_ended arrives as an
+      // event when the supervisor finishes (may take a second).
+      stopScreenShare(sessionId: _session!.sessionId);
+    } catch (e) {
+      setState(() => _status = 'share stop failed: $e');
+    }
   }
 
   void _onEvent(SessionEvent ev) {
@@ -283,6 +320,21 @@ class _DevHomePageState extends State<DevHomePage> {
         final s1 = ev.surface;
         if (s1 != null) {
           setState(() => _videos.remove(s1.userId));
+        }
+      case 'share_started':
+        if (mounted) {
+          setState(() => _sharing = true);
+          _status = 'sharing this screen';
+        }
+      case 'share_ended':
+        if (mounted) {
+          setState(() => _sharing = false);
+          _status = 'share ended';
+        }
+      case 'share_failed':
+        if (mounted) {
+          setState(() => _sharing = false);
+          _status = 'share failed: ${ev.username}';
         }
       case 'session_closed':
         if (mounted) _handleClosed();
@@ -434,6 +486,32 @@ class _DevHomePageState extends State<DevHomePage> {
                       : 'voice idle (join a channel to talk & listen)',
                   style: const TextStyle(color: Colors.white70, fontSize: 13),
                 ),
+              ],
+            ),
+            const Divider(height: 32),
+
+            // --- 7g: screen share (share own screen + hw toggle) ---
+            Row(
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _joinedChannelId == null || _connecting
+                      ? null
+                      : (_sharing ? _stopShare : _startShare),
+                  icon: Icon(_sharing ? Icons.stop_screen_share : Icons.screen_share),
+                  label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
+                ),
+                const SizedBox(width: 16),
+                Switch(
+                  value: _hwEncode,
+                  onChanged: (v) async {
+                    final now = await setHwEncode(enable: v);
+                    setState(() => _hwEncode = now);
+                    _status = v
+                        ? 'hw encode: ON (next share; if the GPU wedges, this is why)'
+                        : 'hw encode: off (software)';
+                  },
+                ),
+                const Text('HW encode', style: TextStyle(fontSize: 13)),
               ],
             ),
             const Divider(height: 32),

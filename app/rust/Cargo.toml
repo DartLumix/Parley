@@ -24,6 +24,9 @@ audio-device = [
 # and the musl server build never touch openh264 or the texture glue.
 # The app builds with --features audio-device,video.
 video = ["dep:irondash_texture", "dep:irondash_engine_context", "parley-core/video"]
+# 7g: in-app screen SHARE (portal capture + encode via parley-client's
+# screen module). Builds ashpd/pipewire into the bridge .so.
+screen-capture = ["parley-client/screen-capture", "video"]
 
 [dependencies]
 flutter_rust_bridge = "=2.13.0"

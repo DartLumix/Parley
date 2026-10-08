@@ -71,21 +71,48 @@ pub fn video_prepare(engine_handle: i64) -> Result<(), String> {
 /// textures). Re-exported for session.rs; the type itself is opaque
 /// to codegen (never in a pub fn signature).
 #[cfg(feature = "video")]
-pub(crate) use imp::DisplayBridge;
+pub use imp::DisplayBridge;
+// 7g: FRB's generated file references these unqualified (its glob import
+// only sees `pub` items of `crate::api::video::imp`). Public re-exports
+// so `use crate::*` there resolves them. The glob may itself be unused
+// when no opaque signature exists — hence the allows.
+#[allow(unused_imports)]
+#[cfg(feature = "video")]
+pub use crate::api::session::SessionEvent;
+#[allow(unused_imports)]
+#[cfg(feature = "video")]
+pub use parley_core::video_receive::SharedVideoReceiveHub;
+#[allow(unused_imports)]
+#[cfg(feature = "video")]
+pub use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(feature = "video")]
-mod imp {
+pub mod imp {
+    // NOTE: pub — FRB codegen emits `use crate::api::video::imp::*` and
+    // DisplayBridge wire glue into frb_generated.rs (7g). The wire glue
+    // references Hub/Event/Sender types UNQUALIFIED at module level in
+    // imp (its own items shadow the glob), so also make them visible
+    // inside imp via pub use here.
     use irondash_engine_context::EngineContext;
     use irondash_texture::{BoxedPixelData, PayloadProvider, SendableTexture, SimplePixelData};
-    use parley_core::video_receive::{SharedVideoReceiveHub, VideoFrame};
+    pub use parley_core::video_receive::{SharedVideoReceiveHub, VideoFrame};
+    pub use crate::api::session::SessionEvent;
+    pub use tokio::sync::mpsc::UnboundedSender;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
-    use crate::api::session::{SessionEvent, VideoSurfaceInfo};
+    use crate::api::session::VideoSurfaceInfo;
 
     static ENGINE_HANDLE: OnceLock<i64> = OnceLock::new();
+
+    /// 7g: alias the opaque sender type FRB names in its glue (the
+    /// generated file writes `UnboundedSenderSessionEvent`). Kept
+    /// name-only: codegen may or may not reference it per cfg set.
+    #[allow(dead_code)]
+    pub(crate) type UnboundedSenderSessionEvent =
+        tokio::sync::mpsc::UnboundedSender<SessionEvent>;
 
     pub(super) fn prepare(engine_handle: i64) -> Result<(), String> {
         // Plugin-presence check must run on the platform thread; hop

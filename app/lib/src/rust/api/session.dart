@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `closed_event`, `connect_async`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `teardown_voice`, `to_event`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `share_event`, `share_failed_event`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
@@ -83,6 +83,34 @@ Future<void> fetchHistory({
 /// Request the presence listing (response: "presence" event).
 Future<void> requestPresence({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionRequestPresence(sessionId: sessionId);
+
+/// Toggle hardware (VAAPI) encode preference. Takes effect at the next
+/// encoder creation — a running share keeps its backend; stop and
+/// re-share to switch. Returns the new state.
+Future<bool> setHwEncode({required bool enable}) =>
+    RustLib.instance.api.crateApiSessionSetHwEncode(enable: enable);
+
+/// Current hardware-encode preference (for the toggle's initial state).
+Future<bool> hwEncodeEnabled() =>
+    RustLib.instance.api.crateApiSessionHwEncodeEnabled();
+
+/// Start sharing this machine's screen (portal dialog opens). The
+/// share runs regardless of channel membership — viewers see it when
+/// they're in the same voice channel (FLAG_VIDEO rides the media
+/// path). Acceptance: share_started event, then the peer's Screens
+/// panel shows this machine.
+Future<void> startScreenShare({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionStartScreenShare(sessionId: sessionId);
+
+/// Stop an active share. Graceful: the supervisor tears down capture
+/// first, THEN StopShare rides the control stream (7a ordering rule).
+Future<void> stopScreenShare({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionStopScreenShare(sessionId: sessionId);
+
+/// Poke a fresh keyframe for a newly joined viewer (the terminal
+/// client's keyframe-on-join; the app's viewer joins mid-share).
+Future<void> pokeShareKeyframe({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionPokeShareKeyframe(sessionId: sessionId);
 
 /// One row of a channel listing.
 class ChannelInfo {

@@ -482,7 +482,14 @@ static HW_ENCODE: AtomicBool = AtomicBool::new(false);
 /// Enable hardware-encode preference. Idempotent; call before
 /// [`create_encoder`]. See [`create_encoder`] for the fallback rules.
 pub fn prefer_hw_encode() {
-    HW_ENCODE.store(true, Ordering::Relaxed);
+    set_hw_encode(true);
+}
+
+/// 7g: full runtime switch (the Flutter app's toggle). Takes effect at
+/// the NEXT encoder creation — a running share keeps its backend; stop
+/// and re-share to switch.
+pub fn set_hw_encode(enable: bool) {
+    HW_ENCODE.store(enable, Ordering::Relaxed);
 }
 
 /// Whether hardware preference is on (for diagnostics).

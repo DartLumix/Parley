@@ -58,7 +58,7 @@ use parley_proto::VideoReport;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
     Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
-    ServerBody, ServerMessage, PROTOCOL_VERSION,
+    ServerBody, ServerMessage, StopShare, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -115,6 +115,10 @@ pub(crate) enum Command {
     VideoReport {
         gap_rate_permille: u32,
     },
+    /// 7g: after the local share's supervisor reported Ended, tell the
+    /// server (never before Ended — no datagram may follow the notice).
+    #[cfg(feature = "screen-capture")]
+    StopShare,
 }
 
 impl Command {
@@ -143,13 +147,15 @@ impl Command {
                     reporter_id: 0, // server stamps the authenticated id
                 })
             }
-            #[cfg(feature = "video")]
-            Command::VideoReport { gap_rate_permille } => {
-                ClientBody::VideoReport(VideoReport {
-                    gap_rate_permille,
-                    reporter_id: 0, // server stamps the authenticated id
-                })
-            }
+        #[cfg(feature = "video")]
+        Command::VideoReport { gap_rate_permille } => {
+            ClientBody::VideoReport(VideoReport {
+                gap_rate_permille,
+                reporter_id: 0, // server stamps the authenticated id
+            })
+        }
+        #[cfg(feature = "screen-capture")]
+        Command::StopShare => ClientBody::StopShare(StopShare {}),
         }
     }
 }
@@ -173,6 +179,18 @@ struct LiveSession {
     mixer: SharedMixer,
     /// Authenticated user id (media reader's self-echo filter).
     user_id: u32,
+    /// 7g: event stream origin for share lifecycle events (share_
+    /// started / share_ended) and the share supervisor's forwarder.
+    event_tx: UnboundedSender<SessionEvent>,
+    /// 7g share state (the in-app "Share screen" button):
+    /// controller slot + keyframe-poke slot + the loss slot the share
+    /// encoder's ladder reads (viewers' VideoReports land here).
+    #[cfg(feature = "screen-capture")]
+    share_ctrl: Arc<Mutex<Option<parley_client::screen::ShareController>>>,
+    #[cfg(feature = "screen-capture")]
+    share_poke: Arc<Mutex<Option<parley_client::screen::ShareHandle>>>,
+    #[cfg(feature = "screen-capture")]
+    share_loss: Arc<AtomicU32>,
     /// The channel listing as seen by the last channel_list event —
     /// 7e profile selection: the mode of the channel being joined
     /// picks speech (mono + AEC) vs music (stereo 256 kbps, no AEC).
@@ -503,6 +521,26 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             let _ = rep;
             Vec::new()
         }
+        // 7g: a peer's video report steers OUR share's bitrate ladder
+        // (same shape as ReceiverReport → voice ladder). The server
+        // routes VideoReport to the other voice-channel members; our
+        // own echo is excluded (reporter_id stamped server-side).
+        ServerBody::VideoReport(rep) => {
+            #[cfg(feature = "screen-capture")]
+            {
+                let is_echo = rep.reporter_id == 0 || rep.reporter_id == own_user_id(session_id);
+                if !is_echo {
+                    if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                        s.share_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
+                    }
+                }
+            }
+            #[cfg(not(feature = "screen-capture"))]
+            {
+                let _ = rep;
+            }
+            Vec::new()
+        }
         ServerBody::VoiceStateList(l) => {
             let mut e = ev("voice_states");
             e.states = l
@@ -536,6 +574,14 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                             d.sender_stopped(s.user_id, false);
                         }
                     }
+                } else {
+                    // OUR share ended (desktop sharing-indicator stop);
+                    // clear the slots so "Share screen" can restart.
+                    #[cfg(feature = "screen-capture")]
+                    if let Some(sess) = SESSIONS.lock().unwrap().get(&session_id) {
+                        *sess.share_ctrl.lock().unwrap() = None;
+                        *sess.share_poke.lock().unwrap() = None;
+                    }
                 }
                 let mut e = ev("video_stopped");
                 e.user_id = s.user_id;
@@ -548,8 +594,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 vec![e]
             }
         }
-        // HeartbeatAck / VideoReport (sender-side feedback): nothing
-        // to surface in the UI.
+        // HeartbeatAck: nothing to surface in the UI.
         _ => Vec::new(),
     }
 }
@@ -891,6 +936,13 @@ async fn connect_async(
             sinks,
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
+            event_tx: event_tx.clone(),
+            #[cfg(feature = "screen-capture")]
+            share_ctrl: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "screen-capture")]
+            share_poke: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "screen-capture")]
+            share_loss: Arc::new(AtomicU32::new(0)),
             channels: Vec::new(),
             #[cfg(feature = "audio-device")]
             loss_report: Arc::new(AtomicU32::new(0)),
@@ -1008,6 +1060,149 @@ pub fn fetch_history(
 /// Request the presence listing (response: "presence" event).
 pub fn request_presence(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::Presence)
+}
+// ===== 7g: in-app screen share =====
+//
+// The Dart side calls start_screen_share after joining a channel; the
+// portal dialog opens (Hyprland's picker). Lifecycle events arrive as
+// session events (share_started / share_ended). Stop is stop_screen_
+// share OR the desktop's sharing indicator — both converge on Ended →
+// StopShare AFTER teardown.
+
+/// Toggle hardware (VAAPI) encode preference. Takes effect at the next
+/// encoder creation — a running share keeps its backend; stop and
+/// re-share to switch. Returns the new state.
+pub fn set_hw_encode(enable: bool) -> bool {
+    parley_core::video::set_hw_encode(enable);
+    enable
+}
+
+/// Current hardware-encode preference (for the toggle's initial state).
+pub fn hw_encode_enabled() -> bool {
+    parley_core::video::hw_encode_enabled()
+}
+
+/// Start sharing this machine's screen (portal dialog opens). The
+/// share runs regardless of channel membership — viewers see it when
+/// they're in the same voice channel (FLAG_VIDEO rides the media
+/// path). Acceptance: share_started event, then the peer's Screens
+/// panel shows this machine.
+#[cfg(feature = "screen-capture")]
+pub fn start_screen_share(session_id: u32) -> Result<(), String> {
+    let (event_tx, share_loss, conn, poke_slot, ctrl_slot) = {
+        let sessions = SESSIONS.lock().unwrap();
+        let s = sessions.get(&session_id).ok_or(format!("no session {session_id}"))?;
+        if s.share_ctrl.lock().unwrap().is_some() {
+            return Err("share already active".to_string());
+        }
+        (
+            s.event_tx.clone(),
+            s.share_loss.clone(),
+            s._conn.clone(),
+            s.share_poke.clone(),
+            s.share_ctrl.clone(),
+        )
+    };
+    // Spawned (not awaited): the portal dialog blocks for seconds and
+    // FRB calls must return fast. The owner task forwards lifecycle
+    // events into the session's stream and clears the slots on Ended.
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    let ended_event_tx = event_tx.clone();
+    rt().spawn(async move {
+        let event_tx = event_tx;
+        let (poke_tx, mut poke_rx) = tokio::sync::mpsc::unbounded_channel::
+            <parley_client::screen::ShareHandle>();
+        let (share_event_tx, mut share_event_rx) = tokio::sync::mpsc::unbounded_channel::
+            <parley_client::ShareEvent>();
+        let owner = tokio::spawn(async move {
+            match parley_client::screen::start(conn, share_loss, share_event_tx, None).await {
+                Ok((handle, ctrl)) => {
+                    let _ = poke_tx.send(handle);
+                    let _ = ctrl_slot.lock().unwrap().insert(ctrl);
+                    let _ = event_tx.send(share_event(session_id, "share_started"));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(share_failed_event(session_id, e));
+                }
+            }
+            // Forward the supervisor's Ended (external stop) and exit.
+            // Internal stop (stop_screen_share) closes its side of the
+            // Ended channel by dropping the ctrl; the supervisor still
+            // sends Ended on the shared `events`... which we own, so
+            // we just drain until it closes.
+            while let Some(ev) = share_event_rx.recv().await {
+                if let parley_client::ShareEvent::Ended { external } = ev {
+                    let _ = ended_tx.send(external);
+                    break;
+                }
+            }
+        });
+        // Hand the keyframe handle to the session slot when it lands.
+        if let Some(handle) = poke_rx.recv().await {
+            *poke_slot.lock().unwrap() = Some(handle);
+        }
+        // Wait for Ended (external OR our own stop), then signal the
+        // server and clean the slots.
+        let _ = ended_rx.recv().await;
+        let _ = send_command(session_id, Command::StopShare);
+        {
+            let sessions = SESSIONS.lock().unwrap();
+            if let Some(s) = sessions.get(&session_id) {
+                *s.share_ctrl.lock().unwrap() = None;
+                *s.share_poke.lock().unwrap() = None;
+            }
+        }
+        let _ = ended_event_tx.send(share_event(session_id, "share_ended"));
+        let _ = owner.await;
+    });
+    Ok(())
+}
+
+/// Stop an active share. Graceful: the supervisor tears down capture
+/// first, THEN StopShare rides the control stream (7a ordering rule).
+#[cfg(feature = "screen-capture")]
+pub fn stop_screen_share(session_id: u32) -> Result<(), String> {
+    let sessions = SESSIONS.lock().unwrap();
+    let s = sessions
+        .get(&session_id)
+        .ok_or(format!("no session {session_id}"))?;
+    let ctrl = s.share_ctrl.lock().unwrap().take();
+    drop(sessions);
+    match ctrl {
+        Some(c) => {
+            c.request_stop();
+            Ok(()) // Ended event follows (share_ended + server notice)
+        }
+        None => Err("no active share".to_string()),
+    }
+}
+
+/// Poke a fresh keyframe for a newly joined viewer (the terminal
+/// client's keyframe-on-join; the app's viewer joins mid-share).
+#[cfg(feature = "screen-capture")]
+pub fn poke_share_keyframe(session_id: u32) -> Result<(), String> {
+    let sessions = SESSIONS.lock().unwrap();
+    let s = sessions
+        .get(&session_id)
+        .ok_or(format!("no session {session_id}"))?;
+    let poke = s.share_poke.lock().unwrap().clone();
+    drop(sessions);
+    if let Some(h) = poke {
+        h.force_keyframe();
+    }
+    Ok(())
+}
+
+fn share_event(session_id: u32, kind: &str) -> SessionEvent {
+    let mut e = closed_event(session_id);
+    e.kind = kind.to_string();
+    e
+}
+
+fn share_failed_event(session_id: u32, err: String) -> SessionEvent {
+    let mut e = share_event(session_id, "share_failed");
+    e.username = err; // reuse the string slot (dev client; documented)
+    e
 }
 
 /// 7f (6e): start the viewer-side VideoReport reporter — worst
