@@ -1,6 +1,7 @@
 #![cfg(feature = "vaapi")]
 
-//! Does a keyframe from the VAAPI encoder stand alone?
+//! Does a keyframe from the VAAPI encoder stand alone — at every profile
+//! the client can ask for?
 //!
 //! The receiver's contract: a viewer's decoder is created mid-stream and
 //! fed its first frame, which is always a wire-flagged keyframe. That
@@ -18,24 +19,45 @@
 //!   * hardware, parameter sets stripped — the negative control; must
 //!     FAIL, proving the check can detect a bad keyframe
 //!
+//! 7h HD: the sweep runs the profiles the client actually selects —
+//! 720p, 1080p and 1440p at the hardware profile's 60 fps — because a
+//! stream shape that decodes at one resolution says nothing about the
+//! level, the macroblock geometry or the rate control at another.
+//! `PARLEY_VAAPI_SWEEP` overrides the list (e.g. `2560x1440`), and
+//! `PARLEY_VAAPI_STREAM` dumps the last hardware stream as Annex-B for
+//! an outside decoder (ffmpeg/ffprobe).
+//!
 //! Run: PARLEY_VAAPI=1 cargo test -p parley-core --features vaapi \
 //!        --test vaapi_keyframe_shape -- --nocapture
 
 use parley_core::video::{VideoDecoder, create_encoder_auto, set_hw_encode};
 
-const W: usize = 1280;
-const H: usize = 720;
+/// (width, height) profiles to sweep.
+const PROFILES: &[(usize, usize)] = &[(1280, 720), (1920, 1080), (2560, 1440)];
+
+fn profiles() -> Vec<(usize, usize)> {
+    match std::env::var("PARLEY_VAAPI_SWEEP") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|p| {
+                let (w, h) = p.trim().split_once('x')?;
+                Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+            })
+            .collect(),
+        Err(_) => PROFILES.to_vec(),
+    }
+}
 
 /// Moving pattern, so the encoder has real inter-frame work to do.
-fn frame(t: usize) -> Vec<u8> {
-    let mut bgra = vec![0u8; W * H * 4];
+fn frame(w: usize, h: usize, t: usize) -> Vec<u8> {
+    let mut bgra = vec![0u8; w * h * 4];
     for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
-        let x = i % W;
-        let y = i / W;
-        let bar = ((t * 37) % W) as i32;
-        px[0] = (x * 255 / W) as u8;
-        px[1] = (y * 255 / H) as u8;
-        px[2] = if (x as i32 - bar).abs() < 60 && y % 5 == 0 {
+        let x = i % w;
+        let y = i / w;
+        let bar = ((t * 37) % w) as i32;
+        px[0] = (x * 255 / w) as u8;
+        px[1] = (y * 255 / h) as u8;
+        px[2] = if (x as i32 - bar).abs() < 60 && y.is_multiple_of(5) {
             255
         } else {
             48
@@ -98,24 +120,30 @@ fn strip_parameter_sets(annexb: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encode `n` frames, forcing keyframes at 0 and `n / 2`, and return the
-/// (frame index, was-flagged-keyframe, Annex-B bytes) of each encoded
-/// frame. `hardware_stripped` removes SPS/PPS from reported keyframes.
-fn encode_run(hardware: bool, n: usize) -> Vec<(usize, bool, Vec<u8>)> {
+/// Encode `n` frames at `w`x`h`, forcing keyframes at 0 and `n / 2`, and
+/// return the (frame index, was-flagged-keyframe, Annex-B bytes) of each
+/// encoded frame plus the wall time the encode loop took.
+fn encode_run(hardware: bool, w: usize, h: usize, n: usize) -> (Vec<(usize, bool, Vec<u8>)>, f64) {
     set_hw_encode(hardware);
-    let mut enc = create_encoder_auto(W, H).expect("encoder");
+    let mut enc = create_encoder_auto(w, h).expect("encoder");
+    // Generate outside the timed region: drawing the pattern is a
+    // per-pixel CPU loop of its own, and at 1440p it dwarfs the encode.
+    let frames: Vec<Vec<u8>> = (0..n).map(|t| frame(w, h, t)).collect();
     let mut out = Vec::new();
-    for t in 0..n {
+    let mut annexb = Vec::new();
+    let started = std::time::Instant::now();
+    for (t, f) in frames.iter().enumerate() {
         if t == 0 || t == n / 2 {
             enc.force_keyframe();
         }
-        let mut annexb = Vec::new();
+        annexb.clear();
         let keyframe = enc
-            .encode_bgra_strided(&frame(t), W, H, W * 4, &mut annexb)
+            .encode_bgra_strided(f, w, h, w * 4, &mut annexb)
             .expect("encode");
-        out.push((t, keyframe, annexb));
+        out.push((t, keyframe, annexb.clone()));
     }
-    out
+    let secs = started.elapsed().as_secs_f64();
+    (out, secs)
 }
 
 /// The receiver's real question: does a FRESH decoder accept this frame?
@@ -145,7 +173,8 @@ fn assert_keyframes_stand_alone(name: &str, run: &[(usize, bool, Vec<u8>)]) -> u
         );
         match decodes_standalone(annexb) {
             Ok(true) => println!(
-                "  {name}: keyframe t={t} ({} NALs {types:?}) stands alone",
+                "  {name}: keyframe t={t} ({} B, {} NALs {types:?}) stands alone",
+                annexb.len(),
                 types.len()
             ),
             Ok(false) => println!("  {name}: keyframe t={t} accepted, no picture yet"),
@@ -159,25 +188,35 @@ fn assert_keyframes_stand_alone(name: &str, run: &[(usize, bool, Vec<u8>)]) -> u
     checked
 }
 
-#[test]
-fn forced_keyframes_stand_alone_on_both_backends() {
+fn vaapi_available() -> bool {
     if std::env::var("PARLEY_VAAPI")
         .map(|v| v != "1")
         .unwrap_or(true)
     {
         eprintln!("vaapi_keyframe_shape: skipping (set PARLEY_VAAPI=1 to run; needs a VAAPI node)");
+        return false;
+    }
+    true
+}
+
+/// The original check at the software profile's resolution: both
+/// backends, plus the negative control that proves the check bites.
+#[test]
+fn forced_keyframes_stand_alone_on_both_backends() {
+    if !vaapi_available() {
         return;
     }
+    let (w, h) = (1280, 720);
 
     // Arm 1: software — the known-good control.
-    let software = encode_run(false, 40);
+    let (software, _) = encode_run(false, w, h, 40);
     assert_keyframes_stand_alone("software", &software);
 
     // Arm 2: hardware — the arm under test. create_encoder_auto falls
     // back silently, so a software result here would be a false pass:
     // make the backend claim its codec and then confirm it really is
     // the VAAPI one by checking only the frames it flagged.
-    let hardware = encode_run(true, 40);
+    let (hardware, secs) = encode_run(true, w, h, 40);
 
     // Hand the whole hardware stream to whoever wants to look at it with a
     // decoder of their own (ffmpeg/ffprobe) — this is how the stream shape
@@ -216,6 +255,10 @@ fn forced_keyframes_stand_alone_on_both_backends() {
             annexb.len()
         );
     }
+    println!(
+        "  hardware: {w}x{h}, 40 frames in {secs:.2} s → {:.1} fps encode",
+        40.0 / secs
+    );
 
     // Arm 3: negative control — the same bytes with parameter sets
     // removed MUST be rejected, else the check above proves nothing.
@@ -233,4 +276,88 @@ fn forced_keyframes_stand_alone_on_both_backends() {
              check cannot detect the bug it is meant to detect"
         ),
     }
+}
+
+/// 7h HD: every profile the client can select must produce standalone
+/// keyframes, and the encoder must actually keep up with the rate it
+/// advertises (a 60 fps profile that encodes at 20 fps is a lie the
+/// share path pays for in dropped frames).
+#[test]
+fn hardware_hd_profiles_stand_alone() {
+    if !vaapi_available() {
+        return;
+    }
+    let frames = 120; // 2 s at the hardware profile's rate
+    let mut failures = Vec::new();
+    for &(w, h) in &profiles() {
+        set_hw_encode(true);
+        let (run, secs) = encode_run(true, w, h, frames);
+        let achieved = frames as f64 / secs;
+        let avg_kb =
+            run.iter().map(|(_, _, a)| a.len()).sum::<usize>() as f64 / run.len() as f64 / 1024.0;
+        println!(
+            "  hd {w}x{h}: {frames} frames in {secs:.2} s → {achieved:.1} fps, {avg_kb:.1} KB/frame avg"
+        );
+        // Same escape hatch as the profile test: leave the stream behind
+        // for an outside decoder (ffprobe -show_frames), named per
+        // profile so a sweep does not overwrite itself.
+        if let Ok(path) = std::env::var("PARLEY_VAAPI_STREAM") {
+            let all: Vec<u8> = run.iter().flat_map(|(_, _, a)| a.clone()).collect();
+            let path = format!("{path}.{w}x{h}.annexb");
+            std::fs::write(&path, &all).expect("write hardware stream");
+            println!("  hd {w}x{h}: wrote {} B to {path}", all.len());
+        }
+        // Keyframes must stand alone at this resolution (a fresh
+        // decoder, exactly like a viewer joining).
+        let mut keyframes = 0;
+        for (t, keyframe, annexb) in &run {
+            if !*keyframe {
+                continue;
+            }
+            keyframes += 1;
+            let types = nal_types(annexb);
+            if !(types.contains(&7) && types.contains(&8)) {
+                failures.push(format!("{w}x{h} t={t}: no SPS/PPS in keyframe"));
+                continue;
+            }
+            match decodes_standalone(annexb) {
+                Ok(true) => println!(
+                    "  hd {w}x{h}: keyframe t={t} ({} B) stands alone",
+                    annexb.len()
+                ),
+                Ok(false) => println!("  hd {w}x{h}: keyframe t={t} accepted, no picture"),
+                Err(e) => failures.push(format!("{w}x{h} t={t}: {e}")),
+            }
+        }
+        if keyframes == 0 {
+            failures.push(format!("{w}x{h}: the encoder flagged no keyframe at all"));
+        }
+        // A silent fallback to software would otherwise be measured
+        // against a bar software can clear: name it.
+        if !parley_core::video::hardware_encoder_active() {
+            failures.push(format!(
+                "{w}x{h}: encoder fell back to SOFTWARE — hardware encode unavailable"
+            ));
+        }
+        // The profile advertises a MEASURED rate (7h). The check is that
+        // the encoder sustains what it advertised: a stream paced at a
+        // rate the encoder cannot hold is late frames and a latency
+        // ladder blaming the network for it. 15% of headroom absorbs
+        // the difference between the measurement's content and this
+        // run's.
+        let advertised = f64::from(parley_core::video::target_fps());
+        let floor = advertised * 0.85;
+        if achieved < floor {
+            failures.push(format!(
+                "{w}x{h}: {achieved:.1} fps measured, but the profile advertises {advertised:.1} \
+                 fps (floor {floor:.1}) — the rate the share paces at must be one the encoder \
+                 can hold"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "hardware HD profiles failed:\n  {}",
+        failures.join("\n  ")
+    );
 }

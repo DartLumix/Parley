@@ -7,68 +7,104 @@ with the `vaapi` feature (the CLI's `--hw-encode`, the Flutter app's
 sources are upstream's (tabs, `#![allow(clippy::all)]`) and must not be
 swept by `fmt`/`clippy`/`test --workspace`.
 
-## Status: necessary, NOT sufficient on Mesa/radeonsi
+## Status: WORKING on Mesa/radeonsi (verified 2026-10-09)
 
-Read this before trusting the patch. It fixes one of two problems, and on
-this project's AMD hardware (RX 590, Mesa 26.2.4, radeonsi, VCE) the second
-one still leaves hardware-encoded H.264 undecodable. Measured state:
+Two independent defects broke hardware share on this project's AMD hardware
+(RX 590 / polaris10, Mesa 26.2.4, radeonsi, VCE). Both are fixed and the
+fixes are measured, not assumed:
 
-| decoder view of the hardware stream | before patch | after patch |
+| | symptom | cause | fix |
+|:--|:--|:--|:--|
+| 1 | no parameter sets anywhere in the stream (`dsNoParamSets`) | the driver accepts packed SPS/PPS and then does not write them into the coded buffer | every IDR is emitted with its SPS/PPS in-band |
+| 2 | every slice header misparsed (`Native:4 dsFrameCorrupted`, ffmpeg `deblocking_filter_idc 4 out of range`) | our synthesized SPS/PPS declared fields Mesa's VCE slice writer never writes (11-bit `frame_num`, POC type 0 with a 12-bit LSB, deblocking present) | declare what the driver actually writes: 7-bit `frame_num`, `pic_order_cnt_type = 2`, no deblocking fields |
+
+The two are in `src/encode.rs`; each carries a `PARLEY PATCH` comment with
+the evidence. Fix 2 was found by diffing our stream against ffmpeg's own
+VAAPI output on the same GPU (`h264dump.py` field-by-field: ffmpeg's
+decodable stream uses exactly `log2_max_frame_num_minus4=3`,
+`pic_order_cnt_type=2`, `deblocking=0`), then confirming with openh264 and
+ffmpeg.
+
+### Measured state after the fixes
+
+Decoder view, openh264 on a FRESH decoder (a viewer joining at a keyframe),
+negative control = the same bytes with SPS/PPS stripped, which must fail:
+
+| profile | standalone-decodable keyframes | encode rate through our path |
 |:--|:--|:--|
-| parameter sets anywhere in the stream | none | SPS+PPS in every IDR |
-| ffprobe stream header | `non-existing PPS` | Profile Main, 1280x720, Level 4.0 |
-| openh264 on a fresh decoder | `Native:16 dsNoParamSets` | `Native:4 dsFrameCorrupted` |
-| ffmpeg on the whole stream | no frames | no frames (`deblocking_filter_idc 4 out of range`, `idr_pic_id is invalid`) |
+| 1280x720 @ 60 | yes (SPS+PPS in-band) | 96.5 fps |
+| 1920x1080 @ 60 | yes | 47.8 fps |
+| 2560x1440 @ 60 | yes | 29.5 fps |
 
-So the parameter sets now exist and parse, but the driver's slice payloads do
-not parse against them: Mesa's VCE encoder writes slice headers whose syntax
-does not match the PPS this crate synthesizes and hands it (`deblocking_filter_idc`
-and `idr_pic_id` are the fields ffmpeg trips over — i.e. the slice header is
-shorter/longer than the PPS implies). That mismatch is inside the driver's
-interpretation of the VA-API picture/slice parameters, not something this
-crate's bitstream synthesis can paper over without reverse-engineering
-Mesa's slice syntax for this hardware.
+For reference, `ffmpeg -c:v h264_vaapi` on the same GPU and kernel
+(`7.3.0-rc4-1-cachyos-rc`) encodes 720p at ~114 fps, 1080p at ~55, 1440p at
+~31 — so the driver's own ceiling at 1080p is ~55 fps, and the crate's path
+is within ~15% of it after the fixes in `parley-core` (parallel BGRA→NV12,
+reused repack/NV12 buffers).
 
-Consequence for Parley: `--hw-encode` / the app's HW-encode toggle must NOT be
-presented as working on radeonsi yet. Contradicting stream shapes, this should
-be re-checked on Intel (iHD/i965), where this crate's packed-header path is
-the one it was written against.
+Consequence for Parley, now that it holds: **the profile rate is measured,
+not assumed.** `create_encoder_auto` times the real strided encode path at
+creation and publishes that rate (`hardware_measured_fps`); the share path
+paces, timestamps and rate-hints at `target_fps()`. On this machine that is
+60 fps at 720p, ~48 at 1080p and ~29 at 1440p. 1080p60 is *not* reachable
+here (the driver stops at ~55 fps while our path stops at ~48) and 1440p60
+is not reachable at all; advertising either would mean pacing frames the
+encoder cannot deliver, which the latency ladder would then blame on the
+network.
 
-## The patch
+## The patches
 
-One change, in `src/encode.rs` (`Encoder::encode_surface`, plus the
-`has_parameter_sets` helper next to it): **every IDR picture is emitted with
-its SPS/PPS in-band, ahead of the slices.**
+1. **In-band parameter sets** (`Encoder::encode_surface`, plus the
+   `has_parameter_sets` helper): every IDR picture is emitted with its
+   SPS/PPS ahead of the slices. A driver that accepts packed headers does
+   not have to write them into the coded buffer, and radeonsi/VCE does not.
+   The patch reuses the crate's own synthesis (`packed_sps`/`packed_pps`,
+   the same structures the encoder was configured from, so the slices
+   reference exactly these) and prepends them when the driver's output has
+   no SPS. Repeats are legal for a compliant decoder, and the
+   `has_parameter_sets` check means a driver that *does* write them never
+   gets duplicates.
 
-Why: the encoder synthesizes SPS and PPS and hands them to the driver as
-*packed headers*, then reads back the coded buffer. A driver that accepts
-packed headers does not have to write them into the coded buffer, and
-radeonsi/VCE does not — the buffer holds the slice NALs and a filler. The
-stream then has no parameter sets anywhere, so *no* receiver can decode it:
-a viewer that joins at a keyframe fails with `dsNoParamSets` (Native:16), and
-so does a decoder that has watched from frame 0, because there is nothing to
-decode against.
+2. **Slice syntax the driver actually writes** (`build_sps_pps`,
+   `FRAME_NUM_LIMIT`, the `FrameMeta` bookkeeping): Mesa's VCE slice writer
+   emits a fixed layout regardless of what the packed headers declare.
+   Declaring more than it writes makes every slice header misparse. The
+   SPS/PPS now declare `MaxFrameNum = 128` (7-bit `frame_num`),
+   `pic_order_cnt_type = 2` (no POC fields in the slice), and no deblocking
+   filter control fields — and `frame_num` is counter-modulo-128 to match.
+   Keep the two in lockstep: `FRAME_NUM_LIMIT` and the SPS builder are one
+   setting spelled twice.
 
-The patch reuses the crate's own synthesis (`packed_sps`/`packed_pps`, the
-same structures the encoder was configured from, so the slices reference
-exactly these) and prepends them when the driver's output has no SPS.
-Repeats are legal for a compliant decoder, and the `has_parameter_sets` check
-means a driver that *does* write them never gets duplicates.
-
-Upstream: worth reporting to moq-dev/vaapi (the packed-header request is
-advertised by the driver and then not honoured; the coded buffer's shape is
-not reachable from outside, which is why the fix has to live inside
-`encode_surface`).
+Upstream: both are worth reporting to moq-dev/vaapi (the packed-header
+request is advertised by the driver and then not honoured; and the slice
+syntax a driver writes is not discoverable from outside, which is why the
+fix has to live inside `encode_surface`/`build_sps_pps`).
 
 ## Keeping it in sync
 
-When bumping `moq-vaapi`, diff the new release against this copy, re-apply the
-patch, and re-run:
+When bumping `moq-vaapi`, diff the new release against this copy, re-apply
+both patches, and re-run:
 
 ```sh
-PARLEY_VAAPI=1 cargo test -p parley-core --features vaapi --test vaapi_keyframe_shape -- --nocapture
+# driver half: does this machine encode H.264, do its IRAPs stand alone?
+tools/hw-probe.sh --encode h264
+
+# parley half: our wrapper's keyframes at every profile, plus the
+# negative control that proves the check bites (720p/1080p/1440p sweep,
+# keyframes, throughput, adaptive rate)
+PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
+    --test vaapi_keyframe_shape -- --nocapture --test-threads=1
+
+# where the time goes, if a profile is slower than the driver allows
+PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
+    --test vaapi_encode_cost -- --nocapture --test-threads=1
+PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
+    --test vaapi_crate_cost -- --nocapture --test-threads=1
+
+# dry run of the whole stack (no GPU): the app's self-test also refuses a
+# hardware encoder whose keyframe does not decode by a fresh decoder
 ```
 
-That test currently FAILS at the last step (frame-corrupted, not
-missing-params) — it is the reproduction of the remaining driver mismatch,
-kept so a fixed backend or driver has something to prove itself against.
+All of these are env-gated (`PARLEY_VAAPI=1`) and never run in CI: they
+need a VAAPI node, and on a machine in the kernel window above an H.264
+encode job can hang VCE (`tools/hw-probe.sh` prints the window check).

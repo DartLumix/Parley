@@ -1766,6 +1766,9 @@ async fn video_routing_is_order_robust() {
             frag_idx: f.frag_idx,
             frag_count: f.frag_count,
             keyframe: f.keyframe,
+            // 7h: this fixture is a 30 fps stream; the rate hint is
+            // advisory and the assembler must not require it.
+            high_rate: false,
             data: &f.data,
         });
     }

@@ -12,14 +12,25 @@
 # Usage:
 #   tools/hw-probe.sh                      # capability report only. Safe: no
 #                                          # encode job is ever submitted.
-#   tools/hw-probe.sh --encode hevc        # ALSO run a bounded VAAPI encode,
+#   tools/hw-probe.sh --encode h264        # ALSO run a bounded VAAPI encode,
 #                                          # then validate the bitstream
-#   tools/hw-probe.sh --encode h264        # needs --force (see caveat)
+#   tools/hw-probe.sh --encode hevc
 #   tools/hw-probe.sh --device /dev/dri/renderD129
 #
-# CAVEAT — READ BEFORE --encode h264
+# This script answers the DRIVER half (does the machine encode, and do the
+# bitstreams it produces stand alone?). The PARLEY half — our own encoder
+# wrapper, the SPS/PPS it synthesizes, the profiles it advertises — is
+# verified by cargo tests, which is what to run after this probe says the
+# driver is fine:
+#
+#   PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
+#       --test vaapi_keyframe_shape -- --nocapture --test-threads=1
+#
+# CAVEAT — READ BEFORE --encode h264 ON AN OLD KERNEL
 #   Kernels 7.2.2 .. 7.3-rc1 have an amdgpu regression that hangs the VCE
 #   encode engine on GCN/Polaris when an H.264 VAAPI job is submitted:
+#   (the gate below fires only inside that window — 7.3-rc2+ is clear, and
+#   an H.264 VCE encode has since been verified working on 7.3-rc4)
 #     ring vce0 timeout, signaled seq=... emitted seq=...
 #     GPU reset begin! ... (recovery can itself crash the kernel)
 #   On the affected kernels that is a hard hang needing a power cycle.
@@ -64,15 +75,6 @@ if [ -n "$CODEC" ] && [ "$CODEC" != "h264" ] && [ "$CODEC" != "hevc" ]; then
     echo "--encode takes h264 or hevc (got '$CODEC')" >&2
     exit 1
 fi
-if [ "$CODEC" = "h264" ] && [ "$FORCE" -ne 1 ]; then
-    cat >&2 <<'EOF'
---encode h264 refused: on kernels 7.2.2..7.3-rc1 an H.264 VAAPI job wedges
-VCE and the recovery is unreliable (needs a power cycle on the polaris box).
-Re-run with --force if this machine is known-clear (7.3-rc2+ or a non-VCE GPU).
-EOF
-    exit 1
-fi
-
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n== %s ==\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -108,6 +110,18 @@ kernel_window() {
     printf 'affected'
 }
 KERNEL_CAVEAT="$(kernel_window)"
+
+# The H.264 wedge is a property of the KERNEL, not of H.264: gate on the
+# window rather than on the codec, so a clear kernel needs no --force.
+if [ "$CODEC" = "h264" ] && [ "$FORCE" -ne 1 ] && [ "$KERNEL_CAVEAT" = affected ]; then
+    cat >&2 <<'EOF'
+--encode h264 refused: this kernel (7.2.2 .. 7.3-rc1) is in the amdgpu window
+where an H.264 VAAPI job wedges VCE and the recovery is unreliable (needs a
+power cycle on the polaris box). Re-run with --force to override, or boot
+7.3-rc2+ / use --encode hevc.
+EOF
+    exit 1
+fi
 
 head1 "system"
 say "distro:  $(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-unknown}")"

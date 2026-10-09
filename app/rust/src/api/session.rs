@@ -666,10 +666,10 @@ fn channel_is_music(session_id: u32, channel_id: u64) -> bool {
 fn start_video_task(session_id: u32, hub: SharedVideoReceiveHub) {
     // Unbounded: the hub itself bounds memory via its frame queue and
     // assembler caps; a burst of fragments just queues briefly.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u8, Vec<u8>)>();
     rt().spawn(async move {
-        while let Some((sender_id, payload)) = rx.recv().await {
-            hub.push_datagram(sender_id, &payload);
+        while let Some((sender_id, codec, payload)) = rx.recv().await {
+            hub.push_datagram_with_codec(sender_id, codec, &payload);
         }
     });
     VIDEO_FEEDS.lock().unwrap().insert(session_id, tx);
@@ -677,7 +677,8 @@ fn start_video_task(session_id: u32, hub: SharedVideoReceiveHub) {
 
 /// 7f: one session's video wire (reader → hub task).
 #[cfg(feature = "video")]
-type VideoFeed = tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>;
+/// (sender_id, codec id from the media flag bits, payload) — 7h.
+type VideoFeed = tokio::sync::mpsc::UnboundedSender<(u32, u8, Vec<u8>)>;
 
 /// 7f: feeds parked per session; enable_voice snapshots the one for
 /// its session and hands it to start_voice.

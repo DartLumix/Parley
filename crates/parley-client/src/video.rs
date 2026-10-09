@@ -26,10 +26,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use parley_core::video::{
-    VIDEO_BITRATE_BPS, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoEncoder, create_encoder_auto,
+    VIDEO_BITRATE_BPS, VIDEO_HEIGHT, VIDEO_WIDTH, VideoEncoder, bitrate_for, create_encoder_auto,
+    target_fps,
 };
 use parley_core::video_receive::{SharedVideoReceiveHub, VideoReceiveHub};
-use parley_proto::video::fragment_frame;
+use parley_proto::video::{MAX_FRAGMENT_PAYLOAD, fragment_frame_with_max, hinted_frame_rate};
 
 /// Spawn an mpv that reads raw RGB24 from our stdin pipe, sized to the
 /// decoded stream. One per remote sender, named after them in the title.
@@ -39,7 +40,16 @@ use parley_proto::video::fragment_frame;
 /// `-format` is FourCC-only), `-fps`. `--title=value` form is
 /// mandatory (space-separated is rejected). stderr is inherited so a
 /// failing mpv is loud instead of silently eating frames.
-fn spawn_mpv(sender_id: u32, width: usize, height: usize) -> Result<Child, String> {
+fn spawn_mpv(
+    sender_id: u32,
+    width: usize,
+    height: usize,
+    // 7h HD: the sender's cadence (the stream's FRAG_HIGH_RATE hint).
+    // mpv's rawvideo demuxer needs a nominal rate: told 30 for a 60 fps
+    // stream it plays at half speed, which reads as a client bug.
+    high_rate: bool,
+) -> Result<Child, String> {
+    let demuxer_fps = hinted_frame_rate(high_rate);
     Command::new("mpv")
         .args([
             &format!("--title=parley: user {sender_id}"),
@@ -49,7 +59,7 @@ fn spawn_mpv(sender_id: u32, width: usize, height: usize) -> Result<Child, Strin
             &format!("--demuxer-rawvideo-w={width}"),
             &format!("--demuxer-rawvideo-h={height}"),
             "--demuxer-rawvideo-mp-format=rgb24",
-            &format!("--demuxer-rawvideo-fps={VIDEO_FPS}"),
+            &format!("--demuxer-rawvideo-fps={demuxer_fps}"),
             "-",
         ])
         .stdin(Stdio::piped())
@@ -105,6 +115,11 @@ pub const VIDEO_ROBUST_BITRATE_BPS: u32 = 1_000_000;
 pub struct VideoLadder {
     ema_permille: f32,
     robust: bool,
+    /// 7h HD: the two rungs in bits per second. Derived from the live
+    /// profile (resolution × rate) rather than fixed at 720p30's
+    /// numbers — see [`Self::set_base`].
+    clean_bps: u32,
+    robust_bps: u32,
     last_switch: std::time::Instant,
     low_since: Option<std::time::Instant>,
     last_step: std::time::Instant,
@@ -112,14 +127,57 @@ pub struct VideoLadder {
 }
 
 impl VideoLadder {
+    /// The 720p30 rungs (the synthetic sender's profile).
     pub fn new() -> Self {
+        Self::with_base(VIDEO_BITRATE_BPS)
+    }
+
+    /// Rungs scaled to a profile: clean at the caller's target, robust
+    /// at 40% of it — the ratio 1.0/2.5 Mbps had at 720p30, kept because
+    /// it is what makes a frame ~4 fragments instead of ~9 (the 6e
+    /// frame-survival arithmetic).
+    pub fn with_base(clean_bps: u32) -> Self {
         Self {
             ema_permille: 0.0,
             robust: false,
+            clean_bps,
+            robust_bps: robust_rung(clean_bps),
             last_switch: std::time::Instant::now(),
             low_since: None,
             last_step: std::time::Instant::now(),
             last_kf_poke: std::time::Instant::now(),
+        }
+    }
+
+    /// 7h HD: a negotiation changed the resolution or the effective
+    /// frame rate, so the rungs move with it. Returns the bitrate to
+    /// apply right now — the new clean target, or the scaled robust rung
+    /// when the ladder is in its loss state (a rebuild must not silently
+    /// promote a loss epoch back to full rate).
+    pub fn set_base(&mut self, clean_bps: u32) -> u32 {
+        self.clean_bps = clean_bps;
+        self.robust_bps = robust_rung(clean_bps);
+        if self.robust {
+            self.robust_bps
+        } else {
+            self.clean_bps
+        }
+    }
+
+    /// Test hook: put the ladder in its loss state without waiting out
+    /// the 1 s step / 5 s switch gates (the transitions themselves are
+    /// time-based — the netem runs exercise those).
+    #[cfg(test)]
+    pub(crate) fn select_robust_for_test(&mut self) {
+        self.robust = true;
+    }
+
+    /// The rung the ladder is on.
+    pub fn current_bps(&self) -> u32 {
+        if self.robust {
+            self.robust_bps
+        } else {
+            self.clean_bps
         }
     }
 
@@ -138,7 +196,7 @@ impl VideoLadder {
                 self.robust = true;
                 self.last_switch = now;
                 self.low_since = None;
-                return Some(VIDEO_ROBUST_BITRATE_BPS);
+                return Some(self.robust_bps);
             }
         } else if self.ema_permille < 10.0 {
             let since = *self.low_since.get_or_insert(now);
@@ -148,7 +206,7 @@ impl VideoLadder {
                 self.robust = false;
                 self.last_switch = now;
                 self.low_since = None;
-                return Some(VIDEO_BITRATE_BPS);
+                return Some(self.clean_bps);
             }
         } else {
             self.low_since = None;
@@ -181,6 +239,14 @@ impl Default for VideoLadder {
     }
 }
 
+/// The robust rung for a clean target: 40% of it, floored so a small
+/// stream still gets a usable picture and capped by the ladder's own
+/// clean value (a 800 kbps clean target cannot have a higher robust
+/// rung).
+fn robust_rung(clean_bps: u32) -> u32 {
+    ((clean_bps as f64 * 0.4) as u32).clamp(300_000, clean_bps)
+}
+
 // ---- send side (synthetic; real capture lives in screen.rs) ----
 
 /// Owns the encoder, frame_id, and the video seq counter (local:
@@ -190,6 +256,10 @@ pub struct ShareSender {
     encoder: Box<dyn VideoEncoder>,
     frame_id: u32,
     seq: u16,
+    /// 7h: live fragment payload budget (the connection's current
+    /// path-MTU estimate, capped by the compiled-in maximum). `set_
+    /// fragment_budget` re-reads it after a TooLarge rejection.
+    max_payload: usize,
 }
 
 impl ShareSender {
@@ -200,7 +270,14 @@ impl ShareSender {
             // Video seq space sits above audio's low range purely as a
             // diagnostic aid.
             seq: 0x8000,
+            max_payload: MAX_FRAGMENT_PAYLOAD,
         })
+    }
+
+    /// 7h: the fragmenter's byte budget (see the capture path's
+    /// `fragment_budget_for`).
+    pub fn set_fragment_budget(&mut self, max_payload: usize) {
+        self.max_payload = max_payload.clamp(200, MAX_FRAGMENT_PAYLOAD);
     }
 
     /// 6e: ladder-driven bitrate change (encoder recreation; next frame
@@ -221,21 +298,21 @@ impl ShareSender {
         let (frame, keyframe) = self.encoder.encode_bgra(&bgra).map_err(|e| e.to_string())?;
         let first_seq = self.seq;
         // Advance by the fragment count (computed the same way the
-        // fragmenter does).
-        self.seq = self.seq.wrapping_add(
-            frame
-                .len()
-                .div_ceil(parley_proto::video::MAX_FRAGMENT_PAYLOAD)
-                .max(1) as u16,
-        );
-        let timestamp = (t as f32 * VIDEO_FPS.recip() * 48_000.0) as u32;
-        let dgs = fragment_frame(
+        // fragmenter does — same budget or the two drift apart).
+        self.seq = self
+            .seq
+            .wrapping_add(frame.len().div_ceil(self.max_payload).max(1) as u16);
+        let fps = target_fps();
+        let timestamp = (t as f32 * fps.recip() * 48_000.0) as u32;
+        let dgs = fragment_frame_with_max(
             self.frame_id,
             keyframe,
             &frame,
             first_seq,
             timestamp,
             0, // sender_id: the server stamps the authenticated id
+            self.max_payload,
+            fps > 45.0,
         );
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok((dgs, keyframe))
@@ -314,11 +391,14 @@ fn mpv_consumer(
         }
         if let std::collections::hash_map::Entry::Vacant(e) = mpvs.entry(frame.sender_id) {
             println!("video: starting viewer for user {}", frame.sender_id);
-            match spawn_mpv(frame.sender_id, frame.width, frame.height) {
+            match spawn_mpv(frame.sender_id, frame.width, frame.height, frame.high_rate) {
                 Ok(child) => {
                     println!(
-                        "video: user {} sharing {}x{}",
-                        frame.sender_id, frame.width, frame.height
+                        "video: user {} sharing {}x{} @ {} fps",
+                        frame.sender_id,
+                        frame.width,
+                        frame.height,
+                        hinted_frame_rate(frame.high_rate)
                     );
                     e.insert(child);
                 }
@@ -357,8 +437,10 @@ fn mpv_consumer(
 /// reader for any datagram with FLAG_VIDEO set. Protocol handling
 /// (stopped-set, assembly, decode) lives in the hub; display happens
 /// on the consumer thread.
-pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, payload: &[u8]) {
-    viewers.hub.push_datagram(sender_id, payload);
+pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, codec: u8, payload: &[u8]) {
+    viewers
+        .hub
+        .push_datagram_with_codec(sender_id, codec, payload);
 }
 
 /// A sender stopped sharing: the hub suppresses stragglers, the
@@ -385,12 +467,25 @@ pub fn stats_line(viewers: &Viewers) -> String {
         viewers.shown.lock().unwrap().clear();
         return "video: no active shares".to_string();
     }
+    // 7h: the decode counters join the assembler counters. "Frames
+    // arrived" and "pictures came out" are different facts, and only the
+    // second one means a viewer saw anything — a stream with thousands
+    // assembled and zero decoded is the fingerprint of a bitstream a
+    // decoder cannot use, and this line now says so.
+    let decode: std::collections::HashMap<u32, (u64, u64, u64)> = viewers
+        .hub
+        .decode_stats()
+        .into_iter()
+        .map(|(id, decoded, no_picture, errors)| (id, (decoded, no_picture, errors)))
+        .collect();
     let mut shown = viewers.shown.lock().unwrap();
     let parts: Vec<String> = stats
         .iter()
         .map(|&(id, _completed, dropped, skipped, shed)| {
+            let (decoded, no_picture, errors) = decode.get(&id).copied().unwrap_or((0, 0, 0));
             format!(
-                "user {id}: {} shown, {dropped} dropped, {skipped} skipped, {shed} shed",
+                "user {id}: {} shown ({decoded} decoded, {no_picture} no-picture, {errors} decode \
+                 errors), {dropped} dropped, {skipped} skipped, {shed} shed",
                 shown.get(&id).copied().unwrap_or(0)
             )
         })
@@ -418,14 +513,20 @@ pub async fn share_task(
     mut sender: ShareSender,
     video_loss: Arc<AtomicU32>,
 ) {
-    let frame_ms = (1000.0 / VIDEO_FPS) as u64;
+    // 7h HD: the profile's rate (60 fps with a live hardware encoder),
+    // not the software constant.
+    let fps = target_fps();
+    let frame_ms = (1000.0 / fps) as u64;
     let mut interval = tokio::time::interval(Duration::from_millis(frame_ms));
     // A frame that overruns its slot skips the next tick rather than
     // bursting catch-up encodes — real-time pacing, not catch-up.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut ladder = VideoLadder::new();
+    let mut ladder = VideoLadder::with_base(bitrate_for(VIDEO_WIDTH, VIDEO_HEIGHT, fps));
     let mut t: usize = 0;
-    println!("share: sending {VIDEO_WIDTH}x{VIDEO_HEIGHT}@{VIDEO_FPS} test pattern");
+    println!(
+        "share: sending {VIDEO_WIDTH}x{VIDEO_HEIGHT}@{fps} test pattern (clean rung {} bps)",
+        ladder.current_bps()
+    );
     loop {
         interval.tick().await;
         if let Some(bps) = ladder.step(video_loss.load(Ordering::Relaxed)) {
@@ -444,19 +545,107 @@ pub async fn share_task(
                 return;
             }
         };
-        for (i, dg) in dgs.iter().enumerate() {
-            if let Err(e) = conn.send_datagram(dg.clone().into()) {
+        // 7h: spread the frame over half its interval, evenly across its
+        // fragments, instead of a fixed 500 µs each — the fixed sleep
+        // cost a 1080p keyframe ~148 fragments × 500 µs = 74 ms, more
+        // than twice the frame interval it was meant to fit inside.
+        let total = dgs.len();
+        let per_frag = if total > 1 {
+            ((frame_ms / 2).max(1) * 1000 / (total - 1) as u64).min(500)
+        } else {
+            0
+        };
+        let mut send_failed = false;
+        for (i, dg) in dgs.into_iter().enumerate() {
+            if let Err(e) = conn.send_datagram(dg.into()) {
                 // Real reason, not a guess (the 6e lesson: TooLarge and
-                // ConnectionLost are very different diagnoses).
-                println!("share: send_datagram failed: {e}");
-                return;
+                // ConnectionLost are very different diagnoses) — and only
+                // the second one ends the share; a TooLarge just means
+                // the path-MTU estimate moved, so drop the frame, adopt
+                // the new budget, and let the next keyframe rebase the
+                // viewer.
+                println!(
+                    "share: send_datagram failed: {e}; dropping this frame and re-reading \
+                     the datagram budget"
+                );
+                sender.set_fragment_budget(fragment_budget_for(&conn));
+                send_failed = true;
+                break;
             }
-            // Pace: ~500 µs between fragments ≈ 2 MB/s ceiling, well
-            // under the 2.5 Mbps encode target.
-            if i + 1 < dgs.len() {
-                tokio::time::sleep(Duration::from_micros(500)).await;
+            if i + 1 < total && per_frag > 0 {
+                tokio::time::sleep(Duration::from_micros(per_frag)).await;
             }
         }
+        if send_failed {
+            if conn.close_reason().is_some() {
+                // The connection is gone: the share is over.
+                println!("share: connection closed — stopping test-pattern send");
+                return;
+            }
+            // A dropped frame is one the viewer never sees; the next
+            // keyframe (2 s intra period) rebases it.
+            t += 1;
+            continue;
+        }
         t += 1;
+    }
+}
+
+/// 7h: largest video-fragment payload the connection will accept right
+/// now.
+///
+/// quinn's path-MTU estimate is the authority — it *shrinks* when the
+/// path demands it, and the 6e netem run recorded it collapsing to the
+/// 1200-byte floor under sustained loss — while the compiled-in
+/// `MAX_FRAGMENT_PAYLOAD` is the ceiling, because an estimate larger
+/// than the constant buys nothing and a one-shot rejection costs a
+/// frame. Re-read after every rejection.
+pub(crate) fn fragment_budget_for(conn: &quinn::Connection) -> usize {
+    use parley_proto::media::{HEADER_LEN, MTU_SAFE_DATAGRAM_SIZE};
+    use parley_proto::video::VIDEO_HEADER_LEN;
+    let mtu = conn.max_datagram_size().unwrap_or(MTU_SAFE_DATAGRAM_SIZE);
+    mtu.saturating_sub(HEADER_LEN)
+        .saturating_sub(VIDEO_HEADER_LEN)
+        .clamp(200, MAX_FRAGMENT_PAYLOAD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn robust_rung_keeps_the_720p30_ratio_and_a_floor() {
+        // 7h HD: the rungs scale with the profile now, but the RATIO is
+        // the one 6e measured (1 Mbps robust : 2.5 Mbps clean — the
+        // frame-survival arithmetic), and a small stream still gets a
+        // usable rung.
+        assert_eq!(robust_rung(VIDEO_BITRATE_BPS), VIDEO_ROBUST_BITRATE_BPS);
+        assert_eq!(robust_rung(11_250_000), 4_500_000); // 1080p60 clean
+        assert_eq!(robust_rung(500_000), 300_000, "floor, not 200 kbps");
+    }
+
+    #[test]
+    fn ladder_rungs_follow_the_profile() {
+        let mut ladder = VideoLadder::new();
+        assert_eq!(ladder.current_bps(), VIDEO_BITRATE_BPS);
+
+        // A hardware HD profile moves both rungs.
+        assert_eq!(
+            ladder.set_base(11_250_000),
+            11_250_000,
+            "clean state → clean rung"
+        );
+        assert_eq!(ladder.current_bps(), 11_250_000);
+
+        // In a loss epoch the rebuild must NOT promote back to full rate:
+        // set_base returns the scaled robust rung.
+        ladder.select_robust_for_test();
+        assert_eq!(ladder.set_base(5_631_000), robust_rung(5_631_000));
+        assert_eq!(ladder.current_bps(), robust_rung(5_631_000));
+
+        // And a negotiation that lowers the profile still respects the
+        // loss state.
+        assert_eq!(ladder.set_base(2_500_000), robust_rung(2_500_000));
+        assert_eq!(ladder.current_bps(), VIDEO_ROBUST_BITRATE_BPS);
     }
 }

@@ -71,8 +71,8 @@ use ashpd::desktop::{
 };
 use futures_util::StreamExt;
 use parley_core::audio::pipeline::SendPipeline;
-use parley_core::video::{VIDEO_FPS, VideoEncoder, create_encoder_auto};
-use parley_proto::video::{MAX_FRAGMENT_PAYLOAD, fragment_frame};
+use parley_core::video::{VideoEncoder, bitrate_for, create_encoder_auto, target_fps};
+use parley_proto::video::fragment_frame_with_max;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -406,9 +406,30 @@ fn pw_thread(
     println!("share: pipewire stream disconnected");
 }
 
-/// Apply a negotiated format: (re)create the encoder, record the fps.
+// 7h: `fragment_budget_for` (the connection's live datagram budget)
+// lives in crate::video — both senders use it and only one of them is
+// behind this module's feature gate.
+use crate::video::fragment_budget_for;
+
+/// The rate the share actually encodes and paces at: the compositor's,
+/// clamped by the encoder's profile ceiling (30 fps software, 60 fps
+/// hardware). Both the pacing interval and the frame timestamps read
+/// this, so a 60 Hz compositor on a software encoder cannot stretch
+/// every timestamp to 1/60 s.
+fn paced_fps(capture_fps: f64) -> f64 {
+    capture_fps.min(f64::from(target_fps()))
+}
+
+/// Apply a negotiated format: (re)create the encoder, record the fps,
+/// and move the loss ladder's rungs to the new resolution's rate.
+///
+/// 7h HD: the ladder's rungs were absolute (2.5 Mbps clean / 1 Mbps
+/// robust), which is a 720p30 budget — on a 1080p60 stream that is the
+/// same as always running degraded. `bitrate_for` scales them with the
+/// pixels and rate the encoder is actually being asked for.
 fn negotiate(
     encoder: &mut Option<Box<dyn VideoEncoder>>,
+    ladder: &mut VideoLadder,
     fps: &mut f64,
     width: u32,
     height: u32,
@@ -417,7 +438,20 @@ fn negotiate(
     *fps = f;
     match create_encoder_auto(width as usize, height as usize) {
         Ok(e) => {
-            println!("share: encoder ready ({width}x{height})");
+            let eff = paced_fps(f);
+            let base = bitrate_for(width as usize, height as usize, eff as f32);
+            let applied = ladder.set_base(base);
+            println!(
+                "share: encoder ready ({width}x{height}, source {f:.0} fps → paced {eff:.0} fps, \
+                 clean rung {base} bps); hardware={}",
+                parley_core::video::hardware_encoder_active()
+            );
+            if applied != base {
+                // The ladder was already on the robust rung: keep the
+                // encoder there rather than pretending the rebuild
+                // restored the clean target.
+                println!("share: bitrate → {applied} bps (robust rung, scaled to profile)");
+            }
             *encoder = Some(e);
         }
         Err(e) => eprintln!("share: encoder init failed: {e}"),
@@ -436,7 +470,10 @@ fn negotiate(
 /// 2. Skip-to-newest: drain anything that queued during the sleep and
 ///    keep only the latest capture — encoding a stale frame while a
 ///    fresher one sits behind it is pure added latency.
-/// 3. Encode + fragment + send with inter-fragment pacing.
+/// 3. Encode + fragment + send with inter-fragment pacing — shared
+///    across the frame's fragments within half its interval (7h; a
+///    fixed per-fragment sleep made large keyframes unfinishable
+///    inside their own frame budget).
 fn encoder_thread(
     rx: Receiver<ToEncoder>,
     conn: quinn::Connection,
@@ -458,6 +495,9 @@ fn encoder_thread(
     let mut last_encode: Option<std::time::Instant> = None;
     // 7g: reused Annex-B output buffer (no per-frame Vec alloc).
     let mut annexb: Vec<u8> = Vec::with_capacity(1 << 20);
+    // 7h: fragment payload budget from the LIVE path-MTU estimate, not
+    // the compiled-in constant — see `fragment_budget_for`.
+    let mut max_payload = fragment_budget_for(&conn);
     while let Ok(msg) = rx.recv() {
         match msg {
             ToEncoder::Negotiated {
@@ -465,15 +505,14 @@ fn encoder_thread(
                 height,
                 fps: f,
             } => {
-                negotiate(&mut encoder, &mut fps, width, height, f);
+                negotiate(&mut encoder, &mut ladder, &mut fps, width, height, f);
             }
             ToEncoder::Frame {
                 data: first,
                 stride: first_stride,
             } => {
                 // 1. Rate pacing (sleep, never drop).
-                let min_interval =
-                    Duration::from_nanos((1_000_000_000.0 / fps.min(VIDEO_FPS as f64)) as u64);
+                let min_interval = Duration::from_nanos((1_000_000_000.0 / paced_fps(fps)) as u64);
                 let now = std::time::Instant::now();
                 if let Some(t) = last_encode
                     && now.duration_since(t) < min_interval
@@ -506,7 +545,7 @@ fn encoder_thread(
                     }
                 }
                 if let Some((width, height, f)) = renegotiate {
-                    negotiate(&mut encoder, &mut fps, width, height, f);
+                    negotiate(&mut encoder, &mut ladder, &mut fps, width, height, f);
                 }
 
                 let Some(enc) = encoder.as_mut() else {
@@ -538,26 +577,74 @@ fn encoder_thread(
                 };
                 let frame: &[u8] = &annexb;
                 let first_seq = seq;
-                seq = seq.wrapping_add(frame.len().div_ceil(MAX_FRAGMENT_PAYLOAD).max(1) as u16);
-                let timestamp = (frame_id as f64 * fps.recip() * 48_000.0) as u32;
-                let dgs = fragment_frame(
-                    frame_id, keyframe, frame, first_seq, timestamp,
+                // The seq advance must match the fragmenter's own count —
+                // it is computed from the same budget, or the two drift
+                // apart the moment the MTU estimate changes.
+                let frags = frame.len().div_ceil(max_payload).max(1) as u16;
+                seq = seq.wrapping_add(frags);
+                // The codec clock the receiver sees must advance at the
+                // rate we actually pace at (see `paced_fps`), not the
+                // compositor's and not a constant.
+                let eff_fps = paced_fps(fps);
+                let timestamp = (frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
+                let dgs = fragment_frame_with_max(
+                    frame_id,
+                    keyframe,
+                    frame,
+                    first_seq,
+                    timestamp,
                     0, // sender_id: the server stamps the authenticated id
+                    max_payload,
+                    // 7h HD: tell viewers this stream runs above ~45 fps
+                    // (mpv's rawvideo demuxer needs a nominal rate; a
+                    // 60 fps stream announced as 30 plays at half speed).
+                    eff_fps > 45.0,
                 );
                 frame_id = frame_id.wrapping_add(1);
+                // 7h pacing: let the frame leave over HALF its interval,
+                // split evenly across its fragments (capped at the old
+                // 500 µs). The previous fixed 500 µs per fragment cost
+                // 44 ms on a 100 KB keyframe — more than the whole 33 ms
+                // frame budget at 30 fps — while still releasing the
+                // first fragments back-to-back: slow exactly where speed
+                // mattered, bursty exactly where it meant to be smooth.
                 let total = dgs.len();
-                for (i, dg) in dgs.iter().enumerate() {
-                    if let Err(e) = conn.send_datagram(dg.clone().into()) {
-                        // Real reason, not a guess: TooLarge (MTU estimate
-                        // collapsed under loss) and ConnectionLost are very
-                        // different diagnoses.
-                        println!("share: send_datagram failed: {e}");
+                let per_frag = if total > 1 {
+                    let half_interval_us = (min_interval.as_micros() as usize / 2).max(200);
+                    (half_interval_us / (total - 1)).min(500) as u64
+                } else {
+                    0
+                };
+                let mut send_failed = false;
+                for (i, dg) in dgs.into_iter().enumerate() {
+                    if let Err(e) = conn.send_datagram(dg.into()) {
+                        // Real reason, not a guess: TooLarge (the estimate
+                        // moved under us) and ConnectionLost are very
+                        // different diagnoses — and only the second one
+                        // means the share is over. Dropping the frame and
+                        // re-reading the budget keeps the session alive;
+                        // the viewer rebases on the next keyframe. This
+                        // used to end the share outright, so a transient
+                        // MTU collapse looked like the share crashing.
+                        println!(
+                            "share: send_datagram failed: {e}; dropping this frame and \
+                             re-reading the datagram budget"
+                        );
+                        max_payload = fragment_budget_for(&conn);
+                        send_failed = true;
+                        break;
+                    }
+                    if i + 1 < total && per_frag > 0 {
+                        std::thread::sleep(Duration::from_micros(per_frag));
+                    }
+                }
+                if send_failed {
+                    if conn.close_reason().is_some() {
+                        // The connection itself is gone: nothing left to do.
                         let _ = die.send(());
                         return;
                     }
-                    if i + 1 < total {
-                        std::thread::sleep(Duration::from_micros(500));
-                    }
+                    continue;
                 }
                 encoded += 1;
                 let el = window.elapsed();
@@ -1136,4 +1223,23 @@ pub async fn start(
     });
 
     Ok((handle, ShareController { stop_tx }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paced_fps;
+
+    #[test]
+    fn paced_rate_is_the_reachable_one() {
+        // 7h HD: the rate the share paces and timestamps at is the
+        // capture rate CLAMPED by the live profile. A 60 Hz compositor on
+        // a software encoder must encode at 30 — otherwise every frame
+        // timestamp would advance at 1/60 s while frames leave at 1/30,
+        // and the receiver's clock would run at half speed.
+        let profile = f64::from(parley_core::video::target_fps());
+        assert_eq!(paced_fps(30.0), 30.0f64.min(profile));
+        assert_eq!(paced_fps(60.0), 60.0f64.min(profile));
+        assert_eq!(paced_fps(120.0), profile, "never above the profile");
+        assert_eq!(paced_fps(1.0), 1.0, "a slow source stays a slow source");
+    }
 }

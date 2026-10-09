@@ -36,6 +36,34 @@ pub const FLAG_VIDEO: u8 = 1 << 1;
 /// never off negotiated state (same rule as FLAG_VIDEO).
 pub const FLAG_STEREO: u8 = 1 << 2;
 
+/// 7h: video codec identity, carried in flag bits 3..4 of VIDEO
+/// datagrams. The media header has no codec field and the flag byte has
+/// two spare bits, so the codec rides there: no length change, no
+/// fragment-size change, and the relay (which only decodes the media
+/// header) needs no change at all.
+///
+/// Why it exists: the receive path is H.264-only, and a stream in any
+/// other codec used to produce pure silence — frames assembled, the
+/// decoder rejected every one, nothing on screen and nothing in the log.
+/// With the codec on the wire a receiver can refuse the stream and name
+/// it, which is the difference between a five-minute diagnosis and a
+/// lost evening.
+pub const VIDEO_CODEC_SHIFT: u8 = 3;
+pub const VIDEO_CODEC_MASK: u8 = 0b11 << VIDEO_CODEC_SHIFT;
+/// Codec ids (flag bits 3..4). Only H.264 exists today.
+pub const VIDEO_CODEC_H264: u8 = 0;
+
+/// Codec id from a datagram's flags (meaningful only with FLAG_VIDEO).
+pub fn video_codec(flags: u8) -> u8 {
+    (flags & VIDEO_CODEC_MASK) >> VIDEO_CODEC_SHIFT
+}
+
+/// Set the codec id, preserving every other flag bit (absence of the
+/// bits means H.264 — every pre-7h sender — so the default is safe).
+pub fn with_video_codec(flags: u8, codec: u8) -> u8 {
+    (flags & !VIDEO_CODEC_MASK) | ((codec & 0b11) << VIDEO_CODEC_SHIFT)
+}
+
 pub const HEADER_LEN: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,5 +142,22 @@ mod tests {
         let encoded = encode(FLAG_STEREO, 1, 96_000, 1, &[0xAA]);
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded.flags, FLAG_STEREO);
+    }
+
+    #[test]
+    fn video_codec_bits_roundtrip_and_leave_other_flags_alone() {
+        // 7h: the codec id shares the flag byte with SPEAKING/VIDEO/STEREO.
+        let flags = with_video_codec(FLAG_VIDEO | FLAG_SPEAKING, VIDEO_CODEC_H264);
+        assert_eq!(video_codec(flags), VIDEO_CODEC_H264);
+        assert_ne!(flags & FLAG_VIDEO, 0, "FLAG_VIDEO must survive");
+        assert_ne!(flags & FLAG_SPEAKING, 0, "FLAG_SPEAKING must survive");
+        let encoded = encode(flags, 3, 7, 9, &[1, 2, 3]);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded.flags, flags);
+        assert_eq!(video_codec(decoded.flags), VIDEO_CODEC_H264);
+        // A future codec does not collide with the audio flags either.
+        let hevc = with_video_codec(FLAG_VIDEO, 1);
+        assert_eq!(video_codec(hevc), 1);
+        assert_eq!(hevc & FLAG_STEREO, 0);
     }
 }

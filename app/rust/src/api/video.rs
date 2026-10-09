@@ -174,9 +174,31 @@ pub mod imp {
 
     /// Latest-frame slot behind the texture's payload provider. The
     /// raster thread clones the buffer out (one frame copy per
-    /// displayed frame — dev-client acceptable; the hub bounds the
-    /// queue upstream).
+    /// displayed frame — unavoidable: a payload owns its bytes — but
+    /// the producer no longer allocates one).
     struct FrameProvider(Mutex<Option<(i32, i32, Vec<u8>)>>);
+
+    impl FrameProvider {
+        /// 7h HD: hand the producer the previous frame's buffer, so the
+        /// next RGB→RGBA conversion writes into it. At 1080p the old
+        /// code allocated 8.3 MB per frame — at the 48 fps a hardware
+        /// encoder now delivers that is ~400 MB/s of allocator traffic
+        /// for a buffer that is overwritten one frame later.
+        fn take_buffer(&self) -> Vec<u8> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .map(|(_, _, buf)| buf)
+                .unwrap_or_default()
+        }
+
+        /// Publish the newest frame (latest-frame-wins: whatever the
+        /// raster thread has not pulled yet is dropped here).
+        fn put_frame(&self, width: i32, height: i32, rgba: Vec<u8>) {
+            *self.0.lock().unwrap() = Some((width, height, rgba));
+        }
+    }
 
     impl PayloadProvider<BoxedPixelData> for FrameProvider {
         fn get_payload(&self) -> BoxedPixelData {
@@ -293,11 +315,26 @@ pub mod imp {
 
     /// RGB24 → RGBA (the Linux embedder's pixel order).
     fn rgb24_to_rgba(rgb: &[u8]) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-        for px in rgb.chunks_exact(3) {
-            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-        }
+        let mut rgba = Vec::new();
+        rgb24_to_rgba_into(rgb, &mut rgba);
         rgba
+    }
+
+    /// 7h HD: the conversion into a REUSED buffer (see
+    /// [`FrameProvider::take_buffer`]). A correctly sized buffer is
+    /// overwritten in full, so only a geometry change resizes it.
+    fn rgb24_to_rgba_into(rgb: &[u8], out: &mut Vec<u8>) {
+        let need = rgb.len() / 3 * 4;
+        if out.len() != need {
+            out.clear();
+            out.resize(need, 255);
+        }
+        for (i, px) in rgb.chunks_exact(3).enumerate() {
+            out[i * 4] = px[0];
+            out[i * 4 + 1] = px[1];
+            out[i * 4 + 2] = px[2];
+            out[i * 4 + 3] = 255;
+        }
     }
 
     /// The display consumer: hub frames → per-sender textures. Same
@@ -314,7 +351,12 @@ pub mod imp {
     ) {
         // Senders whose texture creation failed — no retry until the
         // bridge dies (the terminal client's dead-set rule; spam-free).
-        let mut dead: HashSet<u32> = HashSet::new();
+        // 7h: senders whose texture creation failed, and when. The failure
+        // is nearly always the 2 s platform-thread hop timing out, not a
+        // permanent condition — the old rule (dead for the life of the
+        // session) turned one slow hop into a viewer that never saw
+        // anything. Retried after a cooldown instead.
+        let mut dead: HashMap<u32, std::time::Instant> = HashMap::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -326,8 +368,11 @@ pub mod imp {
                 break;
             }
             let sender = frame.sender_id;
-            if dead.contains(&sender) {
-                continue; // keep draining, display nothing
+            if let Some(&when) = dead.get(&sender) {
+                if when.elapsed() < TEXTURE_RETRY_COOLDOWN {
+                    continue; // keep draining, display nothing
+                }
+                dead.remove(&sender);
             }
             // A previously-hidden sender sending frames again = a NEW
             // share (the hub only un-suppresses on a frame_id-0
@@ -359,8 +404,12 @@ pub mod imp {
                         (texture, provider, (frame.width, frame.height), id)
                     }
                     Err(e) => {
-                        eprintln!("video: texture creation failed for user {sender}: {e}");
-                        dead.insert(sender);
+                        eprintln!(
+                            "video: texture creation failed for user {sender}: {e} (retrying in \
+                             {} s)",
+                            TEXTURE_RETRY_COOLDOWN.as_secs()
+                        );
+                        dead.insert(sender, std::time::Instant::now());
                         continue;
                     }
                 },
@@ -394,15 +443,25 @@ pub mod imp {
             }
             // Latest-frame-wins into the slot, then ping Flutter to
             // pull at its next raster (routed to the platform thread
-            // by SendableTexture).
-            *provider.0.lock().unwrap() = Some((
-                frame.width as i32,
-                frame.height as i32,
-                rgb24_to_rgba(&frame.rgb),
-            ));
+            // by SendableTexture). The conversion writes into the slot
+            // buffer the previous frame left behind — no per-frame
+            // allocation on the consumer thread.
+            let mut rgba = provider.take_buffer();
+            rgb24_to_rgba_into(&frame.rgb, &mut rgba);
+            provider.put_frame(frame.width as i32, frame.height as i32, rgba);
+            // SendableTexture's mark_frame_available has no error
+            // channel (it returns unit — the run-loop hop's failure is
+            // swallowed there), so a torn-down engine surfaces as a
+            // frozen texture rather than a log line. Nothing to check
+            // here; the 7h consumer/decoder accounting remains the way
+            // to tell "frames arrived" from "pictures were shown".
             texture.mark_frame_available();
         }
     }
+
+    /// 7h: how long a sender stays off-screen after a failed texture
+    /// creation before the consumer tries again.
+    const TEXTURE_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
     /// What texture creation hands back: the sendable handle (for
     /// mark_frame_available), the frame slot, and the Flutter texture

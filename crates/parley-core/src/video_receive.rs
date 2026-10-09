@@ -50,6 +50,11 @@ pub struct VideoFrame {
     pub rgb: Vec<u8>,
     pub width: usize,
     pub height: usize,
+    /// 7h HD: the sender's cadence is above ~45 fps (hardware encode at
+    /// 1080p60/1440p60 — see `FRAG_HIGH_RATE`). Display consumers need
+    /// it: a raw-frame viewer shown a 60 fps stream at a nominal 30
+    /// plays it at half speed.
+    pub high_rate: bool,
 }
 
 /// Frames buffered for the consumer before the OLDEST is dropped.
@@ -138,11 +143,38 @@ mod keyframe_dump {
     }
 }
 
+/// 7h: frames fed to a decoder with no picture emerging before the hub
+/// calls it a stall. At 30 fps this is ~3 s — longer than the 2 s intra
+/// period, so a healthy stream always produces a picture first, and
+/// short enough that a broken one is reported while it is happening.
+const STALL_FRAMES: u64 = 90;
+
+/// Minimum spacing between decoder rebuilds. A stream whose every frame
+/// is rejected must not reallocate a decoder per frame; two seconds is
+/// under the intra period, so a rebuild is always followed by a
+/// keyframe that rebases the reference state.
+const DECODER_RESET_COOLDOWN: Duration = Duration::from_secs(2);
+
 struct RecvStream {
     assembler: VideoAssembler,
     decoder: VideoDecoder,
     /// 3b: frames discarded assembled-but-undecoded (consumer behind).
     predecode_skipped: u64,
+    /// 7h decode accounting: an ASSEMBLED frame is not a picture.
+    /// `decoded` yielded an image, `no_picture` was accepted by the
+    /// decoder but produced nothing, `decode_errors` was rejected
+    /// outright. A receiver sitting at decoded=0 with thousands of
+    /// frames assembled is a bitstream-level failure — and before this
+    /// existed it was indistinguishable from an idle stream, which is
+    /// exactly how a malformed hardware stream produced "no picture and
+    /// no error" for a whole evening.
+    decoded: u64,
+    no_picture: u64,
+    decode_errors: u64,
+    /// Frames fed since the last picture (the stall detector).
+    fed_since_picture: u64,
+    /// When the decoder was last rebuilt (cooldown bookkeeping).
+    last_reset: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -152,6 +184,9 @@ struct HubInner {
     /// datagrams are suppressed until their next keyframe fragment
     /// (every new share starts with an encoder-fresh IDR).
     stopped: HashSet<u32>,
+    /// 7h: senders whose declared codec this build cannot decode — the
+    /// refusal is logged once, not per datagram.
+    refused_codec: HashSet<u32>,
     queue: VecDeque<VideoFrame>,
 }
 
@@ -192,6 +227,26 @@ impl VideoReceiveHub {
     /// `drain_streams`, on the caller's thread — the client calls this
     /// from a dedicated video task, never the audio datagram reader.
     pub fn push_datagram(&self, sender_id: u32, payload: &[u8]) {
+        self.push_datagram_with_codec(sender_id, parley_proto::media::VIDEO_CODEC_H264, payload);
+    }
+
+    /// 7h: as [`Self::push_datagram`], with the codec the sender declared
+    /// in the media flag bits. A codec this build cannot decode is
+    /// refused ONCE with a loud line and never fed to the decoder: the
+    /// old behaviour was to hand the bytes to an H.264 decoder, which
+    /// rejects every frame, produces no picture, and explains nothing.
+    pub fn push_datagram_with_codec(&self, sender_id: u32, codec: u8, payload: &[u8]) {
+        if codec != parley_proto::media::VIDEO_CODEC_H264 {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.refused_codec.insert(sender_id) {
+                eprintln!(
+                    "video: user {sender_id} is sending codec id {codec}, which this build \
+                     cannot decode (H.264 only) — stream refused; the sender must use a \
+                     codec both ends support"
+                );
+            }
+            return;
+        }
         let Ok(frag) = decode_fragment(payload) else {
             return;
         };
@@ -221,6 +276,11 @@ impl VideoReceiveHub {
                             assembler: VideoAssembler::new(),
                             decoder,
                             predecode_skipped: 0,
+                            decoded: 0,
+                            no_picture: 0,
+                            decode_errors: 0,
+                            fed_since_picture: 0,
+                            last_reset: None,
                         });
                     }
                     Err(e) => {
@@ -284,23 +344,94 @@ impl VideoReceiveHub {
                 }
                 match stream.decoder.decode_with_dims(&frame.data) {
                     Ok(Some((rgb, w, h))) => {
+                        stream.decoded += 1;
+                        stream.fed_since_picture = 0;
                         queue.push_back(VideoFrame {
                             sender_id,
                             rgb,
                             width: w,
                             height: h,
+                            high_rate: frame.high_rate,
                         });
                         while queue.len() > FRAME_QUEUE_CAP {
                             queue.pop_front();
                         }
                         pushed = true;
                     }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("video decode error: {e}"),
+                    Ok(None) => {
+                        // Accepted, nothing emitted — legitimate for a
+                        // non-reference frame, a red flag when it never
+                        // stops happening.
+                        stream.no_picture += 1;
+                        stream.fed_since_picture += 1;
+                        Self::check_stall(sender_id, stream);
+                    }
+                    Err(e) => {
+                        stream.decode_errors += 1;
+                        stream.fed_since_picture += 1;
+                        if stream.decode_errors == 1 || stream.decode_errors.is_multiple_of(100) {
+                            eprintln!(
+                                "video: user {sender_id}: decoder rejected a frame ({e}) — \
+                                 assembled {}, decoded {}, no-picture {}, errors {} (a transport \
+                                 loss is a different failure: this one means the bytes were \
+                                 assembled whole and still undecodable)",
+                                stream.assembler.frames_completed,
+                                stream.decoded,
+                                stream.no_picture,
+                                stream.decode_errors
+                            );
+                        }
+                        Self::reset_decoder(sender_id, stream);
+                    }
                 }
             }
         }
         pushed
+    }
+
+    /// 7h: report (once per stall window) that frames keep arriving but
+    /// no picture ever comes out, then rebuild the decoder. This is the
+    /// receive-side counterpart of the sender's ladder — the condition
+    /// that used to be invisible.
+    fn check_stall(sender_id: u32, stream: &mut RecvStream) {
+        if stream.fed_since_picture < STALL_FRAMES {
+            return;
+        }
+        eprintln!(
+            "video: user {sender_id}: no picture in the last {STALL_FRAMES} frames — assembled \
+             {}, decoded {}, no-picture {}, errors {} (the decoder is being rebuilt; if this \
+             repeats, the stream itself is not decodable by this build)",
+            stream.assembler.frames_completed,
+            stream.decoded,
+            stream.no_picture,
+            stream.decode_errors
+        );
+        Self::reset_decoder(sender_id, stream);
+    }
+
+    /// 7h: rebuild a failing decoder. openh264 offers no concealment
+    /// contract here, and after rejecting a frame it can keep answering
+    /// \"accepted, no picture\" forever — which is precisely the silent
+    /// state a malformed stream produced. Every IDR carries SPS/PPS
+    /// in-band, so a fresh decoder needs nothing to start and can only
+    /// be better than a poisoned one. Cooldown-bounded so a stream that
+    /// rejects everything does not reallocate per frame.
+    fn reset_decoder(sender_id: u32, stream: &mut RecvStream) {
+        let now = std::time::Instant::now();
+        if let Some(last) = stream.last_reset
+            && now.duration_since(last) < DECODER_RESET_COOLDOWN
+        {
+            stream.fed_since_picture = 0;
+            return;
+        }
+        match VideoDecoder::new() {
+            Ok(d) => {
+                stream.decoder = d;
+                stream.last_reset = Some(now);
+                stream.fed_since_picture = 0;
+            }
+            Err(e) => eprintln!("video: user {sender_id}: decoder rebuild failed: {e}"),
+        }
     }
 
     /// Next decoded frame, waiting up to `timeout`. The consumer's
@@ -342,6 +473,7 @@ impl VideoReceiveHub {
         let mut inner = self.inner.lock().unwrap();
         inner.streams.remove(&sender_id);
         inner.stopped.remove(&sender_id);
+        inner.refused_codec.remove(&sender_id);
     }
 
     /// Worst per-sender video gap rate since the last call (resets each
@@ -357,6 +489,21 @@ impl VideoReceiveHub {
             .values_mut()
             .map(|s| s.assembler.gap_rate_permille())
             .max()
+    }
+
+    /// 7h: cumulative per-sender DECODE accounting, sorted by sender id:
+    /// (sender_id, decoded, no_picture, decode_errors). The assembler
+    /// stats say what arrived; these say what became a picture — the
+    /// distinction that tells a transport problem from a bitstream one.
+    pub fn decode_stats(&self) -> Vec<(u32, u64, u64, u64)> {
+        let inner = self.inner.lock().unwrap();
+        let mut v: Vec<_> = inner
+            .streams
+            .iter()
+            .map(|(&id, s)| (id, s.decoded, s.no_picture, s.decode_errors))
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     /// Cumulative per-sender stats, sorted by sender id:
@@ -560,6 +707,47 @@ mod tests {
             (100..=250).contains(&rate),
             "expected ~167 permille, got {rate}"
         );
+    }
+
+    #[test]
+    fn decode_accounting_counts_pictures() {
+        // 7h: assembled frames and decoded pictures are different
+        // numbers, and the receive path now reports both.
+        let mut enc = crate::video::create_encoder(320, 240).unwrap();
+        let hub = VideoReceiveHub::new();
+        for t in 0..3u8 {
+            enc.force_keyframe();
+            let (annexb, _) = enc.encode_bgra(&noisy_bgra(320, 240, t as usize)).unwrap();
+            for p in payloads(&fragment_frame(t as u32, true, &annexb, 0, 0, 42)) {
+                hub.push_datagram(3, &p);
+            }
+        }
+        while hub.pop_frame(Duration::from_millis(200)).is_some() {}
+        let stats = hub.decode_stats();
+        assert_eq!(stats.len(), 1);
+        let (id, decoded, _no_picture, errors) = stats[0];
+        assert_eq!(id, 3);
+        assert_eq!(decoded, 3, "three keyframes must yield three pictures");
+        assert_eq!(errors, 0);
+    }
+
+    #[test]
+    fn undecodable_codec_is_refused_not_fed_to_the_decoder() {
+        // 7h: a stream in a codec this build cannot decode is refused
+        // loudly and never creates receive state — the alternative was
+        // feeding H.264 decoders foreign bytes and showing nothing.
+        let mut enc = crate::video::create_encoder(320, 240).unwrap();
+        let (annexb, _) = enc.encode_bgra(&noisy_bgra(320, 240, 0)).unwrap();
+        let hub = VideoReceiveHub::new();
+        for p in payloads(&fragment_frame(0, true, &annexb, 0, 0, 42)) {
+            hub.push_datagram_with_codec(4, 1 /* not H.264 */, &p);
+        }
+        assert!(hub.pop_frame(Duration::from_millis(50)).is_none());
+        assert!(
+            hub.decode_stats().is_empty(),
+            "a refused stream must not create receive state"
+        );
+        assert!(hub.gap_rate_permille().is_none(), "nor report loss");
     }
 
     #[test]

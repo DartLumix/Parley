@@ -22,13 +22,59 @@ use crate::error::Error;
 /// v1 send profile: 720p30 screen content.
 pub const VIDEO_WIDTH: usize = 1280;
 pub const VIDEO_HEIGHT: usize = 720;
-pub const VIDEO_FPS: f32 = 30.0;
+/// Frame rate of the software (openh264) profile. Not a taste choice:
+/// openh264 tops out around 32 fps at 1080p on this class of machine,
+/// so promising more would just mean dropping frames.
+pub const VIDEO_FPS_SOFTWARE: f32 = 30.0;
+/// 7h HD: frame rate the share path targets once a HARDWARE encoder is
+/// live. VCE/QuickSync do 1080p60 and 1440p60 without noticing; the
+/// roadmap's "1440p60 with hardware encode" is gated on exactly this.
+pub const VIDEO_FPS_HARDWARE: f32 = 60.0;
+/// The software profile's rate under its historical name (the synthetic
+/// sender and mpv's rawvideo demuxer use it).
+pub const VIDEO_FPS: f32 = VIDEO_FPS_SOFTWARE;
+
 /// Keyframe every 2 s: bounded loss-recovery window (5a's
 /// drop-until-IDR rule means a late or lossy joiner waits at most
-/// this long for a decodable picture).
+/// this long for a decodable picture). Expressed in TIME because the
+/// frame rate is now profile-dependent — a 60 fps stream needs twice
+/// the frames for the same recovery window.
+const KEYFRAME_INTERVAL_SECS: f32 = 2.0;
+
+/// Keyframe interval in frames for a given rate.
+pub fn keyframe_interval_frames(fps: f32) -> u32 {
+    (fps.max(1.0) * KEYFRAME_INTERVAL_SECS).round() as u32
+}
+
+/// The interval at the software profile's rate (2 s at 30 fps).
 pub const KEYFRAME_INTERVAL_FRAMES: u32 = 60;
 /// Screen content at 720p30 holds up well around 2.5 Mbps.
 pub const VIDEO_BITRATE_BPS: u32 = 2_500_000;
+/// Ceiling for the scaled profile below. 12 Mbps is comfortable on the
+/// LAN/local-network deployment this is built for and still far under
+/// what a 1080p60/1440p60 stream can spend.
+pub const MAX_VIDEO_BITRATE_BPS: u32 = 12_000_000;
+/// Floor, so a tiny window on a busy path still gets a usable picture.
+pub const MIN_VIDEO_BITRATE_BPS: u32 = 800_000;
+
+/// Bits per pixel per frame — the quality budget the 720p30 baseline
+/// encodes (2.5 Mbps / (1280·720·30)). Held constant as resolution and
+/// frame rate grow, which is what makes HD *look* like HD: the old
+/// fixed 2.5 Mbps target is what a 720p30 stream spends, and handing it
+/// to 1080p60 buys four times less detail per pixel.
+pub const BITS_PER_PIXEL_PER_FRAME: f64 = VIDEO_BITRATE_BPS as f64 / (1280.0 * 720.0 * 30.0);
+
+/// Bitrate target for a resolution and frame rate.
+///
+/// Exactly [`VIDEO_BITRATE_BPS`] at the 720p30 baseline (so nothing about
+/// the shipped software profile moves), scaled with pixels and rate
+/// above it, capped at [`MAX_VIDEO_BITRATE_BPS`]:
+/// 1080p30 ≈ 5.6 Mbps · 1080p60 ≈ 11.3 Mbps · 1440p60 ≈ 12 Mbps (cap).
+pub fn bitrate_for(width: usize, height: usize, fps: f32) -> u32 {
+    let pixels = width.max(2) as f64 * height.max(2) as f64;
+    let target = pixels * f64::from(fps.max(1.0)) * BITS_PER_PIXEL_PER_FRAME;
+    (target.round() as u64).clamp(MIN_VIDEO_BITRATE_BPS as u64, MAX_VIDEO_BITRATE_BPS as u64) as u32
+}
 
 /// Codec identity for capability reporting (future-proofing for
 /// HEVC/AV1 backends — the media header's flag bits grow one bit per
@@ -80,11 +126,65 @@ pub trait VideoEncoder: Send {
 
 /// Construct the best available encoder for this platform. Hardware
 /// backends are feature-gated, tried first, and fall back to software
-/// at runtime; today software is the only backend (VAAPI parked after
-/// the polaris VCE kernel hang — see HANDOFF §8).
+/// at runtime.
 pub fn create_encoder(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
+    HW_ACTIVE.store(false, Ordering::Relaxed);
+    HW_MEASURED_MFPS.store(0, Ordering::Relaxed);
     Ok(Box::new(SoftwareEncoder::new(width, height)?))
 }
+
+/// 7h: is a HARDWARE encoder the one actually in use? Set when
+/// [`create_encoder_auto`] settles on a backend (only after the
+/// hardware self-test passes), never mid-stream.
+static HW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True when the live encoder is a hardware one — the transport and
+/// display paths size themselves from this (see [`target_fps`]).
+pub fn hardware_encoder_active() -> bool {
+    HW_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Sustained rate measured at encoder creation, in milli-fps (0 = not
+/// measured). See [`hardware_measured_fps`].
+static HW_MEASURED_MFPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The hardware encoder's MEASURED sustained throughput, if one was
+/// measured at creation.
+///
+/// 7h HD: the profile rate is not a constant to assume. On this
+/// project's VCE the same code path measured 720p at 60 fps, 1080p at
+/// 30 and 1440p at 19 — 1080p60 is not a setting that exists here, and
+/// advertising it would mean the share path paces 60 fps while the
+/// encoder delivers 30, i.e. every frame arrives late and the latency
+/// ladder calls a healthy path lossy. The second device will measure
+/// differently, and this is what makes the profile follow the machine
+/// rather than the machine following the profile.
+///
+/// The measurement happens once, at creation (see
+/// [`create_encoder_auto`]): the same self-test frames the decodability
+/// check already encodes are timed.
+pub fn hardware_measured_fps() -> Option<f32> {
+    let m = HW_MEASURED_MFPS.load(Ordering::Relaxed);
+    (m > 0).then(|| m as f32 / 1000.0)
+}
+
+/// Frame rate the share path should pace and timestamp at, given the
+/// backend in use. Read at the moment a frame is sent, so it is always
+/// the rate of the live encoder: the software ceiling, or what the
+/// hardware encoder was measured to sustain (capped by the hardware
+/// profile, floored so a driver hiccup cannot collapse the stream).
+pub fn target_fps() -> f32 {
+    if !hardware_encoder_active() {
+        return VIDEO_FPS_SOFTWARE;
+    }
+    match hardware_measured_fps() {
+        Some(fps) => fps.clamp(VIDEO_FPS_MIN, VIDEO_FPS_HARDWARE),
+        None => VIDEO_FPS_HARDWARE,
+    }
+}
+
+/// A stream below this is not worth sending as video.
+pub const VIDEO_FPS_MIN: f32 = 10.0;
 
 /// The default strided path: repack tight, delegate to `encode_bgra`.
 /// Shared by the trait default and SoftwareEncoder's size-mismatch case
@@ -155,13 +255,13 @@ impl openh264::formats::BGRA8Source for PwStridedBgra<'_> {}
 
 /// The openh264 encoder configuration, shared by construction and
 /// bitrate changes (the latter recreates the encoder).
-fn encoder_config(bps: u32) -> EncoderConfig {
+fn encoder_config(bps: u32, fps: f32) -> EncoderConfig {
     EncoderConfig::new()
         .bitrate(openh264::encoder::BitRate::from_bps(bps))
-        .max_frame_rate(openh264::encoder::FrameRate::from_hz(VIDEO_FPS))
+        .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
         .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
         .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
-            KEYFRAME_INTERVAL_FRAMES,
+            keyframe_interval_frames(fps),
         ))
         .adaptive_quantization(false) // unsupported for screen content
         .background_detection(false) // unsupported for screen content
@@ -182,16 +282,27 @@ pub struct SoftwareEncoder {
 
 impl SoftwareEncoder {
     pub fn new(width: usize, height: usize) -> Result<Self, Error> {
+        Self::with_bitrate(
+            width,
+            height,
+            bitrate_for(width, height, VIDEO_FPS_SOFTWARE),
+        )
+    }
+
+    /// 7h HD: explicit target, so a caller that knows the profile (the
+    /// share path, scaling for resolution) does not go through the
+    /// 720p30 baseline.
+    pub fn with_bitrate(width: usize, height: usize, bps: u32) -> Result<Self, Error> {
         let encoder = Encoder::with_api_config(
             openh264::OpenH264API::from_source(),
-            encoder_config(VIDEO_BITRATE_BPS),
+            encoder_config(bps, VIDEO_FPS_SOFTWARE),
         )
         .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(Self {
             encoder,
             width,
             height,
-            current_bitrate: VIDEO_BITRATE_BPS,
+            current_bitrate: bps,
             yuv: YUVBuffer::new(width, height),
         })
     }
@@ -281,7 +392,10 @@ impl VideoEncoder for SoftwareEncoder {
         if bps == self.current_bitrate {
             return;
         }
-        match Encoder::with_api_config(openh264::OpenH264API::from_source(), encoder_config(bps)) {
+        match Encoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            encoder_config(bps, VIDEO_FPS_SOFTWARE),
+        ) {
             Ok(encoder) => {
                 self.encoder = encoder;
                 self.current_bitrate = bps;
@@ -337,6 +451,208 @@ impl VideoDecoder {
     pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         Ok(self.decode_with_dims(frame)?.map(|(rgb, _, _)| rgb))
     }
+}
+/// 7g: opt-in hardware selection state. NOT a global default — the
+/// client sets this from `--hw-encode` BEFORE creating any encoder.
+/// VAAPI is tried first; ANY error falls back to software, so a box
+/// without VAAPI (or with broken VCE) shares exactly as before.
+static HW_ENCODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable hardware-encode preference. Idempotent; call before
+/// [`create_encoder`]. See [`create_encoder`] for the fallback rules.
+pub fn prefer_hw_encode() {
+    set_hw_encode(true);
+}
+
+/// 7g: full runtime switch (the Flutter app's toggle). Takes effect at
+/// the NEXT encoder creation — a running share keeps its backend; stop
+/// and re-share to switch.
+pub fn set_hw_encode(enable: bool) {
+    HW_ENCODE.store(enable, Ordering::Relaxed);
+}
+
+/// Whether hardware preference is on (for diagnostics).
+pub fn hw_encode_enabled() -> bool {
+    HW_ENCODE.load(Ordering::Relaxed)
+}
+
+/// 7h: does this encoder's output actually decode?
+///
+/// A hardware encoder can emit frames that are perfect for the
+/// transport and undecodable for every receiver — exactly what
+/// radeonsi/VCE did while the vendored crate's SPS/PPS disagreed with
+/// the slice syntax the driver writes. Nothing in the share path
+/// noticed: the sender logged encoded frames, the receivers logged
+/// nothing, and the user watched an empty window while the loss ladder
+/// thrashed. So validate BEFORE going live: force a keyframe, hand it to
+/// a FRESH decoder (the receiver's real situation), and require a
+/// picture.
+///
+/// The pattern is deliberately detailed — a flat frame can survive a
+/// bitstream a real screen capture would not.
+#[cfg(feature = "vaapi")]
+fn encoder_produces_decodable_keyframe(enc: &mut dyn VideoEncoder) -> Result<(), Error> {
+    let (w, h) = enc.dimensions();
+    if w == 0 || h == 0 {
+        return Err(Error::Codec(format!(
+            "encoder reports no dimensions ({w}x{h})"
+        )));
+    }
+    let mut bgra = vec![0u8; w * h * 4];
+    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+        let x = (i % w) as u8;
+        let y = (i / w) as u8;
+        px[0] = x;
+        px[1] = y;
+        px[2] = x ^ y;
+        px[3] = 255;
+    }
+    enc.force_keyframe();
+    let (annexb, keyframe) = enc.encode_bgra(&bgra)?;
+    if !keyframe {
+        return Err(Error::Codec(
+            "self-test frame was not flagged a keyframe".into(),
+        ));
+    }
+    let mut dec = VideoDecoder::new()?;
+    match dec.decode_with_dims(&annexb) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Error::Codec(
+            "keyframe decoded to no picture — a mid-stream receiver could never start".into(),
+        )),
+        Err(e) => Err(Error::Codec(format!(
+            "keyframe rejected by a fresh decoder: {e}"
+        ))),
+    }
+}
+
+/// 7h HD: how fast is this encoder really, through the path the share
+/// will use?
+///
+/// Times a short run of real encode calls — `encode_bgra_strided`, with
+/// a padded stride, i.e. the repack AND the conversion AND the driver,
+/// not a microbenchmark of one stage — and returns the sustained rate.
+/// The first frame is dropped from the measurement (it pays the
+/// driver's pipeline priming), and the result is the rate the profile
+/// should advertise.
+#[cfg(feature = "vaapi")]
+fn measure_encoder_fps(enc: &mut dyn VideoEncoder) -> Option<f32> {
+    let (w, h) = enc.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    const FRAMES: usize = 12;
+    // Padded rows, like a compositor's buffer: the strided path is the
+    // one a real share uses, so it is the one to measure.
+    let stride = w * 4 + 256;
+    let mut bgra = vec![0u8; stride * h];
+    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+        let x = (i % stride / 4) as u8;
+        let y = (i / stride) as u8;
+        px[0] = x.wrapping_mul(3);
+        px[1] = y.wrapping_mul(5);
+        px[2] = x ^ y;
+        px[3] = 255;
+    }
+    let mut out = Vec::new();
+    let started = std::time::Instant::now();
+    for _ in 0..FRAMES {
+        enc.encode_bgra_strided(&bgra, w, h, stride, &mut out)
+            .ok()?;
+    }
+    let secs = started.elapsed().as_secs_f64();
+    (secs > 0.0).then(|| FRAMES as f32 / secs as f32)
+}
+
+/// Construct the best available encoder for this platform.
+///
+/// With `prefer_hw_encode()` set and the `vaapi` feature enabled, tries
+/// [`VaapiEncoder`] first and falls back to [`SoftwareEncoder`] on any
+/// init error (missing libva, no encode-capable node, driver refusal)
+/// OR on a failed keyframe self-test (see
+/// [`encoder_produces_decodable_keyframe`] — init succeeding says
+/// nothing about whether the frames decode).
+///
+/// Without either, software. Hardware is never attempted mid-stream:
+/// the decision happens once, at encoder creation (bitrate changes
+/// recreate the chosen backend only).
+///
+/// 7h HD: the two backends run different PROFILES. Hardware is asked
+/// for [`VIDEO_FPS_HARDWARE`] and a bitrate scaled to the resolution
+/// ([`bitrate_for`]) — that is what makes 1080p60/1440p60 reachable;
+/// software stays at its 30 fps ceiling and its 720p30-anchored rate.
+/// [`hardware_encoder_active`] records which one won, and the share
+/// path paces and timestamps from [`target_fps`].
+pub fn create_encoder_auto(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
+    if hw_encode_enabled() {
+        #[cfg(feature = "vaapi")]
+        match crate::video_vaapi::VaapiEncoder::new_profile(
+            width,
+            height,
+            VIDEO_FPS_HARDWARE,
+            bitrate_for(width, height, VIDEO_FPS_HARDWARE),
+        ) {
+            Ok(mut e) => match encoder_produces_decodable_keyframe(&mut e) {
+                Ok(()) => {
+                    // 7h HD: the decodability self-test says the stream
+                    // is usable; this says how fast it is. Measured
+                    // before the first real frame, so the share path's
+                    // pacing, timestamps and rate hint all reflect the
+                    // machine instead of the datasheet.
+                    let measured = measure_encoder_fps(&mut e);
+                    // The tests consumed frames and left the encoder
+                    // mid-GOP: make the first REAL frame an IDR so a
+                    // viewer joining at t=0 never waits for one.
+                    e.force_keyframe();
+                    HW_ACTIVE.store(true, Ordering::Relaxed);
+                    if let Some(fps) = measured {
+                        HW_MEASURED_MFPS.store((fps * 1000.0) as u32, Ordering::Relaxed);
+                    } else {
+                        HW_MEASURED_MFPS.store(0, Ordering::Relaxed);
+                    }
+                    // The session was opened at the hardware profile's
+                    // top rate; if the measured rate is lower, the
+                    // bitrate target moves with it. A 60 fps budget spent
+                    // over 30 fps of frames is just a bigger coded buffer
+                    // and a rate controller chasing a rate nobody sends.
+                    let effective = bitrate_for(width, height, target_fps());
+                    if effective != bitrate_for(width, height, VIDEO_FPS_HARDWARE) {
+                        e.set_bitrate(effective);
+                    }
+                    eprintln!(
+                        "video: hardware (VAAPI) encoder selected — {width}x{height}, measured \
+                         {:.1} fps sustained (pacing at {:.0}), {} bps, keyframe self-test \
+                         passed (verified decodable by a fresh decoder); if the GPU wedges, \
+                         this is why",
+                        measured.unwrap_or(0.0),
+                        target_fps(),
+                        bitrate_for(width, height, target_fps())
+                    );
+                    return Ok(Box::new(e));
+                }
+                Err(e) => eprintln!(
+                    "video: VAAPI encoder self-test FAILED ({e}); falling back to software — \
+                     hardware share would have shown every viewer an empty window"
+                ),
+            },
+            Err(e) => eprintln!("video: VAAPI init failed ({e}); falling back to software"),
+        }
+        #[cfg(not(feature = "vaapi"))]
+        {
+            eprintln!(
+                "video: hw-encode requested but built without the vaapi feature; using software"
+            );
+        }
+    }
+    HW_ACTIVE.store(false, Ordering::Relaxed);
+    HW_MEASURED_MFPS.store(0, Ordering::Relaxed);
+    let e = SoftwareEncoder::new(width, height)?;
+    eprintln!(
+        "video: software (openh264) encoder selected — {width}x{height} @ {VIDEO_FPS_SOFTWARE} \
+         fps, {} bps",
+        bitrate_for(width, height, VIDEO_FPS_SOFTWARE)
+    );
+    Ok(Box::new(e))
 }
 
 #[cfg(test)]
@@ -471,58 +787,4 @@ mod tests {
             .expect("post-change IDR must decode standalone");
         assert_eq!(rgb.len(), w * h * 3);
     }
-}
-
-/// 7g: opt-in hardware selection state. NOT a global default — the
-/// client sets this from `--hw-encode` BEFORE creating any encoder.
-/// VAAPI is tried first; ANY error falls back to software, so a box
-/// without VAAPI (or with broken VCE) shares exactly as before.
-static HW_ENCODE: AtomicBool = AtomicBool::new(false);
-
-/// Enable hardware-encode preference. Idempotent; call before
-/// [`create_encoder`]. See [`create_encoder`] for the fallback rules.
-pub fn prefer_hw_encode() {
-    set_hw_encode(true);
-}
-
-/// 7g: full runtime switch (the Flutter app's toggle). Takes effect at
-/// the NEXT encoder creation — a running share keeps its backend; stop
-/// and re-share to switch.
-pub fn set_hw_encode(enable: bool) {
-    HW_ENCODE.store(enable, Ordering::Relaxed);
-}
-
-/// Whether hardware preference is on (for diagnostics).
-pub fn hw_encode_enabled() -> bool {
-    HW_ENCODE.load(Ordering::Relaxed)
-}
-
-/// Construct the best available encoder for this platform.
-///
-/// With `prefer_hw_encode()` set and the `vaapi` feature enabled, tries
-/// [`VaapiEncoder`] first and falls back to [`SoftwareEncoder`] on any
-/// init error (missing libva, no encode-capable node, driver refusal).
-/// Without either, software. Hardware is never attempted mid-stream:
-/// the decision happens once, at encoder creation (bitrate changes
-/// recreate the chosen backend only).
-pub fn create_encoder_auto(width: usize, height: usize) -> Result<Box<dyn VideoEncoder>, Error> {
-    if hw_encode_enabled() {
-        #[cfg(feature = "vaapi")]
-        match crate::video_vaapi::VaapiEncoder::new(width, height) {
-            Ok(e) => {
-                eprintln!(
-                    "video: hardware (VAAPI) encoder selected — if the GPU wedges, this is why"
-                );
-                return Ok(Box::new(e));
-            }
-            Err(e) => eprintln!("video: VAAPI init failed ({e}); falling back to software"),
-        }
-        #[cfg(not(feature = "vaapi"))]
-        {
-            eprintln!(
-                "video: hw-encode requested but built without the vaapi feature; using software"
-            );
-        }
-    }
-    Ok(Box::new(SoftwareEncoder::new(width, height)?))
 }

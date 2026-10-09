@@ -77,6 +77,24 @@ pub const RATE_CONTROL_WINDOW_MS: u32 = 1_500;
 /// `max_frame_num` upper bound for the low-delay GOP; matches cros-codecs.
 const LIMIT: u32 = 2048;
 
+/// PARLEY PATCH — frame_num modulus, and the value the SPS advertises as
+/// `MaxFrameNum` (log2_max_frame_num_minus4 = ilog2(128) - 4 = 3).
+///
+/// Mesa's radeonsi/VCE slice writer emits a FIXED slice syntax that does
+/// not follow the packed SPS/PPS this crate hands it: 7-bit frame_num,
+/// `idr_pic_id`, and NO picture-order-count and NO deblocking fields —
+/// regardless of what those packed headers declare. Declaring more (the
+/// ported cros-codecs defaults here were 11-bit frame_num, POC type 0
+/// with a 12-bit LSB, and deblocking present) makes every slice header
+/// misparse: openh264 answers `Native:4 dsFrameCorrupted` and ffmpeg
+/// reports `deblocking_filter_idc 4 out of range` then dies parsing
+/// macroblocks, so hardware share never produces a picture on any
+/// receiver. Verified by diffing against ffmpeg's own VAAPI output on
+/// the same GPU — that stream decodes, and its SPS/PPS declare exactly
+/// this shape (log2_max_frame_num_minus4=3, pic_order_cnt_type=2,
+/// deblocking absent). Keep in lockstep with the SPS builder.
+const FRAME_NUM_LIMIT: u32 = 128;
+
 /// H.264 encoder configuration. Dimensions must be even (4:2:0 chroma).
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -386,7 +404,7 @@ impl Encoder {
 		// driver in the picture parameters.
 		let meta = FrameMeta {
 			poc: self.counter.wrapping_mul(2),
-			frame_num: self.counter % LIMIT,
+			frame_num: self.counter % FRAME_NUM_LIMIT,
 		};
 		let recon_idx = (self.counter as usize) % self.recon.len();
 
@@ -710,9 +728,8 @@ fn build_sps_pps(config: &Config) -> (Rc<Sps>, Rc<Pps>) {
 		.profile_idc(Profile::Main)
 		.chroma_format_idc(1)
 		.level_idc(level)
-		.max_frame_num(LIMIT)
-		.pic_order_cnt_type(0)
-		.max_pic_order_cnt_lsb(LIMIT * 2)
+		.max_frame_num(FRAME_NUM_LIMIT)
+		.pic_order_cnt_type(2)
 		.max_num_ref_frames(1)
 		.frame_mbs_only_flag(true)
 		.direct_8x8_inference_flag(level >= Level::L3)
@@ -731,7 +748,7 @@ fn build_sps_pps(config: &Config) -> (Rc<Sps>, Rc<Pps>) {
 		.pic_init_qp(26)
 		.entropy_coding_mode_flag(true)
 		.transform_8x8_mode_flag(false)
-		.deblocking_filter_control_present_flag(true)
+		.deblocking_filter_control_present_flag(false)
 		.num_ref_idx_l0_default_active(1)
 		.num_ref_idx_l1_default_active_minus1(0)
 		.build();

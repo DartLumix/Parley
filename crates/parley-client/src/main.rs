@@ -884,7 +884,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "audio-device")]
         let dg_mixer = shared_mixer.clone();
         #[cfg(feature = "video")]
-        let (vdg_tx, mut vdg_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+        // (sender_id, codec id from the media flag bits, payload) — 7h.
+        let (vdg_tx, mut vdg_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u8, Vec<u8>)>();
         #[cfg(feature = "video")]
         {
             let v = video_viewers.clone();
@@ -897,8 +898,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // wire rate == 30 fps, and the hub's consumer-side caps
             // bound staleness). Decode runs here, on its own task.
             tokio::spawn(async move {
-                while let Some((sender_id, payload)) = vdg_rx.recv().await {
-                    video::handle_video_datagram(&v, sender_id, &payload);
+                while let Some((sender_id, codec, payload)) = vdg_rx.recv().await {
+                    video::handle_video_datagram(&v, sender_id, codec, &payload);
                 }
             });
         }
@@ -917,7 +918,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if m.sender_id != 0 && m.sender_id != my_id {
                                 // 3b: hand off, never decode here (the
                                 // video task above owns decode).
-                                let _ = vdg_tx.send((m.sender_id, m.payload.to_vec()));
+                                let _ = vdg_tx.send((
+                                    m.sender_id,
+                                    parley_proto::media::video_codec(m.flags),
+                                    m.payload.to_vec(),
+                                ));
                             }
                             continue;
                         }

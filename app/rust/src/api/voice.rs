@@ -254,7 +254,9 @@ pub(crate) fn start_voice(
     // channel (3b: decode never on this reader). None in featureless
     // builds (video datagrams are dropped).
     #[cfg(feature = "audio-device")] video_tx: Option<
-        tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>,
+        // 7h: (sender_id, declared codec id, payload) — the codec rides
+        // the media flag bits; see the send site below.
+        tokio::sync::mpsc::UnboundedSender<(u32, u8, Vec<u8>)>,
     >,
     // 7g: the mic tee routes captured chunks into this mux channel
     // while the share-audio mux owns the route flag; the mux drains it
@@ -298,7 +300,17 @@ pub(crate) fn start_voice(
                             // dropped.
                             if m.flags & parley_proto::media::FLAG_VIDEO != 0 {
                                 if let Some(tx) = &video_tx {
-                                    let _ = tx.send((m.sender_id, m.payload.to_vec()));
+                                    // 7h: carry the sender's declared
+                                    // codec so the hub can refuse a
+                                    // stream this build cannot decode
+                                    // instead of feeding foreign bytes
+                                    // to an H.264 decoder that rejects
+                                    // every frame and says nothing.
+                                    let _ = tx.send((
+                                        m.sender_id,
+                                        parley_proto::media::video_codec(m.flags),
+                                        m.payload.to_vec(),
+                                    ));
                                 }
                                 continue;
                             }

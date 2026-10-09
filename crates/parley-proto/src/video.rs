@@ -31,6 +31,23 @@ pub const MAX_FRAGMENT_PAYLOAD: usize =
 
 /// Video fragment flags.
 pub const FRAG_KEYFRAME: u8 = 1 << 0;
+/// 7h HD: frame-rate hint — set when the sender's cadence is above ~45
+/// fps (a hardware encoder at 1080p60/1440p60; the software profile is
+/// 30). The bitstream itself carries the rate in its SPS VUI, but the
+/// consumers of this header are raw-frame viewers (mpv's rawvideo
+/// demuxer needs a nominal fps, and a 60 fps stream announced as 30
+/// plays at half speed) and diagnostics that should not have to parse
+/// H.264 to know how fast a stream is running.
+///
+/// Additive by construction: senders that predate it leave the bit
+/// clear (⇒ 30 fps, which is what they sent), receivers that predate it
+/// ignore it.
+pub const FRAG_HIGH_RATE: u8 = 1 << 1;
+
+/// Nominal frame rate implied by a fragment's rate hint.
+pub fn hinted_frame_rate(high_rate: bool) -> f32 {
+    if high_rate { 60.0 } else { 30.0 }
+}
 
 /// A single video fragment ready to be wrapped in a media datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +56,8 @@ pub struct VideoFragment<'a> {
     pub frag_idx: u16,
     pub frag_count: u16,
     pub keyframe: bool,
+    /// 7h: see [`FRAG_HIGH_RATE`].
+    pub high_rate: bool,
     pub data: &'a [u8],
 }
 
@@ -49,13 +68,17 @@ pub fn encode_fragment(
     frag_idx: u16,
     frag_count: u16,
     keyframe: bool,
+    high_rate: bool,
     data: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(VIDEO_HEADER_LEN + data.len());
     buf.extend_from_slice(&frame_id.to_be_bytes());
     buf.extend_from_slice(&frag_idx.to_be_bytes());
     buf.extend_from_slice(&frag_count.to_be_bytes());
-    let flags = if keyframe { FRAG_KEYFRAME } else { 0 };
+    let mut flags = if keyframe { FRAG_KEYFRAME } else { 0 };
+    if high_rate {
+        flags |= FRAG_HIGH_RATE;
+    }
     buf.push(flags);
     buf.extend_from_slice(data);
     buf
@@ -79,6 +102,7 @@ pub fn decode_fragment(payload: &[u8]) -> Result<VideoFragment<'_>, &'static str
         frag_idx,
         frag_count,
         keyframe: payload[8] & FRAG_KEYFRAME != 0,
+        high_rate: payload[8] & FRAG_HIGH_RATE != 0,
         data: &payload[VIDEO_HEADER_LEN..],
     })
 }
@@ -96,19 +120,62 @@ pub fn fragment_frame(
     timestamp: u32,
     sender_id: u32,
 ) -> Vec<Vec<u8>> {
-    let frag_count = frame_data.len().div_ceil(MAX_FRAGMENT_PAYLOAD).max(1);
+    fragment_frame_with_max(
+        frame_id,
+        keyframe,
+        frame_data,
+        first_seq,
+        timestamp,
+        sender_id,
+        MAX_FRAGMENT_PAYLOAD,
+        false,
+    )
+}
+
+/// 7h: `fragment_frame` with an explicit payload budget.
+///
+/// Why it exists: MAX_FRAGMENT_PAYLOAD is compiled in, but the path-MTU
+/// estimate a live QUIC connection reports can be *lower* than that —
+/// quinn collapses it to the 1200-byte floor after sustained loss (the
+/// 6e notes record exactly that), and then every full-size fragment is
+/// rejected with TooLarge by the local send path. The sender asks the
+/// connection for its current budget rather than assuming the constant.
+/// Lowering the budget only means more fragments; the assembler is
+/// index-based and does not care.
+// Eight arguments, deliberately: this is the wire layout spelled out
+// (ids, cadence hint, seq, timestamp, budget), and a params struct here
+// would only move the same list one line up. Same convention as the
+// bridge's share entry point (voice.rs).
+#[allow(clippy::too_many_arguments)]
+pub fn fragment_frame_with_max(
+    frame_id: u32,
+    keyframe: bool,
+    frame_data: &[u8],
+    first_seq: u16,
+    timestamp: u32,
+    sender_id: u32,
+    max_payload: usize,
+    // 7h HD: sender cadence above ~45 fps (see FRAG_HIGH_RATE).
+    high_rate: bool,
+) -> Vec<Vec<u8>> {
+    let max_payload = max_payload.max(1);
+    let frag_count = frame_data.len().div_ceil(max_payload).max(1);
     let frag_count = frag_count.min(u16::MAX as usize) as u16;
     let mut out = Vec::with_capacity(frag_count as usize);
     // chunks() on an empty slice yields NOTHING — special-case so an
     // empty frame still produces one fragment (codecs do emit such).
-    let mut chunks: Vec<&[u8]> = frame_data.chunks(MAX_FRAGMENT_PAYLOAD).collect();
+    let mut chunks: Vec<&[u8]> = frame_data.chunks(max_payload).collect();
     if chunks.is_empty() {
         chunks.push(&[]);
     }
+    // 7h: the codec id rides the media flag bits, so a receiver can
+    // refuse a stream it cannot decode instead of showing nothing.
+    let flags =
+        crate::media::with_video_codec(crate::media::FLAG_VIDEO, crate::media::VIDEO_CODEC_H264);
     for (idx, chunk) in chunks.into_iter().take(frag_count as usize).enumerate() {
-        let payload = encode_fragment(frame_id, idx as u16, frag_count, keyframe, chunk);
+        let payload = encode_fragment(frame_id, idx as u16, frag_count, keyframe, high_rate, chunk);
         out.push(crate::media::encode(
-            crate::media::FLAG_VIDEO,
+            flags,
             first_seq.wrapping_add(idx as u16),
             timestamp,
             sender_id,
@@ -130,6 +197,8 @@ pub struct VideoAssembler {
     current_frame_id: Option<u32>,
     current_frag_count: u16,
     current_is_keyframe: bool,
+    /// 7h: rate hint of the in-progress frame (from its fragments).
+    current_high_rate: bool,
     /// Set when a frame was dropped due to loss; cleared on keyframe.
     waiting_for_keyframe: bool,
     /// Completed frames ready for the caller, in order.
@@ -154,6 +223,8 @@ pub struct VideoAssembler {
 pub struct AssembledFrame {
     pub frame_id: u32,
     pub keyframe: bool,
+    /// 7h: sender cadence above ~45 fps (see [`FRAG_HIGH_RATE`]).
+    pub high_rate: bool,
     pub data: Vec<u8>,
 }
 
@@ -164,6 +235,7 @@ impl VideoAssembler {
             current_frame_id: None,
             current_frag_count: 0,
             current_is_keyframe: false,
+            current_high_rate: false,
             waiting_for_keyframe: true,
             output: std::collections::VecDeque::new(),
             frames_completed: 0,
@@ -238,6 +310,7 @@ impl VideoAssembler {
         self.current_frame_id = Some(frag.frame_id);
         self.current_frag_count = frag.frag_count;
         self.current_is_keyframe = frag.keyframe;
+        self.current_high_rate = frag.high_rate;
     }
 
     /// Count a frame as never-displayable, deduped by frame_id within
@@ -260,6 +333,7 @@ impl VideoAssembler {
             let frame = AssembledFrame {
                 frame_id: self.current_frame_id.unwrap(),
                 keyframe: self.current_is_keyframe,
+                high_rate: self.current_high_rate,
                 data,
             };
             self.output.push_back(frame);
@@ -346,6 +420,11 @@ mod tests {
         for (i, dg) in dgs.iter().enumerate() {
             let m = crate::media::decode(dg).unwrap();
             assert_eq!(m.seq, 100 + i as u16);
+            // 7h: the codec id rides every video fragment's flag bits.
+            assert_eq!(
+                crate::media::video_codec(m.flags),
+                crate::media::VIDEO_CODEC_H264
+            );
         }
         let frags = decode_all(&dgs);
         let mut asm = VideoAssembler::new();
@@ -357,6 +436,56 @@ mod tests {
         assert!(frame.keyframe);
         assert_eq!(frame.frame_id, 7);
         assert_eq!(asm.frames_completed, 1);
+    }
+
+    #[test]
+    fn smaller_budget_yields_more_fragments_that_reassemble_identically() {
+        // 7h: a collapsed path-MTU estimate lowers the payload budget at
+        // runtime. Reassembly must be bit-identical regardless of how
+        // many fragments that takes.
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+        let dgs = fragment_frame_with_max(9, true, &data, 0, 0, 42, 512, false);
+        assert_eq!(dgs.len(), 10); // 5000 / 512 = 9.76 → 10
+        let frags = decode_all(&dgs);
+        let mut asm = VideoAssembler::new();
+        for f in frags {
+            asm.push_fragment(f);
+        }
+        let frame = asm.pop_frame().unwrap();
+        assert_eq!(frame.data, data);
+        assert!(frame.keyframe);
+    }
+
+    #[test]
+    fn high_rate_hint_rides_the_flags_and_reaches_the_assembled_frame() {
+        // 7h HD: a 60 fps sender sets FRAG_HIGH_RATE. Old receivers
+        // ignore the bit, and a frame whose fragments disagree (only
+        // possible if two senders race on one frame id) still assembles
+        // — the hint is advisory, never a validity condition.
+        let dgs = fragment_frame_with_max(5, true, &[1, 2, 3], 0, 0, 42, 1024, true);
+        let frags = decode_all(&dgs);
+        assert!(
+            frags.iter().all(|f| f.high_rate),
+            "every fragment carries it"
+        );
+        let mut asm = VideoAssembler::new();
+        for f in frags {
+            asm.push_fragment(f);
+        }
+        let frame = asm.pop_frame().unwrap();
+        assert!(frame.high_rate, "the assembled frame reports the cadence");
+        assert_eq!(hinted_frame_rate(frame.high_rate), 60.0);
+
+        // Default path: no hint ⇒ 30 fps, which is what every pre-7h
+        // sender is.
+        let dgs = fragments(6, true, &[4, 5, 6], 10);
+        let mut asm = VideoAssembler::new();
+        for f in decode_all(&dgs) {
+            asm.push_fragment(f);
+        }
+        let frame = asm.pop_frame().unwrap();
+        assert!(!frame.high_rate);
+        assert_eq!(hinted_frame_rate(frame.high_rate), 30.0);
     }
 
     #[test]
@@ -429,10 +558,10 @@ mod tests {
     #[test]
     fn rejects_malformed() {
         assert!(decode_fragment(&[0u8; 5]).is_err()); // too short
-        let mut f = encode_fragment(1, 2, 3, false, &[0xFF; 10]);
+        let mut f = encode_fragment(1, 2, 3, false, false, &[0xFF; 10]);
         f[6..8].copy_from_slice(&0u16.to_be_bytes()); // frag_count = 0
         assert!(decode_fragment(&f).is_err());
-        let f = encode_fragment(1, 5, 3, false, &[0xFF; 10]); // idx >= count
+        let f = encode_fragment(1, 5, 3, false, false, &[0xFF; 10]); // idx >= count
         assert!(decode_fragment(&f).is_err());
     }
 

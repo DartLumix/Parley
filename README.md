@@ -50,7 +50,7 @@ Voice is the product; everything else grows later.
 
 ## ✨ What it is
 
-- 🎯 Group voice channels, screen share at source quality (1080p30 software today · 1440p60 with hardware encode), camera video
+- 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera video
 - 🐧 Native clients: **Linux → Android → Windows → iOS** — no Electron, no webviews, ever
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
 - 🐳 Deploy with `docker compose up` · one TOML config · one UDP port
@@ -143,8 +143,8 @@ Every message carries version + capability bits — later features are additive,
 - [x] Glass-to-glass measured — **~250 ms avg / 400 ms tail** (1080p30 software, mpv
       test viewer). Budget straddled: the remaining latency is viewer-side queuing —
       the real client owns this budget from here
-- [ ] VAAPI hardware encoder (parked: polaris VCE kernel bug — re-verified on current kernel/mesa, test-encode hangs the GPU; retried on hardware change or driver fix — handoff §8)
-- [ ] 1440p60 / 1080p60 (parked: blocked on hardware encode; software ceiling ~32 fps @ 1080p)
+- [x] VAAPI hardware encoder — **unparked and working** (7h). Two independent stream-shape defects fixed in the vendored crate: no parameter sets reached the coded buffer at all (driver accepts packed SPS/PPS and does not write them), and our synthesized SPS/PPS declared slice syntax Mesa's VCE writer never produces (11-bit `frame_num`, POC type 0, deblocking present) so every slice header misparsed. Keyframes now decode standalone on a fresh decoder at 720p/1080p/1440p, with a negative control proving the check bites. See [vendor/README.md](vendor/README.md)
+- [x] HD profiles — measured, not assumed: hardware encode runs 96 fps at 720p, 48 at 1080p, 29.5 at 1440p through the real capture path (parallel BGRA→NV12 + reused buffers), and `create_encoder_auto` times that path at creation so the share advertises the rate it can hold (`hardware_measured_fps` → `target_fps`). 1080p60 is *not* reachable on the dev box (driver ceiling ~55 fps at 1080p, our path ~48); 1440p60 is not reachable at all. Software stays at its 30 fps ceiling
 - [x] Loss-driven video bitrate ladder — landed in 6e
 
 ### Phase 6 — Backend Hardening & Client-Readiness 
@@ -281,6 +281,7 @@ on startup is **permanent** — that's the value you share with your team.
 | Screen share glass-to-glass | ≤ 250 ms — **met: ~250 ms avg LAN (stopwatch method, 1080p30 software, mpv test viewer); tail bounded by the frame-queue cap + pre-decode shed (310 ms median / 350 max via a foreign-VPS internet path, both ends home Wi-Fi); Phase 7's real display owns this budget from here** |
 | Share-audio tap-to-speaker | ≤ 250 ms — **met: 138.5 ms median / 187 ms max (default-output monitor → laptop speaker, foreign-VPS internet path)** |
 | Low-end receiver (full 1080p30 + stereo + AEC) | ≤ 1 core — **current: ~0.5 core client + ~0.1 core mpv on the 2-core laptop** |
+| Hardware encode rate (measured at creation, per machine) | must hold what the profile advertises — **current: 96 fps @720p, 48 @1080p, 29.5 @1440p (RX 590 VCE, Mesa 26.2.4); the share paces and timestamps at the measured number, never at a constant** |
 | Server idle RSS | ≤ 64 MB — **current: 54.8 MB (info logging), 48.1 MB at RUST_LOG=warn; container 1.4 MiB idle** |
 | 10 active talkers | ≤ 50% of one core — **current: 43% at 10× occupancy (10 senders × 10 recipients, 5000 forwarded pps, loopback; 100% delivery; perf-profiled: cost is per-datagram kernel sendmsg + loopback softirq, not parley code)** |
 | Login → connected | ≤ 400 ms — **current: 70 ms (loopback); 1.0–2.2 s laptop first join over Wi-Fi/internet (re-login with --token is faster)** |
