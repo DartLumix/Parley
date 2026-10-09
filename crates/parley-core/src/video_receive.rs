@@ -55,6 +55,89 @@ pub struct VideoFrame {
 /// Frames buffered for the consumer before the OLDEST is dropped.
 const FRAME_QUEUE_CAP: usize = 3;
 
+/// Diagnostic keyframe dump: with `PARLEY_VIDEO_DUMP=<dir>` set, every
+/// keyframe this hub feeds to a decoder is appended to
+/// `<dir>/sender<id>.annexb` (raw Annex-B, one file per sender).
+///
+/// Why: the receiver-side failures we keep chasing are stream-SHAPE
+/// bugs — a mid-stream join is only decodable if the keyframe it starts
+/// on repeats SPS/PPS in-band (openh264 reports `dsNoParamSets`,
+/// Native:16 otherwise), and the only way to tell an encoder that
+/// repeats them from one that does not is to look at what actually
+/// arrived on the wire. Software openh264 and moq-vaapi differ here, so
+/// a dump is the difference between guessing and knowing.
+///
+/// Off unless the env var is set; the dump directory is dedicated to it
+/// (fixed file names). Capped per sender: keyframes are hundreds of KB
+/// and a long session would otherwise fill the disk.
+mod keyframe_dump {
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Keyframes per sender after which dumping stops (the interesting
+    /// ones — a fresh share, a late join — are always in the first few).
+    const MAX_PER_SENDER: u32 = 20;
+
+    struct Dump {
+        dir: PathBuf,
+        counts: Mutex<HashMap<u32, u32>>,
+    }
+
+    fn dump() -> Option<&'static Dump> {
+        static DUMP: OnceLock<Option<Dump>> = OnceLock::new();
+        DUMP.get_or_init(|| {
+            let dir = PathBuf::from(std::env::var_os("PARLEY_VIDEO_DUMP")?);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("video: PARLEY_VIDEO_DUMP {}: {e}", dir.display());
+                return None;
+            }
+            eprintln!(
+                "video: dumping received keyframes to {} (PARLEY_VIDEO_DUMP, \
+                 max {MAX_PER_SENDER} per sender)",
+                dir.display()
+            );
+            Some(Dump {
+                dir,
+                counts: Mutex::new(HashMap::new()),
+            })
+        })
+        .as_ref()
+    }
+
+    pub fn keyframe(sender_id: u32, frame_id: u32, data: &[u8]) {
+        let Some(d) = dump() else { return };
+        let n = {
+            let mut counts = d.counts.lock().unwrap();
+            let n = counts.entry(sender_id).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if n > MAX_PER_SENDER {
+            if n == MAX_PER_SENDER + 1 {
+                eprintln!("video: user {sender_id}: keyframe dump full ({MAX_PER_SENDER})");
+            }
+            return;
+        }
+        let path = d.dir.join(format!("sender{sender_id}.annexb"));
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(data));
+        match written {
+            Ok(()) => println!(
+                "video: dumped keyframe #{n} (frame_id {frame_id}, {} B) for user \
+                 {sender_id} -> {}",
+                data.len(),
+                path.display()
+            ),
+            Err(e) => eprintln!("video: keyframe dump to {}: {e}", path.display()),
+        }
+    }
+}
+
 struct RecvStream {
     assembler: VideoAssembler,
     decoder: VideoDecoder,
@@ -196,6 +279,9 @@ impl VideoReceiveHub {
                 let Some(frame) = stream.assembler.pop_frame() else {
                     break;
                 };
+                if frame.keyframe {
+                    keyframe_dump::keyframe(sender_id, frame.frame_id, &frame.data);
+                }
                 match stream.decoder.decode_with_dims(&frame.data) {
                     Ok(Some((rgb, w, h))) => {
                         queue.push_back(VideoFrame {

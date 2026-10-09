@@ -13,7 +13,7 @@ pub enum Error {
     Decode(#[from] prost::DecodeError),
     #[error("message exceeds size limit")]
     MessageTooLarge,
-    #[error("opus codec: {0}")]
+    #[error("codec: {0}")]
     Codec(String),
     #[error("audio device: {0}")]
     AudioDevice(String),

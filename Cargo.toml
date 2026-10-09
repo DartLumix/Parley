@@ -7,6 +7,9 @@ members = [
     "crates/parley-client",
     "app/rust"
 ]
+# The patched VA-API crate (see vendor/README.md) is a dependency, not a
+# member: fmt/clippy/test --workspace must not sweep its upstream sources.
+exclude = ["vendor/moq-vaapi"]
 
 
 [workspace.package]
@@ -48,6 +51,15 @@ pipewire = "0.10"
 # pub package irondash_engine_context — app/pubspec.yaml).
 irondash_texture = "0.5"
 irondash_engine_context = "0.5"
+
+# PARLEY PATCH: the published moq-vaapi 0.1.0 hands its SPS/PPS to the driver
+# as packed headers and trusts them to reach the coded buffer. On radeonsi/VCE
+# they do not, so a hardware-encoded H.264 stream carried NO parameter sets at
+# all and no receiver could decode it. The vendored copy writes them in-band in
+# front of every IDR; see vendor/README.md. Only builds with the `vaapi`
+# feature touch this at all.
+[patch.crates-io]
+moq-vaapi = { path = "vendor/moq-vaapi" }
 
 [profile.release]
 strip = true
