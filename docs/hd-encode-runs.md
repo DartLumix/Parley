@@ -17,10 +17,28 @@ Names used below:
 
 ## Step −1 — get the code onto Machine B (once)
 
-Machine B needs a checkout, not a copy of this machine's build cache. From
-**Machine A**, with `target/` excluded (it is 27 GB and B rebuilds anyway):
+**Over git. Nothing has to travel any other way**: the checkout is the whole
+artifact (`vendor/moq-vaapi` is committed, the generated protobuf is
+compiled by a build script from a vendored `protoc`, and the generated
+Flutter bindings are committed too).
 
 ```sh
+# on B
+git clone git@github.com:DartLumix/Parley.git ~/Documents/Parley
+cd ~/Documents/Parley && git log --oneline -1    # the commit A pushed
+```
+
+With the repository already on disk, `git pull --ff-only` instead. Do NOT copy
+`~/.config/parley/known_hosts` between machines: that is each client's own
+TOFU store. If B has an entry for A from an OLDER Parley instance (a
+regenerated cert), the connection will hard-fail on a fingerprint mismatch —
+remove that line and let it pin afresh.
+
+If you would rather not use git, the same checkout moves as files (measured
+~6 MB; `target/` alone is 27 GB and must not travel — B rebuilds it):
+
+```sh
+# on A
 rsync -aH --info=progress2 \
   --exclude 'target/' --exclude 'app/build/' --exclude 'app/.dart_tool/' \
   --exclude 'app/linux/flutter/ephemeral/' --exclude '.freebuff/' \
@@ -28,30 +46,26 @@ rsync -aH --info=progress2 \
   ~/Documents/Parley/ <user>@<laptop>:~/Documents/Parley/
 ```
 
-That moves ~6 MB (measured; `target/` alone is 27 GB). `vendor/` **must** come along — the whole `moq-vaapi` patch
-lives there. `data/` does not: it is the cert + SQLite of whichever machine
-runs the *server*, and B is a client here; TOFU pins A's fingerprint on first
-connect. `.git` comes along, so B can commit; if you would rather not have two
-checkouts diverging, `git push` on A and `git pull` on B instead.
+`vendor/` must come along in that case (the whole `moq-vaapi` patch lives
+there). `data/` does not: it is the cert + SQLite of whichever machine runs
+the *server*, and B is a client here. Copying `data/` would give B a second
+server identity, not the one A prints.
 
 Build prerequisites on B (Arch/CachyOS package names; these are what A has):
 
 ```sh
-sudo pacman -S --needed base-devel cmake meson ninja nasm pkgconf libva \
+sudo pacman -S --needed base-devel clang cmake meson ninja nasm pkgconf libva \
     pipewire alsa-lib rustup ffmpeg mpv git
 ```
 
-`cmake`/`meson`/`ninja` build openh264 and the WebRTC AEC from source, `nasm`
-enables openh264's assembly, `libva` is the VAAPI backend, `pipewire` is the
-capture API, `ffmpeg`+`mpv` are the probe and test viewer. Rust comes from
-`rustup` (the repo pins `stable`). The Flutter app additionally needs a Flutter
-SDK — on A it lives at `~/dev/flutter`, not in a package.
-
-Check B is the same tree before running anything:
-
-```sh
-cd ~/Documents/Parley && git log --oneline -1    # same commit as A
-```
+`clang` is what the VAAPI feature needs at build time: the vendored crate runs
+`bindgen` for the libva bindings and fails without `libclang.so` (Arch ships it
+in the `clang` package). `cmake`/`meson`/`ninja` build openh264 and the WebRTC
+AEC from source, `nasm` enables openh264's assembly, `libva` is the VAAPI
+backend, `pipewire` is the capture API, `ffmpeg`+`mpv` are the probe and test
+viewer. Rust comes from `rustup` (the repo pins `stable`). The Flutter app
+additionally needs a Flutter SDK — on A it lives at `~/dev/flutter`, not in a
+package.
 
 ## What "working" means (the three checks each machine must pass)
 
