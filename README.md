@@ -44,7 +44,8 @@ Voice is the product; everything else grows later.
 | 7e | Voice send + AEC — join-driven devices, reconnect gap closed | ✅ |
 | 7e2 | 4d loss ladder in the app — receiver reports + two-profile send controller | ✅ |
 | 7f | Video receive — VideoReceiveHub → Flutter texture bridge | ✅ |
-| 7+ | Share send, platforms | ⏳ |
+| 7g | Screen-share send — portal capture + encode through the bridge | ✅ |
+| 7+ | Android / Windows / iOS bring-up, file transfer | ⏳ |
 
 ---
 
@@ -205,7 +206,13 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       a plain Texture widget; viewer-side VideoReport (5 s worst gap
       rate) feeds the sharer's 6e ladder; feature `video` default-off,
       build with `--features audio-device,video`
-- [ ] 7g Screen-share send — portal capture through the bridge
+- [x] 7g Screen-share send — portal capture through the bridge in the app: start/stop
+      from the UI (`start_screen_share` + `share_started`/`share_ended`/`share_failed`
+      events), share-audio mux, keyframe poke for a late joiner, and the HW-encode
+      toggle gated on `hw_encode_supported()` (feature `screen-capture`, which implies
+      `video`; the Rust side is parley-client's screen module, the same one the CLI
+      uses). Verified by build + clippy with `audio-device,video,screen-capture,hw-encode`;
+      the on-screen run is step 3 of [docs/hd-encode-runs.md](docs/hd-encode-runs.md)
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
 

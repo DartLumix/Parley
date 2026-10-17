@@ -15,6 +15,44 @@ Names used below:
   is the point: the encoder reports what it measured, so B's numbers decide
   B's profile.
 
+## Step −1 — get the code onto Machine B (once)
+
+Machine B needs a checkout, not a copy of this machine's build cache. From
+**Machine A**, with `target/` excluded (it is 27 GB and B rebuilds anyway):
+
+```sh
+rsync -aH --info=progress2 \
+  --exclude 'target/' --exclude 'app/build/' --exclude 'app/.dart_tool/' \
+  --exclude 'app/linux/flutter/ephemeral/' --exclude '.freebuff/' \
+  --exclude 'data/' --exclude '*.annexb' \
+  ~/Documents/Parley/ <user>@<laptop>:~/Documents/Parley/
+```
+
+That moves ~6 MB (measured; `target/` alone is 27 GB). `vendor/` **must** come along — the whole `moq-vaapi` patch
+lives there. `data/` does not: it is the cert + SQLite of whichever machine
+runs the *server*, and B is a client here; TOFU pins A's fingerprint on first
+connect. `.git` comes along, so B can commit; if you would rather not have two
+checkouts diverging, `git push` on A and `git pull` on B instead.
+
+Build prerequisites on B (Arch/CachyOS package names; these are what A has):
+
+```sh
+sudo pacman -S --needed base-devel cmake meson ninja nasm pkgconf libva \
+    pipewire alsa-lib rustup ffmpeg mpv git
+```
+
+`cmake`/`meson`/`ninja` build openh264 and the WebRTC AEC from source, `nasm`
+enables openh264's assembly, `libva` is the VAAPI backend, `pipewire` is the
+capture API, `ffmpeg`+`mpv` are the probe and test viewer. Rust comes from
+`rustup` (the repo pins `stable`). The Flutter app additionally needs a Flutter
+SDK — on A it lives at `~/dev/flutter`, not in a package.
+
+Check B is the same tree before running anything:
+
+```sh
+cd ~/Documents/Parley && git log --oneline -1    # same commit as A
+```
+
 ## What "working" means (the three checks each machine must pass)
 
 1. **The driver encodes H.264 and its keyframes stand alone** — otherwise
