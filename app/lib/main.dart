@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:irondash_engine_context/irondash_engine_context.dart';
 
 import 'src/rust/frb_generated.dart';
@@ -93,6 +94,9 @@ class _DevHomePageState extends State<DevHomePage> {
   final Map<int, String> _usernames = {}; // user_id → username
   final List<ChatEntry> _chat = [];
   BigInt? _joinedChannelId;
+  // Voice membership (who is in which channel): the snapshot at connect
+  // plus every join/leave broadcast since.
+  final Map<int, BigInt> _voiceChannel = {}; // user_id → channel_id
   // 7e: join = listen + transmit (TeamSpeak shape) — the Rust side
   // opens/closes the devices on the own join/leave events. The UI only
   // reflects membership; there is no listen toggle.
@@ -101,6 +105,13 @@ class _DevHomePageState extends State<DevHomePage> {
   // the video_started / video_stopped events; textures are owned by
   // the Rust bridge (one per sender, stable across stop/re-share).
   final Map<int, (int, int, int)> _videos = {};
+  // Which share the right-hand pane is showing. Starting a share no
+  // longer throws video onto the page: the pane offers a "Watch"
+  // button and the stream is only rendered once chosen.
+  int? _watching;
+  // Fullscreen viewer (an overlay, not a route: a share ending has to
+  // close it from the same state that receives the event).
+  int? _fullscreen;
   // 7g: our own share state (start/stop button) + the hw-encode toggle.
   bool _sharing = false;
   bool _hwEncode = false;
@@ -152,8 +163,21 @@ class _DevHomePageState extends State<DevHomePage> {
     final id = _session!.sessionId;
     final alive = await isConnected(sessionId: id);
     if (_session?.sessionId != id) return;
-    if (!alive && mounted) _handleClosed();
+    if (!alive && mounted) {
+      _handleClosed();
+      return;
+    }
+    // Roster heal: presence and voice membership are event-driven, so
+    // a session that connects after our snapshot arrives with a name
+    // we have never seen. A slow re-poll keeps the channel cards
+    // honest without polling on the media path.
+    if (++_pollTick % 10 == 0) {
+      requestPresence(sessionId: id);
+      requestVoiceStates(sessionId: id);
+    }
   }
+
+  int _pollTick = 0;
 
   void _handleClosed() {
     _events?.cancel();
@@ -168,6 +192,9 @@ class _DevHomePageState extends State<DevHomePage> {
       _chat.clear();
       _usernames.clear();
       _videos.clear();
+      _voiceChannel.clear();
+      _watching = null;
+      _fullscreen = null;
       _sharing = false;
     });
     // Clean the dead registry entry (a manual Disconnect may have
@@ -207,6 +234,9 @@ class _DevHomePageState extends State<DevHomePage> {
       // side no longer issues these itself).
       requestPresence(sessionId: s.sessionId);
       listChannels(sessionId: s.sessionId);
+      // Who was already sitting in a channel before we connected —
+      // no broadcast replays that, only the snapshot has it.
+      requestVoiceStates(sessionId: s.sessionId);
     } catch (e) {
       setState(() => _status = 'connect failed: $e');
     } finally {
@@ -234,6 +264,9 @@ class _DevHomePageState extends State<DevHomePage> {
       _chat.clear();
       _usernames.clear();
       _videos.clear();
+      _voiceChannel.clear();
+      _watching = null;
+      _fullscreen = null;
       _sharing = false;
     });
   }
@@ -263,6 +296,25 @@ class _DevHomePageState extends State<DevHomePage> {
     }
   }
 
+  /// Latency probing and other harness chatter rides the chat
+  /// transport (`PARLEY_LATENCY <ns>` from the --measure client). It
+  /// is diagnostic traffic, never conversation — keep it out of both
+  /// live and replayed chat (the rows are still in the server's log).
+  static bool _isHarnessNoise(String text) =>
+      text.startsWith('PARLEY_LATENCY ') || text.startsWith('PARLEY_HELLO ');
+
+  void _ingestChat(Iterable<ChatEntry> rows, {required bool prepend}) {
+    final clean = rows.where((m) => !_isHarnessNoise(m.text)).toList();
+    if (clean.isEmpty) return;
+    setState(() {
+      if (prepend) {
+        _chat.insertAll(0, clean);
+      } else {
+        _chat.addAll(clean);
+      }
+    });
+  }
+
   void _onEvent(SessionEvent ev) {
     switch (ev.kind) {
       case 'channel_list':
@@ -281,16 +333,19 @@ class _DevHomePageState extends State<DevHomePage> {
           }
         });
       case 'chat':
-        final m = ev.messages.firstOrNull;
-        if (m != null) {
-          setState(() => _chat.add(m));
-          _scrollChat();
-        }
+        _ingestChat(ev.messages, prepend: false);
+        _scrollChat();
       case 'history':
         // Newest-last batch: PREPEND so live messages append after it.
-        setState(() => _chat.insertAll(0, ev.messages));
+        _ingestChat(ev.messages, prepend: true);
+        _scrollChat();
       case 'voice_state':
         setState(() {
+          if (ev.joined) {
+            _voiceChannel[ev.userId] = ev.channelId;
+          } else {
+            _voiceChannel.remove(ev.userId);
+          }
           if (ev.userId == _session?.userId) {
             // 7e: the own join/leave IS the voice lifecycle — the Rust
             // side already opened/closed the devices on this event.
@@ -303,6 +358,10 @@ class _DevHomePageState extends State<DevHomePage> {
         });
       case 'voice_states':
         setState(() {
+          _voiceChannel.clear();
+          for (final st in ev.states) {
+            if (st.joined) _voiceChannel[st.userId] = st.channelId;
+          }
           for (final st in ev.states) {
             if (st.userId == _session?.userId) {
               _joinedChannelId = st.joined ? st.channelId : null;
@@ -321,14 +380,18 @@ class _DevHomePageState extends State<DevHomePage> {
               s0.width.toInt(),
               s0.height.toInt(),
             );
-            final name = _usernames[s0.userId] ?? 'user ${s0.userId}';
+            final name = _nameOf(s0.userId);
             _status = '$name is sharing ${s0.width}×${s0.height}';
           });
         }
       case 'video_stopped':
         final s1 = ev.surface;
         if (s1 != null) {
-          setState(() => _videos.remove(s1.userId));
+          setState(() {
+            _videos.remove(s1.userId);
+            if (_watching == s1.userId) _watching = null;
+            if (_fullscreen == s1.userId) _fullscreen = null;
+          });
         }
       case 'share_started':
         if (mounted) {
@@ -394,246 +457,717 @@ class _DevHomePageState extends State<DevHomePage> {
     );
   }
 
+  String _nameOf(int userId) =>
+      _usernames[userId] ?? 'user $userId';
+
+  /// Display name for the connected account: presence is the authority
+  /// once it arrives, the login field before that.
+  String get _ownName {
+    final id = _session?.userId;
+    if (id == null) return '';
+    return _usernames[id] ?? (_user.text.isEmpty ? 'user $id' : _user.text);
+  }
+
+  /// Users in voice channel [channelId], in a stable order (self first,
+  /// then alphabetical — the roster should not jump around on refresh).
+  List<int> _membersOf(BigInt channelId) {
+    final ids = [
+      for (final e in _voiceChannel.entries)
+        if (e.value == channelId) e.key,
+    ];
+    ids.sort((a, b) {
+      if (a == _session?.userId) return -1;
+      if (b == _session?.userId) return 1;
+      return _nameOf(a).toLowerCase().compareTo(_nameOf(b).toLowerCase());
+    });
+    return ids;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final fullscreenId = _fullscreen;
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: theme.colorScheme.inversePrimary,
+        title: const Text('Parley'),
+        actions: [
+          if (_session != null) ...[
+            Text(
+              '$_ownName · id ${_session!.userId}',
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+            IconButton(
+              tooltip: 'Disconnect',
+              icon: const Icon(Icons.logout, size: 20),
+              onPressed: _disconnect,
+            ),
+            const SizedBox(width: 8),
+          ],
+        ],
+      ),
+      body: Stack(
+        children: [
+          if (_session == null)
+            _LoginView(
+              server: _server,
+              user: _user,
+              password: _password,
+              connecting: _connecting,
+              status: _status,
+              onConnect: _connect,
+            )
+          else
+            _sessionView(theme),
+          if (fullscreenId != null && _videos.containsKey(fullscreenId))
+            _fullscreenLayer(fullscreenId),
+        ],
+      ),
+      floatingActionButton: _session == null ? null : _actionBar(theme),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+    );
+  }
+
+  // --- connected layout: header strip, channels + chat left, share right.
+
+  Widget _sessionView(ThemeData theme) {
+    // The split appears when there is something to watch — not merely
+    // when we are in a channel: a share is the only reason for the
+    // right-hand pane to exist.
+    final split = _videos.isNotEmpty;
+    return Padding(
+      // Bottom room for the floating share/HW bar.
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _connectionStrip(theme),
+          const SizedBox(height: 12),
+          Expanded(
+            child: split
+                ? Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Expanded(flex: 5, child: _leftColumn(theme)),
+                      const SizedBox(width: 16),
+                      Expanded(flex: 6, child: _sharePane(theme)),
+                    ],
+                  )
+                : _leftColumn(theme),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _connectionStrip(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(
+              _voiceUp ? Icons.mic : Icons.mic_off,
+              size: 16,
+              color: _voiceUp ? Colors.deepPurpleAccent : Colors.white38,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _status,
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+            ),
+            if (_sharing) const _Pill(text: 'sharing', color: Colors.greenAccent),
+          ],
+        ),
+        const SizedBox(height: 4),
+        SelectableText(
+          'fingerprint: ${_session!.fingerprint}',
+          style: const TextStyle(
+            color: Colors.white38,
+            fontSize: 11,
+            fontFamily: 'monospace',
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _leftColumn(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _channelsPanel(theme),
+        const SizedBox(height: 12),
+        Expanded(child: _chatPanel(theme)),
+      ],
+    );
+  }
+
+  // --- channels: one card per channel, with its live roster.
+
+  Widget _channelsPanel(ThemeData theme) {
+    final idle = [
+      for (final u in _presence)
+        if (!_voiceChannel.containsKey(u.userId)) u.userId,
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text('Channels', style: theme.textTheme.titleMedium),
+            const SizedBox(width: 8),
+            Text(
+              '${_presence.length} online',
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 260),
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              for (final c in _channels) _channelCard(theme, c),
+              if (idle.isNotEmpty) _idleCard(theme, idle),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _channelCard(ThemeData theme, ChannelInfo c) {
+    final joined = _joinedChannelId == c.id;
+    final members = _membersOf(c.id);
+    final accent = theme.colorScheme.primary;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 10),
+      decoration: BoxDecoration(
+        color: joined
+            ? accent.withValues(alpha: 0.16)
+            : Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: joined ? accent : Colors.white.withValues(alpha: 0.10),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                joined
+                    ? Icons.graphic_eq
+                    : (c.mode == 'music' ? Icons.music_note : Icons.mic),
+                size: 18,
+                color: joined ? accent : Colors.white54,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  c.name,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              Text(
+                members.isEmpty
+                    ? 'voice empty'
+                    : '${members.length} in voice',
+                style: const TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+              const SizedBox(width: 4),
+              joined
+                  ? TextButton(
+                      onPressed: _leaveChannel,
+                      child: const Text('Leave'),
+                    )
+                  : TextButton(
+                      onPressed: () => _joinChannel(c),
+                      child: const Text('Join'),
+                    ),
+            ],
+          ),
+          if (members.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 26, top: 4),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [for (final id in members) _memberChip(id)],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _idleCard(ThemeData theme, List<int> ids) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.people_outline, size: 18, color: Colors.white38),
+              SizedBox(width: 8),
+              Text(
+                'Online, not in a channel',
+                style: TextStyle(color: Colors.white54, fontSize: 13),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Padding(
+            padding: const EdgeInsets.only(left: 26),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [for (final id in ids) _memberChip(id, idle: true)],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _memberChip(int userId, {bool idle = false}) {
+    final self = userId == _session?.userId;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: idle
+                  ? Colors.white24
+                  : (self ? Colors.deepPurpleAccent : Colors.greenAccent),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            self ? '${_nameOf(userId)} (you)' : _nameOf(userId),
+            style: const TextStyle(fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // --- chat
+
+  Widget _chatPanel(ThemeData theme) {
     final joinedName = _joinedChannelId == null
         ? null
         : _channels
               .where((c) => c.id == _joinedChannelId)
               .map((c) => c.name)
               .firstOrNull;
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: const Text('Parley Dev Client'),
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.white24),
+        borderRadius: BorderRadius.circular(10),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // --- connection ---
-          TextField(
-            controller: _server,
-            enabled: _session == null,
-            decoration: const InputDecoration(labelText: 'Server (IP:port)'),
-          ),
-          TextField(
-            controller: _user,
-            enabled: _session == null,
-            decoration: const InputDecoration(labelText: 'Username'),
-          ),
-          TextField(
-            controller: _password,
-            enabled: _session == null,
-            obscureText: true,
-            decoration: const InputDecoration(labelText: 'Password'),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              ElevatedButton(
-                onPressed: _connecting || _session != null ? null : _connect,
-                child: const Text('Connect'),
-              ),
-              const SizedBox(width: 12),
-              ElevatedButton(
-                onPressed: _session == null ? null : _disconnect,
-                child: const Text('Disconnect'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(_status),
-          if (_session != null)
-            Text(
-              'fingerprint: ${_session!.fingerprint}',
-              style: const TextStyle(color: Colors.white54, fontSize: 12),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+            child: Text(
+              joinedName == null ? 'Chat' : 'Chat · $joinedName',
+              style: theme.textTheme.titleSmall,
             ),
-          const Divider(height: 32),
-
-          // --- channels ---
-          if (_session != null) ...[
-            Text('Channels', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            for (final c in _channels)
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(
-                  _joinedChannelId == c.id
-                      ? Icons.graphic_eq
-                      : (c.mode == 'music' ? Icons.music_note : Icons.mic),
-                  color: _joinedChannelId == c.id
-                      ? Colors.deepPurpleAccent
-                      : Colors.white54,
-                ),
-                title: Text(c.name),
-                subtitle: Text('id ${c.id.toInt()} · ${c.mode}'),
-                trailing: _joinedChannelId == c.id
-                    ? TextButton(
-                        onPressed: _leaveChannel,
-                        child: const Text('Leave'),
-                      )
-                    : TextButton(
-                        onPressed: () => _joinChannel(c),
-                        child: const Text('Join'),
-                      ),
-              ),
-            const Divider(height: 32),
-
-            // --- voice (7e: join-driven; no listen toggle) ---
-            Row(
-              children: [
-                Icon(
-                  _voiceUp ? Icons.mic : Icons.mic_off,
-                  size: 18,
-                  color: _voiceUp ? Colors.deepPurpleAccent : Colors.white38,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  _voiceUp
-                      ? 'voice live${joinedName != null ? ' · $joinedName' : ''}'
-                      : 'voice idle (join a channel to talk & listen)',
-                  style: const TextStyle(color: Colors.white70, fontSize: 13),
-                ),
-              ],
-            ),
-            const Divider(height: 32),
-
-            // --- 7g: screen share (share own screen + hw toggle) ---
-            Row(
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _joinedChannelId == null || _connecting
-                      ? null
-                      : (_sharing ? _stopShare : _startShare),
-                  icon: Icon(_sharing ? Icons.stop_screen_share : Icons.screen_share),
-                  label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
-                ),
-                const SizedBox(width: 16),
-                if (_hwEncodeSupported) ...[
-                  Switch(
-                    value: _hwEncode,
-                    onChanged: (v) async {
-                      final now = await setHwEncode(enable: v);
-                      setState(() => _hwEncode = now);
-                      _status = v
-                          ? 'hw encode: ON (next share; if the GPU wedges, this is why)'
-                          : 'hw encode: off (software)';
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: _joinedChannelId == null
+                ? const Center(
+                    child: Text(
+                      'Join a channel to chat.',
+                      style: TextStyle(color: Colors.white38),
+                    ),
+                  )
+                : ListView.builder(
+                    controller: _chatScroll,
+                    padding: const EdgeInsets.all(10),
+                    itemCount: _chat.length,
+                    itemBuilder: (_, i) {
+                      final m = _chat[i];
+                      final own = m.userId == _session!.userId;
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Text.rich(
+                          TextSpan(
+                            style: const TextStyle(fontSize: 13),
+                            children: [
+                              TextSpan(
+                                text: '${m.username}: ',
+                                style: TextStyle(
+                                  color: own
+                                      ? Colors.deepPurpleAccent
+                                      : Colors.white70,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              TextSpan(
+                                text: m.text,
+                                style: const TextStyle(color: Colors.white),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
                     },
                   ),
-                  const Text('HW encode', style: TextStyle(fontSize: 13)),
-                ],
-              ],
-            ),
-            const Divider(height: 32),
-
-            // --- 7f: remote shares (Rust-owned textures) ---
-            if (_videos.isNotEmpty) ...[
-              Text('Screens', style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 8),
-              for (final entry in _videos.entries)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '${_usernames[entry.key] ?? 'user ${entry.key}'} · '
-                        '${entry.value.$2}×${entry.value.$3}',
-                        style: const TextStyle(color: Colors.white54, fontSize: 12),
-                      ),
-                      const SizedBox(height: 4),
-                      AspectRatio(
-                        aspectRatio: 16 / 9,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            border: Border.all(color: Colors.white24),
-                          ),
-                          child: Texture(textureId: entry.value.$1),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              const Divider(height: 32),
-            ],
-
-            // --- chat ---
-            Text(
-              'Chat ${joinedName != null ? '· $joinedName' : '(join a channel)'}',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            if (_joinedChannelId == null)
-              const Text(
-                'Join a channel to chat.',
-                style: TextStyle(color: Colors.white38),
-              )
-            else ...[
-              Container(
-                constraints: const BoxConstraints(maxHeight: 240),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.white24),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: ListView.builder(
-                  controller: _chatScroll,
-                  padding: const EdgeInsets.all(8),
-                  itemCount: _chat.length,
-                  itemBuilder: (_, i) {
-                    final m = _chat[i];
-                    final own = m.userId == _session!.userId;
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Text.rich(
-                        TextSpan(
-                          style: const TextStyle(fontSize: 13),
-                          children: [
-                            TextSpan(
-                              text: '${m.username}: ',
-                              style: TextStyle(
-                                color: own
-                                    ? Colors.deepPurpleAccent
-                                    : Colors.white70,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            TextSpan(
-                              text: m.text,
-                              style: const TextStyle(color: Colors.white),
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-              const SizedBox(height: 8),
-              Row(
+          ),
+          if (_joinedChannelId != null) ...[
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
                 children: [
                   Expanded(
                     child: TextField(
                       controller: _chatInput,
-                      enabled: _joinedChannelId != null,
                       onSubmitted: (_) => _sendChat(),
                       decoration: const InputDecoration(
                         labelText: 'Message',
                         isDense: true,
+                        border: OutlineInputBorder(),
                       ),
                     ),
                   ),
                   const SizedBox(width: 8),
-                  ElevatedButton(
-                    onPressed: _joinedChannelId == null ? null : _sendChat,
-                    child: const Text('Send'),
-                  ),
+                  ElevatedButton(onPressed: _sendChat, child: const Text('Send')),
                 ],
               ),
-            ],
+            ),
           ],
         ],
       ),
+    );
+  }
+
+  // --- share pane (right side): an invitation until "Watch".
+
+  Widget _sharePane(ThemeData theme) {
+    final watching =
+        _watching != null && _videos.containsKey(_watching) ? _watching : null;
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF0B0B0D),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: watching == null
+          ? _shareInvitations(theme)
+          : _shareView(theme, watching),
+    );
+  }
+
+  Widget _shareInvitations(ThemeData theme) {
+    final ids = _videos.keys.toList()
+      ..sort((a, b) => _nameOf(a).compareTo(_nameOf(b)));
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        const Text(
+          'Screens',
+          style: TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+        const SizedBox(height: 8),
+        for (final id in ids) _shareCard(theme, id),
+      ],
+    );
+  }
+
+  Widget _shareCard(ThemeData theme, int userId) {
+    final v = _videos[userId]!;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.screen_share, color: Colors.deepPurpleAccent),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${_nameOf(userId)} is sharing',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  '${v.$2}×${v.$3}',
+                  style: const TextStyle(color: Colors.white38, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          FilledButton.tonal(
+            onPressed: () => setState(() => _watching = userId),
+            child: const Text('Watch'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _shareView(ThemeData theme, int userId) {
+    final v = _videos[userId]!;
+    final texture = Texture(textureId: v.$1);
+    return Column(
+      children: [
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Center(
+              child: AspectRatio(
+                aspectRatio: v.$2 / v.$3,
+                child: texture,
+              ),
+            ),
+          ),
+        ),
+        const Divider(height: 1),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${_nameOf(userId)} · ${v.$2}×${v.$3}',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Fullscreen',
+                icon: const Icon(Icons.fullscreen, size: 20),
+                onPressed: () => setState(() => _fullscreen = userId),
+              ),
+              IconButton(
+                tooltip: 'Stop watching',
+                icon: const Icon(Icons.visibility_off, size: 20),
+                onPressed: () => setState(() => _watching = null),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _fullscreenLayer(int userId) {
+    final v = _videos[userId]!;
+    void close() => setState(() => _fullscreen = null);
+    return Positioned.fill(
+      child: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.escape): close,
+        },
+        child: Focus(
+          autofocus: true,
+          child: Container(
+            color: Colors.black,
+            child: Stack(
+              children: [
+                Center(
+                  child: AspectRatio(
+                    aspectRatio: v.$2 / v.$3,
+                    child: Texture(textureId: v.$1),
+                  ),
+                ),
+                Positioned(
+                  top: 8,
+                  right: 8,
+                  child: IconButton.filledTonal(
+                    tooltip: 'Close (Esc)',
+                    icon: const Icon(Icons.close),
+                    onPressed: close,
+                  ),
+                ),
+                Positioned(
+                  left: 16,
+                  bottom: 12,
+                  child: Text(
+                    '${_nameOf(userId)} · ${v.$2}×${v.$3} · Esc to close',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // --- floating bottom bar: share + hardware encode.
+
+  Widget _actionBar(ThemeData theme) {
+    final canShare = _joinedChannelId != null && !_connecting;
+    return Material(
+      elevation: 10,
+      color: theme.colorScheme.surfaceContainerHigh,
+      shape: const StadiumBorder(),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextButton.icon(
+              onPressed: canShare
+                  ? (_sharing ? _stopShare : _startShare)
+                  : null,
+              icon: Icon(
+                _sharing ? Icons.stop_screen_share : Icons.screen_share,
+                size: 20,
+              ),
+              label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
+            ),
+            if (_hwEncodeSupported) ...[
+              Container(
+                width: 1,
+                height: 24,
+                color: Colors.white.withValues(alpha: 0.12),
+              ),
+              const SizedBox(width: 6),
+              const Text('HW', style: TextStyle(fontSize: 12)),
+              Switch(
+                value: _hwEncode,
+                onChanged: (v) async {
+                  final now = await setHwEncode(enable: v);
+                  setState(() => _hwEncode = now);
+                  _status = v
+                      ? 'hw encode: ON (next share; if the GPU wedges, this is why)'
+                      : 'hw encode: off (software)';
+                },
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Disconnected state: the only thing on screen. Once a session is up
+/// this whole view (fields + Connect) goes away; the AppBar keeps the
+/// account and a Disconnect action.
+class _LoginView extends StatelessWidget {
+  const _LoginView({
+    required this.server,
+    required this.user,
+    required this.password,
+    required this.connecting,
+    required this.status,
+    required this.onConnect,
+  });
+
+  final TextEditingController server;
+  final TextEditingController user;
+  final TextEditingController password;
+  final bool connecting;
+  final String status;
+  final VoidCallback onConnect;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 380),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Sign in',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: server,
+                decoration: const InputDecoration(labelText: 'Server (IP:port)'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: user,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(labelText: 'Username'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: password,
+                obscureText: true,
+                onSubmitted: (_) => onConnect(),
+                decoration: const InputDecoration(labelText: 'Password'),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: connecting ? null : onConnect,
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                child: Text(connecting ? 'Connecting…' : 'Connect'),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                status,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Small status chip (the "sharing" indicator in the header strip).
+class _Pill extends StatelessWidget {
+  const _Pill({required this.text, required this.color});
+
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Text(text, style: TextStyle(color: color, fontSize: 11)),
     );
   }
 }

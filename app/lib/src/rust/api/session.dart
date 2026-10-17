@@ -84,6 +84,15 @@ Future<void> fetchHistory({
 Future<void> requestPresence({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionRequestPresence(sessionId: sessionId);
 
+/// Request the voice-membership snapshot (response: "voice_states"
+/// event): every user currently in a voice channel, with its channel
+/// id. The UI uses it for the per-channel roster; joins/leaves that
+/// happen while connected arrive as individual "voice_state" events.
+Future<void> requestVoiceStates({required int sessionId}) => RustLib
+    .instance
+    .api
+    .crateApiSessionRequestVoiceStates(sessionId: sessionId);
+
 /// Toggle hardware (VAAPI) encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
 /// re-share to switch. Returns the new state. Featureless: no-op stub

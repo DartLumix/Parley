@@ -8,7 +8,7 @@ import '../../lib.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `consumer_loop`, `create_texture`, `prepare`, `rgb24_to_rgba`
+// These functions are ignored because they are not marked as `pub`: `consumer_loop`, `create_texture`, `new`, `prepare`, `put_frame`, `rgb24_to_rgba_into`, `rgb24_to_rgba`, `take_buffer`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `FrameProvider`, `SenderView`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `drop`, `get_payload`
 

@@ -58,7 +58,7 @@ use parley_proto::VideoReport;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
     Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
-    ServerBody, ServerMessage, PROTOCOL_VERSION,
+    ServerBody, ServerMessage, VoiceStatesRequest, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -134,6 +134,12 @@ pub(crate) enum Command {
         before_message_id: u64,
     },
     Presence,
+    /// Voice-membership snapshot ("voice_states" event). VoiceState
+    /// broadcasts cover every join/leave that happens while we are
+    /// connected, but a peer already sitting in a channel before we
+    /// connect is invisible until this snapshot arrives — the UI's
+    /// per-channel roster needs it once at connect.
+    VoiceStates,
     /// 7e2 (4d): our loss report — one aggregate worst-peer permille,
     /// sent every 5 s in speech channels. reporter_id: 0 — the server
     /// stamps the authenticated id and routes the report to the other
@@ -176,6 +182,7 @@ impl Command {
                 before_message_id,
             }),
             Command::Presence => ClientBody::PresenceRequest(PresenceRequest {}),
+            Command::VoiceStates => ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
             #[cfg(feature = "audio-device")]
             Command::ReceiverReport { gap_rate_permille } => {
                 ClientBody::ReceiverReport(ReceiverReport {
@@ -1106,6 +1113,15 @@ pub fn fetch_history(
 pub fn request_presence(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::Presence)
 }
+
+/// Request the voice-membership snapshot (response: "voice_states"
+/// event): every user currently in a voice channel, with its channel
+/// id. The UI uses it for the per-channel roster; joins/leaves that
+/// happen while connected arrive as individual "voice_state" events.
+pub fn request_voice_states(session_id: u32) -> Result<(), String> {
+    send_command(session_id, Command::VoiceStates)
+}
+
 // ===== 7g: in-app screen share =====
 //
 // The Dart side calls start_screen_share after joining a channel; the
