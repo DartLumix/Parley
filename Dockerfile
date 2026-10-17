@@ -15,6 +15,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ---- Stage 3: compile dependencies, then the code ----
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
+# The vendored crate is a `[patch.crates-io]` target, and cargo-chef's recipe
+# only carries workspace members: without this copy `cook` resolves /app/Cargo.toml
+# against a `vendor/moq-vaapi` that does not exist yet and dies on the patch.
+# Copied before cook (not just with `COPY . .` below) so the patch is valid at
+# dependency-resolution time; it only invalidates this layer when vendor changes.
+COPY vendor/ vendor/
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl -p parley-server
