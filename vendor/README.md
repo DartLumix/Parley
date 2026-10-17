@@ -32,15 +32,19 @@ negative control = the same bytes with SPS/PPS stripped, which must fail:
 
 | profile | standalone-decodable keyframes | encode rate through our path |
 |:--|:--|:--|
-| 1280x720 @ 60 | yes (SPS+PPS in-band) | 96.5 fps |
+| 1280x720 @ 60 | yes (SPS+PPS in-band) | 98 fps |
 | 1920x1080 @ 60 | yes | 47.8 fps |
-| 2560x1440 @ 60 | yes | 29.5 fps |
+| 2560x1440 @ 60 | yes | 29.1 fps |
 
 For reference, `ffmpeg -c:v h264_vaapi` on the same GPU and kernel
 (`7.3.0-rc4-1-cachyos-rc`) encodes 720p at ~114 fps, 1080p at ~55, 1440p at
 ~31 — so the driver's own ceiling at 1080p is ~55 fps, and the crate's path
-is within ~15% of it after the fixes in `parley-core` (parallel BGRA→NV12,
-reused repack/NV12 buffers).
+is within ~10% of it. **The encoder is the ceiling, not the pixel conversion:**
+removing the CPU BGRA→NV12 loop (patch 3) and its row repack left the rates
+where they were, because upload + VPP now costs about what the parallel
+conversion did (~1.4 / 3.2 / 3.9 ms per frame at 720p / 1080p / 1440p against
+a 9 / 20 / 33 ms driver encode). What it buys is CPU: the capture thread no
+longer touches a pixel, and nothing is allocated per frame.
 
 Consequence for Parley, now that it holds: **the profile rate is measured,
 not assumed.** `create_encoder_auto` times the real strided encode path at
@@ -75,6 +79,16 @@ network.
    Keep the two in lockstep: `FRAME_NUM_LIMIT` and the SPS builder are one
    setting spelled twice.
 
+3. **Packed-RGB input converted on the GPU** (`encode_bgra`, `make_rgb_surface`,
+   `upload_bgrx`): a packed BGRA/BGRX frame is uploaded into a BGRX surface at
+   the producer's own row pitch (no repack) and the video processor blits it
+   into the encoder's NV12, converting and scaling. Before this, every frame
+   went through a CPU BT.601 loop (parallel, ~1.4–5.5 ms/frame) and a strided
+   repack on top. Verified by `crates/parley-core/tests/vaapi_bgra_path.rs`:
+   a red frame decodes red (R≈233, G/B≈0) and a padded-stride frame decodes
+   byte-identically to the tight one, which is the check that catches a stopped
+   row-pitch walk (a sheared picture).
+
 Upstream: both are worth reporting to moq-dev/vaapi (the packed-header
 request is advertised by the driver and then not honoured; and the slice
 syntax a driver writes is not discoverable from outside, which is why the
@@ -83,7 +97,7 @@ fix has to live inside `encode_surface`/`build_sps_pps`).
 ## Keeping it in sync
 
 When bumping `moq-vaapi`, diff the new release against this copy, re-apply
-both patches, and re-run:
+all three patches, and re-run:
 
 ```sh
 # driver half: does this machine encode H.264, do its IRAPs stand alone?
@@ -94,6 +108,10 @@ tools/hw-probe.sh --encode h264
 # keyframes, throughput, adaptive rate)
 PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
     --test vaapi_keyframe_shape -- --nocapture --test-threads=1
+
+# the BGRA path's correctness: color comes out right, row pitch is honored
+PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
+    --test vaapi_bgra_path -- --nocapture --test-threads=1
 
 # where the time goes, if a profile is slower than the driver allows
 PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \

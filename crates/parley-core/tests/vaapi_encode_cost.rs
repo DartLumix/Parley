@@ -2,12 +2,17 @@
 
 //! 7h HD: where does the VAAPI encode path spend its time?
 //!
-//! The HD sweep measured 30 fps at 720p, 15 at 1080p, 8.6 at 1440p —
-//! i.e. cost scaling with pixels, not a frame-rate cap. The two
-//! candidates are the CPU BGRA→NV12 conversion (scalar, per pixel) and
-//! the driver's own encode. This test separates them, because the fix
-//! is completely different for each: a conversion fix is a loop, a
-//! driver fix is a DMA-BUF path.
+//! Historical: the HD sweep once measured 30 fps at 720p, 15 at 1080p,
+//! 8.6 at 1440p, so this test separated the CPU BGRA→NV12 conversion
+//! from the driver's own encode — a conversion fix is a loop, a driver
+//! fix is a DMA-BUF path.
+//!
+//! 7i removed the CPU conversion entirely (the crate uploads packed
+//! BGRA and the video processor converts), so the first half below is
+//! now a REFERENCE number, not a cost the share pays: it says what the
+//! old loop would have cost. The second half is the real path. Compare
+//! it with the profile rate the encoder measured — the gap to that
+//! number is upload + VPP, and the rest is the driver.
 //!
 //! Run: cargo test --release -p parley-core --features vaapi \
 //!        --test vaapi_encode_cost -- --nocapture --test-threads=1
@@ -60,7 +65,7 @@ fn conversion_and_encode_cost_per_profile() {
             sink / n
         );
 
-        // Half 2: the whole encoder (conversion + upload + driver),
+        // Half 2: the whole encoder (upload + VPP conversion + driver),
         // only when a VAAPI node is asked for — this half can wedge a
         // GPU whose VCE is broken, which is the whole reason the
         // hardware path is opt-in.
@@ -88,14 +93,19 @@ fn conversion_and_encode_cost_per_profile() {
                 bytes += out.len();
             }
             let total = started.elapsed().as_secs_f64();
+            let measured = parley_core::video::hardware_measured_fps().unwrap_or(0.0);
             println!(
-                "  {w}x{h}: full encode {:.2} ms/frame → {:.1} fps (hardware={}), driver half \
-                 ≈ {:.2} ms/frame, {} B/frame out",
+                "  {w}x{h}: full path {:.2} ms/frame → {:.1} fps (hardware={}), {} B/frame out; \
+                 driver measured {measured:.1} fps, so upload+VPP ≈ {:.2} ms/frame",
                 total * 1000.0 / n as f64,
                 n as f64 / total,
                 parley_core::video::hardware_encoder_active(),
-                (total - conv) * 1000.0 / n as f64,
-                bytes / n
+                bytes / n,
+                if measured > 0.0 {
+                    (total / n as f64 - 1.0 / measured as f64) * 1000.0
+                } else {
+                    0.0
+                }
             );
             println!(
                 "  {w}x{h}: profile advertised rate = {:.1} fps (measured {:?})",

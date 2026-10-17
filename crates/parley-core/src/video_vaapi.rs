@@ -11,11 +11,18 @@
 //! no userspace fallback can survive — that risk is what the flag
 //! accepts, knowingly, on non-polaris hardware.
 //!
-//! Input contract: same BGRA bytes the software path takes (tight, no
-//! stride). Conversion BGRA→NV12 (BT.601 limited, matching what a
-//! default pipeline assumes for unlabelled SD/HD) runs on the CPU here
-//! — the upload is the only DMA to the encoder surface. A zero-copy
-//! DMA-BUF path from PipeWire is the future step once this is proven.
+//! Input contract: same BGRA bytes the software path takes, packed rows
+//! with a caller-supplied stride. There is no CPU color conversion on this
+//! path: the BGRA rows are uploaded into a packed-RGB surface with the
+//! producer's own pitch and the VA-API video processor converts them to
+//! NV12 in the encoder's color space (7i). The previous code converted on
+//! the CPU, which cost 12 ms of a 1080p frame's budget — more than the
+//! encode itself.
+//!
+//! A zero-copy DMA-BUF path (PipeWire handing us the compositor's buffer
+//! instead of a memfd) is the next step; it needs the capture side to hold
+//! the producer's buffer until the GPU has read it, which is a thread-model
+//! change, not an encoder change.
 
 use moq_vaapi::encode::{Config as VaConfig, Encoder as VaEncoder};
 
@@ -168,13 +175,6 @@ pub struct VaapiEncoder {
     width: usize,
     height: usize,
     current_bitrate: u32,
-    /// Reused NV12 staging buffer (one alloc, reused per frame).
-    nv12: Vec<u8>,
-    /// 7h: reused BGRA repack buffer for strided input (PipeWire hands
-    /// us row-padded rows; the VA-API upload wants tight NV12, so the
-    /// rows are packed first — into this buffer, not a fresh Vec per
-    /// frame).
-    packed: Vec<u8>,
     /// force_keyframe latched here; the next encode passes it to
     /// moq-vaapi (its `keyframe` argument drives the IDR).
     pending_idr: bool,
@@ -229,8 +229,6 @@ impl VaapiEncoder {
             width,
             height,
             current_bitrate: bitrate,
-            nv12: Vec::new(),
-            packed: Vec::new(),
             pending_idr: false,
         })
     }
@@ -259,23 +257,16 @@ impl VideoEncoder for VaapiEncoder {
     }
 
     fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error> {
-        // The Vec is MOVED out (not copied) because `encode_nv12`
-        // borrows the buffer while `self.enc()` borrows self; its
-        // allocation is reused every frame — the conversion writes into
-        // it in place, so the hot path allocates nothing.
-        let mut nv12 = std::mem::take(&mut self.nv12);
-        if let Err(e) = bgra_to_nv12_into(bgra, self.width, self.height, &mut nv12) {
-            self.nv12 = nv12;
-            return Err(e);
-        }
+        // 7i: no CPU conversion and no repack — the crate uploads packed
+        // BGRA rows straight into a BGRX surface (honoring the pitch) and
+        // the video processor produces the NV12 the encoder consumes.
         let idr = self.pending_idr;
         self.pending_idr = false;
-        let result = self
+        let (width, height) = (self.width, self.height);
+        let annexb = self
             .enc()
-            .encode_nv12(&nv12, idr)
-            .map_err(|e| Error::Codec(format!("vaapi encode: {e:#}")));
-        self.nv12 = nv12;
-        let annexb = result?;
+            .encode_bgra(bgra, width as u32, height as u32, width * 4, idr)
+            .map_err(|e| Error::Codec(format!("vaapi encode: {e:#}")))?;
         // moq-vaapi doesn't report the frame type back; the ladder's
         // IDR bookkeeping only needs "was this one forced". The first
         // frame of a fresh encoder is an IDR by construction; report
@@ -285,16 +276,13 @@ impl VideoEncoder for VaapiEncoder {
         Ok((annexb, idr))
     }
 
-    /// 7g strided input: repack into the REUSED buffer, then convert
-    /// (the VA-API upload wants tight NV12 anyway; the zero-copy DMA-BUF
-    /// path is a later optimization).
+    /// 7g strided input: rows are uploaded with their own pitch — the
+    /// producer's stride is exactly what the driver's image plane takes,
+    /// so there is no repack step at all (7i).
     ///
-    /// 7h HD: `strided_fallback` allocated a fresh `width*height*4` Vec
-    /// per frame — 8 MB at 1080p, on the share thread, every frame —
-    /// which at 60 fps is half a GB a second of allocator traffic for a
-    /// buffer whose lifetime is one function call. A tight frame (the
-    /// strided-buffer case a caller reaches when it already packed) skips
-    /// the repack entirely.
+    /// 7h HD: this used to allocate a fresh `width*height*4` Vec per frame
+    /// to repack rows (8 MB at 1080p, half a GB a second at 60 fps); the
+    /// pitch-aware upload removed both the allocation and the copy.
     fn encode_bgra_strided(
         &mut self,
         bgra: &[u8],
@@ -308,36 +296,15 @@ impl VideoEncoder for VaapiEncoder {
             // self.width/height and never mismatches.
             return crate::video::strided_fallback(self, bgra, width, height, stride, out);
         }
-        let (bytes, keyframe) = if stride == width * 4 {
-            self.encode_bgra(bgra)?
-        } else {
-            let mut packed = std::mem::take(&mut self.packed);
-            let packed_ok = {
-                packed.clear();
-                packed.reserve(width * height * 4);
-                let mut ok = true;
-                for y in 0..height {
-                    match bgra.get(y * stride..y * stride + width * 4) {
-                        Some(row) => packed.extend_from_slice(row),
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                ok
-            };
-            if !packed_ok {
-                self.packed = packed;
-                return Err(Error::Codec("strided frame truncated".into()));
-            }
-            let res = self.encode_bgra(&packed);
-            self.packed = packed;
-            res?
-        };
+        let idr = self.pending_idr;
+        self.pending_idr = false;
+        let bytes = self
+            .enc()
+            .encode_bgra(bgra, width as u32, height as u32, stride, idr)
+            .map_err(|e| Error::Codec(format!("vaapi encode: {e:#}")))?;
         out.clear();
         out.extend_from_slice(&bytes);
-        Ok(keyframe)
+        Ok(idr)
     }
 
     fn force_keyframe(&mut self) {

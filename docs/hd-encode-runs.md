@@ -98,12 +98,18 @@ cd ~/Documents/Parley
 PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
     --test vaapi_keyframe_shape -- --nocapture --test-threads=1
 
-# 1b. conversion vs driver cost per profile (tells a slow GPU from a slow
+# 1b. the BGRA path's correctness — color and row pitch (7i: the conversion
+#     is on the GPU now; this is the test that catches a stopped row walk or
+#     a swapped channel order, which the keyframe checks cannot see)
+PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
+    --test vaapi_bgra_path -- --nocapture --test-threads=1
+
+# 1c. conversion vs driver cost per profile (tells a slow GPU from a slow
 #     conversion; useful on B, whose CPU is not known either)
 PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
     --test vaapi_encode_cost -- --nocapture --test-threads=1
 
-# 1c. the vendored crate's own per-frame cost (bitrate/rate variations, to
+# 1d. the vendored crate's own per-frame cost (bitrate/rate variations, to
 #     separate coded-buffer cost from encode cost)
 PARLEY_VAAPI=1 cargo test --release -p parley-core --features vaapi \
     --test vaapi_crate_cost -- --nocapture --test-threads=1
@@ -123,10 +129,12 @@ done
 Machine A's expected output (2026-10-09):
 
 ```
-hd 1280x720:  120 frames in 1.24 s → 96.5 fps
+hd 1280x720:  120 frames in 1.22 s → 98.0 fps
 hd 1920x1080: 120 frames in 2.51 s → 47.8 fps
-hd 2560x1440: 120 frames in 4.07 s → 29.5 fps
+hd 2560x1440: 120 frames in 4.12 s → 29.1 fps
 each profile: keyframe t=0 and t=60 stand alone; every keyframe carries SPS+PPS
+red frame decodes to R=233.0 G=0.0 B=2.0
+tight vs padded stride: mean |Δ| = 0.000 per channel byte
 negative control: stripped keyframe correctly rejected (Native:16)
 ```
 
