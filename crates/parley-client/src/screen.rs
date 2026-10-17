@@ -400,8 +400,18 @@ fn pw_thread(
             #[cfg(feature = "vaapi")]
             if let Some(share) = user_data.inline.as_mut() {
                 let (drm_format, modifier, width, height) = dmabuf_state;
-                if !share.due() {
-                    return;
+                // Pace by waiting, holding the producer's buffer (see
+                // `wait_for_slot`). A frame that is more than one interval
+                // late means the encoder cannot keep up: drop it rather than
+                // stack latency, which is what the memfd path's
+                // skip-to-newest does on the other side of its channel.
+                let wait = share.wait_for_slot();
+                if !wait.is_zero() {
+                    if wait < share.interval() {
+                        std::thread::sleep(wait);
+                    } else {
+                        return;
+                    }
                 }
                 if data.type_() == spa::buffer::DataType::DmaBuf {
                     // A dupped descriptor is what the encoder takes; the
@@ -790,12 +800,19 @@ impl ShareEncoder {
         Duration::from_nanos((1_000_000_000.0 / paced_fps(self.fps)) as u64)
     }
 
-    /// Is a frame due now? The memfd path sleeps to the interval; the
-    /// DMA-BUF path cannot queue the producer's buffer, so it drops the
-    /// early frame instead.
+    /// How long until the next frame is due (zero when it already is).
+    ///
+    /// The DMA-BUF path sleeps this out while still holding the producer's
+    /// buffer — holding it is exactly the backpressure PipeWire expects, and
+    /// dropping instead costs frames the source did send (measured: 24.7 of a
+    /// 30 fps source when every early frame was dropped).
     #[cfg(feature = "vaapi")]
-    fn due(&mut self) -> bool {
-        !matches!(self.last_encode, Some(t) if t.elapsed() < self.interval())
+    fn wait_for_slot(&mut self) -> Duration {
+        let interval = self.interval();
+        match self.last_encode {
+            Some(t) => interval.saturating_sub(t.elapsed()),
+            None => Duration::ZERO,
+        }
     }
 
     fn note_stale(&mut self) {
