@@ -45,7 +45,7 @@ Voice is the product; everything else grows later.
 | 7e2 | 4d loss ladder in the app — receiver reports + two-profile send controller | ✅ |
 | 7f | Video receive — VideoReceiveHub → Flutter texture bridge | ✅ |
 | 7g | Screen-share send — portal capture + encode through the bridge | ✅ |
-| 7j | Zero-copy capture — compositor DMA-BUF straight into the encoder | ⏳ |
+| 7j | Zero-copy capture — compositor DMA-BUF straight into the encoder | ✅ |
 | 7+ | Android / Windows / iOS bring-up, file transfer | ⏳ |
 
 ---
@@ -215,17 +215,20 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       `video`; the Rust side is parley-client's screen module, the same one the CLI
       uses). Verified by build + clippy with `audio-device,video,screen-capture,hw-encode`;
       the on-screen run is step 3 of [docs/hd-encode-runs.md](docs/hd-encode-runs.md)
-- [ ] 7j Zero-copy capture — `--dmabuf` asks for the compositor's own buffers
+- [x] 7j Zero-copy capture — `--dmabuf` asks for the compositor's own buffers
       (a `Buffers` param whose memory-type mask is `1 << SPA_DATA_DmaBuf`, plus the
       format's modifier property) and imports the descriptor into the VAAPI encoder,
       so no pixel crosses the CPU. The producer's buffer is only guaranteed until
       the process callback returns, so this path encodes ON the capture thread
       (the memfd path keeps its channel and encoder thread). The encoder half is
       verified by `tests/vaapi_dmabuf_input.rs` (an exported VA surface encodes to
-      its own picture); **the capture half has not run against a real compositor
-      yet** — it needs the portal picker, so it is opt-in and the memfd path stays
-      the default. The missing part is a `dma-buf` line in the sender's log and a
-      live share
+      its own picture), and the capture half verified live against
+      xdg-desktop-portal-hyprland: `negotiated 1920x1080 BGRA @ 30 fps (dma-buf,
+      modifier 0xffffffffffffff)`, sender at 24.7 fps, viewer at `243 decoded,
+      0 no-picture, 0 decode errors`. Still opt-in — the memfd path is the
+      default, and the offer's format/modifier list has to match the producer
+      (LINEAR alone fails against a portal that only speaks `MOD_INVALID`;
+      the transcript is in docs/hd-encode-runs.md)
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
 

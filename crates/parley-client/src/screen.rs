@@ -328,9 +328,16 @@ fn pw_thread(
             };
             #[cfg(feature = "vaapi")]
             if user_data.inline.is_some() {
-                // DRM names the packed word, so BGRx in memory is
-                // DRM_FORMAT_XRGB8888 ("XR24").
-                user_data.drm_format = u32::from_le_bytes(*b"XR24");
+                // DRM names the packed word, so the byte order decides:
+                // BGRA in memory is DRM_FORMAT_ARGB8888 ("AR24"), BGRx is
+                // DRM_FORMAT_XRGB8888 ("XR24"). Getting this wrong feeds
+                // the importer a format whose channel order is not the
+                // buffer's.
+                user_data.drm_format = if bgra {
+                    u32::from_le_bytes(*b"AR24")
+                } else {
+                    u32::from_le_bytes(*b"XR24")
+                };
                 user_data.modifier = user_data.format.modifier();
                 let (w, h) = (user_data.width, user_data.height);
                 println!(
@@ -516,12 +523,17 @@ fn pw_thread(
                 Id,
                 spa::param::format::MediaSubtype::Raw
             ),
+            // BGRA is the default because that is what the DMA-BUF
+            // producers offer first (xdg-desktop-portal-hyprland offers
+            // BGRA alone under a modifier, BGRx only without one); the
+            // alpha is ignored by the encoder.
             spa::pod::property!(
                 spa::param::format::FormatProperties::VideoFormat,
                 Choice,
                 Enum,
                 Id,
-                spa::param::video::VideoFormat::BGRx,
+                spa::param::video::VideoFormat::BGRA,
+                spa::param::video::VideoFormat::BGRA,
                 spa::param::video::VideoFormat::BGRx
             ),
             spa::pod::property!(
@@ -679,9 +691,17 @@ fn pw_thread(
     println!("share: pipewire stream disconnected");
 }
 
-/// The `VideoModifier` property of a DMA-BUF format offer: MANDATORY, with
-/// `DRM_FORMAT_MOD_LINEAR` as both the default and the only alternative —
-/// linear memory is the one tiling every importer can address.
+/// The `VideoModifier` property of a DMA-BUF format offer: MANDATORY, and
+/// offering the two tilings that are always importable —
+/// [`DRM_FORMAT_MOD_INVALID`](0x00ffffffffffffff), which is what a portal
+/// advertises for its own buffers (xdg-desktop-portal-hyprland offers
+/// exactly this and nothing else), and `DRM_FORMAT_MOD_LINEAR` (0), which
+/// is what a compositor allocating through GBM picks.
+///
+/// This must match the producer's advertisements: offering LINEAR alone
+/// against a portal that only speaks `INVALID` fails the negotiation
+/// outright — `pw stream ... Error("no more input formats")`, measured
+/// against xdg-desktop-portal-hyprland.
 ///
 /// Built by hand because the `object!`/`property!` macros have no arm for a
 /// numeric choice in this version of libspa (`Choice, Enum, Long, ..` looks
@@ -690,14 +710,16 @@ fn pw_thread(
 fn modifier_property() -> spa::pod::Property {
     use spa::pod::{ChoiceValue, PropertyFlags, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+    const MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
+    const MOD_LINEAR: i64 = 0;
     spa::pod::Property {
         key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
         flags: PropertyFlags::MANDATORY,
         value: Value::Choice(ChoiceValue::Long(Choice::<i64>(
             ChoiceFlags::empty(),
             ChoiceEnum::<i64>::Enum {
-                default: 0, // DRM_FORMAT_MOD_LINEAR
-                alternatives: vec![0],
+                default: MOD_INVALID,
+                alternatives: vec![MOD_INVALID, MOD_LINEAR],
             },
         ))),
     }
@@ -1672,8 +1694,19 @@ mod dmabuf_negotiation_tests {
                     default,
                     alternatives,
                 } => {
-                    assert_eq!(default, 0, "the offered modifier must be LINEAR");
-                    assert_eq!(alternatives, vec![0], "LINEAR must be the only offer");
+                    // INVALID is what xdg-desktop-portal-hyprland offers for
+                    // its own buffers; LINEAR is what a GBM allocator picks.
+                    // An offer that cannot match the producer's own list
+                    // fails negotiation with "no more input formats".
+                    assert_eq!(
+                        default, 0x00ff_ffff_ffff_ffff,
+                        "the default modifier must be DRM_FORMAT_MOD_INVALID"
+                    );
+                    assert_eq!(
+                        alternatives,
+                        vec![0x00ff_ffff_ffff_ffff, 0],
+                        "INVALID and LINEAR are the two importable tilings"
+                    );
                 }
                 other => panic!("the modifier must be an enum choice, got {other:?}"),
             },

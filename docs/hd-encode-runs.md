@@ -194,6 +194,13 @@ exercised: swap the roles and repeat.
 
 ### Step 2b — zero-copy capture, if the compositor offers DMA-BUFs (7j)
 
+> Verified once end to end on Machine A (Hyprland, xdg-desktop-portal-hyprland
+> 0.1, self-view on the same box): negotiation, import, encode, transport and
+> decode all ran, with the sender at ~24.7 fps of a 30 fps source and the
+> viewer at `243 decoded, 0 no-picture, 0 decode errors`. The transcript is at
+> the end of this section — re-run it after a compositor upgrade, since the
+> offer has to match the producer's format list exactly.
+
 Same run with two extra flags on the sender (build it with `vaapi` too):
 
 ```sh
@@ -214,6 +221,34 @@ What changes, and how to tell it apart from the memfd path:
   viewer stats. What to check is that `decoded` still climbs and the encode
   rate is within a frame of the memfd run — the point is where the work runs,
   not how fast it is (the driver is the ceiling either way).
+
+What a passing run looks like (Hyprland / xdg-desktop-portal-hyprland,
+1920x1080 monitor, hardware encode on an RX 590):
+
+```
+sender:  share: pw stream Connecting -> Paused
+sender:  share: negotiated 1920x1080 BGRA @ 30 fps (dma-buf, modifier 0xffffffffffffff)
+sender:  video: hardware (VAAPI) encoder selected — 1920x1080, measured 50.6 fps sustained
+             (pacing at 51), 9486187 bps, keyframe self-test passed ...
+sender:  share: encoder ready (1920x1080, source 30 fps → paced 30 fps, clean rung 5625000 bps); hardware=true
+sender:  share: pw stream Paused -> Streaming
+sender:  share: encoded 247 frames (24.7 fps), 0 stale skipped
+viewer:  video: user 14 sharing 1920x1080 @ 30 fps
+viewer:  video: user 14: 234 shown (243 decoded, 0 no-picture, 0 decode errors), 0 dropped, 14 skipped, 0 shed
+```
+
+The failure this step was written against, and why the modifier list is what
+it is: offering `DRM_FORMAT_MOD_LINEAR` alone ended the negotiation with
+
+```
+share: pw stream Paused -> Error("no more input formats")
+```
+
+against a portal whose own format list is `BGRA` under
+`DRM_FORMAT_MOD_INVALID` (`0x00ffffffffffffff`, which `pw-dump` prints for the
+screencast node) plus `BGRA`/`BGRx` with no modifier at all. The offer now
+carries INVALID and LINEAR, and BGRA is the default format, so both the
+portal's DMA-BUF entry and a GBM-style linear producer can match.
 
 ## Step 3 — the Flutter app (the path users actually run)
 
