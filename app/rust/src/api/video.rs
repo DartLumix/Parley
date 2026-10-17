@@ -551,4 +551,35 @@ pub mod imp {
             .map_err(|e| format!("texture creation: {e}"))?;
         Ok((sendable, provider, id))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// What a raster pull sees is the slot, and the slot must never
+        /// go empty: the regression this guards against emptied it to
+        /// recycle the buffer, so a pull during the conversion answered
+        /// 1x1 black — the shared screen flashing black for one frame.
+        #[test]
+        fn payload_is_never_empty_while_converting() {
+            let provider = FrameProvider::new(4, 2, vec![7u8; 32]);
+            let seeded = provider.get_payload();
+            assert_eq!((seeded.get().width, seeded.get().height), (4, 2));
+
+            // The producer takes its conversion buffer; the last frame
+            // must still be on offer meanwhile.
+            let _spare = provider.take_buffer();
+            let during = provider.get_payload();
+            assert_eq!((during.get().width, during.get().height), (4, 2));
+            assert_eq!(during.get().data, &[7u8; 32][..]);
+
+            // Publishing swaps the buffers and hands the replaced one
+            // back for the next conversion.
+            provider.put_frame(4, 2, vec![9u8; 32]);
+            let after = provider.get_payload();
+            assert_eq!(after.get().data, &[9u8; 32][..]);
+            assert_eq!(provider.take_buffer(), vec![7u8; 32]);
+            assert_eq!(EMPTY_PULLS.load(Ordering::Relaxed), 0);
+        }
+    }
 }
