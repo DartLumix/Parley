@@ -80,6 +80,10 @@ struct Args {
     /// this WEDGES THE GPU — the flag exists for capable machines (the
     /// laptop's iGPU) and for re-testing after kernel/mesa updates.
     hw_encode: bool,
+    /// 7j: capture the compositor's DMA-BUF instead of a mapped copy.
+    /// Implies --hw-encode (a software encoder has nothing to import
+    /// into) and is refused outright if either is unavailable.
+    dmabuf: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -91,7 +95,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut measure, mut report, mut noaec, mut music) = (false, false, false, false);
     let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
-    let (mut share, mut share_audio, mut hw_encode) = (false, false, false);
+    let (mut share, mut share_audio, mut hw_encode, mut dmabuf) = (false, false, false, false);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--server" => server = it.next(),
@@ -117,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
             "--share" => share = true,
             "--share-audio" => share_audio = true,
             "--hw-encode" => hw_encode = true,
+            "--dmabuf" => dmabuf = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -147,6 +152,7 @@ fn parse_args() -> Result<Args, String> {
         share,
         share_audio,
         hw_encode,
+        dmabuf,
     })
 }
 
@@ -207,6 +213,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "video"))]
     if args.hw_encode {
         eprintln!("--hw-encode ignored: built without the video feature");
+    }
+    // 7j: DMA-BUF capture is a hardware-only path, so the flag implies the
+    // hardware preference (and refuses before the portal opens if this
+    // build cannot do it at all).
+    #[cfg(feature = "vaapi")]
+    if args.dmabuf {
+        parley_core::video::prefer_hw_encode();
+        eprintln!(
+            "dmabuf: capturing the compositor's own buffers; the share fails rather than \
+             falling back to software if the encoder cannot import them"
+        );
+    }
+    #[cfg(not(feature = "vaapi"))]
+    if args.dmabuf {
+        return Err("--dmabuf needs a build with the vaapi feature".into());
     }
 
     // --- connect (TOFU) ---
@@ -1074,7 +1095,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                                 } else {
                                                                                     (None, None)
                                                                                 };
-                                        match screen::start(conn, vloss, events.clone(), sys_tx).await {
+                                        match screen::start(
+                                            conn,
+                                            vloss,
+                                            events.clone(),
+                                            sys_tx,
+                                            args.dmabuf,
+                                        )
+                                        .await
+                                        {
                                             Ok((handle, ctrl)) => {
                                                 *poke.lock().unwrap() = Some(handle);
                                                 *ctrl_slot.lock().unwrap() = Some(ctrl);

@@ -93,19 +93,20 @@ fn conversion_and_encode_cost_per_profile() {
                 bytes += out.len();
             }
             let total = started.elapsed().as_secs_f64();
+            // The profile rate is measured with THIS path (create_encoder_auto
+            // times the strided encode at creation), so it is not an
+            // independent number to subtract. The driver's own ceiling comes
+            // from `tools/hw-probe.sh --encode h264` (ffmpeg on the same GPU),
+            // and the gap to this line is what our upload + VPP costs.
             let measured = parley_core::video::hardware_measured_fps().unwrap_or(0.0);
             println!(
                 "  {w}x{h}: full path {:.2} ms/frame → {:.1} fps (hardware={}), {} B/frame out; \
-                 driver measured {measured:.1} fps, so upload+VPP ≈ {:.2} ms/frame",
+                 the profile advertises {measured:.1} fps (same path, so compare against \
+                 hw-probe's ffmpeg number for the driver's ceiling)",
                 total * 1000.0 / n as f64,
                 n as f64 / total,
                 parley_core::video::hardware_encoder_active(),
                 bytes / n,
-                if measured > 0.0 {
-                    (total / n as f64 - 1.0 / measured as f64) * 1000.0
-                } else {
-                    0.0
-                }
             );
             println!(
                 "  {w}x{h}: profile advertised rate = {:.1} fps (measured {:?})",

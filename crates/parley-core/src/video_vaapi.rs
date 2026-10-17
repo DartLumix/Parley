@@ -33,7 +33,7 @@ const PARALLEL_CONVERT_MIN_PIXELS: usize = 1280 * 720;
 
 use crate::error::Error;
 use crate::video::{
-    CodecId, VIDEO_FPS_SOFTWARE, VideoEncoder, bitrate_for, keyframe_interval_frames,
+    CodecId, DmaBufFrame, VIDEO_FPS_SOFTWARE, VideoEncoder, bitrate_for, keyframe_interval_frames,
 };
 
 /// BGRA (0xAABBGGRR little-endian) → NV12 (4:2:0, Y then interleaved
@@ -302,6 +302,50 @@ impl VideoEncoder for VaapiEncoder {
             .enc()
             .encode_bgra(bgra, width as u32, height as u32, stride, idr)
             .map_err(|e| Error::Codec(format!("vaapi encode: {e:#}")))?;
+        out.clear();
+        out.extend_from_slice(&bytes);
+        Ok(idr)
+    }
+
+    /// 7j: the zero-copy handoff. The capture side negotiated DMA-BUFs
+    /// precisely because this returns true; a false here means the
+    /// negotiation should never have offered them.
+    fn dmabuf_supported(&self) -> bool {
+        true
+    }
+
+    /// 7j: import and encode the producer's buffer in place.
+    ///
+    /// The crate decides between in-place (NV12 at the encoder's size)
+    /// and a video-processor pass (anything else mapped, including the
+    /// packed BGRX a screencast produces), so a renegotiated size still
+    /// encodes — scaled — instead of failing.
+    fn encode_dmabuf(&mut self, frame: DmaBufFrame, out: &mut Vec<u8>) -> Result<bool, Error> {
+        let idr = self.pending_idr;
+        self.pending_idr = false;
+        let buffer = moq_vaapi::dmabuf::DmaBuf {
+            drm_format: frame.drm_format,
+            modifier: frame.modifier,
+            width: frame.width,
+            height: frame.height,
+            planes: frame
+                .planes
+                .iter()
+                .map(|p| moq_vaapi::dmabuf::Plane {
+                    offset: p.offset,
+                    pitch: p.pitch,
+                })
+                .collect(),
+            fd: frame.fd,
+            // PipeWire hands out packed RGB here, whose space is the
+            // stream's by definition; a YUV producer that knows its space
+            // would need a field on DmaBufFrame to say so.
+            color: None,
+        };
+        let bytes = self
+            .enc()
+            .encode_dmabuf(buffer, idr)
+            .map_err(|e| Error::Codec(format!("vaapi encode (dmabuf): {e:#}")))?;
         out.clear();
         out.extend_from_slice(&bytes);
         Ok(idr)

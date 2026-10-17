@@ -45,6 +45,7 @@ Voice is the product; everything else grows later.
 | 7e2 | 4d loss ladder in the app — receiver reports + two-profile send controller | ✅ |
 | 7f | Video receive — VideoReceiveHub → Flutter texture bridge | ✅ |
 | 7g | Screen-share send — portal capture + encode through the bridge | ✅ |
+| 7j | Zero-copy capture — compositor DMA-BUF straight into the encoder | ⏳ |
 | 7+ | Android / Windows / iOS bring-up, file transfer | ⏳ |
 
 ---
@@ -214,6 +215,17 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       `video`; the Rust side is parley-client's screen module, the same one the CLI
       uses). Verified by build + clippy with `audio-device,video,screen-capture,hw-encode`;
       the on-screen run is step 3 of [docs/hd-encode-runs.md](docs/hd-encode-runs.md)
+- [ ] 7j Zero-copy capture — `--dmabuf` asks for the compositor's own buffers
+      (a `Buffers` param whose memory-type mask is `1 << SPA_DATA_DmaBuf`, plus the
+      format's modifier property) and imports the descriptor into the VAAPI encoder,
+      so no pixel crosses the CPU. The producer's buffer is only guaranteed until
+      the process callback returns, so this path encodes ON the capture thread
+      (the memfd path keeps its channel and encoder thread). The encoder half is
+      verified by `tests/vaapi_dmabuf_input.rs` (an exported VA surface encodes to
+      its own picture); **the capture half has not run against a real compositor
+      yet** — it needs the portal picker, so it is opt-in and the memfd path stays
+      the default. The missing part is a `dma-buf` line in the sender's log and a
+      live share
 - [ ] Android / Windows / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
 
@@ -248,6 +260,9 @@ cargo run -p parley-client --features audio-device -- --server 127.0.0.1:4443 \
 # screen share (needs mpv; --release is REQUIRED for real-time fps)
 cargo run --release -p parley-client --features audio-device,screen-capture -- \
     --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender: portal picker pops up
+#    zero-copy: add --features ...,vaapi and --hw-encode --dmabuf (implies --hw-encode;
+#    needs a compositor that hands out DMA-BUFs, and refuses rather than downgrading)
+#    the sender's log then says: negotiated <W>x<H> BGRx @ <fps> fps (dma-buf, modifier <M>)
 #    sender: type "share" / "stop" to start/stop without restarting
 #    share audio: append --share-audio (captures the DEFAULT OUTPUT — a local listener must play to another sink, else feedback)
 cargo run --release -p parley-client --features video -- \

@@ -192,6 +192,29 @@ warning naming exactly that (`no picture in the last 90 frames`).
 Then re-verify the reverse direction (A sends to B) so both encoders are
 exercised: swap the roles and repeat.
 
+### Step 2b — zero-copy capture, if the compositor offers DMA-BUFs (7j)
+
+Same run with two extra flags on the sender (build it with `vaapi` too):
+
+```sh
+cargo run --release -p parley-client --features audio-device,video,screen-capture,vaapi -- \
+    --server <A-ip>:4443 --user <sender> --password <pass> --hw-encode --dmabuf
+```
+
+What changes, and how to tell it apart from the memfd path:
+
+- The sender's log says `negotiated <W>x<H> BGRx @ <fps> fps (dma-buf, modifier <M>)`
+  instead of `(source-paced)`. `<M>` is the tiling the compositor chose — `0x0`
+  is linear. An import failure is loud (`vaapi encode (dmabuf): ...`) and the
+  frame is dropped, not silently copied.
+- If the portal or the compositor refuses the DMA-BUF offer, or this build has
+  no `vaapi` feature, the share fails at start with the reason rather than
+  falling back — a CPU copy measured as zero-copy is worse than an error.
+- Everything downstream is unchanged: the same `encoder ready` line, the same
+  viewer stats. What to check is that `decoded` still climbs and the encode
+  rate is within a frame of the memfd run — the point is where the work runs,
+  not how fast it is (the driver is the ceiling either way).
+
 ## Step 3 — the Flutter app (the path users actually run)
 
 Both machines:

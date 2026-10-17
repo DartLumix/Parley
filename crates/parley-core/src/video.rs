@@ -122,6 +122,66 @@ pub trait VideoEncoder: Send {
     /// Change target bitrate at runtime (quality ladder). Backends may
     /// clamp; the change takes effect over the next few frames.
     fn set_bitrate(&mut self, bps: u32);
+
+    /// Can this backend encode a [`DmaBufFrame`] without the pixels
+    /// passing through the CPU? Only the VAAPI backend can (7j), and the
+    /// capture side asks BEFORE it negotiates a stream format: a
+    /// producer that hands out DMA-BUFs and a software encoder are an
+    /// incompatible pair, so the decision has to be made up front.
+    fn dmabuf_supported(&self) -> bool {
+        false
+    }
+
+    /// Encode one frame held in a DMA-BUF, writing Annex-B bytes into
+    /// `out` (cleared first) and reporting whether it was flagged as a
+    /// keyframe. `frame` owns its fd, so the caller's buffer stays open
+    /// for the duration of the call.
+    ///
+    /// The default is a loud error rather than a silent copy: a backend
+    /// that does not override this must never be handed a DMA-BUF, and
+    /// `dmabuf_supported` is what callers check.
+    fn encode_dmabuf(&mut self, frame: DmaBufFrame, out: &mut Vec<u8>) -> Result<bool, Error> {
+        let _ = (frame, out);
+        Err(Error::Codec(
+            "this encoder cannot encode DMA-BUF frames".into(),
+        ))
+    }
+}
+
+/// One plane of a [`DmaBufFrame`], within the single fd holding them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaBufPlane {
+    /// Byte offset of the plane from the start of the buffer.
+    pub offset: u32,
+    /// Bytes between adjacent rows of the plane.
+    pub pitch: u32,
+}
+
+/// A frame some other API allocated, described the DRM way (7j).
+///
+/// This is the neutral form of `moq_vaapi::dmabuf::DmaBuf`: the encoder
+/// trait lives in this crate, which must not depend on a VAAPI device, so
+/// the capture side builds one of these from a PipeWire buffer and only the
+/// backend knows how to import it.
+///
+/// `drm_format` is a `DRM_FORMAT_*` fourcc (little-endian bytes, e.g.
+/// `b"XR24"` for packed `B G R X`), and `modifier` is the DRM format
+/// modifier the producer negotiated — a driver will refuse to import a
+/// tiling it cannot address, which is a fact the caller cannot paper over.
+#[derive(Debug)]
+pub struct DmaBufFrame {
+    /// The exported descriptor; held open until the encoder returns.
+    pub fd: std::os::fd::OwnedFd,
+    /// Pixel format, a `DRM_FORMAT_*` code.
+    pub drm_format: u32,
+    /// Format modifier describing the tiling of the buffer.
+    pub modifier: u64,
+    /// Visible width in pixels (padding lives in the plane pitches).
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Plane offsets and pitches, in format order (one to four).
+    pub planes: Vec<DmaBufPlane>,
 }
 
 /// Construct the best available encoder for this platform. Hardware

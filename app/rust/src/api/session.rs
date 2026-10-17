@@ -1208,8 +1208,17 @@ pub fn start_screen_share(session_id: u32) -> Result<(), String> {
                 Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
                 Option<std::sync::mpsc::Receiver<Vec<f32>>>,
             ) = (None, None);
-            match parley_client::screen::start(conn.clone(), share_loss, share_event_tx, sys_tx)
-                .await
+            // The app keeps the mapped-copy capture path: DMA-BUF capture
+            // (`--dmabuf` on the CLI) needs the encoder on the capture
+            // thread, which the bridge's share pipeline does not do yet.
+            match parley_client::screen::start(
+                conn.clone(),
+                share_loss,
+                share_event_tx,
+                sys_tx,
+                false,
+            )
+            .await
             {
                 Ok((handle, ctrl)) => {
                     // Spawn the mux NOW (the terminal client's

@@ -49,6 +49,26 @@
 //! the negotiated size is whatever the compositor serves (the viewer
 //! sizes itself from the H.264 SPS).
 //!
+//! 7j DMA-BUF capture (`--dmabuf`, behind the `vaapi` feature) is the
+//! other half of that request: instead of asking for a shared-memory copy
+//! and encoding it, the stream asks for the compositor's OWN buffers (a
+//! `Buffers` param whose memory-type mask is `1 << SPA_DATA_DmaBuf`, plus
+//! the format's modifier property) and the encoder imports the descriptor.
+//! No pixels cross the CPU on that path.
+//!
+//! The catch that shapes the code: PipeWire guarantees a buffer only until
+//! the process callback queues it back, and an import is read by the GPU
+//! later. So in DMA-BUF mode the encoder lives ON THE CAPTURE THREAD
+//! (`UserData::inline`) and the frame is encoded inside the callback — the
+//! buffer cannot be handed to another thread and forgotten. That is also
+//! why pacing there drops an early frame instead of sleeping: there is no
+//! queue to sleep in front of. The memfd path keeps its channel and its
+//! separate encoder thread, unchanged.
+//!
+//! A request this build or run cannot honor is refused before the portal
+//! opens (`start`), because a silent downgrade would be measured as
+//! zero-copy while copying.
+//!
 //! Share audio (6.9): `--share-audio` captures the DEFAULT OUTPUT via
 //! PipeWire's native `stream.capture.sink` (no portal involvement —
 //! the xdg ScreenCast spec has no audio; see the handoff ledger). The
@@ -126,6 +146,7 @@ impl ShareController {
 }
 
 /// Listener user data, owned by the pw loop thread.
+#[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
     accepted: bool,
@@ -133,6 +154,54 @@ struct UserData {
     height: u32,
     tx: SyncSender<ToEncoder>,
     drops: u64,
+    /// 7j: DMA-BUF capture. Some ONLY in that mode, and in that mode it
+    /// also holds the encoder: the producer's buffer is guaranteed valid
+    /// only until this callback queues it back, so the GPU has to be done
+    /// with it before we return — which means encoding here, not on the
+    /// encoder thread. `None` keeps the proven memfd + channel path.
+    inline: Option<ShareEncoder>,
+    /// Pixel format of the DMA-BUF the producer negotiated, as a
+    /// `DRM_FORMAT_*` code. Only meaningful with `inline`.
+    drm_format: u32,
+    /// The negotiated format modifier, passed through to the importer.
+    modifier: u64,
+}
+
+/// Everything the sender half needs, shared by both capture paths.
+///
+/// The memfd path owns one on `encoder_thread`; the DMA-BUF path owns one
+/// inside the PipeWire listener (see `UserData::inline`). One
+/// implementation, so a fix to pacing, the ladder, timestamps or
+/// fragmentation reaches both.
+struct ShareEncoder {
+    conn: quinn::Connection,
+    encoder: Option<Box<dyn VideoEncoder>>,
+    ladder: VideoLadder,
+    fps: f64,
+    seq: u16,
+    frame_id: u32,
+    annexb: Vec<u8>,
+    max_payload: usize,
+    encoded: u64,
+    stale_skipped: u64,
+    window: std::time::Instant,
+    /// Start of the last encode — what both pacing rules measure from.
+    last_encode: Option<std::time::Instant>,
+    die: tokio::sync::mpsc::UnboundedSender<()>,
+    force_idr: Arc<AtomicBool>,
+    video_loss: Arc<AtomicU32>,
+}
+
+/// The connection-side handles the capture thread needs when it owns the
+/// encoder (DMA-BUF mode). Cloned from `start`'s arguments rather than
+/// shared through a channel, because in that mode the capture thread IS the
+/// encoding thread.
+#[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
+struct ShareSenderArgs {
+    conn: quinn::Connection,
+    die: tokio::sync::mpsc::UnboundedSender<()>,
+    force_idr: Arc<AtomicBool>,
+    video_loss: Arc<AtomicU32>,
 }
 
 /// The pipewire side, on its own thread: loop, stream, listener.
@@ -149,6 +218,8 @@ fn pw_thread(
     tx: SyncSender<ToEncoder>,
     stop: Arc<AtomicBool>,
     setup: tokio::sync::oneshot::Sender<Result<(), pw::Error>>,
+    dmabuf: bool,
+    sender: ShareSenderArgs,
 ) {
     // MainLoopBox::new calls pw::init() itself (refcounted in C, no
     // deinit exists — repeated init across share restarts is the
@@ -175,6 +246,18 @@ fn pw_thread(
         }
     };
 
+    // 7j: DMA-BUF mode builds its encoder HERE, on the thread that will
+    // use it (libva contexts are thread-bound), and the format pod below
+    // asks for the producer's own buffers. A request this build cannot
+    // honor — no `vaapi` feature — was already refused by `start`.
+    #[cfg(feature = "vaapi")]
+    let inline = dmabuf.then(|| ShareEncoder::new(sender));
+    #[cfg(not(feature = "vaapi"))]
+    let inline = {
+        let _ = (dmabuf, sender);
+        None::<ShareEncoder>
+    };
+
     let data = UserData {
         format: Default::default(),
         accepted: false,
@@ -182,6 +265,9 @@ fn pw_thread(
         height: 0,
         tx,
         drops: 0,
+        inline,
+        drm_format: 0,
+        modifier: 0,
     };
 
     let stream = match pw::stream::StreamBox::new(
@@ -240,6 +326,23 @@ fn pw_thread(
             } else {
                 30.0
             };
+            #[cfg(feature = "vaapi")]
+            if user_data.inline.is_some() {
+                // DRM names the packed word, so BGRx in memory is
+                // DRM_FORMAT_XRGB8888 ("XR24").
+                user_data.drm_format = u32::from_le_bytes(*b"XR24");
+                user_data.modifier = user_data.format.modifier();
+                let (w, h) = (user_data.width, user_data.height);
+                println!(
+                    "share: negotiated {w}x{h} {} @ {fps:.0} fps (dma-buf, modifier {:#x})",
+                    if bgra { "BGRA" } else { "BGRx" },
+                    user_data.modifier
+                );
+                if let Some(share) = user_data.inline.as_mut() {
+                    share.negotiate(w, h, fps);
+                }
+                return;
+            }
             println!(
                 "share: negotiated {}x{} {} @ {:.0} fps (source-paced)",
                 user_data.width,
@@ -272,10 +375,77 @@ fn pw_thread(
             }
             let offset = chunk.offset() as usize;
             let stride = chunk.stride() as usize;
+            let (w, h) = (user_data.width as usize, user_data.height as usize);
+
+            // 7j: DMA-BUF mode. The producer's buffer is valid only until
+            // this callback queues it back, so the GPU has to be done with
+            // it before we return: encode here, on this thread, and let the
+            // buffer go at the end of the call. `due()` drops a frame that
+            // arrives ahead of the pacing interval — this path cannot
+            // queue, so dropping is the pacing.
+            #[cfg(feature = "vaapi")]
+            let dmabuf_state = (
+                user_data.drm_format,
+                user_data.modifier,
+                user_data.width,
+                user_data.height,
+            );
+            #[cfg(feature = "vaapi")]
+            if let Some(share) = user_data.inline.as_mut() {
+                let (drm_format, modifier, width, height) = dmabuf_state;
+                if !share.due() {
+                    return;
+                }
+                if data.type_() == spa::buffer::DataType::DmaBuf {
+                    // A dupped descriptor is what the encoder takes; the
+                    // buffer itself stays dequeued (and therefore unwritten)
+                    // until this callback returns.
+                    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(data.fd()) };
+                    let Ok(fd) = borrowed.try_clone_to_owned() else {
+                        eprintln!(
+                            "share: could not dup the producer's DMA-BUF fd — skipping frame"
+                        );
+                        return;
+                    };
+                    let frame = parley_core::video::DmaBufFrame {
+                        fd,
+                        drm_format,
+                        modifier,
+                        width,
+                        height,
+                        planes: vec![parley_core::video::DmaBufPlane {
+                            offset: offset as u32,
+                            pitch: stride as u32,
+                        }],
+                    };
+                    if !share.encode_dmabuf(frame) {
+                        let _ = share.die.send(());
+                    }
+                } else if let Some(mapped) = data.data() {
+                    // The producer gave us a mapped buffer despite the
+                    // negotiation. Encode it inline rather than dropping
+                    // frames; the encoder takes either form.
+                    let stride = if stride == 0 { w * 4 } else { stride };
+                    let mut padded = Vec::with_capacity(stride * h);
+                    for y in 0..h {
+                        let start = offset + y * stride;
+                        let Some(row) = mapped.get(start..start + w * 4) else {
+                            return;
+                        };
+                        let dst = y * stride;
+                        padded.resize(dst + row.len(), 0);
+                        padded[dst..dst + row.len()].copy_from_slice(row);
+                    }
+                    if !share.encode_bgra(&padded, stride) {
+                        let _ = share.die.send(());
+                    }
+                }
+                return;
+            }
+
             let Some(mapped) = data.data() else {
                 return;
             };
-            let (w, h) = (user_data.width as usize, user_data.height as usize);
             // Row-wise repack: handles both padded strides and the
             // tightly-packed case, and never panics on short buffers.
             let stride = if stride == 0 { w * 4 } else { stride };
@@ -314,6 +484,88 @@ fn pw_thread(
             return;
         }
     };
+
+    // 7j: the DMA-BUF offer — two parameter objects, because SPA puts the
+    // memory type in the buffer configuration, not the format:
+    //
+    // * `EnumFormat` describing packed BGRx plus a MANDATORY modifier. The
+    //   modifier property is what marks the negotiation as DMA-BUF, and it
+    //   offers only DRM_FORMAT_MOD_LINEAR: the importer can address linear
+    //   memory, and a screencast producer can always allocate it.
+    // * `Buffers` with a data-type mask of exactly `1 << SPA_DATA_DmaBuf`,
+    //   so the producer allocates the compositor's own buffers rather than
+    //   a shared-memory copy.
+    //
+    // Both are built by hand where the `object!` macro cannot express them:
+    // numeric choices (the modifier, the mask) have no macro arm in this
+    // version of libspa, and the buffers keys have no typed constants.
+    #[cfg(feature = "vaapi")]
+    let dmabuf_objects = dmabuf.then(|| {
+        use spa::param::ParamType;
+        use spa::pod::Object;
+        use spa::utils::SpaTypes;
+
+        let mut properties = vec![
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaType,
+                Id,
+                spa::param::format::MediaType::Video
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                spa::param::format::MediaSubtype::Raw
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                spa::param::video::VideoFormat::BGRx,
+                spa::param::video::VideoFormat::BGRx
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                spa::utils::Rectangle {
+                    width: 1280,
+                    height: 720
+                },
+                spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                },
+                spa::utils::Rectangle {
+                    width: 4096,
+                    height: 4096
+                }
+            ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                spa::utils::Fraction { num: 30, denom: 1 },
+                spa::utils::Fraction { num: 0, denom: 1 },
+                spa::utils::Fraction { num: 60, denom: 1 }
+            ),
+        ];
+        properties.push(modifier_property());
+
+        let format = Object {
+            type_: SpaTypes::ObjectParamFormat.as_raw(),
+            id: ParamType::EnumFormat.as_raw(),
+            properties,
+        };
+        let buffers = Object {
+            type_: SpaTypes::ObjectParamBuffers.as_raw(),
+            id: ParamType::Buffers.as_raw(),
+            properties: vec![buffers_data_type_property()],
+        };
+        vec![format, buffers]
+    });
 
     // EnumFormat: BGRx preferred (alpha is meaningless for encoding),
     // BGRA accepted; size/framerate ranges let the source pick native.
@@ -367,20 +619,41 @@ fn pw_thread(
             spa::utils::Fraction { num: 60, denom: 1 }
         ),
     );
-    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &spa::pod::Value::Object(obj),
-    )
-    .expect("static pod serialization cannot fail")
-    .0
-    .into_inner();
+    #[cfg(feature = "vaapi")]
+    let objects = dmabuf_objects.unwrap_or_else(|| vec![obj]);
+    #[cfg(not(feature = "vaapi"))]
+    let objects = vec![obj];
 
-    let mut params = [spa::pod::Pod::from_bytes(&values).expect("serialized pod is valid")];
+    // The serialized bytes must outlive the Pods that borrow them.
+    let values: Vec<Vec<u8>> = objects
+        .iter()
+        .map(|object| {
+            spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &spa::pod::Value::Object(object.clone()),
+            )
+            .expect("static pod serialization cannot fail")
+            .0
+            .into_inner()
+        })
+        .collect();
+    let mut params: Vec<&spa::pod::Pod> = values
+        .iter()
+        .map(|bytes| spa::pod::Pod::from_bytes(bytes).expect("serialized pod is valid"))
+        .collect();
 
+    // MAP_BUFFERS asks PipeWire to map every buffer into our address
+    // space. A DMA-BUF is not mapped here — the GPU reads it — and asking
+    // for both at once is not a combination the stream accepts.
+    let flags = if dmabuf {
+        pw::stream::StreamFlags::AUTOCONNECT
+    } else {
+        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS
+    };
     if let Err(e) = stream.connect(
         spa::utils::Direction::Input,
         Some(node_id),
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        flags,
         &mut params,
     ) {
         let _ = setup.send(Err(e));
@@ -406,6 +679,54 @@ fn pw_thread(
     println!("share: pipewire stream disconnected");
 }
 
+/// The `VideoModifier` property of a DMA-BUF format offer: MANDATORY, with
+/// `DRM_FORMAT_MOD_LINEAR` as both the default and the only alternative —
+/// linear memory is the one tiling every importer can address.
+///
+/// Built by hand because the `object!`/`property!` macros have no arm for a
+/// numeric choice in this version of libspa (`Choice, Enum, Long, ..` looks
+/// for a type named `utils::Long`, which is a pod type tag, not a type).
+#[cfg(feature = "vaapi")]
+fn modifier_property() -> spa::pod::Property {
+    use spa::pod::{ChoiceValue, PropertyFlags, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+    spa::pod::Property {
+        key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
+        flags: PropertyFlags::MANDATORY,
+        value: Value::Choice(ChoiceValue::Long(Choice::<i64>(
+            ChoiceFlags::empty(),
+            ChoiceEnum::<i64>::Enum {
+                default: 0, // DRM_FORMAT_MOD_LINEAR
+                alternatives: vec![0],
+            },
+        ))),
+    }
+}
+
+/// The `SPA_PARAM_BUFFERS_dataType` property of a DMA-BUF request: a flags
+/// choice whose only member is the DMA-BUF bit, so the producer allocates
+/// its own buffers instead of a shared-memory copy.
+///
+/// `SPA_PARAM_BUFFERS_dataType` has no typed constant in libspa, so the raw
+/// key comes from the generated bindings.
+#[cfg(feature = "vaapi")]
+fn buffers_data_type_property() -> spa::pod::Property {
+    use spa::pod::{ChoiceValue, PropertyFlags, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+    let dma_buf_bit = 1i32 << spa::buffer::DataType::DmaBuf.as_raw();
+    spa::pod::Property {
+        key: spa::sys::SPA_PARAM_BUFFERS_dataType,
+        flags: PropertyFlags::empty(),
+        value: Value::Choice(ChoiceValue::Int(Choice::<i32>(
+            ChoiceFlags::empty(),
+            ChoiceEnum::<i32>::Flags {
+                default: dma_buf_bit,
+                flags: vec![dma_buf_bit],
+            },
+        ))),
+    }
+}
+
 // 7h: `fragment_budget_for` (the connection's live datagram budget)
 // lives in crate::video — both senders use it and only one of them is
 // behind this module's feature gate.
@@ -420,60 +741,236 @@ fn paced_fps(capture_fps: f64) -> f64 {
     capture_fps.min(f64::from(target_fps()))
 }
 
-/// Apply a negotiated format: (re)create the encoder, record the fps,
-/// and move the loss ladder's rungs to the new resolution's rate.
-///
-/// 7h HD: the ladder's rungs were absolute (2.5 Mbps clean / 1 Mbps
-/// robust), which is a 720p30 budget — on a 1080p60 stream that is the
-/// same as always running degraded. `bitrate_for` scales them with the
-/// pixels and rate the encoder is actually being asked for.
-fn negotiate(
-    encoder: &mut Option<Box<dyn VideoEncoder>>,
-    ladder: &mut VideoLadder,
-    fps: &mut f64,
-    width: u32,
-    height: u32,
-    f: f64,
-) {
-    *fps = f;
-    match create_encoder_auto(width as usize, height as usize) {
-        Ok(e) => {
-            let eff = paced_fps(f);
-            let base = bitrate_for(width as usize, height as usize, eff as f32);
-            let applied = ladder.set_base(base);
-            println!(
-                "share: encoder ready ({width}x{height}, source {f:.0} fps → paced {eff:.0} fps, \
-                 clean rung {base} bps); hardware={}",
-                parley_core::video::hardware_encoder_active()
-            );
-            if applied != base {
-                // The ladder was already on the robust rung: keep the
-                // encoder there rather than pretending the rebuild
-                // restored the clean target.
-                println!("share: bitrate → {applied} bps (robust rung, scaled to profile)");
-            }
-            *encoder = Some(e);
+impl ShareEncoder {
+    fn new(sender: ShareSenderArgs) -> Self {
+        let max_payload = fragment_budget_for(&sender.conn);
+        Self {
+            conn: sender.conn,
+            encoder: None,
+            ladder: VideoLadder::new(),
+            fps: 30.0,
+            seq: 0x8000,
+            frame_id: 0,
+            annexb: Vec::with_capacity(1 << 20),
+            max_payload,
+            encoded: 0,
+            stale_skipped: 0,
+            window: std::time::Instant::now(),
+            die: sender.die,
+            force_idr: sender.force_idr,
+            video_loss: sender.video_loss,
+            last_encode: None,
         }
-        Err(e) => eprintln!("share: encoder init failed: {e}"),
+    }
+
+    /// The pacing interval the stream is being held to.
+    fn interval(&self) -> Duration {
+        Duration::from_nanos((1_000_000_000.0 / paced_fps(self.fps)) as u64)
+    }
+
+    /// Is a frame due now? The memfd path sleeps to the interval; the
+    /// DMA-BUF path cannot queue the producer's buffer, so it drops the
+    /// early frame instead.
+    #[cfg(feature = "vaapi")]
+    fn due(&mut self) -> bool {
+        !matches!(self.last_encode, Some(t) if t.elapsed() < self.interval())
+    }
+
+    fn note_stale(&mut self) {
+        self.stale_skipped += 1;
+    }
+
+    /// Apply a negotiated format: (re)create the encoder, record the fps,
+    /// and move the loss ladder's rungs to the new resolution's rate.
+    ///
+    /// 7h HD: the ladder's rungs were absolute (2.5 Mbps clean / 1 Mbps
+    /// robust), which is a 720p30 budget — on a 1080p60 stream that is
+    /// the same as always running degraded. `bitrate_for` scales them
+    /// with the pixels and rate the encoder is actually being asked for.
+    fn negotiate(&mut self, width: u32, height: u32, f: f64) {
+        self.fps = f;
+        match create_encoder_auto(width as usize, height as usize) {
+            Ok(e) => {
+                let eff = paced_fps(f);
+                let base = bitrate_for(width as usize, height as usize, eff as f32);
+                let applied = self.ladder.set_base(base);
+                println!(
+                    "share: encoder ready ({width}x{height}, source {f:.0} fps → paced {eff:.0} fps, \
+                     clean rung {base} bps); hardware={}",
+                    parley_core::video::hardware_encoder_active()
+                );
+                if applied != base {
+                    // The ladder was already on the robust rung: keep the
+                    // encoder there rather than pretending the rebuild
+                    // restored the clean target.
+                    println!("share: bitrate → {applied} bps (robust rung, scaled to profile)");
+                }
+                self.encoder = Some(e);
+            }
+            Err(e) => eprintln!("share: encoder init failed: {e}"),
+        }
+    }
+
+    /// Ladder step + pending keyframe requests, applied to the next frame.
+    fn prepare(&mut self) -> Option<&mut Box<dyn VideoEncoder>> {
+        let enc = self.encoder.as_mut()?;
+        if let Some(bps) = self.ladder.step(self.video_loss.load(Ordering::Relaxed)) {
+            enc.set_bitrate(bps);
+            println!("share: bitrate → {bps} bps (video loss ladder)");
+        }
+        if self.ladder.should_force_keyframe() {
+            enc.force_keyframe();
+            println!("share: IDR re-poke (loss epoch)");
+        }
+        if self.force_idr.swap(false, Ordering::Relaxed) {
+            enc.force_keyframe();
+            println!("share: forced keyframe (viewer joined)");
+        }
+        Some(enc)
+    }
+
+    /// Encode one BGRA frame (strided) and send it. Returns false when the
+    /// connection is gone; a dropped frame returns true.
+    fn encode_bgra(&mut self, data: &[u8], stride: usize) -> bool {
+        let Some((w, h)) = self.encoder.as_ref().map(|e| e.dimensions()) else {
+            return true;
+        };
+        self.last_encode = Some(std::time::Instant::now());
+        self.frame_encode(|enc, out| enc.encode_bgra_strided(data, w, h, stride, out))
+    }
+
+    /// 7j: encode one frame in the producer's DMA-BUF. The descriptor is
+    /// consumed by the encoder, and the capture thread holds the producer's
+    /// buffer until this returns.
+    #[cfg(feature = "vaapi")]
+    fn encode_dmabuf(&mut self, frame: parley_core::video::DmaBufFrame) -> bool {
+        self.last_encode = Some(std::time::Instant::now());
+        self.frame_encode(move |enc, out| enc.encode_dmabuf(frame, out))
+    }
+
+    /// The shared hot path: prepare, encode into the reused buffer, send.
+    fn frame_encode(
+        &mut self,
+        encode: impl FnOnce(
+            &mut Box<dyn VideoEncoder>,
+            &mut Vec<u8>,
+        ) -> Result<bool, parley_core::error::Error>,
+    ) -> bool {
+        let mut annexb = std::mem::take(&mut self.annexb);
+        let encoded = match self.prepare() {
+            Some(enc) => encode(enc, &mut annexb),
+            None => {
+                self.annexb = annexb;
+                return true;
+            }
+        };
+        let keyframe = match encoded {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("share: encode failed: {e}");
+                self.annexb = annexb;
+                return true;
+            }
+        };
+        self.annexb = annexb;
+        self.send(keyframe)
+    }
+
+    /// Fragment + pace + send the last encoded frame.
+    ///
+    /// Output discipline (learned the hard way): fragments leave over HALF
+    /// the frame's interval, split evenly (7h; a fixed 500 µs per fragment
+    /// made a 100 KB keyframe unfinishable inside its own frame budget).
+    fn send(&mut self, keyframe: bool) -> bool {
+        let annexb = std::mem::take(&mut self.annexb);
+        let alive = self.send_inner(&annexb, keyframe);
+        self.annexb = annexb;
+        alive
+    }
+
+    fn send_inner(&mut self, frame: &[u8], keyframe: bool) -> bool {
+        let first_seq = self.seq;
+        // The seq advance must match the fragmenter's own count — it is
+        // computed from the same budget, or the two drift apart the moment
+        // the MTU estimate changes.
+        let frags = frame.len().div_ceil(self.max_payload).max(1) as u16;
+        self.seq = self.seq.wrapping_add(frags);
+        // The codec clock the receiver sees must advance at the rate we
+        // actually pace at (see `paced_fps`), not the compositor's and not
+        // a constant.
+        let eff_fps = paced_fps(self.fps);
+        let timestamp = (self.frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
+        let dgs = fragment_frame_with_max(
+            self.frame_id,
+            keyframe,
+            frame,
+            first_seq,
+            timestamp,
+            0, // sender_id: the server stamps the authenticated id
+            self.max_payload,
+            // 7h HD: tell viewers this stream runs above ~45 fps (mpv's
+            // rawvideo demuxer needs a nominal rate; a 60 fps stream
+            // announced as 30 plays at half speed).
+            eff_fps > 45.0,
+        );
+        self.frame_id = self.frame_id.wrapping_add(1);
+        let min_interval = self.interval();
+        let total = dgs.len();
+        let per_frag = if total > 1 {
+            let half_interval_us = (min_interval.as_micros() as usize / 2).max(200);
+            (half_interval_us / (total - 1)).min(500) as u64
+        } else {
+            0
+        };
+        for (i, dg) in dgs.into_iter().enumerate() {
+            if let Err(e) = self.conn.send_datagram(dg.into()) {
+                // Real reason, not a guess: TooLarge (the estimate moved
+                // under us) and ConnectionLost are very different
+                // diagnoses — and only the second one means the share is
+                // over. Dropping the frame and re-reading the budget keeps
+                // the session alive; the viewer rebases on the next
+                // keyframe. This used to end the share outright, so a
+                // transient MTU collapse looked like the share crashing.
+                println!(
+                    "share: send_datagram failed: {e}; dropping this frame and re-reading the \
+                     datagram budget"
+                );
+                self.max_payload = fragment_budget_for(&self.conn);
+                return self.conn.close_reason().is_none();
+            }
+            if i + 1 < total && per_frag > 0 {
+                std::thread::sleep(Duration::from_micros(per_frag));
+            }
+        }
+        self.encoded += 1;
+        let el = self.window.elapsed();
+        if el.as_secs() >= 10 {
+            println!(
+                "share: encoded {} frames ({:.1} fps), {} stale skipped",
+                self.encoded,
+                self.encoded as f64 / el.as_secs_f64(),
+                self.stale_skipped
+            );
+            self.encoded = 0;
+            self.stale_skipped = 0;
+            self.window = std::time::Instant::now();
+        }
+        true
     }
 }
 
-/// Encode → fragment → paced send. Owns the encoder once the format is
-/// negotiated; drops frames that arrive before that. Exits when the
-/// frame channel closes (the pw thread ended).
+/// Encode → fragment → paced send, for the memfd capture path. Owns the
+/// encoder once the format is negotiated; drops frames that arrive before
+/// that. Exits when the frame channel closes (the pw thread ended).
 ///
 /// Output discipline, in order per frame:
-/// 1. Pace: sleep until min_interval since the last encode START —
-///    mpv consumes piped rawvideo at exactly VIDEO_FPS; sending faster
+/// 1. Pace: sleep until min_interval since the last encode START — mpv
+///    consumes piped rawvideo at exactly VIDEO_FPS; sending faster
 ///    accumulates drift in its queue (~3 s over a session, measured).
 ///    Sleep, never drop: the frame is wanted, just early.
 /// 2. Skip-to-newest: drain anything that queued during the sleep and
 ///    keep only the latest capture — encoding a stale frame while a
 ///    fresher one sits behind it is pure added latency.
-/// 3. Encode + fragment + send with inter-fragment pacing — shared
-///    across the frame's fragments within half its interval (7h; a
-///    fixed per-fragment sleep made large keyframes unfinishable
-///    inside their own frame budget).
 fn encoder_thread(
     rx: Receiver<ToEncoder>,
     conn: quinn::Connection,
@@ -481,40 +978,23 @@ fn encoder_thread(
     video_loss: Arc<AtomicU32>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
 ) {
-    let mut encoder: Option<Box<dyn VideoEncoder>> = None;
-    // 6e: loss-driven bitrate ladder (viewer reports → video_loss).
-    let mut ladder = VideoLadder::new();
-    let mut frame_id: u32 = 0;
-    // Video seq space: local to this sender (receivers demux on
-    // FLAG_VIDEO, never seq — audio's counter never interacts).
-    let mut seq: u16 = 0x8000;
-    let mut fps = 30.0;
-    let mut encoded: u64 = 0;
-    let mut stale_skipped: u64 = 0;
-    let mut window = std::time::Instant::now();
-    let mut last_encode: Option<std::time::Instant> = None;
-    // 7g: reused Annex-B output buffer (no per-frame Vec alloc).
-    let mut annexb: Vec<u8> = Vec::with_capacity(1 << 20);
-    // 7h: fragment payload budget from the LIVE path-MTU estimate, not
-    // the compiled-in constant — see `fragment_budget_for`.
-    let mut max_payload = fragment_budget_for(&conn);
+    let mut share = ShareEncoder::new(ShareSenderArgs {
+        conn,
+        die,
+        force_idr,
+        video_loss,
+    });
     while let Ok(msg) = rx.recv() {
         match msg {
-            ToEncoder::Negotiated {
-                width,
-                height,
-                fps: f,
-            } => {
-                negotiate(&mut encoder, &mut ladder, &mut fps, width, height, f);
-            }
+            ToEncoder::Negotiated { width, height, fps } => share.negotiate(width, height, fps),
             ToEncoder::Frame {
                 data: first,
                 stride: first_stride,
             } => {
                 // 1. Rate pacing (sleep, never drop).
-                let min_interval = Duration::from_nanos((1_000_000_000.0 / paced_fps(fps)) as u64);
+                let min_interval = share.interval();
                 let now = std::time::Instant::now();
-                if let Some(t) = last_encode
+                if let Some(t) = share.last_encode
                     && now.duration_since(t) < min_interval
                 {
                     std::thread::sleep(min_interval - now.duration_since(t));
@@ -531,7 +1011,7 @@ fn encoder_thread(
                         Ok(ToEncoder::Frame { data, stride: s }) => {
                             bgra = data;
                             stride = s;
-                            stale_skipped += 1;
+                            share.note_stale();
                         }
                         Ok(ToEncoder::Negotiated {
                             width,
@@ -545,117 +1025,12 @@ fn encoder_thread(
                     }
                 }
                 if let Some((width, height, f)) = renegotiate {
-                    negotiate(&mut encoder, &mut ladder, &mut fps, width, height, f);
+                    share.negotiate(width, height, f);
                 }
-
-                let Some(enc) = encoder.as_mut() else {
-                    continue;
-                };
-                if let Some(bps) = ladder.step(video_loss.load(Ordering::Relaxed)) {
-                    enc.set_bitrate(bps);
-                    println!("share: bitrate → {bps} bps (video loss ladder)");
-                }
-                if ladder.should_force_keyframe() {
-                    enc.force_keyframe();
-                    println!("share: IDR re-poke (loss epoch)");
-                }
-                if force_idr.swap(false, Ordering::Relaxed) {
-                    enc.force_keyframe();
-                    println!("share: forced keyframe (viewer joined)");
-                }
-                last_encode = Some(std::time::Instant::now());
-                // 7g: strided zero-repack encode into the reused output
-                // buffer; dims come from the last Negotiated (fps var is
-                // updated there too, and (enc_w, enc_h) tracks them).
-                let (w, h) = enc.dimensions();
-                let keyframe = match enc.encode_bgra_strided(&bgra, w, h, stride, &mut annexb) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("share: encode failed: {e}");
-                        continue;
-                    }
-                };
-                let frame: &[u8] = &annexb;
-                let first_seq = seq;
-                // The seq advance must match the fragmenter's own count —
-                // it is computed from the same budget, or the two drift
-                // apart the moment the MTU estimate changes.
-                let frags = frame.len().div_ceil(max_payload).max(1) as u16;
-                seq = seq.wrapping_add(frags);
-                // The codec clock the receiver sees must advance at the
-                // rate we actually pace at (see `paced_fps`), not the
-                // compositor's and not a constant.
-                let eff_fps = paced_fps(fps);
-                let timestamp = (frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
-                let dgs = fragment_frame_with_max(
-                    frame_id,
-                    keyframe,
-                    frame,
-                    first_seq,
-                    timestamp,
-                    0, // sender_id: the server stamps the authenticated id
-                    max_payload,
-                    // 7h HD: tell viewers this stream runs above ~45 fps
-                    // (mpv's rawvideo demuxer needs a nominal rate; a
-                    // 60 fps stream announced as 30 plays at half speed).
-                    eff_fps > 45.0,
-                );
-                frame_id = frame_id.wrapping_add(1);
-                // 7h pacing: let the frame leave over HALF its interval,
-                // split evenly across its fragments (capped at the old
-                // 500 µs). The previous fixed 500 µs per fragment cost
-                // 44 ms on a 100 KB keyframe — more than the whole 33 ms
-                // frame budget at 30 fps — while still releasing the
-                // first fragments back-to-back: slow exactly where speed
-                // mattered, bursty exactly where it meant to be smooth.
-                let total = dgs.len();
-                let per_frag = if total > 1 {
-                    let half_interval_us = (min_interval.as_micros() as usize / 2).max(200);
-                    (half_interval_us / (total - 1)).min(500) as u64
-                } else {
-                    0
-                };
-                let mut send_failed = false;
-                for (i, dg) in dgs.into_iter().enumerate() {
-                    if let Err(e) = conn.send_datagram(dg.into()) {
-                        // Real reason, not a guess: TooLarge (the estimate
-                        // moved under us) and ConnectionLost are very
-                        // different diagnoses — and only the second one
-                        // means the share is over. Dropping the frame and
-                        // re-reading the budget keeps the session alive;
-                        // the viewer rebases on the next keyframe. This
-                        // used to end the share outright, so a transient
-                        // MTU collapse looked like the share crashing.
-                        println!(
-                            "share: send_datagram failed: {e}; dropping this frame and \
-                             re-reading the datagram budget"
-                        );
-                        max_payload = fragment_budget_for(&conn);
-                        send_failed = true;
-                        break;
-                    }
-                    if i + 1 < total && per_frag > 0 {
-                        std::thread::sleep(Duration::from_micros(per_frag));
-                    }
-                }
-                if send_failed {
-                    if conn.close_reason().is_some() {
-                        // The connection itself is gone: nothing left to do.
-                        let _ = die.send(());
-                        return;
-                    }
-                    continue;
-                }
-                encoded += 1;
-                let el = window.elapsed();
-                if el.as_secs() >= 10 {
-                    println!(
-                        "share: encoded {encoded} frames ({:.1} fps), {stale_skipped} stale skipped",
-                        encoded as f64 / el.as_secs_f64()
-                    );
-                    encoded = 0;
-                    stale_skipped = 0;
-                    window = std::time::Instant::now();
+                if !share.encode_bgra(&bgra, stride) {
+                    // The connection itself is gone: nothing left to do.
+                    let _ = share.die.send(());
+                    return;
                 }
             }
         }
@@ -1063,7 +1438,19 @@ pub async fn start(
     video_loss: Arc<AtomicU32>,
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
     sys_tx: Option<SyncSender<Vec<f32>>>,
+    dmabuf: bool,
 ) -> Result<(ShareHandle, ShareController), String> {
+    // 7j: a request for zero-copy is refused up front when this build or
+    // this run cannot honor it. Silently downgrading would make the caller
+    // measure a CPU copy it believes is not there.
+    if dmabuf {
+        #[cfg(not(feature = "vaapi"))]
+        return Err("dma-buf capture needs a build with the vaapi feature".to_string());
+        #[cfg(feature = "vaapi")]
+        if !parley_core::video::hw_encode_enabled() {
+            return Err("dma-buf capture needs hardware encode (--hw-encode)".to_string());
+        }
+    }
     let proxy = Screencast::new()
         .await
         .map_err(|e| format!("portal: {e}"))?;
@@ -1124,19 +1511,43 @@ pub async fn start(
     };
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    // Encoder-death signal: whoever owns an encoder fires it on send
+    // failure AND on any exit (pw death → rx closes → return → drop).
+    // Either way the supervisor must tear everything down — a dead
+    // connection must not leave a portal session and pw loop running
+    // (found in the 6e netem run: endless "encoder behind").
+    let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let sender = ShareSenderArgs {
+        conn: conn.clone(),
+        die: die_tx.clone(),
+        force_idr: force_idr.clone(),
+        video_loss: video_loss.clone(),
+    };
+
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
     let stop_for_thread = stop_flag.clone();
     let pw_handle = std::thread::spawn(move || {
-        pw_thread(node_id, fd, frame_tx, stop_for_thread, setup_tx);
+        pw_thread(
+            node_id,
+            fd,
+            frame_tx,
+            stop_for_thread,
+            setup_tx,
+            dmabuf,
+            sender,
+        );
     });
-    // Encoder-death signal: the encoder thread owns the only sender, so
-    // it fires on send failure AND on any exit (pw death → rx closes →
-    // return → drop). Either way the supervisor must tear everything
-    // down — a dead connection must not leave a portal session and pw
-    // loop running (found in the 6e netem run: endless "encoder behind").
-    let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let enc_handle =
-        std::thread::spawn(move || encoder_thread(frame_rx, conn, force_idr, video_loss, die_tx));
+    // 7j: in DMA-BUF mode there is no encoder thread — the capture thread
+    // owns the encoder, because the producer's buffer must stay dequeued
+    // until the GPU has read it. The channel is unused (and dropped) there.
+    let enc_handle = if dmabuf {
+        drop(frame_rx);
+        None
+    } else {
+        Some(std::thread::spawn(move || {
+            encoder_thread(frame_rx, conn, force_idr, video_loss, die_tx)
+        }))
+    };
 
     // Surface pw setup failures (and close the session on them).
     let setup = tokio::time::timeout(Duration::from_secs(5), setup_rx).await;
@@ -1207,15 +1618,17 @@ pub async fn start(
             Ok(Err(_)) => eprintln!("share: pw thread join failed"),
             Err(_) => eprintln!("share: pw thread did not stop within 2 s — leaked"),
         }
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || enc_handle.join()),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => eprintln!("share: encoder thread join failed"),
-            Err(_) => eprintln!("share: encoder thread did not stop within 5 s — leaked"),
+        if let Some(enc_handle) = enc_handle {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || enc_handle.join()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => eprintln!("share: encoder thread join failed"),
+                Err(_) => eprintln!("share: encoder thread did not stop within 5 s — leaked"),
+            }
         }
         // Already-closed (external stop) is fine — errors ignored.
         let _ = session.close().await;
@@ -1223,6 +1636,67 @@ pub async fn start(
     });
 
     Ok((handle, ShareController { stop_tx }))
+}
+
+#[cfg(all(test, feature = "vaapi"))]
+mod dmabuf_negotiation_tests {
+    use super::{buffers_data_type_property, modifier_property};
+    use pipewire::spa::pod::{ChoiceValue, PropertyFlags, Value};
+    use pipewire::spa::utils::ChoiceEnum;
+
+    /// The two properties that decide whether the share gets the
+    /// compositor's buffers at all. A wrong bit or a missing modifier does
+    /// not fail loudly — the producer quietly hands over a mapped copy, or
+    /// refuses the format — so both are pinned here.
+    ///
+    /// 7j reasoning: the memory type lives in SPA_PARAM_Buffers (the format
+    /// object has no dataType key in this protocol version), and the
+    /// modifier property with MANDATORY is what marks a format offer as
+    /// DMA-BUF.
+    #[test]
+    fn the_dmabuf_offer_asks_for_the_right_memory() {
+        let modifier = modifier_property();
+        assert_eq!(
+            modifier.key,
+            pipewire::spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            "the modifier property must be SPA_FORMAT_VIDEO_modifier"
+        );
+        assert_eq!(
+            modifier.flags,
+            PropertyFlags::MANDATORY,
+            "without MANDATORY a producer may ignore the modifier and send memfd"
+        );
+        match modifier.value {
+            Value::Choice(ChoiceValue::Long(choice)) => match choice.1 {
+                ChoiceEnum::Enum {
+                    default,
+                    alternatives,
+                } => {
+                    assert_eq!(default, 0, "the offered modifier must be LINEAR");
+                    assert_eq!(alternatives, vec![0], "LINEAR must be the only offer");
+                }
+                other => panic!("the modifier must be an enum choice, got {other:?}"),
+            },
+            other => panic!("the modifier must be a Long choice, got {other:?}"),
+        }
+
+        let buffers = buffers_data_type_property();
+        assert_eq!(
+            buffers.key, 6,
+            "the data-type key is SPA_PARAM_BUFFERS_dataType"
+        );
+        match buffers.value {
+            Value::Choice(ChoiceValue::Int(choice)) => match choice.1 {
+                ChoiceEnum::Flags { default, flags } => {
+                    // SPA_DATA_Invalid, MemPtr, MemFd, DmaBuf = 0, 1, 2, 3.
+                    assert_eq!(flags, vec![1 << 3], "only the DMA-BUF bit is offered");
+                    assert_eq!(default, 1 << 3);
+                }
+                other => panic!("the data type must be a flags choice, got {other:?}"),
+            },
+            other => panic!("the data type must be an Int choice, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
