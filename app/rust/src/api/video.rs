@@ -176,36 +176,70 @@ pub mod imp {
     /// raster thread clones the buffer out (one frame copy per
     /// displayed frame — unavoidable: a payload owns its bytes — but
     /// the producer no longer allocates one).
-    struct FrameProvider(Mutex<Option<(i32, i32, Vec<u8>)>>);
+    ///
+    /// The slot must NEVER be empty while a texture exists. Recycling its
+    /// buffer by `take()`ing the slot (the first version of this) left it
+    /// empty for the whole RGB→RGBA conversion — milliseconds at 1080p —
+    /// and `get_payload` answered those pulls with a 1x1 black pixel, so
+    /// the viewer saw the shared screen flash black for a single frame.
+    /// Conversion therefore happens in a separate `spare` buffer that is
+    /// swapped in under the lock.
+    struct FrameProvider {
+        frame: Mutex<Option<(i32, i32, Vec<u8>)>>,
+        spare: Mutex<Vec<u8>>,
+    }
 
     impl FrameProvider {
+        fn new(width: i32, height: i32, rgba: Vec<u8>) -> Self {
+            Self {
+                frame: Mutex::new(Some((width, height, rgba))),
+                spare: Mutex::new(Vec::new()),
+            }
+        }
+
         /// 7h HD: hand the producer the previous frame's buffer, so the
         /// next RGB→RGBA conversion writes into it. At 1080p the old
         /// code allocated 8.3 MB per frame — at the 48 fps a hardware
         /// encoder now delivers that is ~400 MB/s of allocator traffic
         /// for a buffer that is overwritten one frame later.
+        ///
+        /// Empty only until the first `put_frame` hands one back; the
+        /// conversion resizes in that case.
         fn take_buffer(&self) -> Vec<u8> {
-            self.0
-                .lock()
-                .unwrap()
-                .take()
-                .map(|(_, _, buf)| buf)
-                .unwrap_or_default()
+            std::mem::take(&mut *self.spare.lock().unwrap())
         }
 
         /// Publish the newest frame (latest-frame-wins: whatever the
-        /// raster thread has not pulled yet is dropped here).
+        /// raster thread has not pulled yet is dropped here). The frame
+        /// being replaced becomes the next conversion buffer.
         fn put_frame(&self, width: i32, height: i32, rgba: Vec<u8>) {
-            *self.0.lock().unwrap() = Some((width, height, rgba));
+            let old = self.frame.lock().unwrap().replace((width, height, rgba));
+            if let Some((_, _, old)) = old {
+                *self.spare.lock().unwrap() = old;
+            }
         }
     }
 
+    /// Pulls that found no frame. Unreachable since the slot is seeded on
+    /// creation and never emptied — counted so a regression is a log line
+    /// rather than a mystery flash in someone's shared screen.
+    static EMPTY_PULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     impl PayloadProvider<BoxedPixelData> for FrameProvider {
         fn get_payload(&self) -> BoxedPixelData {
-            let slot = self.0.lock().unwrap();
+            let slot = self.frame.lock().unwrap();
             match &*slot {
                 Some((w, h, rgba)) => SimplePixelData::new_boxed(*w, *h, rgba.clone()),
-                None => SimplePixelData::new_boxed(1, 1, vec![0, 0, 0, 255]),
+                None => {
+                    let n = EMPTY_PULLS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(100) {
+                        eprintln!(
+                            "video: empty frame slot pulled {n}x — showing a 1x1 black frame \
+                             (display-bridge race)"
+                        );
+                    }
+                    SimplePixelData::new_boxed(1, 1, vec![0, 0, 0, 255])
+                }
             }
         }
     }
@@ -479,11 +513,11 @@ pub mod imp {
         let handle = *ENGINE_HANDLE
             .get()
             .ok_or("video_prepare was never called")?;
-        let provider = Arc::new(FrameProvider(Mutex::new(Some((
+        let provider = Arc::new(FrameProvider::new(
             frame.width as i32,
             frame.height as i32,
             rgb24_to_rgba(&frame.rgb),
-        )))));
+        ));
         let (tx, rx) = std::sync::mpsc::channel::<
             Result<(i64, Arc<SendableTexture<BoxedPixelData>>), String>,
         >();
