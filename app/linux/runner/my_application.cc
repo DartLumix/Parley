@@ -19,6 +19,36 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
+// Window control channel ("parley/window", Dart side app/lib/main.dart).
+// The share viewer asks for REAL fullscreen here: a widget can fill the
+// window, but only the window manager can take the window borderless and
+// over the panel — which is what a fullscreen screen share means.
+static FlMethodChannel* window_channel = nullptr;
+
+static void window_method_call_cb(FlMethodChannel* channel,
+                                  FlMethodCall* method_call,
+                                  gpointer user_data) {
+  GtkWindow* window = GTK_WINDOW(user_data);
+  const gchar* method = fl_method_call_get_name(method_call);
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (g_strcmp0(method, "setFullscreen") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    gboolean on = TRUE;
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL) {
+      on = fl_value_get_bool(args);
+    }
+    if (on) {
+      gtk_window_fullscreen(window);
+    } else {
+      gtk_window_unfullscreen(window);
+    }
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+  fl_method_call_respond(method_call, response, nullptr);
+}
+
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
@@ -74,6 +104,15 @@ static void my_application_activate(GApplication* application) {
   gtk_widget_realize(GTK_WIDGET(view));
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
+
+  // One channel for the process (kept alive in the static above).
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  window_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(fl_view_get_engine(view)),
+      "parley/window", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(window_channel,
+                                            window_method_call_cb, window,
+                                            nullptr);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }

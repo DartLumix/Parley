@@ -27,6 +27,19 @@ pub fn new_processor() -> Result<Arc<Processor>, webrtc_audio_processing::Error>
     Ok(Arc::new(processor))
 }
 
+/// Echo-cancellation ONLY (no noise suppression, no high-pass): the
+/// share-audio path cancels our own playback out of the captured system
+/// mix, and the content there is music and video sound — NS and a HPF
+/// would chew on it. Same processor type, smaller toolset.
+pub fn new_echo_canceller() -> Result<Arc<Processor>, webrtc_audio_processing::Error> {
+    let processor = Processor::new(48_000)?;
+    processor.set_config(Config {
+        echo_canceller: Some(config::EchoCanceller::default()),
+        ..Default::default()
+    });
+    Ok(Arc::new(processor))
+}
+
 /// Buffers arbitrary-length chunks; pops exact 10 ms frames.
 pub struct FrameAssembler {
     buf: VecDeque<f32>,

@@ -369,12 +369,31 @@ pub(crate) fn start_voice(
     let mut pcm_rx = if let Some(mux_tx) = mic_mux_tx {
         let route = crate::api::session::share_mic_route().clone();
         let (tee_enc_tx, tee_enc_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(16);
+        // 7k: the AEC runs HERE, before the split, so the mux's mic leg
+        // is echo-cancelled too. Routing the raw mic into the share
+        // (the 7g shape) meant a sharer's share carried whatever their
+        // speakers played — the acoustic half of the feedback loop.
+        // Processing before the split keeps each chunk processed exactly
+        // once (`aec_in_tee` below tells the encoder not to repeat it).
+        let tee_aec = aec.clone();
         crate::api::session::rt().spawn(async move {
             let mut pcm_rx = pcm_rx;
+            let mut asm = parley_client::aec::FrameAssembler::new();
             loop {
                 let Some(chunk) = pcm_rx.recv().await else {
                     break;
                 };
+                let chunk: Vec<f32> = match tee_aec.as_ref() {
+                    Some(ap) => {
+                        let mut out = Vec::new();
+                        parley_client::aec::process_capture(ap, &mut asm, &chunk, &mut out);
+                        out
+                    }
+                    None => chunk,
+                };
+                if chunk.is_empty() {
+                    continue;
+                }
                 if route.load(Ordering::Relaxed) {
                     let _ = mux_tx.try_send(chunk);
                     continue;
@@ -388,6 +407,10 @@ pub(crate) fn start_voice(
     } else {
         pcm_rx
     };
+    #[cfg(feature = "screen-capture")]
+    let aec_in_tee = mic_mux_tx_keep.is_some();
+    #[cfg(not(feature = "screen-capture"))]
+    let aec_in_tee = false;
     #[cfg(not(feature = "screen-capture"))]
     let mut pcm_rx = pcm_rx;
 
@@ -395,7 +418,10 @@ pub(crate) fn start_voice(
     // when the capture sender drops (teardown) or the connection dies.
     let encoder_task = {
         let conn = conn.clone();
-        let aec = aec.clone();
+        // 7k: with the tee installed (screen-capture builds) the mic is
+        // already echo-cancelled upstream — processing it again here
+        // would feed the canceller its own output.
+        let aec = if aec_in_tee { None } else { aec.clone() };
         crate::api::session::rt().spawn(async move {
             let mut send = if music {
                 match SendPipeline::new_music(256_000) {
@@ -713,13 +739,20 @@ fn build_streams(
                 // duplicated at the mixer); frames = per-channel
                 // frames.
                 let mixed = mixer.lock().unwrap().mix(frames);
-                // Far-end reference for the AEC: what this callback
-                // plays, downmixed to mono. Speech clients' voices are
-                // mono-duplicated, so this is exactly the terminal
-                // client's reference; music runs without AEC.
-                if let Some(ap) = &aec {
+                // Far-end reference: what this callback plays, downmixed
+                // to mono. Two consumers — the mic's AEC (speech only)
+                // and the 7k share-audio filter, which subtracts our own
+                // playback from the captured system mix so a screen
+                // share can never carry the voice channel (or another
+                // share) back out as a feedback loop. Speech clients'
+                // voices are mono-duplicated, so this is exactly the
+                // terminal client's reference.
+                if aec.is_some() || crate::api::share_echo::active() {
                     let mono: Vec<f32> = mixed.chunks(2).map(|p| (p[0] + p[1]) * 0.5).collect();
-                    parley_client::aec::analyze_render(ap, &mut render_carry, &mono);
+                    if let Some(ap) = &aec {
+                        parley_client::aec::analyze_render(ap, &mut render_carry, &mono);
+                    }
+                    crate::api::share_echo::push_render(&mono);
                 }
                 // ch0 = L, everything else = R (the terminal client's
                 // mapping; a mono output device gets L only).

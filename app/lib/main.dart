@@ -8,6 +8,22 @@ import 'src/rust/frb_generated.dart';
 import 'src/rust/api/session.dart';
 import 'src/rust/api/video.dart' as video_api;
 
+/// The GTK side's window channel (linux/runner/my_application.cc).
+/// Fullscreen means the real thing — borderless, covering panels — not
+/// a full-window widget inside a decorated window.
+const _windowChannel = MethodChannel('parley/window');
+
+Future<void> _setWindowFullscreen(bool on) async {
+  try {
+    await _windowChannel.invokeMethod<void>('setFullscreen', on);
+  } on MissingPluginException {
+    // Not the Linux runner (tests, other platforms): the Flutter view
+    // still fills the window, so this is cosmetic only.
+  } catch (e) {
+    debugPrint('window: fullscreen $on failed: $e');
+  }
+}
+
 Future<void> main() async {
   // Platform channels (EngineContext.getEngineHandle) need the services
   // binding before runApp initializes it for us.
@@ -109,8 +125,9 @@ class _DevHomePageState extends State<DevHomePage> {
   // longer throws video onto the page: the pane offers a "Watch"
   // button and the stream is only rendered once chosen.
   int? _watching;
-  // Fullscreen viewer (an overlay, not a route: a share ending has to
-  // close it from the same state that receives the event).
+  // Fullscreen viewer (a whole-page mode, not a route: a share ending
+  // has to close it from the same state that receives the event). The
+  // GTK window goes genuinely fullscreen alongside it.
   int? _fullscreen;
   // 7g: our own share state (start/stop button) + the hw-encode toggle.
   bool _sharing = false;
@@ -197,6 +214,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _fullscreen = null;
       _sharing = false;
     });
+    _setWindowFullscreen(false);
     // Clean the dead registry entry (a manual Disconnect may have
     // raced us — ignore).
     try {
@@ -269,6 +287,52 @@ class _DevHomePageState extends State<DevHomePage> {
       _fullscreen = null;
       _sharing = false;
     });
+    _setWindowFullscreen(false);
+  }
+
+  // --- fullscreen: a real window mode, with only the two controls the
+  // viewer needs (exit, stop watching) over the picture.
+
+  void _enterFullscreen(int userId) {
+    setState(() {
+      _fullscreen = userId;
+      _watching = userId;
+    });
+    _setWindowFullscreen(true);
+  }
+
+  void _exitFullscreen() {
+    _setWindowFullscreen(false);
+    if (mounted) setState(() => _fullscreen = null);
+  }
+
+  /// Drop share cards this client can no longer legitimately hold.
+  ///
+  /// A share is only visible to the sharer's voice-channel members (the
+  /// server routes video that way) and dies with the sharer's
+  /// membership or session. The server now announces that; this is the
+  /// backstop for a notice that never arrived — the "card that stays
+  /// there forever, Watch shows the last frame" bug.
+  void _pruneShares() {
+    if (_videos.isEmpty) return;
+    final me = _session?.userId;
+    final myChannel = _joinedChannelId;
+    final online = {for (final u in _presence) u.userId};
+    _videos.removeWhere((id, _) {
+      if (id == me) return true; // our own share is not a remote pane
+      if (online.isNotEmpty && !online.contains(id)) return true;
+      if (myChannel == null) return true; // not in voice: nothing routed
+      if (_voiceChannel.isNotEmpty) {
+        final theirs = _voiceChannel[id];
+        if (theirs == null || theirs != myChannel) return true;
+      }
+      return false;
+    });
+    if (_watching != null && !_videos.containsKey(_watching)) _watching = null;
+    if (_fullscreen != null && !_videos.containsKey(_fullscreen)) {
+      _fullscreen = null;
+      _setWindowFullscreen(false);
+    }
   }
 
   // 7g: share lifecycle. Start: portal dialog opens (compositor's
@@ -331,6 +395,7 @@ class _DevHomePageState extends State<DevHomePage> {
           for (final u in ev.users) {
             _usernames[u.userId] = u.username;
           }
+          _pruneShares();
         });
       case 'chat':
         _ingestChat(ev.messages, prepend: false);
@@ -355,6 +420,7 @@ class _DevHomePageState extends State<DevHomePage> {
                 ? 'in voice — mic + speakers live'
                 : 'connected';
           }
+          _pruneShares();
         });
       case 'voice_states':
         setState(() {
@@ -368,6 +434,7 @@ class _DevHomePageState extends State<DevHomePage> {
               _voiceUp = st.joined;
             }
           }
+          _pruneShares();
         });
       case 'video_started':
         final s0 = ev.surface;
@@ -390,7 +457,10 @@ class _DevHomePageState extends State<DevHomePage> {
           setState(() {
             _videos.remove(s1.userId);
             if (_watching == s1.userId) _watching = null;
-            if (_fullscreen == s1.userId) _fullscreen = null;
+            if (_fullscreen == s1.userId) {
+              _fullscreen = null;
+              _setWindowFullscreen(false);
+            }
           });
         }
       case 'share_started':
@@ -486,7 +556,30 @@ class _DevHomePageState extends State<DevHomePage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final fullscreenId = _fullscreen;
+    final fullscreenId =
+        (_fullscreen != null && _videos.containsKey(_fullscreen))
+        ? _fullscreen
+        : null;
+    // Fullscreen is its own page, not a layer over the session view: no
+    // app bar, no floating share/HW bar, no padding. The GTK window is
+    // in real fullscreen behind it.
+    if (fullscreenId != null) {
+      final v = _videos[fullscreenId]!;
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: _FullscreenShare(
+          title: _nameOf(fullscreenId),
+          textureId: v.$1,
+          width: v.$2,
+          height: v.$3,
+          onExit: _exitFullscreen,
+          onStopWatching: () {
+            _exitFullscreen();
+            setState(() => _watching = null);
+          },
+        ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         backgroundColor: theme.colorScheme.inversePrimary,
@@ -519,8 +612,6 @@ class _DevHomePageState extends State<DevHomePage> {
             )
           else
             _sessionView(theme),
-          if (fullscreenId != null && _videos.containsKey(fullscreenId))
-            _fullscreenLayer(fullscreenId),
         ],
       ),
       floatingActionButton: _session == null ? null : _actionBar(theme),
@@ -968,7 +1059,7 @@ class _DevHomePageState extends State<DevHomePage> {
               IconButton(
                 tooltip: 'Fullscreen',
                 icon: const Icon(Icons.fullscreen, size: 20),
-                onPressed: () => setState(() => _fullscreen = userId),
+                onPressed: () => _enterFullscreen(userId),
               ),
               IconButton(
                 tooltip: 'Stop watching',
@@ -979,51 +1070,6 @@ class _DevHomePageState extends State<DevHomePage> {
           ),
         ),
       ],
-    );
-  }
-
-  Widget _fullscreenLayer(int userId) {
-    final v = _videos[userId]!;
-    void close() => setState(() => _fullscreen = null);
-    return Positioned.fill(
-      child: CallbackShortcuts(
-        bindings: {
-          const SingleActivator(LogicalKeyboardKey.escape): close,
-        },
-        child: Focus(
-          autofocus: true,
-          child: Container(
-            color: Colors.black,
-            child: Stack(
-              children: [
-                Center(
-                  child: AspectRatio(
-                    aspectRatio: v.$2 / v.$3,
-                    child: Texture(textureId: v.$1),
-                  ),
-                ),
-                Positioned(
-                  top: 8,
-                  right: 8,
-                  child: IconButton.filledTonal(
-                    tooltip: 'Close (Esc)',
-                    icon: const Icon(Icons.close),
-                    onPressed: close,
-                  ),
-                ),
-                Positioned(
-                  left: 16,
-                  bottom: 12,
-                  child: Text(
-                    '${_nameOf(userId)} · ${v.$2}×${v.$3} · Esc to close',
-                    style: const TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
     );
   }
 
@@ -1142,6 +1188,140 @@ class _LoginView extends StatelessWidget {
                 status,
                 textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The fullscreen viewer: black background, the stream letterboxed to
+/// its own aspect, and one translucent control cluster that fades after
+/// a few idle seconds and comes back on pointer movement. Nothing else
+/// — no app bar, no session chrome, no floating action bar.
+class _FullscreenShare extends StatefulWidget {
+  const _FullscreenShare({
+    required this.title,
+    required this.textureId,
+    required this.width,
+    required this.height,
+    required this.onExit,
+    required this.onStopWatching,
+  });
+
+  final String title;
+  final int textureId;
+  final int width;
+  final int height;
+  final VoidCallback onExit;
+  final VoidCallback onStopWatching;
+
+  @override
+  State<_FullscreenShare> createState() => _FullscreenShareState();
+}
+
+class _FullscreenShareState extends State<_FullscreenShare> {
+  bool _controls = true;
+  Timer? _hide;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleHide();
+  }
+
+  @override
+  void dispose() {
+    _hide?.cancel();
+    super.dispose();
+  }
+
+  void _scheduleHide() {
+    _hide?.cancel();
+    _hide = Timer(const Duration(seconds: 3), () {
+      if (mounted && _controls) setState(() => _controls = false);
+    });
+  }
+
+  void _reveal() {
+    if (!mounted) return;
+    if (!_controls) setState(() => _controls = true);
+    _scheduleHide();
+  }
+
+  Widget _button(IconData icon, String label, VoidCallback onTap) {
+    return FilledButton.tonalIcon(
+      onPressed: onTap,
+      icon: Icon(icon, size: 18),
+      label: Text(label),
+      style: FilledButton.styleFrom(
+        backgroundColor: Colors.black54,
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.escape): widget.onExit,
+      },
+      child: Focus(
+        autofocus: true,
+        child: MouseRegion(
+          cursor: _controls ? SystemMouseCursors.basic : SystemMouseCursors.none,
+          onHover: (_) => _reveal(),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Center(
+                child: AspectRatio(
+                  aspectRatio: widget.width / widget.height,
+                  child: Texture(textureId: widget.textureId),
+                ),
+              ),
+              Positioned(
+                top: 16,
+                right: 16,
+                child: AnimatedOpacity(
+                  opacity: _controls ? 1 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  child: IgnorePointer(
+                    ignoring: !_controls,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _button(
+                          Icons.visibility_off,
+                          'Stop watching',
+                          widget.onStopWatching,
+                        ),
+                        const SizedBox(width: 8),
+                        _button(
+                          Icons.fullscreen_exit,
+                          'Exit fullscreen',
+                          widget.onExit,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 20,
+                bottom: 16,
+                child: AnimatedOpacity(
+                  opacity: _controls ? 1 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  child: Text(
+                    '${widget.title} · ${widget.width}×${widget.height} · Esc to exit',
+                    style: const TextStyle(color: Colors.white60, fontSize: 12),
+                  ),
+                ),
               ),
             ],
           ),

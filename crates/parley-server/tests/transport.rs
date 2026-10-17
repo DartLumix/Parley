@@ -1072,6 +1072,101 @@ async fn stop_share_scoped_to_channel_members() {
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 
+/// 7k: a share cannot outlive channel membership. Leaving voice while
+/// sharing used to notify nobody — viewers kept the card (and its Watch
+/// button showed the last decoded frame) indefinitely.
+#[tokio::test]
+async fn share_stop_notice_on_voice_leave() {
+    let (mut a, mut b, mut c, _ch2, config) = setup_two_channels("stop-leave").await;
+
+    // A is sharing: one video datagram is what marks that server-side
+    // (the teardown paths only announce a stop for a live share).
+    let dg = parley_proto::media::encode(parley_proto::media::FLAG_VIDEO, 0, 0, 0, &[0u8; 16]);
+    a.0.send_datagram(dg.into()).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    send_client_msg(&mut a.1, ClientBody::LeaveVoice(LeaveVoice {})).await;
+
+    let mut saw_stop = false;
+    let mut saw_leave = false;
+    while !(saw_stop && saw_leave) {
+        let msg = timeout(Duration::from_secs(2), read_server_msg(&mut b.2))
+            .await
+            .expect("viewer must hear about the leave");
+        match msg.body {
+            Some(ServerBody::ShareStopped(s)) => {
+                assert_eq!(s.user_id, 1, "stamped with the leaver's id");
+                saw_stop = true;
+            }
+            Some(ServerBody::VoiceState(v)) if v.user_id == 1 => {
+                assert!(!v.joined);
+                saw_leave = true;
+            }
+            _ => {}
+        }
+    }
+
+    // Neither the leaver nor the other channel sees the stop notice.
+    for stream in [&mut a.2, &mut c.2] {
+        for _ in 0..4 {
+            let Ok(read) = timeout(
+                Duration::from_millis(300),
+                session::read_message::<ServerMessage>(stream),
+            )
+            .await
+            else {
+                break;
+            };
+            let Ok(msg) = read else { break };
+            assert!(
+                !matches!(msg.body, Some(ServerBody::ShareStopped(_))),
+                "stop notice must stay in the sharer's channel and exclude the sharer"
+            );
+        }
+    }
+
+    a.0.close(0u32.into(), b"done");
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// 7k: a sharer whose app dies (crash, closed window, network drop)
+/// never sends StopShare — the server's own teardown has to tell the
+/// room, or its viewers hold a dead card until they reconnect.
+#[tokio::test]
+async fn share_stop_notice_on_session_death() {
+    let (a, mut b, c, _ch2, config) = setup_two_channels("stop-death").await;
+
+    // Mark the share, give the server's datagram task a beat to see it,
+    // then kill the session the way a crash does: no StopShare ever
+    // rides the control stream.
+    let dg = parley_proto::media::encode(parley_proto::media::FLAG_VIDEO, 0, 0, 0, &[0u8; 16]);
+    a.0.send_datagram(dg.into()).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    a.0.close(0u32.into(), b"gone");
+
+    let mut saw_stop = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !saw_stop && tokio::time::Instant::now() < deadline {
+        let Ok(msg) = timeout(Duration::from_secs(1), read_server_msg(&mut b.2)).await else {
+            continue;
+        };
+        if let Some(ServerBody::ShareStopped(s)) = msg.body {
+            assert_eq!(s.user_id, 1, "stamped with the dead sharer's id");
+            saw_stop = true;
+        }
+    }
+    assert!(
+        saw_stop,
+        "viewers must hear that a dead sharer's share ended"
+    );
+
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
 #[tokio::test]
 async fn voice_states_snapshot_two_channels() {
     let (mut a, _b, _c, ch2, config) = setup_two_channels("snapshot").await;

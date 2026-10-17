@@ -616,6 +616,12 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             {
                 if s.user_id != own_user_id(session_id) {
                     if let Some(sess) = SESSIONS.lock().unwrap().get(&session_id) {
+                        // 7k: the sharer's audio stream ends with the
+                        // share. Flush what is still buffered (and stop
+                        // the decoder's PLC extrapolation) so no tail
+                        // plays on after the card is gone — the stream
+                        // itself keeps existing for their voice.
+                        sess.mixer.lock().unwrap().remove(s.user_id);
                         if let Some(d) = sess.display.as_ref() {
                             d.sender_stopped(s.user_id, false);
                         }
@@ -1216,11 +1222,20 @@ pub fn start_screen_share(session_id: u32) -> Result<(), String> {
             // the mux lives.
             #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
             let (sys_tx, sys_rx) = {
+                // 7k: the PipeWire monitor mix enters RAW and leaves the
+                // echo filter with our own playback subtracted, then
+                // reaches the mux. Two bounded channels: the capture
+                // thread never blocks, and a canceller-init failure
+                // degrades to a pass-through instead of silence.
+                let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
                 let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
-                (Some(tx), Some(rx))
+                crate::api::share_echo::spawn_filter(raw_rx, tx.clone());
+                (Some(raw_tx), Some(rx))
             };
+            // No share audio in this build: the mux below is cfg'd out
+            // with the same predicate, so the receiver is never read.
             #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
-            let (sys_tx, sys_rx): (
+            let (sys_tx, _sys_rx): (
                 Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
                 Option<std::sync::mpsc::Receiver<Vec<f32>>>,
             ) = (None, None);

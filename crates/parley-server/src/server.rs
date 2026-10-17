@@ -282,6 +282,13 @@ async fn serve(
     // and voice.leave would be booted from voice; coupling the two
     // locks isn't worth it.)
     let still_current = registry.unregister_if(info.id, session_gen);
+    // 7k: the channel a dying session was in, captured before the leave
+    // below forgets it — the ShareStopped notice goes to the room.
+    let died_in_channel = if still_current {
+        voice.channel_of(info.id)
+    } else {
+        None
+    };
     if still_current {
         // Presence push on leave: the fresh list (dying user already
         // unregistered) reaches the survivors. Generation-guarded — a
@@ -296,6 +303,15 @@ async fn serve(
                 joined: false,
             })),
         });
+    }
+    // 7k: the session (and with it any share) is over — the channel it
+    // was routed to must hear that, or a crash/disconnect strands a
+    // frozen card on every viewer. `voice.leave` above already dropped
+    // the membership, so the surviving members are all that remain.
+    if let Some(channel_id) = died_in_channel
+        && voice.stop_sharing(info.id)
+    {
+        notify_share_stopped(info.id, channel_id, registry, voice);
     }
     info!(user_id = info.id, "session ended");
     let _ = tx.finish();
@@ -414,6 +430,11 @@ async fn handle_client_message(
                 if let Some(old) = voice.join(info.id, j.channel_id)
                     && old != j.channel_id
                 {
+                    // A channel switch is leave + join: the share died
+                    // with the old membership.
+                    if voice.stop_sharing(info.id) {
+                        notify_share_stopped(info.id, old, registry, voice);
+                    }
                     registry.broadcast(ServerMessage {
                         body: Some(ServerBody::VoiceState(PbVoiceState {
                             user_id: info.id,
@@ -434,7 +455,16 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::LeaveVoice(_)) => {
-            if registry.is_current(info.id, session_gen) && voice.leave(info.id).is_some() {
+            if registry.is_current(info.id, session_gen)
+                && let Some(old_channel) = voice.leave(info.id)
+            {
+                // 7k: a share cannot outlive channel membership — the
+                // media route it rides is gone. Tell the room, or its
+                // viewers hold a card whose Watch button shows a frozen
+                // last frame forever (the reported 7j bug).
+                if voice.stop_sharing(info.id) {
+                    notify_share_stopped(info.id, old_channel, registry, voice);
+                }
                 registry.broadcast(ServerMessage {
                     body: Some(ServerBody::VoiceState(PbVoiceState {
                         user_id: info.id,
@@ -487,15 +517,18 @@ async fn handle_client_message(
             // 6a/6b: scoped exactly like the video datagrams it
             // terminates — members of the sharer's channel, sharer
             // excluded (their own state machine drove the stop).
-            if let Some(channel_id) = voice.channel_of(info.id) {
-                let msg = ServerMessage {
+            // An explicit stop always notifies: the client only sends
+            // it after teardown, and a duplicate is a no-op downstream.
+            voice.stop_sharing(info.id);
+            match voice.channel_of(info.id) {
+                Some(channel_id) => notify_share_stopped(info.id, channel_id, registry, voice),
+                // 7k: the sharer already left voice (or the leave and
+                // the stop raced). Nobody is in the old channel by our
+                // books, but a viewer may still hold the card — a
+                // broadcast is harmless (a second stop is a no-op).
+                None => registry.broadcast(ServerMessage {
                     body: Some(ServerBody::ShareStopped(ShareStopped { user_id: info.id })),
-                };
-                for member in voice.members_of(channel_id) {
-                    if member != info.id {
-                        registry.send_to_user(member, msg.clone());
-                    }
-                }
+                }),
             }
         }
 
@@ -528,6 +561,29 @@ async fn handle_client_message(
     Ok(true)
 }
 
+/// Tell one channel's members that `user_id` is no longer sharing.
+///
+/// Every path that kills the share's route calls this: an explicit
+/// stop, leaving voice, switching channels, and session end. Before
+/// 7k only an explicit stop *while still in the channel* notified
+/// anyone, so a sharer who closed their app (or hopped channels) left
+/// viewers with a card that never went away.
+fn notify_share_stopped(
+    user_id: u32,
+    channel_id: u64,
+    registry: &Arc<SessionRegistry>,
+    voice: &Arc<VoiceManager>,
+) {
+    let msg = ServerMessage {
+        body: Some(ServerBody::ShareStopped(ShareStopped { user_id })),
+    };
+    for member in voice.members_of(channel_id) {
+        if member != user_id {
+            registry.send_to_user(member, msg.clone());
+        }
+    }
+}
+
 /// Forward a media datagram from `sender` to their voice channel.
 /// The sender id in the header is overwritten with the authenticated id.
 fn route_datagram(
@@ -547,6 +603,12 @@ fn route_datagram(
     let Some(channel_id) = voice.channel_of(sender.id) else {
         return; // sender is not in a voice channel: drop
     };
+    // 7k: a video datagram means a share is live for this user. The
+    // teardown paths consult this flag so they only announce a stop
+    // for someone who had something to stop.
+    if decoded.flags & parley_proto::media::FLAG_VIDEO != 0 {
+        voice.mark_sharing(sender.id);
+    }
 
     let forwarded = Bytes::from(parley_proto::media::encode(
         decoded.flags,
