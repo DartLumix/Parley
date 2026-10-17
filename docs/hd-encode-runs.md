@@ -194,12 +194,12 @@ exercised: swap the roles and repeat.
 
 ### Step 2b — zero-copy capture, if the compositor offers DMA-BUFs (7j)
 
-> Verified once end to end on Machine A (Hyprland, xdg-desktop-portal-hyprland
-> 0.1, self-view on the same box): negotiation, import, encode, transport and
-> decode all ran, with the sender at ~24.7 fps of a 30 fps source and the
-> viewer at `243 decoded, 0 no-picture, 0 decode errors`. The transcript is at
-> the end of this section — re-run it after a compositor upgrade, since the
-> offer has to match the producer's format list exactly.
+> Verified once end to end on Machine A (Hyprland, xdg-desktop-portal-hyprland,
+> self-view on the same box): negotiation, import, encode, transport and
+> decode all ran, with the sender at ~28 fps of a 30 fps source and the viewer
+> at `1020 decoded, 0 no-picture, 0 decode errors, 0 dropped, 0 skipped`. The
+> transcript is at the end of this section — re-run it after a compositor
+> upgrade, since the offer has to match the producer's format list exactly.
 
 Same run with two extra flags on the sender (build it with `vaapi` too):
 
@@ -232,10 +232,15 @@ sender:  video: hardware (VAAPI) encoder selected — 1920x1080, measured 50.6 f
              (pacing at 51), 9486187 bps, keyframe self-test passed ...
 sender:  share: encoder ready (1920x1080, source 30 fps → paced 30 fps, clean rung 5625000 bps); hardware=true
 sender:  share: pw stream Paused -> Streaming
-sender:  share: encoded 247 frames (24.7 fps), 0 stale skipped
+sender:  share: encoded 280 frames (28.0 fps), 0 stale skipped
 viewer:  video: user 14 sharing 1920x1080 @ 30 fps
-viewer:  video: user 14: 234 shown (243 decoded, 0 no-picture, 0 decode errors), 0 dropped, 14 skipped, 0 shed
+viewer:  video: user 14: 240 shown (1020 decoded, 0 no-picture, 0 decode errors), 0 dropped, 0 skipped, 0 shed
 ```
+
+The first version of this path paced by DROPPING an early frame and measured
+`24.7 fps` with the viewer dropping 14 — the frames were early, not stale.
+Waiting for the slot while still holding the producer's buffer (which is the
+backpressure PipeWire expects) recovered them: `28 fps`, nothing dropped.
 
 The failure this step was written against, and why the modifier list is what
 it is: offering `DRM_FORMAT_MOD_LINEAR` alone ended the negotiation with
