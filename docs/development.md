@@ -47,6 +47,12 @@ The crate configures with `meson setup --reconfigure`, which Ubuntu
 contain a valid build tree"). Install meson from pip (>= 1.0) on 22.04;
 the release workflow does exactly that.
 
+Opus follows the same rule: on glibc Linux `audiopus_sys` links the
+system `libopus.so` unless `LIBOPUS_STATIC=1` is set. The release job
+sets that plus `LIBOPUS_NO_PKG=1` so the bundled Opus is built (cmake
+< 4 — its CMakeLists predates policy 3.5) and linked statically, which
+24.04's non-PIC `libopus.a` cannot be.
+
 Building the shipping features also needs PipeWire >= 0.3.65 headers:
 pipewire-rs uses `spa_video_info_raw.flags`, which 22.04's 0.3.48 does
 not have. 24.04 (1.0.5) is therefore the build and runtime baseline for

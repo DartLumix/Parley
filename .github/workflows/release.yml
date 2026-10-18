@@ -131,6 +131,14 @@ jobs:
     # headers (22.04 ships 0.3.48, which fails with E0609). 24.04 also
     # sets the glibc baseline the tarball is built for.
     runs-on: ubuntu-24.04
+    env:
+      # audiopus_sys links the distro libopus.so by default on glibc
+      # Linux, which would leave the tarball depending on the user's
+      # libopus0. Skip pkg-config and build the bundled Opus, which
+      # cmake compiles with -fPIC and links statically (24.04's
+      # libopus.a is not PIC and cannot go into a .so).
+      LIBOPUS_NO_PKG: "1"
+      LIBOPUS_STATIC: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -195,9 +203,9 @@ jobs:
             missing=$(ldd /bundle/parley /bundle/lib/libparley_flutter.so \
                     /bundle/lib/libflutter_linux_gtk.so | grep "not found" || true)
             if [ -n "$missing" ]; then echo "$missing"; exit 1; fi
-            if ldd /bundle/lib/libparley_flutter.so | grep -Eq 'webrtc-audio|absl'; then
+            if ldd /bundle/lib/libparley_flutter.so | grep -Eq "webrtc-audio|absl"; then
               echo "system WebRTC/abseil linked — the AEC was not self-contained"
-              ldd /bundle/lib/libparley_flutter.so | grep -E 'webrtc-audio|absl'
+              ldd /bundle/lib/libparley_flutter.so | grep -E "webrtc-audio|absl"
               exit 1
             fi
             echo "bundle resolves on a clean Ubuntu 24.04, AEC self-contained"
