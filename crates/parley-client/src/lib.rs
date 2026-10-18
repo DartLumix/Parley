@@ -3,6 +3,7 @@
 //! (see tests/aec.rs).
 
 pub mod cert;
+pub mod endpoint;
 
 #[cfg(feature = "audio-device")]
 pub mod aec;

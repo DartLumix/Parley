@@ -23,13 +23,21 @@ COPY --from=planner /app/recipe.json recipe.json
 COPY vendor/ vendor/
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl -p parley-server
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    -p parley-server --bin parley-server --bin parley-adduser
 RUN printf 'listen = "0.0.0.0:4443"\ndata_dir = "/data"\n' > /config.toml \
     && mkdir -p /data && touch /data/.keep
 
 # ---- Stage 4: the image that actually ships ----
 FROM scratch
+LABEL org.opencontainers.image.title="Parley" \
+      org.opencontainers.image.description="Self-hosted voice, chat and screen share server" \
+      org.opencontainers.image.source="https://github.com/DartLumix/Parley" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/parley-server /parley-server
+# Account management without a shell: `docker compose exec parley
+# /parley-server adduser USER PASS`. Statically linked, so scratch is fine.
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/parley-adduser /parley-adduser
 COPY --from=builder /config.toml /config.toml
 COPY --from=builder --chown=65534:65534 /data /data
 USER 65534:65534

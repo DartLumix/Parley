@@ -1,11 +1,21 @@
+# From a checkout: builds the server image and runs it.
+# For a released image / VPS, use deploy/compose.yaml instead.
 services:
   parley:
-    image: parley:latest
+    image: parley:local
     build: .
     ports:
-      - "443:4443/udp"      # host 443 → container 4443
+      - "${PARLEY_PORT:-443}:4443/udp"   # host UDP port → container 4443
     volumes:
-      - ./data:/data        # first run: mkdir -p data && sudo chown 65534:65534 data
+      # The container runs as uid 65534. First time only:
+      #   mkdir -p data && sudo chown 65534:65534 data
+      - ./data:/data
     environment:
-      - PARLEY_ADMIN_PASSWORD=${PARLEY_ADMIN_PASSWORD:-}   # first boot only
+      # First boot only: creates the admin account when the users table is
+      # empty. Afterwards the variable is ignored — remove it from .env.
+      - PARLEY_ADMIN_PASSWORD=${PARLEY_ADMIN_PASSWORD:-}
     restart: unless-stopped
+
+# Accounts (no user-management RPC yet). While the container runs:
+#   docker compose exec parley /parley-server adduser <user> <password>
+# A BUSY error means the write raced the server: retry.

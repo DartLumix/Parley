@@ -1,6 +1,6 @@
 //! Synthetic AEC verification (Phase 4a): no hardware needed. The mic on
-//! the dev machine cannot acoustically hear its own headphones (HANDOFF
-//! §10), so real echo cancellation can't be observed by ear — this test
+//! the dev machine cannot acoustically hear its own headphones, so real
+//! echo cancellation can't be observed by ear — this test
 //! constructs the echo path mathematically instead: render a tone, feed
 //! the processor a delayed attenuated copy as "capture", expect the
 //! processor to cancel it.

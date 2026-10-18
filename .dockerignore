@@ -1,3 +1,26 @@
+# Cargo output and git history (cargo builds inside the image).
 target/
 .git/
 rust-toolchain.toml
+
+# Flutter UI and desktop assets: not part of the server image. app/rust is
+# a workspace member, so its manifest/source stay.
+app/build/
+app/.dart_tool/
+app/.idea/
+app/lib/
+app/linux/
+app/test/
+app/.metadata
+app/parley.iml
+
+# Local state, docs, release tooling.
+data/
+docs/
+deploy/
+packaging/
+tools/
+.github/
+.freebuff/
+dist/
+*.tar.gz

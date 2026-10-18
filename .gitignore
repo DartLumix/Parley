@@ -1,5 +1,6 @@
 /target
 /data
+/dist
 # Building the excluded vendored crate on its own (to check a patch) creates
 # these; the workspace has its own lock file one level up.
 vendor/*/target/

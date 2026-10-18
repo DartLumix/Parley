@@ -4,7 +4,7 @@
 //! ring has wedged the GPU twice — the rustdesk incident, and our own
 //! first-party contained probe (standalone binary, H.264 profile, NV12
 //! input, MB-aligned 720p — the "wrong profile / RGB fed to VCE"
-//! hypotheses are both falsified; see HANDOFF §8). This module exists
+//! hypotheses are both falsified; see docs/hd-encode-runs.md). This module exists
 //! ONLY behind the `vaapi` cargo feature AND the runtime `--hw-encode`
 //! flag, and selection happens once at encoder creation with fallback
 //! to software on any init error. A wedge mid-stream is a kernel event

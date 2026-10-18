@@ -1,0 +1,24 @@
+# Production: one container, one UDP port, one volume.
+#
+#   cp .env.example .env    # set PARLEY_ADMIN_PASSWORD, then edit it out
+#   docker compose up -d
+#   docker compose exec parley /parley-server adduser alice 'pass'
+#
+# `PARLEY_IMAGE` defaults to parley:latest, which is the tag of the image
+# loaded from the release asset (docker load -i parley-image-*.tar.gz).
+# Set it to ghcr.io/dartlumix/parley:<version> to pull instead.
+name: parley
+
+services:
+  parley:
+    image: ${PARLEY_IMAGE:-parley:latest}
+    ports:
+      - "${PARLEY_PORT:-443}:4443/udp"
+    volumes:
+      - parley-data:/data
+    environment:
+      PARLEY_ADMIN_PASSWORD: ${PARLEY_ADMIN_PASSWORD:-}
+    restart: unless-stopped
+
+volumes:
+  parley-data:

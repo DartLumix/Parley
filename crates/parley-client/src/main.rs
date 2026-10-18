@@ -36,7 +36,6 @@
 //! tee routes the mic: normal encoder when idle, the share-audio mux
 //! while sharing. Mic + system audio both ride FLAG_STEREO per-packet.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,6 +83,10 @@ struct Args {
     /// Implies --hw-encode (a software encoder has nothing to import
     /// into) and is refused outright if either is unavailable.
     dmabuf: bool,
+    /// Release/ops smoke test: connect, authenticate, list channels and
+    /// exit. No audio devices, no video, no stdin — runnable against a
+    /// server in a container or on a VPS from any machine.
+    check: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -96,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
     let mut volumes = Vec::new();
     let mut it = std::env::args().skip(1);
     let (mut share, mut share_audio, mut hw_encode, mut dmabuf) = (false, false, false, false);
+    let mut check = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--server" => server = it.next(),
@@ -122,6 +126,7 @@ fn parse_args() -> Result<Args, String> {
             "--share-audio" => share_audio = true,
             "--hw-encode" => hw_encode = true,
             "--dmabuf" => dmabuf = true,
+            "--check" => check = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -153,6 +158,7 @@ fn parse_args() -> Result<Args, String> {
         share_audio,
         hw_encode,
         dmabuf,
+        check,
     })
 }
 
@@ -187,17 +193,8 @@ async fn read_frame(rx: &mut quinn::RecvStream) -> Result<Vec<u8>, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let started = std::time::Instant::now();
-    let addr: SocketAddr = args.server.parse().map_err(|_| {
-        format!(
-            "--server must be IP:port for now (got \"{}\") — DNS names come with the real client",
-            args.server
-        )
-    })?;
-    let server_name = args
-        .server
-        .split_once(':')
-        .map(|(h, _)| h.to_string())
-        .unwrap_or_else(|| args.server.clone());
+    // host[:port], DNS included; the pin stays keyed by the typed string.
+    let (addr, server_name) = parley_client::endpoint::resolve(&args.server)?;
 
     if args.share_audio && args.music {
         eprintln!("--share-audio and --music are mutually exclusive; share-audio disabled");
@@ -233,7 +230,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- connect (TOFU) ---
     let (pin, hosts_path) = cert::load_pin(&args.server)?;
     let (endpoint, seen) = cert::build_endpoint(pin.clone());
-    let conn = endpoint.connect(addr, &server_name)?.await?;
+    let connecting = endpoint.connect(addr, &server_name)?;
+    // --check is an ops tool: a firewalled UDP port must fail in seconds
+    // with a sentence, not hang on QUIC retransmissions until Ctrl-C.
+    let conn = if args.check {
+        match tokio::time::timeout(Duration::from_secs(10), connecting).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(format!(
+                    "check: no QUIC handshake with {} within 10 s — is the UDP port open?",
+                    args.server
+                )
+                .into());
+            }
+        }
+    } else {
+        connecting.await?
+    };
 
     // --- handshake + auth (bare messages) ---
     let (mut tx, mut rx) = conn.open_bi().await?;
@@ -276,6 +289,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("relogged in via session token (user id {})", ok.user_id);
     } else {
         println!("session token (relogin with --token): {}", ok.session_token);
+    }
+
+    // --- --check: the release/ops smoke test ---
+    // A real end-to-end without devices: QUIC + TLS + TOFU verifier +
+    // password auth + DB + channel list + heartbeat. Exit status is the
+    // contract (0 = the server a new device will get answers).
+    if args.check {
+        let sent = now_ms();
+        session::write_message(
+            &mut tx,
+            &ClientMessage {
+                body: Some(ClientBody::Heartbeat(Heartbeat {
+                    client_time_ms: sent,
+                })),
+            },
+        )
+        .await?;
+        session::write_message(
+            &mut tx,
+            &ClientMessage {
+                body: Some(ClientBody::ListChannels(ListChannels {})),
+            },
+        )
+        .await?;
+        let mut channels: Option<usize> = None;
+        let mut rtt_ms: Option<u64> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while channels.is_none() || rtt_ms.is_none() {
+            let msg: ServerMessage =
+                match tokio::time::timeout_at(deadline, session::read_message(&mut rx)).await {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(e)) => return Err(format!("check: server closed: {e}").into()),
+                    Err(_) => return Err("check: timed out waiting for the server".into()),
+                };
+            match msg.body {
+                Some(ServerBody::ChannelList(list)) => channels = Some(list.channels.len()),
+                Some(ServerBody::HeartbeatAck(a)) => {
+                    rtt_ms = Some(now_ms().saturating_sub(a.client_time_ms));
+                }
+                _ => {}
+            }
+        }
+        let channels = channels.unwrap_or(0);
+        if channels == 0 {
+            return Err("check: server returned no channels".into());
+        }
+        println!(
+            "CHECK OK server={} user={} id={} channels={} rtt_ms={} elapsed_ms={}",
+            args.server,
+            args.user,
+            ok.user_id,
+            channels,
+            rtt_ms.unwrap_or(0),
+            started.elapsed().as_millis()
+        );
+        conn.close(0u32.into(), b"check done");
+        return Ok(());
     }
 
     // --- 6d: channel mode discovery (before the writer task takes tx) ---

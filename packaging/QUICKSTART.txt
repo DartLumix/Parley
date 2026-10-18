@@ -1,0 +1,37 @@
+Parley — Linux desktop client
+=============================
+
+Install (no root, installs to ~/.local):
+
+    ./install.sh
+
+Then launch "Parley" from your app launcher, or run:
+
+    ~/.local/bin/parley
+
+Connect to a server:
+
+    host or IP, port optional — the default QUIC port is 4443.
+    With the release container mapped to host port 443, type
+    "your-server:443".
+
+Your login is a username and password created by the server owner:
+
+    docker compose exec parley /parley-server adduser alice 'a password'
+
+The first time you connect, the client pins the server's certificate
+(the same TOFU model as SSH). Compare the fingerprint the server prints
+on startup with the one the app shows after login. If the owner ever
+regenerates the identity, delete that server's line from
+~/.config/parley/known_hosts and reconnect.
+
+Requirements: GTK 3, PipeWire (screen capture), ALSA (audio) and a
+Wayland or X11 session. install.sh reports anything missing.
+
+Screen sharing asks the desktop's portal for a capture stream. On
+Hyprland install xdg-desktop-portal-hyprland; on GNOME, KDE and sway
+use the matching backend. Audio and chat never need the portal.
+
+Uninstall:
+
+    ./install.sh --uninstall

@@ -13,7 +13,7 @@ exclude = ["vendor/moq-vaapi"]
 
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -40,7 +40,12 @@ bytes = "1"
 futures-util = "0.3"
 audiopus = "0.3.0-rc.0"
 cpal = "0.15"
-webrtc-audio-processing = "2.1"
+# `bundled` compiles WebRTC APM from source and links it statically. The
+# default links the SYSTEM library (libwebrtc-audio-processing-2.so), which
+# is not installed on most distros — a prebuilt client would fail to start
+# there. Build requirement: meson, ninja, a C++ toolchain and libclang
+# (bindgen); runtime requirement: none.
+webrtc-audio-processing = { version = "2.1", features = ["bundled"] }
 openh264 = "0.9"
 ashpd = "0.13"
 pipewire = "0.10"
@@ -67,7 +72,7 @@ lto = "thin"
 
 
 # For profiling: release optimization + symbols. Used for perf work
-# (6g CPU investigation; see HANDOFF §8 when it concludes).
+# (6g CPU investigation; see docs/hd-encode-runs.md for the measurements).
 [profile.release-with-debug]
 inherits = "release"
 strip = false
