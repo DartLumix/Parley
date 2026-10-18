@@ -282,11 +282,39 @@ jobs:
           # become a second release asset.
           rm -f dist/parley-image-*.tar.gz
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
-          awk -v ver="$VERSION" '
-            index($0, "## [" ver "]") == 1 { p = 1 }
-            p && /^## \[/ && index($0, "## [" ver "]") != 1 { exit }
-            p { print }
-          ' CHANGELOG.md > notes.md
+          # CHANGELOG.md is wrapped at 80 columns; GitHub renders every
+          # newline as a hard break, so refill each paragraph and bullet
+          # into one line before publishing.
+          python3 - CHANGELOG.md "$VERSION" > notes.md <<'PY'
+          import re, sys
+
+          path, version = sys.argv[1], sys.argv[2]
+          text = open(path, encoding="utf-8").read()
+          section = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)",
+              text, re.M | re.S,
+          )
+          if section is None:
+              sys.exit(f"CHANGELOG.md has no section for {version}")
+
+          blocks = []
+          for block in re.split(r"\n\s*\n", section.group(1).strip()):
+              lines = [line.strip() for line in block.splitlines() if line.strip()]
+              if lines and (lines[0].startswith("#") or lines[0].startswith("- ")):
+                  items = []
+                  for line in lines:
+                      if line.startswith(("#", "- ")):
+                          items.append(line)
+                      else:
+                          items[-1] += " " + line
+                  blocks.append("\n".join(items))
+              elif lines:
+                  blocks.append(" ".join(lines))
+          # One heading level up: the release page already shows the
+          # version as its title, so "### Added" becomes "## Added".
+          blocks = [block[1:] if block.startswith("### ") else block for block in blocks]
+          print("\n\n".join(blocks))
+          PY
           {
             echo
             echo "## Assets"
