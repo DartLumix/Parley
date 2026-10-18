@@ -3,6 +3,7 @@
 One container, one UDP port, one volume. No database service, no proxy.
 
 ```sh
+cd parley-deploy-<version>          # this directory
 docker load -i parley-image-<version>.tar.gz
 cp .env.example .env          # set PARLEY_ADMIN_PASSWORD
 docker compose up -d
@@ -21,14 +22,15 @@ the users table is empty.
 
 ## Ports and firewall
 
-`PARLEY_PORT` (default 443) is the host UDP port; the container always
+`PARLEY_PORT` (default 4443) is the host UDP port; the container always
 listens on 4443. QUIC is UDP only — no TCP rule is needed.
 
 ```sh
-sudo ufw allow 443/udp
+sudo ufw allow 4443/udp
 ```
 
-Clients connect with `your-server:443` (or the port you chose).
+Clients connect with `your-server` (the client default is 4443), or
+`your-server:<port>` if you chose something else.
 
 ## Identity
 
@@ -50,6 +52,8 @@ Restore into a fresh volume the same way with `tar xzf`.
 ## Upgrade
 
 ```sh
+tar xf parley-deploy-<new-version>.tar.gz
+cd parley-deploy-<new-version>
 docker load -i parley-image-<new-version>.tar.gz
 docker compose up -d
 ```

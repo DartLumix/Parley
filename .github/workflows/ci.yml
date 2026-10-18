@@ -57,6 +57,9 @@ jobs:
         run: |
           cargo test -p parley-core --features video
           cargo test -p parley-client --features audio-device
+          # The disconnect/presence regression only reproduces with the
+          # video task running (it holds a session-lifetime sender).
+          cargo test -p parley_flutter --features video
       - name: flutter checks
         working-directory: app
         run: |

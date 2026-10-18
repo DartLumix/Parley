@@ -13,27 +13,22 @@ binary on `scratch` — no shell, no libc, ~10 MB.
   container is 1.4 MiB).
 
 ```sh
-sudo ufw allow 443/udp      # or your chosen port
+sudo ufw allow 4443/udp     # or your chosen port
 ```
 
 ## 2. Install
 
-From the release page, download two assets:
-
-```
-parley-deploy-<version>.tar.gz
-parley-image-<version>.tar.gz
-```
-
-Then, on the server:
+From the release page, download `parley-deploy-<version>.tar.gz` — it
+contains the compose file, the env template, the runbook and the server
+image. Then, on the server:
 
 ```sh
 tar xf parley-deploy-<version>.tar.gz
 cd parley-deploy-<version>
-docker load -i ../parley-image-<version>.tar.gz
+docker load -i parley-image-<version>.tar.gz
 
 cp .env.example .env
-# edit .env: set PARLEY_ADMIN_PASSWORD (first boot only), keep PARLEY_PORT=443
+# edit .env: set PARLEY_ADMIN_PASSWORD (first boot only), keep PARLEY_PORT=4443
 
 docker compose up -d
 ```
@@ -74,8 +69,8 @@ use a checkout (`tools/vps-check.sh`):
 ```sh
 tar xf parley-cli-<version>-linux-x86_64.tar.gz
 ./parley-cli-<version>-linux-x86_64/parley-cli \
-    --server your-server:443 --user alice --password 'a long password' --check
-# CHECK OK server=your-server:443 user=alice id=2 channels=1 rtt_ms=…
+    --server your-server --user alice --password 'a long password' --check
+# CHECK OK server=your-server:4443 user=alice id=2 channels=1 rtt_ms=…
 ```
 
 `--check` does QUIC + TLS + TOFU + password auth + channel list and
@@ -91,12 +86,13 @@ cd parley-<version>-linux-x86_64
 ./install.sh          # installs to ~/.local, checks runtime deps
 ```
 
-Then launch "Parley", connect to `your-server:443`, log in. Details and
+Then launch "Parley", connect to `your-server`, log in. Details and
 troubleshooting: [client.md](client.md).
 
 ## Upgrades
 
 ```sh
+tar xf parley-deploy-<new>.tar.gz && cd parley-deploy-<new>
 docker load -i parley-image-<new>.tar.gz
 docker compose up -d
 ```

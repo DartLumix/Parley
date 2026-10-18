@@ -29,8 +29,10 @@ the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`, `-gnome`).
 
 ## Connect
 
-    Server:   host or IP, port optional — the default is 4443.
-              With the released container on host port 443: "your-server:443".
+    Server:   host or IP, port optional — the default is 4443, so
+              "your-server" is enough. The deploy kit publishes 4443
+              by default; "your-server:443" only if you changed
+              PARLEY_PORT.
     Username: created by the server owner (`docker compose exec parley
               /parley-server adduser alice 'password'`)
     Password: as created.
@@ -46,8 +48,13 @@ was regenerated, delete that server's line from
 - **Voice** — click *Join* on a channel: joining opens the microphone
   and speakers (TeamSpeak shape, no separate listen toggle). *Leave*
   closes them. The channel card lists who is in voice.
+- **Layout** — channels fill the left pane, chat sits on the right. A
+  screen share opens above the chat and pushes it down.
 - **Chat** — the chat panel belongs to the joined channel; history
   loads on join.
+- **Mute** — the mic button beside *Share screen* (available while in
+  voice). A muted mic sends no audio at all, and the mute survives
+  switching channels.
 - **Screen share** — *Share screen* in the floating bar; the desktop's
   portal asks which monitor or window. Everyone in the same channel
   gets a card; *Watch* renders it, and the share's system audio starts

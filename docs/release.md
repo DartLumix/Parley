@@ -49,9 +49,10 @@ git push origin v0.2.0
    the docs use).
 4. **client** — builds the bridge and the Flutter bundle in release
    mode with `--dart-define=PARLEY_VERSION`, packages the client, the
-   CLI and the deploy kit, then checks the bundle's shared libraries on
-   a clean Ubuntu 24.04 (and that the system WebRTC dependency is gone).
-5. **smoke** — boots the released image, adds a user through
+   CLI and the deploy kit (with the server image inside it), then checks
+   the bundle's shared libraries on a clean Ubuntu 24.04 (and that the
+   system WebRTC dependency is gone).
+5. **smoke** — extracts the kit, loads its image, boots it, adds a user through
    `/parley-server adduser`, logs in as two accounts and proves a wrong
    password is refused (`tools/e2e-container.sh`).
 6. **publish** — writes `SHA256SUMS`, extracts the changelog section
@@ -68,16 +69,20 @@ notes.
 | `parley-<v>-linux-x86_64.tar.gz` | desktop client; `./install.sh` |
 | `parley-cli-<v>-linux-x86_64.tar.gz` | terminal client, `--check` smoke test |
 | `parley-server-<v>-x86_64-linux-musl` | static server without Docker |
-| `parley-image-<v>.tar.gz` | `docker load -i …` |
-| `parley-deploy-<v>.tar.gz` | compose file, env template, runbook |
+| `parley-deploy-<v>.tar.gz` | deploy kit: compose file, env template, runbook **and** `parley-image-<v>.tar.gz` |
 | `SHA256SUMS` | `sha256sum -c SHA256SUMS` after downloading |
+
+The image is never a separate asset — installing the kit without it
+would only mean downloading the image from somewhere else and loading
+it by hand.
 
 ## Verifying a published release
 
 ```sh
 sha256sum -c SHA256SUMS
-docker load -i parley-image-0.2.0.tar.gz
-docker run -d --name parley -p 443:4443/udp -e PARLEY_ADMIN_PASSWORD=secret parley:0.2.0
+tar xf parley-deploy-0.2.0.tar.gz
+docker load -i parley-deploy-0.2.0/parley-image-0.2.0.tar.gz
+docker run -d --name parley -p 4443:4443/udp -e PARLEY_ADMIN_PASSWORD=secret parley:0.2.0
 cargo build --release -p parley-client
 tools/e2e-container.sh          # builds its own image and boots it on a free port
 ```
@@ -85,5 +90,5 @@ tools/e2e-container.sh          # builds its own image and boots it on a free po
 Or against the running server, with the shipped CLI:
 
 ```sh
-./parley-cli --server 127.0.0.1:443 --user admin --password secret --check
+./parley-cli --server 127.0.0.1 --user admin --password secret --check
 ```

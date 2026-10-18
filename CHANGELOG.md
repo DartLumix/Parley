@@ -3,6 +3,37 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.2.1] — 2026-10-18
+
+A small follow-up to 0.2.0: a presence bug fix, a simpler deploy download, and
+layout/UX polish.
+
+### Added
+
+- **Microphone mute.** A *Mute* button next to *Share screen* (only while
+  in voice) stops the mic at the capture callback — muted users send no
+  packets at all, and the mute survives channel switches.
+- **One-file deploy kit.** `parley-deploy-<version>.tar.gz` now carries
+  the server image, so deploying is one download, one extract and one
+  `docker load`. There is no separate image asset to fetch.
+
+### Changed
+
+- **Client layout.** Channels fill the left pane; chat moved to the right
+  pane (the one shares used before). A screen share now appears above the
+  chat and pushes it down instead of taking over half the page.
+- **Brighter app bar**, a lifted blue-black instead of near-black.
+- **Port 4443 is the deploy default** end to end (compose, env template,
+  runbooks): `your-server` with no port just works. 443 still works by
+  setting `PARLEY_PORT`.
+
+### Fixed
+
+- **A disconnected user no longer stays online.** Disconnecting closes
+  the QUIC connection explicitly (and the viewer's report task exits
+  with its session), so the server ends the session immediately instead
+  of keeping the account in presence for the next login.
+
 ## [0.2.0] — 2026-10-18
 
 First downloadable release: a Linux client tarball, a single-container

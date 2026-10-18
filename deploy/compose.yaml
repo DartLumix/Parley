@@ -5,15 +5,15 @@
 #   docker compose exec parley /parley-server adduser alice 'pass'
 #
 # `PARLEY_IMAGE` defaults to parley:latest, which is the tag of the image
-# loaded from the release asset (docker load -i parley-image-*.tar.gz).
-# Set it to ghcr.io/dartlumix/parley:<version> to pull instead.
+# shipped in this kit (docker load -i parley-image-*.tar.gz). Set it to
+# ghcr.io/dartlumix/parley:<version> to pull instead.
 name: parley
 
 services:
   parley:
     image: ${PARLEY_IMAGE:-parley:latest}
     ports:
-      - "${PARLEY_PORT:-443}:4443/udp"
+      - "${PARLEY_PORT:-4443}:4443/udp"
     volumes:
       - parley-data:/data
     environment:

@@ -57,8 +57,10 @@ Voice is the product; everything else grows later.
 **Server** — one container, one UDP port. From the release page:
 
 ```sh
+tar xf parley-deploy-<version>.tar.gz   # compose file + env template + image
+cd parley-deploy-<version>
 docker load -i parley-image-<version>.tar.gz
-cd deploy && cp .env.example .env    # set PARLEY_ADMIN_PASSWORD
+cp .env.example .env                    # set PARLEY_ADMIN_PASSWORD
 docker compose up -d
 docker compose exec parley /parley-server adduser alice 'a long password'
 ```
@@ -70,7 +72,7 @@ tar xf parley-<version>-linux-x86_64.tar.gz
 cd parley-<version>-linux-x86_64 && ./install.sh
 ```
 
-Connect to `your-server:443`. The full runbooks are
+Connect to `your-server` (port 4443, the client default). The full runbooks are
 [docs/deploy.md](docs/deploy.md) and [docs/client.md](docs/client.md).
 
 ---
@@ -309,7 +311,7 @@ One container, one UDP port, one volume — [deploy/compose.yaml](deploy/compose
 services:
   parley:
     image: ${PARLEY_IMAGE:-parley:latest}
-    ports: ["${PARLEY_PORT:-443}:4443/udp"]
+    ports: ["${PARLEY_PORT:-4443}:4443/udp"]
     volumes: ["parley-data:/data"]
     environment:
       PARLEY_ADMIN_PASSWORD: ${PARLEY_ADMIN_PASSWORD:-}

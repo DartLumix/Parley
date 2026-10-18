@@ -125,7 +125,7 @@ jobs:
 
   client:
     name: Linux client
-    needs: meta
+    needs: [meta, server]
     # 24.04, not 22.04: pipewire-rs 0.10 uses `spa_video_info_raw.flags`
     # unconditionally, and that field only exists in PipeWire >= 0.3.65
     # headers (22.04 ships 0.3.48, which fails with E0609). 24.04 also
@@ -181,6 +181,13 @@ jobs:
         run: |
           cargo test -p parley-core --features video
           cargo test -p parley-client --features audio-device
+      # The deploy kit ships the server image inside it: one download,
+      # one extract, one `docker load` — no hunting for a matching
+      # image asset afterwards.
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-assets
+          path: dist
       - name: package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -188,7 +195,11 @@ jobs:
         run: |
           tools/package-client.sh "$VERSION" dist
           tools/package-cli.sh "$VERSION" dist
-          tools/package-deploy.sh "$VERSION" dist
+          tools/package-deploy.sh "$VERSION" dist \
+            "dist/parley-image-${VERSION}.tar.gz"
+          # The image now lives inside the deploy kit; keeping a second
+          # copy would just be a duplicate download.
+          rm "dist/parley-image-${VERSION}.tar.gz"
           ls -lh dist
       # A prebuilt binary that only runs on the builder is not shipped.
       # The bundle must resolve on a clean 24.04 — the oldest glibc and
@@ -236,7 +247,11 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          docker load -i "dist/parley-image-${VERSION}.tar.gz"
+          # The image travels inside the deploy kit, so this also proves
+          # the kit is complete and its image loads.
+          tar xzf "dist/parley-deploy-${VERSION}.tar.gz" -C "$RUNNER_TEMP"
+          docker load -i \
+            "$RUNNER_TEMP/parley-deploy-${VERSION}/parley-image-${VERSION}.tar.gz"
           BUILD=0 IMAGE="parley:${VERSION}" tools/e2e-container.sh
       - name: assets are readable archives
         env:
@@ -262,6 +277,10 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
+          # The image ships INSIDE the deploy kit. The server job uploads
+          # a standalone copy so the smoke job can load it; it must not
+          # become a second release asset.
+          rm -f dist/parley-image-*.tar.gz
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           awk -v ver="$VERSION" '
             index($0, "## [" ver "]") == 1 { p = 1 }
@@ -275,11 +294,10 @@ jobs:
             echo "- \`parley-${VERSION}-linux-x86_64.tar.gz\` — desktop client (extract, run \`./install.sh\`)"
             echo "- \`parley-cli-${VERSION}-linux-x86_64.tar.gz\` — terminal client and \`--check\` smoke tool"
             echo "- \`parley-server-${VERSION}-x86_64-linux-musl\` — static server, if you do not want Docker"
-            echo "- \`parley-image-${VERSION}.tar.gz\` — OCI image (\`docker load -i …\`)"
-            echo "- \`parley-deploy-${VERSION}.tar.gz\` — compose file, env template, VPS runbook"
+            echo "- \`parley-deploy-${VERSION}.tar.gz\` — deploy kit: compose file, env template, VPS runbook, AND the server image"
             echo "- \`SHA256SUMS\`"
             echo
-            echo "Deploy: \`tar xf parley-deploy-${VERSION}.tar.gz\`, \`docker load\` the image, \`docker compose up -d\`."
+            echo "Deploy: \`tar xf parley-deploy-${VERSION}.tar.gz\`, \`docker load -i parley-deploy-${VERSION}/parley-image-${VERSION}.tar.gz\`, \`docker compose up -d\`."
             echo "Client: \`tar xf parley-${VERSION}-linux-x86_64.tar.gz && cd parley-${VERSION}-linux-x86_64 && ./install.sh\`."
           } >> notes.md
           cat notes.md
