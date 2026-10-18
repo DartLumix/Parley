@@ -1,7 +1,7 @@
 name: parley
-description: "A new Flutter project."
+description: "Parley — self-hosted voice, chat and screen share (Linux desktop client)."
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.2.0+2
 
 environment:
   sdk: ^3.13.5

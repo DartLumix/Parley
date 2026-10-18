@@ -31,7 +31,6 @@
 
 use parley_core::audio::mixer::{self as core_mixer, SharedMixer};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 #[cfg(feature = "audio-device")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -809,13 +808,9 @@ async fn connect_async(
     user: String,
     password: String,
 ) -> Result<SessionInfo, String> {
-    let addr: SocketAddr = server
-        .parse()
-        .map_err(|_| format!("server must be IP:port (got \"{server}\")"))?;
-    let server_name = server
-        .split_once(':')
-        .map(|(h, _)| h.to_string())
-        .unwrap_or_else(|| server.clone());
+    // host[:port], with DNS. The user may type an IP, a LAN name or a
+    // domain; the TOFU pin stays keyed by the exact string they typed.
+    let (addr, server_name) = parley_client::endpoint::resolve(&server)?;
 
     // TOFU + endpoint (cert.rs — same path as the terminal client).
     let (pin, hosts_path) = cert::load_pin(&server)?;

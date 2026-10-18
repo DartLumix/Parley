@@ -1,9 +1,6 @@
 #include "my_application.h"
 
 #include <flutter_linux/flutter_linux.h>
-#ifdef GDK_WINDOWING_X11
-#include <gdk/gdkx.h>
-#endif
 
 #include "flutter/generated_plugin_registrant.h"
 
@@ -80,6 +77,52 @@ static void window_method_call_cb(FlMethodChannel* channel,
               is_fullscreen ? "fullscreen" : "not fullscreen");
     response = FL_METHOD_RESPONSE(
         fl_method_success_response_new(fl_value_new_bool(is_fullscreen)));
+  } else if (g_strcmp0(method, "minimize") == 0) {
+    gtk_window_iconify(window);
+    g_message("window: minimize");
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(TRUE)));
+  } else if (g_strcmp0(method, "toggleMaximize") == 0) {
+    if (gtk_window_is_maximized(window)) {
+      gtk_window_unmaximize(window);
+    } else {
+      gtk_window_maximize(window);
+    }
+    gboolean maximized = gtk_window_is_maximized(window);
+    g_message("window: maximize %s", maximized ? "on" : "off");
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(maximized)));
+  } else if (g_strcmp0(method, "close") == 0) {
+    g_message("window: close requested");
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(TRUE)));
+    // Respond before closing: a destroyed channel must not lose the
+    // reply the Dart side is awaiting.
+    fl_method_call_respond(method_call, response, nullptr);
+    gtk_window_close(window);
+    return;
+  } else if (g_strcmp0(method, "startDrag") == 0) {
+    // Best-effort window move. On X11 this is the real _NET_WM_MOVERESIZE
+    // path; on Wayland GTK needs the seat's last button-press serial,
+    // which Flutter owns, so the compositor may ignore it. Tiling
+    // compositors (Hyprland, sway) move windows with their own binding
+    // anyway — the toolbar's controls remain the guaranteed part.
+    GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
+    GdkSeat* seat = display != nullptr ? gdk_display_get_default_seat(display) : nullptr;
+    GdkDevice* pointer = seat != nullptr ? gdk_seat_get_pointer(seat) : nullptr;
+    gboolean dispatched = FALSE;
+    if (pointer != nullptr) {
+      gint x = 0;
+      gint y = 0;
+      GdkScreen* screen = nullptr;
+      gdk_device_get_position(pointer, &screen, &x, &y);
+      gtk_window_begin_move_drag(window, 1, x, y, gtk_get_current_event_time());
+      dispatched = TRUE;
+    }
+    g_message("window: move drag %s",
+              dispatched ? "dispatched" : "unavailable (no pointer)");
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(dispatched)));
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }
@@ -92,32 +135,17 @@ static void my_application_activate(GApplication* application) {
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
 
-  // Use a header bar when running in GNOME as this is the common style used
-  // by applications and is the setup most users will be using (e.g. Ubuntu
-  // desktop).
-  // If running on X and not using GNOME then just use a traditional title bar
-  // in case the window manager does more exotic layout, e.g. tiling.
-  // If running on Wayland assume the header bar will work (may need changing
-  // if future cases occur).
-  gboolean use_header_bar = TRUE;
-#ifdef GDK_WINDOWING_X11
-  GdkScreen* screen = gtk_window_get_screen(window);
-  if (GDK_IS_X11_SCREEN(screen)) {
-    const gchar* wm_name = gdk_x11_screen_get_window_manager_name(screen);
-    if (g_strcmp0(wm_name, "GNOME Shell") != 0) {
-      use_header_bar = FALSE;
-    }
-  }
-#endif
-  if (use_header_bar) {
-    GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
-    gtk_widget_show(GTK_WIDGET(header_bar));
-    gtk_header_bar_set_title(header_bar, "parley");
-    gtk_header_bar_set_show_close_button(header_bar, TRUE);
-    gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
-  } else {
-    gtk_window_set_title(window, "parley");
-  }
+  // No title bar at all. Flutter's template installs a GtkHeaderBar on
+  // Wayland, which is the big white strip with the app name and an X that
+  // a tiling desktop shows above the page. The app draws its own thin
+  // hover toolbar instead (app/lib/src/window.dart) and calls the window
+  // channel for min/max/close, so the native window is the page itself.
+  // gtk_window_set_title stays: taskbars and window rules still read it.
+  gtk_window_set_title(window, "Parley");
+  gtk_window_set_decorated(window, FALSE);
+  g_message("window: decorations off (titlebar %s, decorated %s, app id %s)",
+            gtk_window_get_titlebar(window) == nullptr ? "none" : "custom",
+            gtk_window_get_decorated(window) ? "on" : "off", APPLICATION_ID);
 
   gtk_window_set_default_size(window, 1280, 720);
 
