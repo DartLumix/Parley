@@ -144,9 +144,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang g++ cmake ninja-build meson nasm pkg-config libclang-dev \
+            clang g++ cmake ninja-build nasm pkg-config libclang-dev \
+            python3-venv \
             libgtk-3-dev liblzma-dev libpipewire-0.3-dev libasound2-dev \
             libva-dev
+      # The bundled AEC is configured by webrtc-audio-processing-sys,
+      # which always passes `meson setup --reconfigure`. 22.04 ships
+      # meson 0.61, and 0.61 refuses --reconfigure on a fresh build dir
+      # ("Directory does not contain a valid build tree"), so the whole
+      # client job died at the first `cargo clippy`. A current meson in
+      # a venv, first on PATH for the rest of the job, fixes it; the
+      # distro one is deliberately not installed.
+      - name: meson for the bundled AEC
+        run: |
+          python3 -m venv "$RUNNER_TEMP/meson"
+          "$RUNNER_TEMP/meson/bin/pip" install --disable-pip-version-check \
+            --no-cache-dir 'meson==1.12.1'
+          echo "$RUNNER_TEMP/meson/bin" >> "$GITHUB_PATH"
       - name: clippy with shipping features
         run: |
           cargo clippy -p parley_flutter --all-targets \

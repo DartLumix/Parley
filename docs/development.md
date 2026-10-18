@@ -42,6 +42,11 @@ on such a machine produces a binary that links system absl; the release
 CI has no system abseil, which is why released tarballs are
 self-contained. `tools/package-client.sh` warns when it sees that.
 
+The crate configures with `meson setup --reconfigure`, which Ubuntu
+22.04's meson 0.61 rejects on a fresh build dir ("Directory does not
+contain a valid build tree"). Install meson from pip (>= 1.0) on 22.04;
+the release workflow does exactly that.
+
 ## Everyday commands
 
 ```sh
