@@ -32,4 +32,4 @@ only flavor that changes the arrival/consumption balance.
   stretching later, behind the same trigger).
 - Sustained arrival ABOVE consumption rate is explicitly NOT the
   shed's job — that's the overflow cap's (drops + PLC concealment).
-- Incident data: HANDOFF §8.
+- Incident data: [../hd-encode-runs.md](../hd-encode-runs.md).

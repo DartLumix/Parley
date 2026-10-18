@@ -24,4 +24,4 @@ ALWAYS printed verbatim — never summarized as "connection closed".
   the server's independent forwarding legs.
 - Cost of the alternative: a share that dies minutes into every
   sustained-loss event, with a misleading log line.
-- Incident data: HANDOFF §8.
+- Incident data: [../hd-encode-runs.md](../hd-encode-runs.md).

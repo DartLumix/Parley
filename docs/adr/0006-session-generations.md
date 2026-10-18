@@ -25,4 +25,4 @@ JoinVoice/LeaveVoice from a replaced session's stray messages.
 - Known residual micro-race (documented, accepted): a register landing
   between unregister_if and voice.leave would be booted from voice;
   coupling the registry and voice locks isn't worth it.
-- Incident data: HANDOFF §8.
+- Incident data: [../hd-encode-runs.md](../hd-encode-runs.md).

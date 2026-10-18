@@ -37,7 +37,7 @@ Voice is the product; everything else grows later.
 | 5e | Encoder trait, rate pacing, glass-to-glass measured | ✅ |
 | 6 | Backend hardening & client-readiness | ✅ |
 | 6.9 | Client-prep — share audio, receiver hardening, latency re-measure | ✅ |
-| 7a | Flutter shell + bridge verified (pong) | ✅ |
+| 7a | Flutter shell + bridge verified | ✅ |
 | 7b | Session — connect/auth/TOFU/heartbeat/events | ✅ |
 | 7c | Channels, presence (push), join, chat, history | ✅ |
 | 7d | Voice receive — mixer + cpal output through the bridge | ✅ |
@@ -46,7 +46,32 @@ Voice is the product; everything else grows later.
 | 7f | Video receive — VideoReceiveHub → Flutter texture bridge | ✅ |
 | 7g | Screen-share send — portal capture + encode through the bridge | ✅ |
 | 7j | Zero-copy capture — compositor DMA-BUF straight into the encoder | ✅ |
+| 7k | Share teardown notices, ghost-card race, real fullscreen, app chrome | ✅ |
+| 0.2 | First downloadable release — client tarball, container kit, release CI | ✅ |
 | 7+ | Android / Windows / iOS bring-up, file transfer | ⏳ |
+
+---
+
+## ⚡ Quickstart
+
+**Server** — one container, one UDP port. From the release page:
+
+```sh
+docker load -i parley-image-<version>.tar.gz
+cd deploy && cp .env.example .env    # set PARLEY_ADMIN_PASSWORD
+docker compose up -d
+docker compose exec parley /parley-server adduser alice 'a long password'
+```
+
+**Client** — the Linux tarball from the same release:
+
+```sh
+tar xf parley-<version>-linux-x86_64.tar.gz
+cd parley-<version>-linux-x86_64 && ./install.sh
+```
+
+Connect to `your-server:443`. The full runbooks are
+[docs/deploy.md](docs/deploy.md) and [docs/client.md](docs/client.md).
 
 ---
 
@@ -139,7 +164,7 @@ Every message carries version + capability bits — later features are additive,
 - [x] Encoder abstraction — `trait VideoEncoder` + software fallback + `create_encoder()`
       selection; hardware backends slot in per-platform with runtime fallback
 - [x] Rate discipline — sleep-pacing + skip-to-newest in the capture encoder;
-      drift-free 30 fps (the 3-second-drift lesson lives in the handoff ledger)
+      drift-free 30 fps (the 3-second-drift lesson is in [docs/hd-encode-runs.md](docs/hd-encode-runs.md))
 - [x] Runtime bitrate mechanism — `set_bitrate` via encoder recreation (next frame
       is a standalone IDR with in-band SPS/PPS; tested)
 - [x] Glass-to-glass measured — **~250 ms avg / 400 ms tail** (1080p30 software, mpv
@@ -152,7 +177,7 @@ Every message carries version + capability bits — later features are additive,
 
 ### Phase 6 — Backend Hardening & Client-Readiness 
 Goal: every open/parked backend item closed — a stable, complete backend the
-Flutter client can attach to. Full plan + acceptance criteria: HANDOFF §12.
+Flutter client can attach to.
 - [x] 6a Share lifecycle — stop/start without process exit; viewer cleanup
 - [x] 6b Multi-channel correctness + per-channel report routing
 - [x] 6c Session-token relogin + reconnect hardening
@@ -238,66 +263,25 @@ backend feature through `flutter_rust_bridge` before any real UI design.
 
 ## 🚀 Development
 
-```bash
-git clone <repo> && cd parley
-
-cargo test --workspace                              # run tests
-cargo run -p parley-server                          # dev mode (listens :4443)
-docker build -t parley . && docker run --rm parley  # container build
-
-cargo fmt --all                                     # format (CI enforces)
-cargo clippy --workspace --all-targets -- -D warnings  # lint (CI enforces)
-
-# hardware audio test (needs mic + output; never runs in CI)
-PARLEY_AUDIO=1 cargo test -p parley-core --features audio-device --test audio_loopback -- --nocapture
-
-# voice test client (needs mic + output; never runs in CI)
-cargo run -p parley-server --bin parley-adduser -- data <user> <pass>
-cargo run -p parley-client --features audio-device -- --server 127.0.0.1:4443 \
-    --user <user> --password <pass>            # AEC/NS on by default; --no-aec to A/B
-# two clients = two users; speak and listen on the other terminal
-# per-user volume: append --volume <user_id>:<gain> (0.0 mutes)
-# latency measurement: one client --measure, one --report (add --no-aec; loud clicks!)
-# AEC verification (synthetic echo, no hardware): cargo test -p parley-client --features audio-device
-
-# screen share (needs mpv; --release is REQUIRED for real-time fps)
-cargo run --release -p parley-client --features audio-device,screen-capture -- \
-    --server 127.0.0.1:4443 --user <user> --password <pass> --share   # sender: portal picker pops up
-#    zero-copy: add --features ...,vaapi and --hw-encode --dmabuf (implies --hw-encode;
-#    needs a compositor that hands out DMA-BUFs, and refuses rather than downgrading)
-#    the sender's log then says: negotiated <W>x<H> BGRx @ <fps> fps (dma-buf, modifier <M>)
-#    sender: type "share" / "stop" to start/stop without restarting
-#    share audio: append --share-audio (captures the DEFAULT OUTPUT — a local listener must play to another sink, else feedback)
-cargo run --release -p parley-client --features video -- \
-    --server 127.0.0.1:4443 --user <user2> --password <pass2>         # viewer (mpv opens; video-only build)
-    # token relogin: password login prints a token — rerun with --token <tok> instead of --user/--password
-# music channels: add a channel with mode=1 (sqlite) — clients auto-profile; --music sends synthetic L/R test tones
-# synthetic test pattern (no portal): build the sender with --features audio-device,video
-# Flutter dev client (app/): bridge surface is plain types only — session_id
-# handles; non-plain types in pub signatures get wrapped as opaque objects
-# and the generated code stops resolving (the 7d lesson)
-cd app
-cargo build -p parley_flutter --features audio-device   # Rust (audio needs the feature)
-flutter_rust_bridge_codegen generate                    # API changed → regenerate Dart
-cargo build -p parley_flutter --features audio-device   # rebuild with generated wiring
-flutter run -d linux                                    # CMake install() re-bundles the .so
-# dev-server CWD determines the cert identity (data/ is relative) — always
-# run T1 from the repo root, else TOFU hard-fails on a fresh app/data/ cert
-
+```sh
+cargo test --workspace
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
+PARLEY_ADMIN_PASSWORD=secret cargo run -p parley-server   # listens :4443
+cargo run -p parley-client --features audio-device,video,screen-capture \
+    -- --server 127.0.0.1:4443 --user alice --password 'secret'
 ```
 
-Config (`config.toml`, auto-created with defaults):
-```toml
-listen = "0.0.0.0:4443"
-data_dir = "data"
+The Flutter client, feature flags, native dependencies, the hardware
+probe and the container functional test are in
+[docs/development.md](docs/development.md); the two-machine runbook is
+[docs/two-machine-demo.md](docs/two-machine-demo.md).
+
+```sh
+cargo build --release -p parley_flutter \
+    --features audio-device,video,screen-capture,hw-encode
+cd app && flutter run --release -d linux
 ```
 
-First boot: `PARLEY_ADMIN_PASSWORD=secret cargo run -p parley-server` creates the admin account.
-
-First run generates `data/cert.der` + `data/key.pk8`. The fingerprint printed
-on startup is **permanent** — that's the value you share with your team.
-
----
 
 ## 📊 Performance budgets
 
@@ -319,28 +303,48 @@ A regression is a bug, tracked as one.
 
 ## 🐳 Deployment
 
+One container, one UDP port, one volume — [deploy/compose.yaml](deploy/compose.yaml):
+
 ```yaml
 services:
   parley:
-    image: parley:latest
-    ports: ["443:4443/udp"]    # host 443 → container 4443
-    volumes: ["./data:/data"]
+    image: ${PARLEY_IMAGE:-parley:latest}
+    ports: ["${PARLEY_PORT:-443}:4443/udp"]
+    volumes: ["parley-data:/data"]
+    environment:
+      PARLEY_ADMIN_PASSWORD: ${PARLEY_ADMIN_PASSWORD:-}
     restart: unless-stopped
+volumes:
+  parley-data:
 ```
 
-All state lives under `data/` — backup by copying. No telemetry, no outbound connections.
+The first boot creates `admin` from `PARLEY_ADMIN_PASSWORD`; everyone
+else is `docker compose exec parley /parley-server adduser <user> '<pass>'`.
+The volume holds accounts, history and the certificate — back it up by
+copying; the fingerprint is permanent. No telemetry, no outbound
+connections. Full runbook: [docs/deploy.md](docs/deploy.md).
 
 ---
+
 
 ## 📁 Layout
 
 ```
 proto/                  # .proto files — protocol source of truth
 crates/
-  parley-proto/         # wire types, framing, media + video fragmentation, generated protobuf code
-  parley-core/          # shared session I/O + audio pipeline + encoder trait & H.264 codec (server + clients)
-  parley-server/        # binary: QUIC listener, TLS, config, routing (+ parley-adduser bin)
-  parley-client/        # test client: TOFU pinning, 48k audio, AEC/NS, mix, portal screen capture + share/view
-app/                    # Flutter dev client: rust/ (parley_flutter bridge crate) + lib/
+  parley-proto/         # wire types, framing, media + video fragmentation
+  parley-core/          # session I/O, audio pipeline, encoder trait, H.264
+  parley-server/        # QUIC listener, TLS, config, routing (+ adduser)
+  parley-client/        # terminal client + shared capture/audio modules
+app/                    # Flutter desktop client (Rust bridge in app/rust)
+deploy/                 # released compose file + env template
+packaging/              # install.sh, icon, quickstart shipped in the tarball
+tools/                  # hw-probe, container e2e, packaging scripts
+docs/                   # deploy / client / release / development / status
 docs/adr/               # one file per architectural decision
+vendor/moq-vaapi/       # patched VA-API crate (see vendor/README.md)
 ```
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).

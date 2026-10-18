@@ -27,4 +27,4 @@ Mutex is deleted entirely.
   actor (Argon2 ~100 ms each) and can stall db ops. Trusted-community
   threat model; revisit on any public exposure (fix shape: separate
   auth executor).
-- Incident data: HANDOFF §8.
+- Incident data: [../hd-encode-runs.md](../hd-encode-runs.md).

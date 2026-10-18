@@ -1,0 +1,274 @@
+name: release
+
+# Only a tag builds a release. `v0.2.0` is stable; `v0.2.0-rc1` is a
+# prerelease and never gets the `latest` image tag. Manual dispatch
+# re-runs an existing tag (after a failed job or a yanked asset).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.2.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FLUTTER_VERSION: "3.47.6"
+
+jobs:
+  meta:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRE: ${{ inputs.prerelease }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+            PRE="$INPUT_PRE"
+          else
+            TAG="$REF_NAME"
+            case "$TAG" in
+              *-*) PRE="true" ;;
+              *) PRE="false" ;;
+            esac
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "release tags must start with v (got '$TAG')" >&2; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: tests
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  server:
+    name: server image
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - name: build
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: docker build -t "parley:${VERSION}" .
+      - name: extract binary + image
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          mkdir -p dist
+          cid=$(docker create "parley:${VERSION}")
+          docker cp "$cid:/parley-server" "dist/parley-server-${VERSION}-x86_64-linux-musl"
+          docker rm "$cid"
+          docker save "parley:${VERSION}" | gzip -9 > "dist/parley-image-${VERSION}.tar.gz"
+          ls -lh dist
+      # The image tarball above is the authoritative artifact: it works
+      # without registry credentials. GHCR is the convenience path.
+      - name: push to GHCR
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/$OWNER/parley"
+          docker tag "parley:${VERSION}" "$IMAGE:${VERSION}"
+          if [ "$PRE" = "false" ]; then docker tag "parley:${VERSION}" "$IMAGE:latest"; fi
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:${VERSION}"
+          if [ "$PRE" = "false" ]; then docker push "$IMAGE:latest"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-assets
+          path: dist/*
+          if-no-files-found: error
+
+  client:
+    name: Linux client
+    needs: meta
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang g++ cmake ninja-build meson nasm pkg-config libclang-dev \
+            libgtk-3-dev liblzma-dev libpipewire-0.3-dev libasound2-dev \
+            libva-dev
+      - name: clippy with shipping features
+        run: |
+          cargo clippy -p parley_flutter --all-targets \
+            --features audio-device,video,screen-capture,hw-encode \
+            -- -D warnings
+      - name: feature tests
+        run: |
+          cargo test -p parley-core --features video
+          cargo test -p parley-client --features audio-device
+      - name: package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          tools/package-client.sh "$VERSION" dist
+          tools/package-cli.sh "$VERSION" dist
+          tools/package-deploy.sh "$VERSION" dist
+          ls -lh dist
+      # A prebuilt binary that only runs on the builder is not shipped.
+      # The bundle must resolve on a clean 22.04 with runtime packages
+      # only — and must NOT carry the old system WebRTC dependency.
+      - name: runtime dependency check (clean Ubuntu)
+        run: |
+          docker run --rm -v "$PWD/app/build/linux/x64/release/bundle:/bundle:ro" ubuntu:22.04 bash -c '
+            apt-get update -qq
+            apt-get install -y -qq libgtk-3-0 libpipewire-0.3-0 libasound2 \
+                libstdc++6 libgl1 libegl1 >/dev/null
+            missing=$(ldd /bundle/parley /bundle/lib/libparley_flutter.so \
+                    /bundle/lib/libflutter_linux_gtk.so | grep "not found" || true)
+            if [ -n "$missing" ]; then echo "$missing"; exit 1; fi
+            if ldd /bundle/lib/libparley_flutter.so | grep -Eq 'webrtc-audio|absl'; then
+              echo "system WebRTC/abseil linked — the AEC was not self-contained"
+              ldd /bundle/lib/libparley_flutter.so | grep -E 'webrtc-audio|absl'
+              exit 1
+            fi
+            echo "bundle resolves on a clean Ubuntu 22.04, AEC self-contained"
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-assets
+          path: dist/*
+          if-no-files-found: error
+
+  smoke:
+    name: functional test
+    needs: [meta, server, client]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: control-only smoke client
+        run: cargo build --release -p parley-client
+      - name: boot the released image and authenticate
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          docker load -i "dist/parley-image-${VERSION}.tar.gz"
+          BUILD=0 IMAGE="parley:${VERSION}" tools/e2e-container.sh
+      - name: assets are readable archives
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          for f in dist/parley-*.tar.gz; do tar tzf "$f" >/dev/null; done
+          test -s "dist/parley-${VERSION}-linux-x86_64.tar.gz"
+          echo "ok"
+
+  publish:
+    name: GitHub release
+    needs: [meta, verify, server, client, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums and notes
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { p = 1 }
+            p && /^## \[/ && index($0, "## [" ver "]") != 1 { exit }
+            p { print }
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "## Assets"
+            echo
+            echo "- \`parley-${VERSION}-linux-x86_64.tar.gz\` — desktop client (extract, run \`./install.sh\`)"
+            echo "- \`parley-cli-${VERSION}-linux-x86_64.tar.gz\` — terminal client and \`--check\` smoke tool"
+            echo "- \`parley-server-${VERSION}-x86_64-linux-musl\` — static server, if you do not want Docker"
+            echo "- \`parley-image-${VERSION}.tar.gz\` — OCI image (\`docker load -i …\`)"
+            echo "- \`parley-deploy-${VERSION}.tar.gz\` — compose file, env template, VPS runbook"
+            echo "- \`SHA256SUMS\`"
+            echo
+            echo "Deploy: \`tar xf parley-deploy-${VERSION}.tar.gz\`, \`docker load\` the image, \`docker compose up -d\`."
+            echo "Client: \`tar xf parley-${VERSION}-linux-x86_64.tar.gz && cd parley-${VERSION}-linux-x86_64 && ./install.sh\`."
+          } >> notes.md
+          cat notes.md
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          PRE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          ARGS=(--title "Parley $TAG" --notes-file notes.md)
+          if [ "$PRE" = "true" ]; then ARGS+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" "${ARGS[@]}"
+          else
+            gh release create "$TAG" dist/* "${ARGS[@]}" --verify-tag
+          fi
+          gh release view "$TAG" --json url,assets --jq '{url, assets: [.assets[].name]}'

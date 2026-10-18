@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FLUTTER_VERSION: "3.47.6"
 
 jobs:
   check:
@@ -22,15 +23,56 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  docker:
-    name: image builds and boots
+  app:
+    name: flutter analyze + test + release build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t parley:ci .
-      - name: server boots and listens
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: native build deps
         run: |
-          docker run -d --name smoke parley:ci
-          sleep 3
-          docker logs smoke 2>&1 | grep -q "listening"
-          docker rm -f smoke
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang g++ cmake ninja-build meson nasm pkg-config libclang-dev \
+            libgtk-3-dev liblzma-dev libpipewire-0.3-dev libasound2-dev \
+            libva-dev
+      # Compiles the bridge with every shipping feature: this is the half
+      # CI never built before, and the one a release actually ships.
+      - name: bridge (all features)
+        run: |
+          cargo build --release -p parley_flutter \
+            --features audio-device,video,screen-capture,hw-encode
+          cargo clippy -p parley_flutter --all-targets \
+            --features audio-device,video,screen-capture,hw-encode \
+            -- -D warnings
+      # The shipping features are the ones that must actually run, not
+      # just compile: video decode/assembly and the bundled AEC.
+      - name: feature tests
+        run: |
+          cargo test -p parley-core --features video
+          cargo test -p parley-client --features audio-device
+      - name: flutter checks
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+          flutter build linux --release --dart-define=PARLEY_VERSION=ci
+
+  docker:
+    name: image boots + client handshake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The smoke client is deliberately control-only: no ALSA, no
+      # PipeWire, no display — it proves protocol, auth and routing.
+      - run: cargo build --release -p parley-client
+      - run: tools/e2e-container.sh

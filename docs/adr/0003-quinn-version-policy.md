@@ -29,4 +29,4 @@ permanently.
   against silent-corruption classes that unit tests cannot see.
 - Both defects to be reported upstream; re-vet on any quinn-proto
   release claiming a datagram-accounting fix.
-- Incident data + the .16 blacklist evidence: HANDOFF §8.
+- Incident data + the .16 blacklist evidence: [../hd-encode-runs.md](../hd-encode-runs.md).
