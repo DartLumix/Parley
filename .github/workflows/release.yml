@@ -290,10 +290,15 @@ jobs:
 
           path, version = sys.argv[1], sys.argv[2]
           text = open(path, encoding="utf-8").read()
-          section = re.search(
-              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)",
-              text, re.M | re.S,
-          )
+          def find_section(ver):
+              return re.search(
+                  rf"^## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=^## \[|\Z)",
+                  text, re.M | re.S,
+              )
+
+          # Prerelease tags (0.2.1-rc1) reuse the stable version's notes
+          # unless they keep a section of their own.
+          section = find_section(version) or find_section(version.split("-")[0])
           if section is None:
               sys.exit(f"CHANGELOG.md has no section for {version}")
 
