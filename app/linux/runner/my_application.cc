@@ -24,6 +24,29 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
 // window, but only the window manager can take the window borderless and
 // over the panel — which is what a fullscreen screen share means.
 static FlMethodChannel* window_channel = nullptr;
+/// Last fullscreen state we told Dart about (edge detection: the state
+/// event fires for every window-state change, focus included).
+static gboolean window_is_fullscreen = FALSE;
+
+// The desktop can leave fullscreen on its own — its own shortcut, its
+// own exit hint. Tell Dart so the viewer PAGE goes away with the window:
+// staying in a fullscreen viewer inside a decorated window is worse than
+// either state on its own.
+static gboolean window_state_event_cb(GtkWidget* widget, GdkEvent* event,
+                                      gpointer user_data) {
+  GdkEventWindowState* state = (GdkEventWindowState*)event;
+  gboolean is_fullscreen =
+      (state->new_window_state & GDK_WINDOW_STATE_FULLSCREEN) != 0;
+  if (is_fullscreen != window_is_fullscreen) {
+    window_is_fullscreen = is_fullscreen;
+    if (window_channel != nullptr) {
+      g_autoptr(FlValue) value = fl_value_new_bool(is_fullscreen);
+      fl_method_channel_invoke_method(window_channel, "fullscreenChanged", value,
+                                      nullptr, nullptr, nullptr);
+    }
+  }
+  return FALSE;
+}
 
 static void window_method_call_cb(FlMethodChannel* channel,
                                   FlMethodCall* method_call,
@@ -37,12 +60,26 @@ static void window_method_call_cb(FlMethodChannel* channel,
     if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL) {
       on = fl_value_get_bool(args);
     }
+    // The native call the compositor understands (xdg_toplevel
+    // set_fullscreen on Wayland, _NET_WM_STATE_FULLSCREEN on X11) —
+    // this is what makes the desktop itself treat the window as
+    // fullscreen and offer its own exit hint.
     if (on) {
       gtk_window_fullscreen(window);
     } else {
       gtk_window_unfullscreen(window);
     }
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+    // Read the state back so the Dart side can SEE whether the
+    // compositor took it — "the fullscreen button does nothing" is
+    // otherwise indistinguishable from "the compositor ignored it".
+    GdkWindow* gdk_window = gtk_widget_get_window(GTK_WIDGET(window));
+    gboolean is_fullscreen =
+        gdk_window != nullptr &&
+        (gdk_window_get_state(gdk_window) & GDK_WINDOW_STATE_FULLSCREEN) != 0;
+    g_message("window: fullscreen %s (state now %s)", on ? "on" : "off",
+              is_fullscreen ? "fullscreen" : "not fullscreen");
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(is_fullscreen)));
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }
@@ -113,6 +150,8 @@ static void my_application_activate(GApplication* application) {
   fl_method_channel_set_method_call_handler(window_channel,
                                             window_method_call_cb, window,
                                             nullptr);
+  g_signal_connect(window, "window-state-event",
+                   G_CALLBACK(window_state_event_cb), nullptr);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,20 +10,44 @@ import 'src/rust/api/session.dart';
 import 'src/rust/api/video.dart' as video_api;
 
 /// The GTK side's window channel (linux/runner/my_application.cc).
-/// Fullscreen means the real thing — borderless, covering panels — not
-/// a full-window widget inside a decorated window.
+///
+/// Fullscreen is the WINDOW's, not the page's: the same call every
+/// native player makes (`gtk_window_fullscreen` → xdg_toplevel /
+/// _NET_WM_STATE_FULLSCREEN). That is what makes the system recognise
+/// it — compositor overlays, "press Esc to exit" hints, panel hiding —
+/// instead of a widget that merely covers our own window.
 const _windowChannel = MethodChannel('parley/window');
 
-Future<void> _setWindowFullscreen(bool on) async {
+Future<void> _setWindowFullscreen(bool on, {bool probe = false}) async {
   try {
-    await _windowChannel.invokeMethod<void>('setFullscreen', on);
+    // The GTK handler answers with the window's state AFTER the call, so
+    // a compositor that ignored the request is visible in the log
+    // instead of looking like a dead button.
+    final state = await _windowChannel.invokeMethod<bool>('setFullscreen', on);
+    debugPrint(
+      'window: fullscreen ${on ? 'on' : 'off'} — state now: '
+      '${state == true ? 'fullscreen' : 'not fullscreen'}'
+      '${probe ? ' (channel ready)' : ''}',
+    );
   } on MissingPluginException {
     // Not the Linux runner (tests, other platforms): the Flutter view
     // still fills the window, so this is cosmetic only.
+    if (probe) {
+      debugPrint('window: no platform channel — fullscreen stays window-filling');
+    }
   } catch (e) {
     debugPrint('window: fullscreen $on failed: $e');
   }
 }
+
+/// Accent: a dark electric blue. Bright enough to read on black, dark
+/// enough to stay electric rather than neon.
+const _accent = Color(0xFF1E6BFF);
+/// The same hue lifted for icons, dots and names on black.
+const _accentSoft = Color(0xFF4D93FF);
+/// App-bar surface: black with a blue cast, so the accent reads as the
+/// app's colour rather than a pale title bar.
+const _barSurface = Color(0xFF0B1424);
 
 Future<void> main() async {
   // Platform channels (EngineContext.getEngineHandle) need the services
@@ -39,6 +64,21 @@ Future<void> main() async {
   } catch (e, st) {
     debugPrint('video prepare failed (video disabled): $e\n$st');
   }
+  // One probe at startup. Whether the platform channel is reachable is
+  // the difference between REAL fullscreen (the compositor's) and a page
+  // that merely covers our window — and a silent failure only shows up
+  // as "the fullscreen button does nothing".
+  await _setWindowFullscreen(false, probe: true);
+  // Dev affordance (env-gated, like the harness flags): prove that the
+  // native call actually reaches the compositor on this machine —
+  // gtk_window_fullscreen → GDK_WINDOW_STATE_FULLSCREEN — rather than
+  // only compiling. Run it as `PARLEY_FULLSCREEN_SELFTEST=1 ./parley`;
+  // the log then reads "on — state now: fullscreen".
+  if (Platform.environment['PARLEY_FULLSCREEN_SELFTEST'] == '1') {
+    await _setWindowFullscreen(true);
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    await _setWindowFullscreen(false);
+  }
   runApp(const ParleyApp());
 }
 
@@ -53,25 +93,25 @@ class ParleyApp extends StatelessWidget {
         brightness: Brightness.dark,
         scaffoldBackgroundColor: Colors.black,
         appBarTheme: const AppBarTheme(
-          backgroundColor: Colors.black,
+          backgroundColor: _barSurface,
           foregroundColor: Colors.white,
         ),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.deepPurple,
+          seedColor: _accent,
           brightness: Brightness.dark,
-        ),
+        ).copyWith(primary: _accent, secondary: _accentSoft),
         inputDecorationTheme: const InputDecorationTheme(
           labelStyle: TextStyle(color: Colors.white70),
           enabledBorder: OutlineInputBorder(
             borderSide: BorderSide(color: Colors.white24),
           ),
           focusedBorder: OutlineInputBorder(
-            borderSide: BorderSide(color: Colors.deepPurpleAccent),
+            borderSide: BorderSide(color: _accentSoft),
           ),
         ),
         elevatedButtonTheme: ElevatedButtonThemeData(
           style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.deepPurple,
+            backgroundColor: _accent,
             foregroundColor: Colors.white,
             disabledBackgroundColor: Colors.grey.shade900,
             disabledForegroundColor: Colors.grey.shade600,
@@ -139,6 +179,15 @@ class _DevHomePageState extends State<DevHomePage> {
   @override
   void initState() {
     super.initState();
+    // The desktop can take the window out of fullscreen itself (its own
+    // shortcut, its own "how to exit" hint). The viewer page follows, so
+    // the UI is never a fullscreen view inside a windowed window.
+    _windowChannel.setMethodCallHandler((call) async {
+      if (call.method == 'fullscreenChanged' && call.arguments == false) {
+        if (_fullscreen != null) _exitFullscreen();
+      }
+      return null;
+    });
     _liveness = Timer.periodic(
       const Duration(seconds: 1),
       (_) => _checkAlive(),
@@ -162,6 +211,7 @@ class _DevHomePageState extends State<DevHomePage> {
 
   @override
   void dispose() {
+    _windowChannel.setMethodCallHandler(null);
     _liveness.cancel();
     _events?.cancel();
     _server.dispose();
@@ -645,7 +695,6 @@ class _DevHomePageState extends State<DevHomePage> {
     }
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: theme.colorScheme.inversePrimary,
         title: const Text('Parley'),
         actions: [
           if (_session != null) ...[
@@ -723,7 +772,7 @@ class _DevHomePageState extends State<DevHomePage> {
             Icon(
               _voiceUp ? Icons.mic : Icons.mic_off,
               size: 16,
-              color: _voiceUp ? Colors.deepPurpleAccent : Colors.white38,
+              color: _voiceUp ? _accentSoft : Colors.white38,
             ),
             const SizedBox(width: 8),
             Expanded(
@@ -914,7 +963,7 @@ class _DevHomePageState extends State<DevHomePage> {
               shape: BoxShape.circle,
               color: idle
                   ? Colors.white24
-                  : (self ? Colors.deepPurpleAccent : Colors.greenAccent),
+                  : (self ? _accentSoft : Colors.greenAccent),
             ),
           ),
           const SizedBox(width: 6),
@@ -977,7 +1026,7 @@ class _DevHomePageState extends State<DevHomePage> {
                                 text: '${m.username}: ',
                                 style: TextStyle(
                                   color: own
-                                      ? Colors.deepPurpleAccent
+                                      ? _accentSoft
                                       : Colors.white70,
                                   fontWeight: FontWeight.bold,
                                 ),
@@ -1066,7 +1115,7 @@ class _DevHomePageState extends State<DevHomePage> {
       ),
       child: Row(
         children: [
-          const Icon(Icons.screen_share, color: Colors.deepPurpleAccent),
+          const Icon(Icons.screen_share, color: _accentSoft),
           const SizedBox(width: 10),
           Expanded(
             child: Column(

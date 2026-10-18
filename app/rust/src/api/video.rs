@@ -330,6 +330,10 @@ pub mod imp {
         /// texture through the consumer's hidden-set path.
         pub fn hide(&self, sender_id: u32) {
             self.hidden.lock().unwrap().insert(sender_id);
+            // Frames already decoded would arrive as "a hidden sender is
+            // sending again" and re-announce the surface — the card
+            // would flicker back the moment it was expired.
+            self.hub.discard_queued(sender_id);
         }
 
         pub fn sender_stopped(&self, sender_id: u32, forget: bool) {
@@ -415,6 +419,14 @@ pub mod imp {
                 break;
             }
             let sender = frame.sender_id;
+            // 7k: a straggler from a share that already ended (or from a
+            // sender who left voice) must not reach the display — the
+            // consumer would treat it as a hidden sender sending again
+            // and re-announce the surface, resurrecting the card the
+            // stop notice just removed.
+            if hub.is_stopped(sender) {
+                continue;
+            }
             if let Some(&when) = dead.get(&sender) {
                 if when.elapsed() < TEXTURE_RETRY_COOLDOWN {
                     continue; // keep draining, display nothing

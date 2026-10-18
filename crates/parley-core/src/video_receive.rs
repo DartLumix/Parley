@@ -472,6 +472,7 @@ impl VideoReceiveHub {
         let mut inner = self.inner.lock().unwrap();
         inner.streams.remove(&sender_id);
         inner.stopped.insert(sender_id);
+        inner.queue.retain(|f| f.sender_id != sender_id);
     }
 
     /// Sender left voice entirely: drop state, forget stopped-state —
@@ -479,8 +480,35 @@ impl VideoReceiveHub {
     pub fn remove(&self, sender_id: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.streams.remove(&sender_id);
-        inner.stopped.remove(&sender_id);
         inner.refused_codec.remove(&sender_id);
+        inner.queue.retain(|f| f.sender_id != sender_id);
+        // Suppressed like a stopped share rather than forgotten: a frame
+        // already in flight would otherwise announce a surface for
+        // someone who just left voice, and the card would come back
+        // after the prune that removed it. A genuine new share clears
+        // this with its frame_id-0 keyframe.
+        inner.stopped.insert(sender_id);
+    }
+
+    /// Is this sender suppressed until their next share's first
+    /// keyframe? The display consumer drops such frames — closing the
+    /// window where a frame pops between a stop notice and the queue
+    /// flush.
+    pub fn is_stopped(&self, sender_id: u32) -> bool {
+        self.inner.lock().unwrap().stopped.contains(&sender_id)
+    }
+
+    /// Drop frames this sender already has sitting in the display queue.
+    ///
+    /// A share that just ended can still have one decoded frame in
+    /// flight; the consumer would deliver it, see its sender in the
+    /// hidden set and RE-ANNOUNCE the surface — so the card the stop
+    /// notice just removed comes back, and only for viewers who were
+    /// watching (their pane had just closed, which is what made it look
+    /// like "the card stays when the other side is watching").
+    pub fn discard_queued(&self, sender_id: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue.retain(|f| f.sender_id != sender_id);
     }
 
     /// Senders whose stream has been silent for longer than `max_idle`.
@@ -607,6 +635,34 @@ mod tests {
     /// 7k: a share can end without a stop notice (crash, killed capture,
     /// dropped network). Silence is the only signal then — the expiry
     /// watchdog is built on this.
+    /// 7k: the queued-frame race. Ending a share while a viewer is
+    /// watching delivered one already-decoded frame AFTER the stop
+    /// notice; the consumer saw a hidden sender sending, and announced
+    /// the surface again — the card came back and stayed.
+    #[test]
+    fn stop_discards_frames_queued_before_it() {
+        let mut enc = crate::video::create_encoder(320, 240).unwrap();
+        let (annexb, _key) = enc.encode_bgra(&flat_bgra(320, 240, 40)).unwrap();
+        let dgs = fragment_frame(0, true, &annexb, 0, 0, 9);
+        let hub = VideoReceiveHub::new();
+        for p in payloads(&dgs) {
+            hub.push_datagram(5, &p);
+        }
+        hub.mark_stopped(5);
+        assert!(
+            hub.pop_frame(Duration::from_millis(80)).is_none(),
+            "a frame queued before the stop must never reach the display"
+        );
+        // A genuine new share (frame_id 0 keyframe) still gets through.
+        for p in payloads(&dgs) {
+            hub.push_datagram(5, &p);
+        }
+        assert!(
+            hub.pop_frame(Duration::from_millis(500)).is_some(),
+            "a new share must still be delivered"
+        );
+    }
+
     #[test]
     fn stalled_detects_a_silent_sender() {
         let hub = VideoReceiveHub::new();
