@@ -33,11 +33,29 @@ Future<bool> isConnected({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionIsConnected(sessionId: sessionId);
 
 /// Disconnect: voice devices die FIRST (deterministic teardown), then
-/// the registry entry drops — closing the streams (and the endpoint's
-/// socket). The server ends the session on control-stream close (§5
-/// semantics). Writer/reader tasks error out and exit.
+/// the registry entry drops, and the QUIC connection is closed
+/// EXPLICITLY.
+///
+/// The explicit close is load-bearing. Several background tasks (the
+/// video reporter's command sender, the video wire, the voice reader)
+/// hold clones of the connection or of the command channel, so merely
+/// dropping the registry entry does not necessarily end the writer
+/// task — and a control stream that never closes leaves the server's
+/// session registered, so the account keeps showing as online for every
+/// later login. Closing the connection is one deterministic signal the
+/// server cannot miss.
 Future<void> disconnect({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionDisconnect(sessionId: sessionId);
+
+/// Mute or unmute this session's microphone. Takes effect in the
+/// capture callback on the next device period (~21 ms); the flag
+/// outlives leave/join, so a muted user stays muted when they switch
+/// channels.
+Future<void> setMicMuted({required int sessionId, required bool muted}) =>
+    RustLib.instance.api.crateApiSessionSetMicMuted(
+      sessionId: sessionId,
+      muted: muted,
+    );
 
 /// Request the channel listing (response: "channel_list" event).
 Future<void> listChannels({required int sessionId}) =>

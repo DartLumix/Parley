@@ -7,9 +7,11 @@ const accent = Color(0xFF1E6BFF);
 /// The same hue lifted for icons, dots and names on black.
 const accentSoft = Color(0xFF4D93FF);
 
-/// App-bar surface: black with a blue cast, so the accent reads as the
-/// app's colour rather than a pale title bar.
-const barSurface = Color(0xFF0B1424);
+/// App-bar surface: a lifted blue-black. Bright enough to separate the
+/// bar from the black page (and, with the window toolbar drawn over it,
+/// to read as chrome rather than a hole); dark enough that the accent
+/// still reads as the app's colour rather than a pale title bar.
+const barSurface = Color(0xFF16233B);
 
 /// One theme for the whole app. Widgets read the accent through the
 /// scheme, not through the constants, so a future re-skin touches this

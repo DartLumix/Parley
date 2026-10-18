@@ -61,6 +61,10 @@ class _HomePageState extends State<HomePage> {
   bool _sharing = false;
   bool _hwEncode = false;
   bool _hwEncodeSupported = false;
+  // Mic mute (the button next to Share): while set, the Rust capture
+  // callback sends nothing at all. Session-scoped; a new login starts
+  // unmuted.
+  bool _micMuted = false;
 
   late final Timer _liveness;
 
@@ -151,6 +155,7 @@ class _HomePageState extends State<HomePage> {
       _watching = null;
       _fullscreen = null;
       _sharing = false;
+      _micMuted = false;
     });
     setWindowFullscreen(false);
     _muteAllShares();
@@ -226,6 +231,7 @@ class _HomePageState extends State<HomePage> {
       _watching = null;
       _fullscreen = null;
       _sharing = false;
+      _micMuted = false;
     });
     setWindowFullscreen(false);
   }
@@ -625,15 +631,13 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // --- connected layout: header strip, channels + chat left, share right.
+  // --- connected layout: channels on the left, chat on the right, and a
+  // share pushes in ABOVE the chat (the chat keeps its width and moves
+  // down rather than the whole page re-splitting).
 
   Widget _sessionView(ThemeData theme) {
-    // The split appears when there is something to watch — not merely
-    // when we are in a channel: a share is the only reason for the
-    // right-hand pane to exist.
-    final split = _videos.isNotEmpty;
     return Padding(
-      // Bottom room for the floating share/HW bar.
+      // Bottom room for the floating share/mute/HW bar.
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -641,19 +645,32 @@ class _HomePageState extends State<HomePage> {
           _connectionStrip(theme),
           const SizedBox(height: 12),
           Expanded(
-            child: split
-                ? Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Expanded(flex: 5, child: _leftColumn(theme)),
-                      const SizedBox(width: 16),
-                      Expanded(flex: 6, child: _sharePane(theme)),
-                    ],
-                  )
-                : _leftColumn(theme),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(flex: 4, child: _channelsPanel(theme)),
+                const SizedBox(width: 16),
+                Expanded(flex: 6, child: _rightPane(theme)),
+              ],
+            ),
           ),
         ],
       ),
+    );
+  }
+
+  /// The right-hand split: the share (when there is one) on top, the
+  /// chat below it. With no share the chat simply owns the pane.
+  Widget _rightPane(ThemeData theme) {
+    final sharing = _videos.isNotEmpty;
+    return Column(
+      children: [
+        if (sharing) ...[
+          Expanded(flex: 3, child: _sharePane(theme)),
+          const SizedBox(height: 12),
+        ],
+        Expanded(flex: sharing ? 2 : 1, child: _chatPanel(theme)),
+      ],
     );
   }
 
@@ -664,9 +681,9 @@ class _HomePageState extends State<HomePage> {
         Row(
           children: [
             Icon(
-              _voiceUp ? Icons.mic : Icons.mic_off,
+              _voiceUp && !_micMuted ? Icons.mic : Icons.mic_off,
               size: 16,
-              color: _voiceUp ? accentSoft : Colors.white38,
+              color: _voiceUp && !_micMuted ? accentSoft : Colors.white38,
             ),
             const SizedBox(width: 8),
             Expanded(
@@ -691,18 +708,8 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _leftColumn(ThemeData theme) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _channelsPanel(theme),
-        const SizedBox(height: 12),
-        Expanded(child: _chatPanel(theme)),
-      ],
-    );
-  }
-
-  // --- channels: one card per channel, with its live roster.
+  // --- channels: one card per channel, with its live roster. The
+  // column fills the left pane and scrolls on its own.
 
   Widget _channelsPanel(ThemeData theme) {
     final idle = [
@@ -723,10 +730,8 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
         const SizedBox(height: 8),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 260),
+        Expanded(
           child: ListView(
-            shrinkWrap: true,
             children: [
               for (final c in _channels) _channelCard(theme, c),
               if (idle.isNotEmpty) _idleCard(theme, idle),
@@ -1077,10 +1082,27 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // --- floating bottom bar: share + hardware encode.
+  Future<void> _toggleMic() async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    final next = !_micMuted;
+    try {
+      await setMicMuted(sessionId: sessionId, muted: next);
+    } catch (e) {
+      if (mounted) setState(() => _status = 'mute failed: $e');
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _micMuted = next;
+      _status = next ? 'mic muted' : 'mic live';
+    });
+  }
+
+  // --- floating bottom bar: mute + share + hardware encode.
 
   Widget _actionBar(ThemeData theme) {
-    final canShare = _joinedChannelId != null && !_connecting;
+    final inVoice = _joinedChannelId != null && !_connecting;
     return Material(
       elevation: 10,
       color: theme.colorScheme.surfaceContainerHigh,
@@ -1091,7 +1113,17 @@ class _HomePageState extends State<HomePage> {
           mainAxisSize: MainAxisSize.min,
           children: [
             TextButton.icon(
-              onPressed: canShare
+              onPressed: inVoice ? _toggleMic : null,
+              icon: Icon(_micMuted ? Icons.mic_off : Icons.mic, size: 20),
+              label: Text(_micMuted ? 'Unmute' : 'Mute'),
+            ),
+            Container(
+              width: 1,
+              height: 24,
+              color: Colors.white.withValues(alpha: 0.12),
+            ),
+            TextButton.icon(
+              onPressed: inVoice
                   ? (_sharing ? _stopShare : _startShare)
                   : null,
               icon: Icon(

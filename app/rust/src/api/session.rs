@@ -221,6 +221,11 @@ struct LiveSession {
     mixer: SharedMixer,
     /// Authenticated user id (media reader's self-echo filter).
     user_id: u32,
+    /// Mic mute: the capture callback drops chunks while this is set
+    /// (no packets at all, rather than silence packets). Session-scoped
+    /// and deliberately not cleared by leave/join — muting is a user
+    /// preference, not a device property.
+    mic_muted: Arc<AtomicBool>,
     /// 7g: event stream origin for share lifecycle events (share_
     /// started / share_ended) and the share supervisor's forwarder.
     /// Featureless builds never touch it (share fns are stubs) —
@@ -710,7 +715,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
     // ladder reads; 7f adds the video feed for the same media path.)
     #[cfg(feature = "screen-capture")]
     let mic_mux_tx = Some(share_mic_mux_channel().0);
-    let (mixer, conn, my_id, loss_report, cmd_tx, video_tx) = {
+    let (mixer, conn, my_id, loss_report, cmd_tx, video_tx, mic_muted) = {
         let sessions = SESSIONS.lock().unwrap();
         let Some(s) = sessions.get(&session_id) else {
             return;
@@ -732,6 +737,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             VIDEO_FEEDS.lock().unwrap().get(&session_id).cloned(),
             #[cfg(not(feature = "video"))]
             None,
+            s.mic_muted.clone(),
         )
     };
 
@@ -745,6 +751,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             loss_report,
             cmd_tx,
             video_tx,
+            mic_muted,
             #[cfg(feature = "screen-capture")]
             mic_mux_tx,
         ) {
@@ -976,7 +983,7 @@ async fn connect_async(
     #[cfg(feature = "video")]
     start_video_task(session_id, session_hub.clone());
     #[cfg(feature = "video")]
-    start_video_reporter(session_hub.clone(), cmd_tx.clone());
+    start_video_reporter(session_id, session_hub.clone(), cmd_tx.clone());
 
     SESSIONS.lock().unwrap().insert(
         session_id,
@@ -988,6 +995,7 @@ async fn connect_async(
             sinks,
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
+            mic_muted: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "screen-capture")]
             event_tx: event_tx.clone(),
             #[cfg(feature = "screen-capture")]
@@ -1056,9 +1064,17 @@ pub fn is_connected(session_id: u32) -> bool {
 }
 
 /// Disconnect: voice devices die FIRST (deterministic teardown), then
-/// the registry entry drops — closing the streams (and the endpoint's
-/// socket). The server ends the session on control-stream close (§5
-/// semantics). Writer/reader tasks error out and exit.
+/// the registry entry drops, and the QUIC connection is closed
+/// EXPLICITLY.
+///
+/// The explicit close is load-bearing. Several background tasks (the
+/// video reporter's command sender, the video wire, the voice reader)
+/// hold clones of the connection or of the command channel, so merely
+/// dropping the registry entry does not necessarily end the writer
+/// task — and a control stream that never closes leaves the server's
+/// session registered, so the account keeps showing as online for every
+/// later login. Closing the connection is one deterministic signal the
+/// server cannot miss.
 pub fn disconnect(session_id: u32) -> Result<(), String> {
     teardown_voice(session_id);
     // 7f: the display bridge tears down OUTSIDE the registry lock —
@@ -1072,10 +1088,29 @@ pub fn disconnect(session_id: u32) -> Result<(), String> {
         .and_then(|s| s.display.take());
     #[cfg(feature = "video")]
     drop(display);
-    match SESSIONS.lock().unwrap().remove(&session_id) {
-        Some(_) => Ok(()),
-        None => Err(format!("no session {session_id}")),
-    }
+    let (conn, endpoint) = match SESSIONS.lock().unwrap().remove(&session_id) {
+        Some(s) => (s._conn, s._endpoint),
+        None => return Err(format!("no session {session_id}")),
+    };
+    #[cfg(feature = "video")]
+    VIDEO_FEEDS.lock().unwrap().remove(&session_id);
+    conn.close(0u32.into(), b"disconnect");
+    drop(conn);
+    drop(endpoint);
+    Ok(())
+}
+
+/// Mute or unmute this session's microphone. Takes effect in the
+/// capture callback on the next device period (~21 ms); the flag
+/// outlives leave/join, so a muted user stays muted when they switch
+/// channels.
+pub fn set_mic_muted(session_id: u32, muted: bool) -> Result<(), String> {
+    let sessions = SESSIONS.lock().unwrap();
+    let s = sessions
+        .get(&session_id)
+        .ok_or(format!("no session {session_id}"))?;
+    s.mic_muted.store(muted, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Request the channel listing (response: "channel_list" event).
@@ -1507,11 +1542,21 @@ fn start_share_watchdog(
 /// exits when the writer dies. (The hub returns None with no active
 /// streams — nothing is sent then.)
 #[cfg(feature = "video")]
-fn start_video_reporter(hub: SharedVideoReceiveHub, cmd_tx: UnboundedSender<Command>) {
+fn start_video_reporter(
+    session_id: u32,
+    hub: SharedVideoReceiveHub,
+    cmd_tx: UnboundedSender<Command>,
+) {
     rt().spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
+            // The reporter holds a command sender, which would otherwise
+            // keep the session writer (and its control stream) alive
+            // after a disconnect. Leave with the registry entry.
+            if !SESSIONS.lock().unwrap().contains_key(&session_id) {
+                break;
+            }
             let Some(worst) = hub.gap_rate_permille() else {
                 continue; // no active streams: nothing to report
             };
@@ -1525,4 +1570,135 @@ fn start_video_reporter(hub: SharedVideoReceiveHub, cmd_tx: UnboundedSender<Comm
             }
         }
     });
+}
+
+/// Regression: a manual disconnect must end the server-side session.
+///
+/// The bug this guards: `disconnect` used to drop the registry entry and
+/// rely on the writer task noticing. The video reporter holds a command
+/// sender for the session's lifetime, so the writer never noticed, the
+/// control stream stayed open, and the server kept the account listed as
+/// online — the next login (as another user) saw the previous user still
+/// present. The fix is an explicit `conn.close`; this test asserts the
+/// observable outcome against a real server.
+#[cfg(test)]
+mod disconnect_tests {
+    use super::*;
+    use parley_core::session as wire;
+    use parley_proto::{
+        AuthRequest, ClientBody, ClientMessage, Hello, HelloAck, PresenceRequest, ServerBody,
+    };
+    use parley_server::{Config, Server};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("parley-bridge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Ask the server for the online set over a throwaway raw connection
+    /// (the CLI's wire, same pinned fingerprint as the bridge).
+    async fn online_users(addr: std::net::SocketAddr, pin: String) -> Vec<String> {
+        let (endpoint, _seen) = parley_client::cert::build_endpoint(Some(pin));
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+        wire::write_message(
+            &mut tx,
+            &Hello {
+                protocol_version: PROTOCOL_VERSION,
+                caps: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let _: HelloAck = wire::read_message(&mut rx).await.unwrap();
+        wire::write_message(
+            &mut tx,
+            &AuthRequest {
+                username: "bob".into(),
+                password: "pass_b".into(),
+                session_token: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let _: AuthOk = wire::read_message(&mut rx).await.unwrap();
+        wire::write_message(
+            &mut tx,
+            &ClientMessage {
+                body: Some(ClientBody::PresenceRequest(PresenceRequest {})),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "no presence list within 2 s");
+            let msg: ServerMessage = tokio::time::timeout(remaining, wire::read_message(&mut rx))
+                .await
+                .expect("presence response timed out")
+                .unwrap();
+            if let Some(ServerBody::PresenceList(list)) = msg.body {
+                let names = list.users.into_iter().map(|u| u.username).collect();
+                conn.close(0u32.into(), b"done");
+                return names;
+            }
+        }
+    }
+
+    #[test]
+    fn disconnect_ends_the_server_side_session() {
+        let dir = temp_dir("disconnect");
+        // TOFU pinning writes here; keep the real user config untouched.
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        let config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            data_dir: dir.join("data"),
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        {
+            let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+            db.create_user("alice", "pass_a", false).unwrap();
+            db.create_user("bob", "pass_b", false).unwrap();
+        }
+        // quinn's endpoint needs a tokio context to bind.
+        let server = rt().block_on(async { Server::bind(&config).unwrap() });
+        let addr = server.local_addr();
+        let pin = server.fingerprint().to_string();
+        rt().spawn(server.run());
+
+        let alice = connect(
+            format!("127.0.0.1:{}", addr.port()),
+            "alice".into(),
+            "pass_a".into(),
+        )
+        .expect("bridge connect");
+
+        let before = rt().block_on(online_users(addr, pin.clone()));
+        assert!(
+            before.iter().any(|u| u == "alice"),
+            "alice should be online: {before:?}"
+        );
+
+        disconnect(alice.session_id).expect("bridge disconnect");
+
+        // The close is asynchronous on the wire; the server drops the
+        // session as soon as it observes it. Poll briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let after = rt().block_on(online_users(addr, pin.clone()));
+            if !after.iter().any(|u| u == "alice") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "alice still online 5 s after disconnect: {after:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

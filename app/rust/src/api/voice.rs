@@ -258,6 +258,10 @@ pub(crate) fn start_voice(
         // the media flag bits; see the send site below.
         tokio::sync::mpsc::UnboundedSender<(u32, u8, Vec<u8>)>,
     >,
+    // Mic mute: the capture callback reads this per device period and
+    // drops the chunk entirely. Session-owned, so the state survives a
+    // leave/join and dies with the session.
+    muted: Arc<AtomicBool>,
     // 7g: the mic tee routes captured chunks into this mux channel
     // while the share-audio mux owns the route flag; the mux drains it
     // and mixes the mic with the share's system audio. None when the
@@ -579,7 +583,7 @@ pub(crate) fn start_voice(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let stop_for_thread = stop.clone();
     let device_thread = std::thread::spawn(move || {
-        match build_streams(&mixer, aec, pcm_tx) {
+        match build_streams(&mixer, aec, pcm_tx, muted) {
             Ok(streams) => {
                 let AudioStreams { input, output } = streams;
                 let played = input.play().and_then(|_| output.play());
@@ -641,6 +645,7 @@ fn build_streams(
     mixer: &SharedMixer,
     aec: Option<Arc<webrtc_audio_processing::Processor>>,
     pcm_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+    muted: Arc<AtomicBool>,
 ) -> Result<AudioStreams, String> {
     let host = cpal::default_host();
     let in_dev = host
@@ -680,6 +685,7 @@ fn build_streams(
     let build_input = |cfg: &cpal::StreamConfig| {
         let pcm_tx = pcm_tx.clone();
         let drops = drops.clone();
+        let muted = muted.clone();
         let mut first = true;
         in_dev.build_input_stream(
             cfg,
@@ -691,6 +697,12 @@ fn build_streams(
                         "voice: capture period: {frames} frames ({:.1} ms)",
                         frames as f64 / 48.0
                     );
+                }
+                // Muted: drop the chunk before the encoder. Sending
+                // nothing (rather than encoded silence) keeps the
+                // muted mic off the wire entirely.
+                if muted.load(Ordering::Relaxed) {
+                    return;
                 }
                 // Downmix to mono (sum/channels — the terminal
                 // client's downmix).
