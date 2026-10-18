@@ -50,7 +50,7 @@ git push origin v0.2.0
 4. **client** — builds the bridge and the Flutter bundle in release
    mode with `--dart-define=PARLEY_VERSION`, packages the client, the
    CLI and the deploy kit, then checks the bundle's shared libraries on
-   a clean Ubuntu 22.04 (and that the system WebRTC dependency is gone).
+   a clean Ubuntu 24.04 (and that the system WebRTC dependency is gone).
 5. **smoke** — boots the released image, adds a user through
    `/parley-server adduser`, logs in as two accounts and proves a wrong
    password is refused (`tools/e2e-container.sh`).

@@ -19,7 +19,11 @@ packages, when a shared library is missing.
 removes everything again.
 
 Runtime requirements: GTK 3, PipeWire (`libpipewire-0.3`), ALSA
-(`libasound`), a C++ runtime and a Wayland or X11 session.
+(`libasound`), a C++ runtime and a Wayland or X11 session. The bundle
+is built on Ubuntu 24.04, so it needs **glibc 2.39** — Ubuntu 24.04+,
+Debian 13+, Fedora 40+ — and a PipeWire new enough to carry
+`spa_video_info_raw.flags` (0.3.65+, which 24.04 and everything newer
+ships; Ubuntu 22.04's 0.3.48 cannot run this build).
 Screen sharing additionally needs a ScreenCast portal backend matching
 the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`, `-gnome`).
 

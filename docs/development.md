@@ -47,6 +47,11 @@ The crate configures with `meson setup --reconfigure`, which Ubuntu
 contain a valid build tree"). Install meson from pip (>= 1.0) on 22.04;
 the release workflow does exactly that.
 
+Building the shipping features also needs PipeWire >= 0.3.65 headers:
+pipewire-rs uses `spa_video_info_raw.flags`, which 22.04's 0.3.48 does
+not have. 24.04 (1.0.5) is therefore the build and runtime baseline for
+the release client; 22.04 builds everything except `screen-capture`.
+
 ## Everyday commands
 
 ```sh

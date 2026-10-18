@@ -126,7 +126,11 @@ jobs:
   client:
     name: Linux client
     needs: meta
-    runs-on: ubuntu-22.04
+    # 24.04, not 22.04: pipewire-rs 0.10 uses `spa_video_info_raw.flags`
+    # unconditionally, and that field only exists in PipeWire >= 0.3.65
+    # headers (22.04 ships 0.3.48, which fails with E0609). 24.04 also
+    # sets the glibc baseline the tarball is built for.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,12 +153,11 @@ jobs:
             libgtk-3-dev liblzma-dev libpipewire-0.3-dev libasound2-dev \
             libva-dev
       # The bundled AEC is configured by webrtc-audio-processing-sys,
-      # which always passes `meson setup --reconfigure`. 22.04 ships
-      # meson 0.61, and 0.61 refuses --reconfigure on a fresh build dir
-      # ("Directory does not contain a valid build tree"), so the whole
-      # client job died at the first `cargo clippy`. A current meson in
-      # a venv, first on PATH for the rest of the job, fixes it; the
-      # distro one is deliberately not installed.
+      # which always passes `meson setup --reconfigure`. Not every
+      # distro meson accepts that on a fresh build dir (0.61 refuses it:
+      # "Directory does not contain a valid build tree"), so the job
+      # pins a known-good meson in a venv instead of the distro one and
+      # puts it first on PATH for the rest of the job.
       - name: meson for the bundled AEC
         run: |
           python3 -m venv "$RUNNER_TEMP/meson"
@@ -180,13 +183,14 @@ jobs:
           tools/package-deploy.sh "$VERSION" dist
           ls -lh dist
       # A prebuilt binary that only runs on the builder is not shipped.
-      # The bundle must resolve on a clean 22.04 with runtime packages
-      # only — and must NOT carry the old system WebRTC dependency.
+      # The bundle must resolve on a clean 24.04 — the oldest glibc and
+      # PipeWire the build targets — with runtime packages only, and
+      # must NOT carry the old system WebRTC dependency.
       - name: runtime dependency check (clean Ubuntu)
         run: |
-          docker run --rm -v "$PWD/app/build/linux/x64/release/bundle:/bundle:ro" ubuntu:22.04 bash -c '
+          docker run --rm -v "$PWD/app/build/linux/x64/release/bundle:/bundle:ro" ubuntu:24.04 bash -c '
             apt-get update -qq
-            apt-get install -y -qq libgtk-3-0 libpipewire-0.3-0 libasound2 \
+            apt-get install -y -qq libgtk-3-0t64 libpipewire-0.3-0t64 libasound2t64 \
                 libstdc++6 libgl1 libegl1 >/dev/null
             missing=$(ldd /bundle/parley /bundle/lib/libparley_flutter.so \
                     /bundle/lib/libflutter_linux_gtk.so | grep "not found" || true)
@@ -196,7 +200,7 @@ jobs:
               ldd /bundle/lib/libparley_flutter.so | grep -E 'webrtc-audio|absl'
               exit 1
             fi
-            echo "bundle resolves on a clean Ubuntu 22.04, AEC self-contained"
+            echo "bundle resolves on a clean Ubuntu 24.04, AEC self-contained"
           '
       - uses: actions/upload-artifact@v4
         with:
