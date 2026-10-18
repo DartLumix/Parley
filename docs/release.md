@@ -79,7 +79,7 @@ sha256sum -c SHA256SUMS
 docker load -i parley-image-0.2.0.tar.gz
 docker run -d --name parley -p 443:4443/udp -e PARLEY_ADMIN_PASSWORD=secret parley:0.2.0
 cargo build --release -p parley-client
-tools/e2e-container.sh          # with the container stopped: builds and runs its own
+tools/e2e-container.sh          # builds its own image and boots it on a free port
 ```
 
 Or against the running server, with the shipped CLI:
