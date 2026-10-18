@@ -36,6 +36,16 @@ pub const FLAG_VIDEO: u8 = 1 << 1;
 /// never off negotiated state (same rule as FLAG_VIDEO).
 pub const FLAG_STEREO: u8 = 1 << 2;
 
+/// 7k: this audio datagram is a SCREEN SHARE's system audio, not the
+/// sender's voice. The two streams are separate (the share runs its own
+/// music-profile encoder), so a receiver can decide what to play
+/// independently — the app plays share audio only while that share is
+/// being watched, and the sender's voice is never affected.
+///
+/// Audio-only: shares bit 3 with the video codec id, which is
+/// meaningful only when FLAG_VIDEO is set. No datagram is ever both.
+pub const FLAG_SHARE_AUDIO: u8 = 1 << 3;
+
 /// 7h: video codec identity, carried in flag bits 3..4 of VIDEO
 /// datagrams. The media header has no codec field and the flag byte has
 /// two spare bits, so the codec rides there: no length change, no
@@ -142,6 +152,18 @@ mod tests {
         let encoded = encode(FLAG_STEREO, 1, 96_000, 1, &[0xAA]);
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded.flags, FLAG_STEREO);
+    }
+
+    #[test]
+    fn share_audio_flag_is_independent_of_the_audio_flags() {
+        // 7k: the share-audio marker rides alongside SPEAKING/STEREO on
+        // an audio datagram and never touches the video codec bits.
+        let flags = FLAG_SHARE_AUDIO | FLAG_STEREO | FLAG_SPEAKING;
+        let encoded = encode(flags, 5, 960, 12, &[0x55]);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded.flags, flags);
+        assert_ne!(decoded.flags & FLAG_SHARE_AUDIO, 0);
+        assert_eq!(decoded.flags & FLAG_VIDEO, 0);
     }
 
     #[test]

@@ -175,6 +175,11 @@ struct RecvStream {
     fed_since_picture: u64,
     /// When the decoder was last rebuilt (cooldown bookkeeping).
     last_reset: Option<std::time::Instant>,
+    /// When the last fragment for this sender arrived — the stall
+    /// detector's clock. A share whose sender went away without a stop
+    /// notice (crash, killed capture) never sends again; a viewer that
+    /// only trusts events would keep the card forever.
+    last_packet: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -281,6 +286,7 @@ impl VideoReceiveHub {
                             decode_errors: 0,
                             fed_since_picture: 0,
                             last_reset: None,
+                            last_packet: std::time::Instant::now(),
                         });
                     }
                     Err(e) => {
@@ -291,6 +297,7 @@ impl VideoReceiveHub {
             }
             let stream = streams.get_mut(&sender_id).expect("just inserted");
             stream.assembler.push_fragment(frag);
+            stream.last_packet = std::time::Instant::now();
         }
         let pushed = Self::drain_streams(&mut inner);
         drop(inner);
@@ -476,6 +483,34 @@ impl VideoReceiveHub {
         inner.refused_codec.remove(&sender_id);
     }
 
+    /// Senders whose stream has been silent for longer than `max_idle`.
+    ///
+    /// A share can end without a stop notice — the process crashes, the
+    /// capture thread is killed, the network drops — and then no event
+    /// will ever arrive. The expiry path treats these as gone until
+    /// frames resume; it deliberately does NOT `mark_stopped` (that
+    /// would suppress every non-keyframe and a transient stall could
+    /// never recover).
+    pub fn stalled(&self, max_idle: Duration) -> Vec<u32> {
+        let inner = self.inner.lock().unwrap();
+        let mut v: Vec<u32> = inner
+            .streams
+            .iter()
+            .filter(|(_, s)| s.last_packet.elapsed() > max_idle)
+            .map(|(&id, _)| id)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Senders with receive state right now (stalled or not).
+    pub fn senders(&self) -> Vec<u32> {
+        let inner = self.inner.lock().unwrap();
+        let mut v: Vec<u32> = inner.streams.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Worst per-sender video gap rate since the last call (resets each
     /// sender's window). None when no streams are active. Feeds the
     /// sender's 6e ladder via VideoReport.
@@ -567,6 +602,30 @@ mod tests {
             px[3] = 255;
         }
         bgra
+    }
+
+    /// 7k: a share can end without a stop notice (crash, killed capture,
+    /// dropped network). Silence is the only signal then — the expiry
+    /// watchdog is built on this.
+    #[test]
+    fn stalled_detects_a_silent_sender() {
+        let hub = VideoReceiveHub::new();
+        let dgs = fragment_frame(0, true, &[0u8; 64], 0, 0, 7);
+        hub.push_datagram(21, &payloads(&dgs)[0]);
+        assert_eq!(hub.senders(), vec![21]);
+        assert!(
+            hub.stalled(Duration::from_secs(60)).is_empty(),
+            "a stream that just delivered is not stalled"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            hub.stalled(Duration::from_millis(10)),
+            vec![21],
+            "30 ms of silence past a 10 ms threshold is a stall"
+        );
+        // Frames resuming clear the verdict (the watchdog un-expires).
+        hub.push_datagram(21, &payloads(&dgs)[0]);
+        assert!(hub.stalled(Duration::from_millis(10)).is_empty());
     }
 
     #[test]

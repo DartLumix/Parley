@@ -315,11 +315,23 @@ pub(crate) fn start_voice(
                                 continue;
                             }
                             let stereo = m.flags & FLAG_STEREO != 0;
-                            if let Err(e) = mixer
-                                .lock()
-                                .unwrap()
-                                .push_packet(m.sender_id, m.seq, m.payload, stereo)
+                            let share = m.flags & parley_proto::media::FLAG_SHARE_AUDIO != 0;
+                            // 7k: a share's system audio stays silent until
+                            // the viewer asks for it. Everyone in a channel
+                            // should not hear someone's music just because
+                            // they started sharing — the sender's VOICE
+                            // rides its own stream and is never gated here.
+                            if share && !crate::api::session::share_audio_audible(m.sender_id)
                             {
+                                continue;
+                            }
+                            if let Err(e) = mixer.lock().unwrap().push_packet(
+                                m.sender_id,
+                                m.seq,
+                                m.payload,
+                                stereo,
+                                share,
+                            ) {
                                 eprintln!(
                                     "voice: recv pipeline for user {}: {e}",
                                     m.sender_id

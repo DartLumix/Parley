@@ -91,6 +91,12 @@ pub(crate) fn spawn_filter(raw: Receiver<Vec<f32>>, out: SyncSender<Vec<f32>>) {
             buf.clear();
         }
         ACTIVE.store(true, Ordering::Relaxed);
+        if left_aec.is_some() {
+            println!(
+                "share-audio: echo guard on — this app's own playback (voice + other shares) is \
+                 subtracted from the capture"
+            );
+        }
 
         let mut asm_l = FrameAssembler::new();
         let mut asm_r = FrameAssembler::new();
@@ -153,6 +159,7 @@ pub(crate) fn spawn_filter(raw: Receiver<Vec<f32>>, out: SyncSender<Vec<f32>>) {
 
         ACTIVE.store(false, Ordering::Relaxed);
         REF.lock().unwrap().clear();
+        println!("share-audio: echo guard off");
     });
 }
 

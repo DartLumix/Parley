@@ -1015,6 +1015,13 @@ async fn connect_async(
         },
     );
 
+    // 7k: share-expiry watchdog. A stop notice is the normal end of a
+    // share; a crash, a killed capture thread or a dropped network ends
+    // it silently, and the viewer would hold the card (showing the last
+    // decoded frame) forever. Silence is the only signal in that case.
+    #[cfg(feature = "video")]
+    start_share_watchdog(session_id, session_hub.clone(), event_tx.clone());
+
     Ok(SessionInfo {
         session_id,
         user_id: ok.user_id,
@@ -1126,6 +1133,58 @@ pub fn request_presence(session_id: u32) -> Result<(), String> {
 /// happen while connected arrive as individual "voice_state" events.
 pub fn request_voice_states(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::VoiceStates)
+}
+
+/// 7k: senders whose SCREEN SHARE audio this client is playing.
+/// Watching is a UI decision; this is its audio half. Empty by default —
+/// starting a share never plays its sound into the room unasked.
+#[cfg(feature = "audio-device")]
+static SHARE_AUDIO_AUDIBLE: LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Is this sender's share audio being played? Read by the media reader
+/// (voice.rs) for every FLAG_SHARE_AUDIO datagram.
+#[cfg(feature = "audio-device")]
+pub(crate) fn share_audio_audible(user_id: u32) -> bool {
+    SHARE_AUDIO_AUDIBLE.lock().unwrap().contains(&user_id)
+}
+
+/// Play (or stop playing) one sharer's screen audio. The UI calls this
+/// with the share it is watching — the pane, the fullscreen viewer, or
+/// nothing at all. Only the share's system audio is affected: the
+/// sender's voice rides its own stream and keeps playing.
+///
+/// Featureless: reports the stub convention's error (no audio path).
+pub fn set_share_audio(session_id: u32, user_id: u32, audible: bool) -> Result<(), String> {
+    #[cfg(feature = "audio-device")]
+    {
+        let mixer = {
+            let sessions = SESSIONS.lock().unwrap();
+            let s = sessions
+                .get(&session_id)
+                .ok_or(format!("no session {session_id}"))?;
+            s.mixer.clone()
+        };
+        {
+            let mut set = SHARE_AUDIO_AUDIBLE.lock().unwrap();
+            if audible {
+                set.insert(user_id);
+            } else {
+                set.remove(&user_id);
+            }
+        }
+        if !audible {
+            // Flush the share's buffered tail — the voice stream is a
+            // separate pipeline and is deliberately untouched.
+            mixer.lock().unwrap().clear_share(user_id);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "audio-device"))]
+    {
+        let _ = (session_id, user_id, audible);
+        Err("audio-device feature off".into())
+    }
 }
 
 // ===== 7g: in-app screen share =====
@@ -1259,7 +1318,14 @@ pub fn start_screen_share(session_id: u32) -> Result<(), String> {
                     // started yet — sys-only degradation).
                     #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
                     if let Some(sys_rx) = sys_rx {
-                        let mic_rx = SHARE_MIC_MUX_SLOT.lock().unwrap().take();
+                        // 7k: system audio only. Bundling the mic into the
+                        // share (the CLI's 6.9 shape) made the whole mux
+                        // one stream, so a viewer could not have the
+                        // sharer's voice without also getting the share's
+                        // sound — and the app gates share sound on
+                        // "watching". The mic keeps its own speech
+                        // encoder, at speech quality, all share long.
+                        let mic_rx = None;
                         let route = share_mic_route().clone();
                         let mux_conn = conn.clone();
                         std::thread::spawn(move || {
@@ -1375,6 +1441,69 @@ fn share_failed_event(session_id: u32, err: String) -> SessionEvent {
     let mut e = share_event(session_id, "share_failed");
     e.username = err; // reuse the string slot (dev client; documented)
     e
+}
+
+/// 7k: expire shares that stopped sending without telling anyone.
+///
+/// `ShareStopped` covers every clean end (stop button, leaving voice,
+/// session death). What it cannot cover is a sender whose capture or
+/// process died mid-share: the socket may stay up, the room hears
+/// nothing, and every viewer keeps a card whose Watch button shows a
+/// frozen last frame. Five seconds of silence on a stream that paced at
+/// 25–30 fps is dead by any measure; the surface is HIDDEN rather than
+/// marked stopped, so a sender that starts sending again (a stall, not
+/// a death) re-announces the same texture without a reconnect.
+#[cfg(feature = "video")]
+fn start_share_watchdog(
+    session_id: u32,
+    hub: SharedVideoReceiveHub,
+    events: UnboundedSender<SessionEvent>,
+) {
+    const IDLE: Duration = Duration::from_secs(5);
+    rt().spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut expired: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        loop {
+            tick.tick().await;
+            let alive = SESSIONS.lock().unwrap().contains_key(&session_id);
+            if !alive {
+                break; // session gone: nothing left to expire
+            }
+            let stalled: std::collections::HashSet<u32> = hub.stalled(IDLE).into_iter().collect();
+            let senders = hub.senders();
+            for id in &senders {
+                if !stalled.contains(id) {
+                    // Frames are back: the consumer re-announces on the
+                    // next one, so just forget that we expired them.
+                    expired.remove(id);
+                    continue;
+                }
+                if !expired.insert(*id) {
+                    continue; // already announced — no per-second spam
+                }
+                if let Some(sess) = SESSIONS.lock().unwrap().get(&session_id) {
+                    if let Some(d) = sess.display.as_ref() {
+                        d.hide(*id);
+                    }
+                }
+                let mut e = closed_event(session_id);
+                e.kind = "video_stopped".to_string();
+                e.user_id = *id;
+                e.surface = Some(VideoSurfaceInfo {
+                    user_id: *id,
+                    width: 0,
+                    height: 0,
+                    texture_id: 0,
+                });
+                println!(
+                    "video: user {id} stopped sending frames — share expired after {} s of silence",
+                    IDLE.as_secs()
+                );
+                let _ = events.send(e);
+            }
+            expired.retain(|id| senders.contains(id));
+        }
+    });
 }
 
 /// 7f (6e): start the viewer-side VideoReport reporter — worst

@@ -215,6 +215,7 @@ class _DevHomePageState extends State<DevHomePage> {
       _sharing = false;
     });
     _setWindowFullscreen(false);
+    _muteAllShares();
     // Clean the dead registry entry (a manual Disconnect may have
     // raced us — ignore).
     try {
@@ -264,6 +265,7 @@ class _DevHomePageState extends State<DevHomePage> {
 
   Future<void> _disconnect() async {
     if (_session == null) return;
+    await _muteAllShares();
     _isDisconnecting = true;
     try {
       await disconnect(sessionId: _session!.sessionId);
@@ -294,11 +296,62 @@ class _DevHomePageState extends State<DevHomePage> {
   // viewer needs (exit, stop watching) over the picture.
 
   void _enterFullscreen(int userId) {
-    setState(() {
-      _fullscreen = userId;
-      _watching = userId;
-    });
+    _watch(userId);
+    setState(() => _fullscreen = userId);
     _setWindowFullscreen(true);
+  }
+
+  /// Which share is on screen, and therefore audible. A screen share's
+  /// system audio is silent until its card is opened: hearing someone's
+  /// music the instant they start sharing is not the same thing as
+  /// watching the share. Their VOICE is a separate stream and keeps
+  /// coming through either way.
+  void _watch(int? userId) {
+    final previous = _watching;
+    setState(() => _watching = userId);
+    if (previous != null && previous != userId) {
+      _setShareAudio(previous, false);
+    }
+    if (userId != null) _setShareAudio(userId, true);
+  }
+
+  /// Sharers whose share audio the Rust side is currently playing —
+  /// muted again on disconnect so a later session starts silent.
+  final Set<int> _audibleShares = {};
+
+  Future<void> _setShareAudio(int userId, bool audible) async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    if (audible) {
+      _audibleShares.add(userId);
+    } else {
+      _audibleShares.remove(userId);
+    }
+    try {
+      await setShareAudio(
+        sessionId: sessionId,
+        userId: userId,
+        audible: audible,
+      );
+    } catch (e) {
+      debugPrint('share audio: $e');
+    }
+  }
+
+  Future<void> _muteAllShares() async {
+    final sessionId = _session?.sessionId;
+    final ids = _audibleShares.toList();
+    _audibleShares.clear();
+    if (sessionId == null) return;
+    for (final id in ids) {
+      try {
+        await setShareAudio(
+          sessionId: sessionId,
+          userId: id,
+          audible: false,
+        );
+      } catch (_) {}
+    }
   }
 
   void _exitFullscreen() {
@@ -328,7 +381,13 @@ class _DevHomePageState extends State<DevHomePage> {
       }
       return false;
     });
-    if (_watching != null && !_videos.containsKey(_watching)) _watching = null;
+    if (_watching != null && !_videos.containsKey(_watching)) {
+      _setShareAudio(_watching!, false);
+      _watching = null;
+    }
+    for (final id in _audibleShares.toList()) {
+      if (!_videos.containsKey(id)) _setShareAudio(id, false);
+    }
     if (_fullscreen != null && !_videos.containsKey(_fullscreen)) {
       _fullscreen = null;
       _setWindowFullscreen(false);
@@ -439,6 +498,9 @@ class _DevHomePageState extends State<DevHomePage> {
       case 'video_started':
         final s0 = ev.surface;
         if (s0 != null) {
+          // A share starts silent. Watching it (the card, fullscreen)
+          // turns its sound on; the sharer's voice is unaffected.
+          _setShareAudio(s0.userId, _watching == s0.userId);
           setState(() {
             // FRB maps u64 → BigInt and i64 → PlatformInt64: narrow
             // for display (dev-client resolutions fit int).
@@ -454,6 +516,7 @@ class _DevHomePageState extends State<DevHomePage> {
       case 'video_stopped':
         final s1 = ev.surface;
         if (s1 != null) {
+          _setShareAudio(s1.userId, false);
           setState(() {
             _videos.remove(s1.userId);
             if (_watching == s1.userId) _watching = null;
@@ -575,7 +638,7 @@ class _DevHomePageState extends State<DevHomePage> {
           onExit: _exitFullscreen,
           onStopWatching: () {
             _exitFullscreen();
-            setState(() => _watching = null);
+            _watch(null);
           },
         ),
       );
@@ -1021,7 +1084,7 @@ class _DevHomePageState extends State<DevHomePage> {
             ),
           ),
           FilledButton.tonal(
-            onPressed: () => setState(() => _watching = userId),
+            onPressed: () => _watch(userId),
             child: const Text('Watch'),
           ),
         ],
@@ -1064,7 +1127,7 @@ class _DevHomePageState extends State<DevHomePage> {
               IconButton(
                 tooltip: 'Stop watching',
                 icon: const Icon(Icons.visibility_off, size: 20),
-                onPressed: () => setState(() => _watching = null),
+                onPressed: () => _watch(null),
               ),
             ],
           ),

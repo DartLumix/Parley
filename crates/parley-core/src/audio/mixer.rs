@@ -10,7 +10,15 @@ use std::sync::{Arc, Mutex};
 use crate::audio::SAMPLES_PER_FRAME;
 use crate::audio::pipeline::RecvPipeline;
 
-pub struct Voice {
+/// One encoded stream from one sender: its own decoder, jitter buffer
+/// and pending samples.
+///
+/// A sender can have TWO at once (7k): the voice stream (mic, speech
+/// profile) and a screen share's system-audio stream (music profile).
+/// They have independent sequence and timestamp clocks, so they must not
+/// share a receive pipeline — that was the pre-7k shape, and mixing the
+/// two seq spaces into one jitter buffer scrambled both.
+struct Stream {
     pipeline: RecvPipeline,
     /// Decoded samples not yet consumed by the output callback —
     /// ALWAYS interleaved stereo pairs (mono sources duplicated).
@@ -20,7 +28,7 @@ pub struct Voice {
     stereo: bool,
 }
 
-impl Voice {
+impl Stream {
     fn new(sender_id: u32, stereo: bool) -> Result<Self, String> {
         let mut pipeline = RecvPipeline::new(sender_id).map_err(|e| e.to_string())?;
         pipeline.set_stereo(stereo).map_err(|e| e.to_string())?;
@@ -42,6 +50,69 @@ impl Voice {
         }
         self.pipeline.push_packet(seq, packet);
         Ok(())
+    }
+
+    /// Pull enough decoded samples to cover `n` audio frames.
+    fn ensure(&mut self, n: usize) {
+        // Pull only what we're short of — pending is interleaved pairs:
+        // len/2 = audio frames buffered.
+        let need_frames = n.saturating_sub(self.pending.len() / 2);
+        if need_frames == 0 {
+            return;
+        }
+        let mut tmp = Vec::new();
+        // Codec error here = one bad packet; pull_pcm's PLC path keeps
+        // the stream moving, so it stays quiet.
+        let _ = self
+            .pipeline
+            .pull_pcm(&mut tmp, need_frames.div_ceil(SAMPLES_PER_FRAME));
+        if self.stereo {
+            self.pending.extend(tmp);
+        } else {
+            for s in tmp {
+                self.pending.push_back(s);
+                self.pending.push_back(s);
+            }
+        }
+    }
+
+    fn add(&self, mix: &mut [f32], gain: f32) {
+        for (i, out) in mix.iter_mut().enumerate() {
+            if let Some(&s) = self.pending.get(i) {
+                *out += s * gain;
+            }
+        }
+    }
+
+    fn drain(&mut self, n: usize) {
+        let drop = self.pending.len().min(n * 2);
+        self.pending.drain(..drop);
+    }
+}
+
+/// One sender's receive state: the streams they currently have open.
+#[derive(Default)]
+pub struct Voice {
+    voice: Option<Stream>,
+    share: Option<Stream>,
+}
+
+impl Voice {
+    fn stream_mut(
+        &mut self,
+        sender_id: u32,
+        share: bool,
+        stereo: bool,
+    ) -> Result<&mut Stream, String> {
+        let slot = if share {
+            &mut self.share
+        } else {
+            &mut self.voice
+        };
+        if slot.is_none() {
+            *slot = Some(Stream::new(sender_id, stereo)?);
+        }
+        Ok(slot.as_mut().expect("just inserted"))
     }
 }
 
@@ -74,22 +145,28 @@ impl Mixer {
         self.voices.remove(&sender_id);
     }
 
-    /// Feed one received packet, creating the sender's pipeline on first
-    /// sight. `stereo` is the packet's FLAG_STEREO — per-packet truth.
+    /// Feed one received packet, creating the sender's stream on first
+    /// sight. `stereo` is the packet's FLAG_STEREO and `share` its
+    /// FLAG_SHARE_AUDIO — per-packet truth, never negotiated state.
     pub fn push_packet(
         &mut self,
         sender_id: u32,
         seq: u16,
         packet: &[u8],
         stereo: bool,
+        share: bool,
     ) -> Result<(), String> {
+        let v = self.voices.entry(sender_id).or_default();
+        v.stream_mut(sender_id, share, stereo)?
+            .push_packet(seq, packet, stereo)
+    }
+
+    /// Drop a sender's SCREEN SHARE audio state (their voice stream is
+    /// untouched). Called when the share ends or stops being watched, so
+    /// no buffered tail plays on after the picture is gone.
+    pub fn clear_share(&mut self, sender_id: u32) {
         if let Some(v) = self.voices.get_mut(&sender_id) {
-            v.push_packet(seq, packet, stereo)
-        } else {
-            let mut v = Voice::new(sender_id, stereo)?;
-            v.push_packet(seq, packet, stereo)?;
-            self.voices.insert(sender_id, v);
-            Ok(())
+            v.share = None;
         }
     }
 
@@ -98,7 +175,16 @@ impl Mixer {
     pub fn gap_rates(&mut self) -> Vec<(u32, u32)> {
         self.voices
             .iter_mut()
-            .map(|(&id, v)| (id, v.pipeline.gap_rate_permille()))
+            .map(|(&id, v)| {
+                let mut worst = 0;
+                if let Some(s) = v.voice.as_mut() {
+                    worst = worst.max(s.pipeline.gap_rate_permille());
+                }
+                if let Some(s) = v.share.as_mut() {
+                    worst = worst.max(s.pipeline.gap_rate_permille());
+                }
+                (id, worst)
+            })
             .collect()
     }
 
@@ -115,26 +201,11 @@ impl Mixer {
     /// 6.9 promotion dropped it once; the mixer unit tests caught it).
     pub fn mix(&mut self, n: usize) -> Vec<f32> {
         for v in self.voices.values_mut() {
-            // Pull only what we're short of — pending is interleaved
-            // pairs: len/2 = audio frames buffered.
-            let need_frames = n.saturating_sub(v.pending.len() / 2);
-            if need_frames == 0 {
-                continue;
+            if let Some(s) = v.voice.as_mut() {
+                s.ensure(n);
             }
-            let mut tmp = Vec::new();
-            // Codec error here = one bad packet; pull_pcm's PLC path
-            // keeps the stream moving, so it stays quiet.
-            let _ = v
-                .pipeline
-                .pull_pcm(&mut tmp, need_frames.div_ceil(SAMPLES_PER_FRAME));
-            if v.stereo {
-                v.pending.extend(tmp);
-            } else {
-                // Mono → duplicate into both channels.
-                for s in tmp {
-                    v.pending.push_back(s);
-                    v.pending.push_back(s);
-                }
+            if let Some(s) = v.share.as_mut() {
+                s.ensure(n);
             }
         }
         let mut mix = vec![0.0f32; n * 2];
@@ -143,15 +214,20 @@ impl Mixer {
             if gain == 0.0 {
                 continue; // muted — pending still drains below, timing stays honest
             }
-            for (i, out) in mix.iter_mut().enumerate() {
-                if let Some(&s) = v.pending.get(i) {
-                    *out += s * gain;
-                }
+            if let Some(s) = &v.voice {
+                s.add(&mut mix, gain);
+            }
+            if let Some(s) = &v.share {
+                s.add(&mut mix, gain);
             }
         }
         for v in self.voices.values_mut() {
-            let drop = v.pending.len().min(n * 2);
-            v.pending.drain(..drop);
+            if let Some(s) = v.voice.as_mut() {
+                s.drain(n);
+            }
+            if let Some(s) = v.share.as_mut() {
+                s.drain(n);
+            }
         }
         for s in &mut mix {
             *s = s.clamp(-1.0, 1.0);
@@ -250,7 +326,7 @@ mod tests {
     /// pending (the first warm-up attempt made exactly that mistake).
     fn warm_up(m: &mut Mixer, sender: u32, packets: &[(u16, u32, Vec<u8>)], stereo: bool) {
         for (seq, _ts, pkt) in packets {
-            m.push_packet(sender, *seq, pkt, stereo).unwrap();
+            m.push_packet(sender, *seq, pkt, stereo, false).unwrap();
         }
         let _ = m.mix(SAMPLES_PER_FRAME);
     }
@@ -326,7 +402,7 @@ mod tests {
             let mut m = mixer.lock().unwrap();
             m.set_gain(9, 1.0);
             for (seq, _ts, pkt) in speech_packets_from(10, 2) {
-                m.push_packet(9, seq, &pkt, false).unwrap();
+                m.push_packet(9, seq, &pkt, false, false).unwrap();
             }
         }
         let mixed3 = {
@@ -381,6 +457,46 @@ mod tests {
         );
     }
 
+    /// 7k: a sender can have a voice stream and a share-audio stream at
+    /// the same time, with independent sequence clocks (both start at
+    /// seq 0 — the collision separate pipelines exist to survive). Both
+    /// must decode and mix, and dropping the share must not touch the
+    /// voice.
+    #[test]
+    fn voice_and_share_streams_coexist() {
+        let mixer = new();
+        {
+            let mut m = mixer.lock().unwrap();
+            for (seq, _ts, pkt) in speech_packets(6) {
+                m.push_packet(11, seq, &pkt, false, false).unwrap();
+            }
+            for (seq, _ts, pkt) in music_packets(6) {
+                m.push_packet(11, seq, &pkt, true, true).unwrap();
+            }
+            let _ = m.mix(SAMPLES_PER_FRAME); // warm both decoders
+        }
+        let mixed = { mixer.lock().unwrap().mix(SAMPLES_PER_FRAME) };
+        assert_eq!(mixed.len(), SAMPLES_PER_FRAME * 2);
+        assert!(
+            mixed.iter().any(|&s| s.abs() > 0.01),
+            "both streams must be audible: {:?}",
+            &mixed[..8.min(mixed.len())]
+        );
+
+        {
+            let mut m = mixer.lock().unwrap();
+            m.clear_share(11);
+            for (seq, _ts, pkt) in speech_packets_from(20, 2) {
+                m.push_packet(11, seq, &pkt, false, false).unwrap();
+            }
+        }
+        let after = { mixer.lock().unwrap().mix(SAMPLES_PER_FRAME) };
+        assert!(
+            after.iter().any(|&s| s.abs() > 0.01),
+            "voice must survive clear_share"
+        );
+    }
+
     #[test]
     fn remove_drops_voice_gain_survives() {
         let mixer = new();
@@ -401,7 +517,7 @@ mod tests {
         {
             let mut m = mixer.lock().unwrap();
             for (seq, _ts, pkt) in speech_packets_from(0, 2) {
-                m.push_packet(5, seq, &pkt, false).unwrap();
+                m.push_packet(5, seq, &pkt, false, false).unwrap();
             }
         }
         let _ = {

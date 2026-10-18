@@ -17,17 +17,21 @@ pub fn remove(mixer: &SharedMixer, sender_id: u32) {
     mixer.lock().unwrap().remove(sender_id);
 }
 
+/// 7k: `share` is the datagram's FLAG_SHARE_AUDIO — a screen share's
+/// system audio, kept on its own receive pipeline (independent seq and
+/// timestamp clocks from the sender's voice).
 pub fn push_packet(
     mixer: &SharedMixer,
     sender_id: u32,
     seq: u16,
     packet: &[u8],
     stereo: bool,
+    share: bool,
 ) -> Result<(), String> {
     mixer
         .lock()
         .unwrap()
-        .push_packet(sender_id, seq, packet, stereo)
+        .push_packet(sender_id, seq, packet, stereo, share)
 }
 
 pub fn gap_rates(mixer: &SharedMixer) -> Vec<(u32, u32)> {

@@ -1338,7 +1338,11 @@ pub fn spawn_share_audio_mux(
 ) -> std::thread::JoinHandle<Option<tokio::sync::mpsc::Receiver<Vec<f32>>>> {
     std::thread::spawn(move || {
         let mut mic_rx = mic_rx;
-        mic_route.store(true, Ordering::Relaxed);
+        // 7k: only take the mic route when the mic is actually joining
+        // this stream. With None the voice stays on its own (speech)
+        // encoder and the share carries system audio alone — which is
+        // what lets a receiver play the voice without the share audio.
+        mic_route.store(mic_rx.is_some(), Ordering::Relaxed);
         let mut send = match SendPipeline::new_music(256_000) {
             Ok(s) => s,
             Err(e) => {
@@ -1347,7 +1351,12 @@ pub fn spawn_share_audio_mux(
                 return mic_rx;
             }
         };
-        let flags = parley_proto::media::FLAG_SPEAKING | parley_proto::media::FLAG_STEREO;
+        // 7k: FLAG_SHARE_AUDIO marks this stream as a share's system
+        // audio, so receivers gate it on "am I watching this share?"
+        // without touching the sender's voice stream.
+        let flags = parley_proto::media::FLAG_SPEAKING
+            | parley_proto::media::FLAG_STEREO
+            | parley_proto::media::FLAG_SHARE_AUDIO;
         let mut sys_buffer: Vec<f32> = Vec::new();
         let mut sys_alive = true;
         let mut capped: u64 = 0; // frames dropped by the drift cap
@@ -1367,8 +1376,11 @@ pub fn spawn_share_audio_mux(
                     }
                     None => {
                         // Mic channel closed (client teardown): finish
-                        // with sys-only at delivery pace, below.
+                        // with sys-only at delivery pace, below. Hand
+                        // the mic route back so the voice encoder sees
+                        // the microphone again.
                         mic_rx = None;
+                        mic_route.store(false, Ordering::Relaxed);
                     }
                 }
             }

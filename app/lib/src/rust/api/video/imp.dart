@@ -19,6 +19,13 @@ abstract class DisplayBridge implements RustOpaqueInterface {
   /// voice entirely (`forget = true`: hub forgets them). The
   /// view is KEPT and marked hidden — re-announced on their next
   /// frame — so textures are only ever destroyed at teardown.
+  /// 7k: the sender's stream has gone quiet (no frames for long
+  /// enough that it cannot be a hiccup) — hide the surface so the
+  /// card goes away, WITHOUT declaring the share stopped. The hub
+  /// keeps decoding, so frames that resume re-announce the same
+  /// texture through the consumer's hidden-set path.
+  Future<void> hide_({required int senderId});
+
   Future<void> senderStopped({required int senderId, required bool forget});
 
   /// Spawn the consumer thread. `events` is the session's event

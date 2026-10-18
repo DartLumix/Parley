@@ -956,9 +956,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // 6d: FLAG_STEREO per packet — the mixer keys
                             // the decoder off it.
                             let stereo = m.flags & parley_proto::media::FLAG_STEREO != 0;
-                            if let Err(e) =
-                                mixer::push_packet(&dg_mixer, m.sender_id, m.seq, m.payload, stereo)
-                            {
+                            // 7k: share audio keeps its own pipeline, so
+                            // its seq clock never collides with the voice.
+                            let share = m.flags & parley_proto::media::FLAG_SHARE_AUDIO != 0;
+                            if let Err(e) = mixer::push_packet(
+                                &dg_mixer,
+                                m.sender_id,
+                                m.seq,
+                                m.payload,
+                                stereo,
+                                share,
+                            ) {
                                 eprintln!("recv pipeline for user {}: {e}", m.sender_id);
                             }
                         }

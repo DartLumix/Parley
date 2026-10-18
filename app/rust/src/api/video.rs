@@ -106,6 +106,10 @@ pub mod imp {
         pub fn sender_stopped(&self, _sender_id: u32, _forget: bool) {
             unreachable!("video feature off")
         }
+        /// 7k: the stall watchdog's expiry hook — see the real impl.
+        pub fn hide(&self, _sender_id: u32) {
+            unreachable!("video feature off")
+        }
     }
 
     /// Stub type mirrors the real hub's name for the generated glue;
@@ -319,6 +323,15 @@ pub mod imp {
         /// voice entirely (`forget = true`: hub forgets them). The
         /// view is KEPT and marked hidden — re-announced on their next
         /// frame — so textures are only ever destroyed at teardown.
+        /// 7k: the sender's stream has gone quiet (no frames for long
+        /// enough that it cannot be a hiccup) — hide the surface so the
+        /// card goes away, WITHOUT declaring the share stopped. The hub
+        /// keeps decoding, so frames that resume re-announce the same
+        /// texture through the consumer's hidden-set path.
+        pub fn hide(&self, sender_id: u32) {
+            self.hidden.lock().unwrap().insert(sender_id);
+        }
+
         pub fn sender_stopped(&self, sender_id: u32, forget: bool) {
             if forget {
                 self.hub.remove(sender_id);
