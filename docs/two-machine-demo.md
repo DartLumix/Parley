@@ -18,9 +18,10 @@ Fill these in once, from **A**:
 | `<sender>` / `<sender-pass>` | account created in step A1 |
 | `<viewer>` / `<viewer-pass>` | account created in step A1 |
 
-Use the same spelling of the address on both machines (`<A-ip>`, never
-`127.0.0.1` on A) — the TOFU pin is keyed by the address string, so mixing them
-leaves two entries in `known_hosts`.
+Use the same address on both machines (`<A-ip>`, never `127.0.0.1` on A) — each
+address is its own TOFU pin, so mixing them leaves two entries in
+`known_hosts`. The port may be omitted or spelled out (`host`, `host:4443`);
+both are the same pin.
 
 ---
 
@@ -349,7 +350,7 @@ stats (frames arrived but did not decode vs frames never arrived).
 
 | symptom | where | meaning |
 |:--|:--|:--|
-| `FINGERPRINT MISMATCH for this server! pinned: … seen: …` | client | a stale pin for that address; delete the line from `~/.config/parley/known_hosts` and reconnect |
+| `fingerprint mismatch for <addr>: the certificate changed` | client | a stale pin for that address; the app offers to trust the new certificate, or delete that line from `~/.config/parley/known_hosts` and reconnect |
 | `hardware (VAAPI) encoder selected` never appears | sender | fell back to software; the preceding line names the reason |
 | `no picture in the last 90 frames` | viewer | frames arrive, nothing decodes — stream shape, not the network |
 | `Native:4 dsFrameCorrupted` / `Native:16 dsNoParamSets` | viewer | keyframes do not stand alone: encoder side |

@@ -7,9 +7,21 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `read_frame`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `probe`, `read_frame`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`, `Probe`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+
+/// The certificate a server presents right now, beside the pin we hold.
+/// Read-only: nothing is trusted or written here.
+Future<ServerCertificate> probeServer({required String server}) =>
+    RustLib.instance.api.crateApiSessionProbeServer(server: server);
+
+/// Re-pin `server` to the certificate it presents now, returning that
+/// fingerprint. Only call after the user compared it with the fingerprint
+/// the server logs at startup — this is the "I know the identity changed"
+/// step, and it is the one operation that can undo TOFU's protection.
+Future<String> trustServer({required String server}) =>
+    RustLib.instance.api.crateApiSessionTrustServer(server: server);
 
 /// Connect + authenticate. Blocks until the handshake completes (runs
 /// on an FRB worker thread; Dart sees a Future).
@@ -240,6 +252,43 @@ class PresenceEntry {
           runtimeType == other.runtimeType &&
           userId == other.userId &&
           username == other.username;
+}
+
+/// What a server presents on the wire, beside what this machine has
+/// pinned — the facts behind a "trust new certificate" decision.
+class ServerCertificate {
+  /// The address as the user typed it.
+  final String server;
+
+  /// The fingerprint on file, if this server was trusted before.
+  final String? pinned;
+
+  /// SHA-256 of the certificate the server presented just now.
+  final String seen;
+
+  /// `pinned == Some(seen)`; false when the identity changed.
+  final bool matches;
+
+  const ServerCertificate({
+    required this.server,
+    this.pinned,
+    required this.seen,
+    required this.matches,
+  });
+
+  @override
+  int get hashCode =>
+      server.hashCode ^ pinned.hashCode ^ seen.hashCode ^ matches.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ServerCertificate &&
+          runtimeType == other.runtimeType &&
+          server == other.server &&
+          pinned == other.pinned &&
+          seen == other.seen &&
+          matches == other.matches;
 }
 
 /// Everything the server can tell the UI, as one flat event struct.

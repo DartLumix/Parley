@@ -193,8 +193,10 @@ async fn read_frame(rx: &mut quinn::RecvStream) -> Result<Vec<u8>, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let started = std::time::Instant::now();
-    // host[:port], DNS included; the pin stays keyed by the typed string.
+    // host[:port], DNS included. The pin is keyed by the normalized
+    // `host:port`, not by how the user happened to spell it.
     let (addr, server_name) = parley_client::endpoint::resolve(&args.server)?;
+    let pin_key = parley_client::endpoint::pin_key(&args.server)?;
 
     if args.share_audio && args.music {
         eprintln!("--share-audio and --music are mutually exclusive; share-audio disabled");
@@ -228,14 +230,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- connect (TOFU) ---
-    let (pin, hosts_path) = cert::load_pin(&args.server)?;
+    let (pin, hosts_path) = cert::load_pin(&pin_key)?;
     let (endpoint, seen) = cert::build_endpoint(pin.clone());
     let connecting = endpoint.connect(addr, &server_name)?;
+    // A changed certificate is the one connect failure the user has to act
+    // on, so report it as a decision (both digests, the file that holds
+    // the pin) instead of burying it in quinn's transport error.
+    let explain = |e: quinn::ConnectionError| -> String {
+        let seen = seen.lock().unwrap().clone();
+        cert::mismatch_report(&hosts_path, &pin_key, pin.as_deref(), seen.as_deref())
+            .unwrap_or_else(|| e.to_string())
+    };
     // --check is an ops tool: a firewalled UDP port must fail in seconds
     // with a sentence, not hang on QUIC retransmissions until Ctrl-C.
     let conn = if args.check {
         match tokio::time::timeout(Duration::from_secs(10), connecting).await {
-            Ok(result) => result?,
+            Ok(result) => result.map_err(explain)?,
             Err(_) => {
                 return Err(format!(
                     "check: no QUIC handshake with {} within 10 s — is the UDP port open?",
@@ -245,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        connecting.await?
+        connecting.await.map_err(explain)?
     };
 
     // --- handshake + auth (bare messages) ---
@@ -409,10 +419,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .clone()
             .ok_or("server presented no certificate")?;
-        cert::save_pin(&hosts_path, &args.server, &fp)?;
+        cert::save_pin(&hosts_path, &pin_key, &fp)?;
         println!(
             "TOFU: pinned {fp} for {} in {}",
-            args.server,
+            pin_key,
             hosts_path.display()
         );
         println!("      (sanity-check it against the fingerprint the server prints on startup)");

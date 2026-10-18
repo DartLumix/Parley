@@ -39,9 +39,16 @@ the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`, `-gnome`).
 
 The first connection pins the server's certificate — the same TOFU
 model as SSH. Compare the fingerprint shown after login with the one
-the server printed at startup. To re-pin after the server's identity
-was regenerated, delete that server's line from
-`~/.config/parley/known_hosts` and reconnect.
+the server printed at startup.
+
+If the server's identity changes (a redeploy onto an empty volume, a
+restored backup without the certificate), the next login is refused and
+the app shows **both** fingerprints — the saved one and the one the
+server presents now — with a *Trust new certificate* button. Nothing is
+written until you accept, and accepting is only right after the new
+fingerprint matches the one the server logs at startup. The pin is
+keyed by `host:port`, so `your-server` and `your-server:4443` are the
+same trust decision.
 
 ## Use
 
@@ -77,7 +84,7 @@ was regenerated, delete that server's line from
 | symptom | meaning / fix |
 |:--|:--|
 | `Missing shared libraries` from install.sh | install the packages it names |
-| `FINGERPRINT MISMATCH for this server!` | the pin changed. Verify the server's new fingerprint out of band, then delete that line from `~/.config/parley/known_hosts` |
+| "Server certificate changed" prompt | the pin no longer matches. Compare the fingerprint it shows against the server's startup log; *Trust new certificate* only if they agree |
 | connect fails immediately | wrong port (remember it is UDP), or the server's firewall |
 | join a channel, no sound | check the system mixer; joining opens the default devices |
 | share asks nothing / `portal` error | install the ScreenCast backend for your desktop and restart `xdg-desktop-portal` |

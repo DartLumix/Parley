@@ -352,6 +352,78 @@ pub struct SessionInfo {
     pub fingerprint: String,
 }
 
+/// What a server presents on the wire, beside what this machine has
+/// pinned — the facts behind a "trust new certificate" decision.
+#[derive(Debug, Clone)]
+pub struct ServerCertificate {
+    /// The address as the user typed it.
+    pub server: String,
+    /// The fingerprint on file, if this server was trusted before.
+    pub pinned: Option<String>,
+    /// SHA-256 of the certificate the server presented just now.
+    pub seen: String,
+    /// `pinned == Some(seen)`; false when the identity changed.
+    pub matches: bool,
+}
+
+struct Probe {
+    key: String,
+    path: std::path::PathBuf,
+    fingerprint: String,
+    pinned: Option<String>,
+}
+
+/// TLS handshake only: no Hello, no auth, no session, and no pin applied
+/// (the point is to read what is presented even when it is not trusted).
+/// Bounded so a firewalled UDP port fails in seconds.
+async fn probe(server: &str) -> Result<Probe, String> {
+    let (addr, server_name) = parley_client::endpoint::resolve(server)?;
+    let key = parley_client::endpoint::pin_key(server)?;
+    let (pinned, path) = cert::load_pin(&key)?;
+    let (endpoint, seen) = cert::build_endpoint(None);
+    let connecting = endpoint
+        .connect(addr, &server_name)
+        .map_err(|e| e.to_string())?;
+    let conn = tokio::time::timeout(Duration::from_secs(10), connecting)
+        .await
+        .map_err(|_| format!("no TLS handshake with {server} within 10 s"))?
+        .map_err(|e| e.to_string())?;
+    let fingerprint = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("server presented no certificate")?;
+    conn.close(0u32.into(), b"probe");
+    Ok(Probe {
+        key,
+        path,
+        fingerprint,
+        pinned,
+    })
+}
+
+/// The certificate a server presents right now, beside the pin we hold.
+/// Read-only: nothing is trusted or written here.
+pub fn probe_server(server: String) -> Result<ServerCertificate, String> {
+    let probe = rt().block_on(probe(&server))?;
+    Ok(ServerCertificate {
+        matches: probe.pinned.as_deref() == Some(probe.fingerprint.as_str()),
+        server,
+        pinned: probe.pinned,
+        seen: probe.fingerprint,
+    })
+}
+
+/// Re-pin `server` to the certificate it presents now, returning that
+/// fingerprint. Only call after the user compared it with the fingerprint
+/// the server logs at startup — this is the "I know the identity changed"
+/// step, and it is the one operation that can undo TOFU's protection.
+pub fn trust_server(server: String) -> Result<String, String> {
+    let probe = rt().block_on(probe(&server))?;
+    cert::save_pin(&probe.path, &probe.key, &probe.fingerprint)?;
+    Ok(probe.fingerprint)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -820,13 +892,23 @@ async fn connect_async(
     let (addr, server_name) = parley_client::endpoint::resolve(&server)?;
 
     // TOFU + endpoint (cert.rs — same path as the terminal client).
-    let (pin, hosts_path) = cert::load_pin(&server)?;
+    // The pin key spells out the port, so "host" and "host:4443" are one
+    // trust decision rather than two.
+    let pin_key = parley_client::endpoint::pin_key(&server)?;
+    let (pin, hosts_path) = cert::load_pin(&pin_key)?;
     let (endpoint, seen) = cert::build_endpoint(pin.clone());
     let conn = endpoint
         .connect(addr, &server_name)
         .map_err(|e| e.to_string())?
         .await
-        .map_err(|e| format!("connect: {e}"))?;
+        .map_err(|e| {
+            // A changed certificate is a decision for the user, not a
+            // transport failure to dump on them: name both digests and
+            // the file that holds the pin.
+            let seen = seen.lock().unwrap().clone();
+            cert::mismatch_report(&hosts_path, &pin_key, pin.as_deref(), seen.as_deref())
+                .unwrap_or_else(|| format!("connect: {e}"))
+        })?;
 
     // Handshake + auth (bare messages, pre-oneof).
     let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
@@ -869,7 +951,7 @@ async fn connect_async(
         .clone()
         .ok_or("server presented no certificate")?;
     if pin.is_none() {
-        cert::save_pin(&hosts_path, &server, &fingerprint)?;
+        cert::save_pin(&hosts_path, &pin_key, &fingerprint)?;
     }
 
     // Assign the session id BEFORE spawning tasks: the tasks stamp it
@@ -1475,6 +1557,12 @@ fn share_failed_event(session_id: u32, err: String) -> SessionEvent {
 
 /// 7k: expire shares that stopped sending without telling anyone.
 ///
+/// Tests below point `XDG_CONFIG_HOME` at a scratch directory so TOFU pins
+/// never touch the developer's real `known_hosts`. The variable is
+/// process-global, so those tests take this lock.
+#[cfg(test)]
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// `ShareStopped` covers every clean end (stop button, leaving voice,
 /// session death). What it cannot cover is a sender whose capture or
 /// process died mid-share: the socket may stay up, the room hears
@@ -1650,6 +1738,7 @@ mod disconnect_tests {
 
     #[test]
     fn disconnect_ends_the_server_side_session() {
+        let _env = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = temp_dir("disconnect");
         // TOFU pinning writes here; keep the real user config untouched.
         std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
@@ -1698,6 +1787,78 @@ mod disconnect_tests {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The user-facing TOFU recovery path, end to end against a real server:
+/// a pin from an older identity must refuse the login with both digests,
+/// leave the pin alone, and only replace it after `trust_server`.
+#[cfg(test)]
+mod tofu_tests {
+    use super::*;
+    use parley_server::{Config, Server};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("parley-bridge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn changed_certificate_is_reported_and_explicitly_trusted() {
+        const OLD: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let _env = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("tofu");
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        let config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            data_dir: dir.join("data"),
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        {
+            let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+            db.create_user("alice", "pass_a", false).unwrap();
+        }
+        let server = rt().block_on(async { Server::bind(&config).unwrap() });
+        let addr = server.local_addr();
+        let real = server.fingerprint().to_string();
+        rt().spawn(server.run());
+
+        let address = format!("127.0.0.1:{}", addr.port());
+        let key = parley_client::endpoint::pin_key(&address).unwrap();
+
+        // Exactly what a redeploy leaves behind: a pin from the old identity.
+        let (_, path) = cert::load_pin(&key).unwrap();
+        cert::save_pin(&path, &key, OLD).unwrap();
+
+        let err = connect(address.clone(), "alice".into(), "pass_a".into())
+            .expect_err("a changed certificate must refuse the login");
+        assert!(err.contains("fingerprint mismatch for"), "{err}");
+        assert!(err.contains(OLD), "the saved pin is shown: {err}");
+        assert!(
+            err.contains(&real),
+            "the presented certificate is shown: {err}"
+        );
+        assert_eq!(
+            cert::load_pin(&key).unwrap().0.as_deref(),
+            Some(OLD),
+            "a refused attempt must not re-pin"
+        );
+
+        // The probe the app runs to fill its prompt.
+        let probe = probe_server(address.clone()).unwrap();
+        assert!(!probe.matches);
+        assert_eq!(probe.pinned.as_deref(), Some(OLD));
+        assert_eq!(probe.seen, real);
+
+        // Accepting the prompt replaces the pin, and the login works again.
+        assert_eq!(trust_server(address.clone()).unwrap(), real);
+        assert!(probe_server(address.clone()).unwrap().matches);
+        let session = connect(address, "alice".into(), "pass_a".into())
+            .expect("login after trusting the new certificate");
+        disconnect(session.session_id).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }

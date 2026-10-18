@@ -3,6 +3,30 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.2.2] — 2026-10-18
+
+A reconnection fix: a server whose certificate changed is now a question the
+client asks, not a wall it hits.
+
+### Fixed
+
+- **A changed server certificate no longer dead-ends the login.** The app
+  shows the fingerprint saved on the machine beside the one the server
+  presents now and offers *Trust new certificate*; nothing is written until
+  you accept, and a refused attempt never re-pins. The CLI names both
+  digests and the pin file instead of burying the refusal in a transport
+  error. This is the expected case after deploying onto a fresh volume,
+  which generates a new identity.
+- **One server, one pin.** Pins are keyed by `host:port`, so `your-server`
+  and `your-server:4443` (and a differently-cased name) are the same trust
+  decision. Retyping the default port used to bypass the existing pin.
+
+### Added
+
+- **Certificate probe across the bridge** — a TLS-only, credential-free
+  handshake the app uses to fill the trust prompt, with an end-to-end test
+  that refuses a stale pin, leaves it untouched, then trusts and connects.
+
 ## [0.2.1] — 2026-10-18
 
 A small follow-up to 0.2.0: a presence bug fix, a simpler deploy download, and

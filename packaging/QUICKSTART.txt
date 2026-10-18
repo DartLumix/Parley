@@ -21,9 +21,12 @@ Your login is a username and password created by the server owner:
 
 The first time you connect, the client pins the server's certificate
 (the same TOFU model as SSH). Compare the fingerprint the server prints
-on startup with the one the app shows after login. If the owner ever
-regenerates the identity, delete that server's line from
-~/.config/parley/known_hosts and reconnect.
+on startup with the one the app shows after login.
+
+If the owner ever regenerates the identity, the next login is refused:
+the app shows the saved fingerprint beside the new one and offers to
+trust it. Only accept after the new value matches the server's startup
+log. (Settings are in ~/.config/parley/known_hosts if you need to look.)
 
 Requirements: GTK 3, PipeWire (screen capture), ALSA (audio) and a
 Wayland or X11 session. install.sh reports anything missing.

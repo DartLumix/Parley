@@ -1,8 +1,8 @@
 //! Server address handling shared by the terminal client and the
 //! Flutter bridge: `host[:port]`, DNS names included.
 //!
-//! The address string the user typed is also the TOFU pin key, so this
-//! module only resolves — it never rewrites the pin identity.
+//! Resolving never rewrites the user's string; [`pin_key`] is the one
+//! place the identity used for TOFU pins is derived from it.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -39,6 +39,21 @@ pub fn split(server: &str) -> Result<(String, u16), String> {
         Some(_) => Err(format!("missing host in {s}")),
         None => Ok((s.to_string(), DEFAULT_PORT)),
     }
+}
+
+/// The TOFU pin key for a typed address: `host:port`, always with the
+/// port spelled out. Keying on the raw string made `host` and
+/// `host:4443` two separate trust decisions, so simply retyping the same
+/// server with the default port written out skipped the existing pin.
+pub fn pin_key(server: &str) -> Result<String, String> {
+    let (host, port) = split(server)?;
+    // DNS names are case-insensitive; one server, one pin.
+    let host = host.to_lowercase();
+    Ok(if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    })
 }
 
 fn parse_port(port: &str, whole: &str) -> Result<u16, String> {
@@ -111,6 +126,27 @@ mod tests {
         assert!(split("2001:db8::1").is_err()); // unbracketed IPv6
         assert!(split(":443").is_err());
         assert!(split("[::1").is_err());
+    }
+
+    #[test]
+    fn pin_key_spells_out_the_default_port() {
+        assert_eq!(
+            pin_key("parley.example.com").unwrap(),
+            "parley.example.com:4443"
+        );
+        assert_eq!(
+            pin_key("parley.example.com:4443").unwrap(),
+            "parley.example.com:4443"
+        );
+        assert_eq!(pin_key("192.0.2.10:443").unwrap(), "192.0.2.10:443");
+        assert_eq!(pin_key("[2001:db8::1]").unwrap(), "[2001:db8::1]:4443");
+        assert_eq!(pin_key(" host \n").unwrap(), "host:4443");
+        assert_eq!(
+            pin_key("Parley.Example.COM").unwrap(),
+            "parley.example.com:4443"
+        );
+        assert!(pin_key("2001:db8::1").is_err());
+        assert!(pin_key("").is_err());
     }
 
     #[test]

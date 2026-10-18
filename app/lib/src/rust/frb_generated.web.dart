@@ -122,10 +122,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<VoiceEntry> dco_decode_list_voice_entry(dynamic raw);
 
   @protected
+  String? dco_decode_opt_String(dynamic raw);
+
+  @protected
   VideoSurfaceInfo? dco_decode_opt_box_autoadd_video_surface_info(dynamic raw);
 
   @protected
   PresenceEntry dco_decode_presence_entry(dynamic raw);
+
+  @protected
+  ServerCertificate dco_decode_server_certificate(dynamic raw);
 
   @protected
   SessionEvent dco_decode_session_event(dynamic raw);
@@ -242,12 +248,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<VoiceEntry> sse_decode_list_voice_entry(SseDeserializer deserializer);
 
   @protected
+  String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
   VideoSurfaceInfo? sse_decode_opt_box_autoadd_video_surface_info(
     SseDeserializer deserializer,
   );
 
   @protected
   PresenceEntry sse_decode_presence_entry(SseDeserializer deserializer);
+
+  @protected
+  ServerCertificate sse_decode_server_certificate(SseDeserializer deserializer);
 
   @protected
   SessionEvent sse_decode_session_event(SseDeserializer deserializer);
@@ -392,6 +404,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_box_autoadd_video_surface_info(
     VideoSurfaceInfo? self,
     SseSerializer serializer,
@@ -399,6 +414,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_presence_entry(PresenceEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_server_certificate(
+    ServerCertificate self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_session_event(SessionEvent self, SseSerializer serializer);

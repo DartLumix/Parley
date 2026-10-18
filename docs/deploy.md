@@ -115,7 +115,7 @@ container first). Everything the server knows is in that volume.
 | symptom | cause / fix |
 |:--|:--|
 | client hangs on "connect" | UDP port not open, wrong port, or a TCP-only firewall rule |
-| `FINGERPRINT MISMATCH for this server` on every client | the volume was recreated (new identity), or a stale pin. Delete that server's line from `~/.config/parley/known_hosts` |
+| every client refuses the connection: certificate changed | the volume was recreated (new identity), or a stale pin. Clients show both fingerprints and ask before trusting; only accept it if the new one matches this container's startup log. From a shell, the pinned line lives in `~/.config/parley/known_hosts` |
 | `no users and PARLEY_ADMIN_PASSWORD not set` | first boot without the variable and an empty volume. Set it and restart once, or `adduser` |
 | `adduser` prints BUSY | server was writing; run it again |
 | container restarts in a loop | port already bound on the host; change `PARLEY_PORT` |

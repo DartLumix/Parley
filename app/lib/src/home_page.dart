@@ -173,7 +173,12 @@ class _HomePageState extends State<HomePage> {
   int? _lastSessionId;
   bool _isDisconnecting = false;
 
-  Future<void> _connect() async {
+  /// Prefix of the Rust-side refusal when a server's certificate no longer
+  /// matches its pin (`cert::mismatch_report`). The trust prompt hangs off
+  /// it, so the two sides move together.
+  static const _pinMismatch = 'fingerprint mismatch for';
+
+  Future<void> _connect({bool offerTrust = true}) async {
     setState(() => _connecting = true);
     try {
       final s = await connect(
@@ -200,10 +205,100 @@ class _HomePageState extends State<HomePage> {
       // no broadcast replays that, only the snapshot has it.
       requestVoiceStates(sessionId: s.sessionId);
     } catch (e) {
-      setState(() => _status = 'connect failed: $e');
+      if (mounted) setState(() => _status = 'connect failed: $e');
+      // A changed certificate is a decision, not an error to retype around.
+      if (offerTrust && '$e'.contains(_pinMismatch) && mounted) {
+        await _offerTrust();
+      }
     } finally {
       if (mounted) setState(() => _connecting = false);
     }
+  }
+
+  /// TOFU refused the connection: show both digests and let the user decide.
+  /// Nothing is written unless they explicitly trust the new certificate;
+  /// only then is the pin replaced and the login retried.
+  Future<void> _offerTrust() async {
+    final server = _server.text.trim();
+    final ServerCertificate cert;
+    try {
+      // Read what is on the wire NOW (TLS only, no credentials) instead of
+      // the stale text of the failure that got us here.
+      cert = await probeServer(server: server);
+    } catch (e) {
+      if (mounted) setState(() => _status = 'connect failed: $e');
+      return;
+    }
+    if (!mounted || cert.matches) return; // pin was repaired meanwhile
+    final trust = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Server certificate changed'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${cert.server} presented a certificate that does not match '
+              'the one saved on this machine.',
+            ),
+            const SizedBox(height: 12),
+            _fingerprintRow('saved', cert.pinned ?? '—'),
+            _fingerprintRow('now', cert.seen),
+            const SizedBox(height: 12),
+            const Text(
+              'That is expected after a redeploy with a new identity. Compare '
+              'the second fingerprint with the one the server prints at '
+              'startup. If it differs, someone else is on that address — '
+              'cancel and do not sign in.',
+              style: TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Trust new certificate'),
+          ),
+        ],
+      ),
+    );
+    if (trust != true || !mounted) return;
+    try {
+      final pinned = await trustServer(server: server);
+      setState(() => _status = 'trusted $pinned');
+      await _connect(offerTrust: false);
+    } catch (e) {
+      if (mounted) setState(() => _status = 'trust failed: $e');
+    }
+  }
+
+  Widget _fingerprintRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 52,
+            child: Text(
+              label,
+              style: const TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              value,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _disconnect() async {
@@ -615,7 +710,7 @@ class _HomePageState extends State<HomePage> {
                   password: _password,
                   connecting: _connecting,
                   status: _status,
-                  onConnect: _connect,
+                  onConnect: () => _connect(),
                 )
               else
                 _sessionView(theme),
