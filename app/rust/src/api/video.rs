@@ -380,7 +380,7 @@ pub mod imp {
             out.clear();
             out.resize(need, 255);
         }
-        for (i, px) in rgb.chunks_exact(3).enumerate() {
+        for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
             out[i * 4] = px[0];
             out[i * 4 + 1] = px[1];
             out[i * 4 + 2] = px[2];

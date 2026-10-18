@@ -126,7 +126,7 @@ pub(crate) fn spawn_filter(raw: Receiver<Vec<f32>>, out: SyncSender<Vec<f32>>) {
 
                 let mut pl: Vec<f32> = Vec::with_capacity(chunk.len() / 2);
                 let mut pr: Vec<f32> = Vec::with_capacity(chunk.len() / 2);
-                for pair in chunk.chunks_exact(2) {
+                for pair in chunk.as_chunks::<2>().0.iter() {
                     pl.push(pair[0]);
                     pr.push(pair[1]);
                 }

@@ -559,7 +559,7 @@ fn encoder_produces_decodable_keyframe(enc: &mut dyn VideoEncoder) -> Result<(),
         )));
     }
     let mut bgra = vec![0u8; w * h * 4];
-    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+    for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = (i % w) as u8;
         let y = (i / w) as u8;
         px[0] = x;
@@ -606,7 +606,7 @@ fn measure_encoder_fps(enc: &mut dyn VideoEncoder) -> Option<f32> {
     // one a real share uses, so it is the one to measure.
     let stride = w * 4 + 256;
     let mut bgra = vec![0u8; stride * h];
-    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+    for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = (i % stride / 4) as u8;
         let y = (i / stride) as u8;
         px[0] = x.wrapping_mul(3);
