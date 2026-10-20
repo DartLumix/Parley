@@ -3,6 +3,38 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.2.3] — 2026-10-20
+
+Staying signed in, and a roster that shows what people are actually doing.
+
+### Added
+
+- **Closing the window no longer signs you out.** A login remembers the
+  server-issued session token — never the password — in
+  `~/.config/parley/session.toml` (owner-only). The next launch reconnects
+  to the last server on its own, and *Reconnect as …* does the same after a
+  dropped connection. *Disconnect* is the explicit sign-out and deletes the
+  token; a token the server refuses falls back to the form with the server
+  and account prefilled.
+- **Per-user volume.** Click a name in a channel roster for a 0–200% voice
+  slider, applied in the receive mix.
+- **Per-stream volume.** A sharer's system audio has its own bar, both in
+  the roster dialog and in the share pane, trimmed independently of their
+  voice — two streams, two levels.
+- **Muted badge.** Mute is announced (`SetMute`) and kept by the server per
+  session, so every roster shows a muted mic, a late joiner's snapshot
+  includes it, and a channel rejoin carries it.
+- **Speaking indicator.** Roster chips light up while that person's decoded
+  audio is non-silent, from per-sender peaks the mixer already computes
+  (polled at 10 Hz and decayed so the glow fades), and the mic button
+  lights with your own capture level. Peaks are measured before volume, so
+  a turned-down person still lights up.
+
+### Changed
+
+- `VoiceState` gains `muted`; `ClientMessage` gains `SetMute`. The change is
+  additive — an older client simply never announces a mute.
+
 ## [0.2.2] — 2026-10-18
 
 A reconnection fix: a server whose certificate changed is now a question the
