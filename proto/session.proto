@@ -83,6 +83,17 @@ message VoiceState {
   uint32 user_id = 1;
   uint64 channel_id = 2;
   bool joined = 3;
+  // Mic muted. The client announces it (SetMute) and the server keeps it
+  // per user, so the roster can show a muted badge without listening to
+  // their packets.
+  bool muted = 4;
+}
+
+// Client -> server: my microphone is (un)muted. Answered by a VoiceState
+// broadcast carrying the same flag, to the whole session (the roster is
+// not channel-scoped in the UI).
+message SetMute {
+  bool muted = 1;
 }
 
 message VoiceStatesRequest {}
@@ -133,6 +144,7 @@ message ClientMessage {
     ReceiverReport receiver_report = 9;
     StopShare stop_share = 10;
     VideoReport video_report = 11;
+    SetMute set_mute = 12;
   }
 }
 

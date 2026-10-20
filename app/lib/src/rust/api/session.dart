@@ -7,9 +7,9 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `probe`, `read_frame`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Command`, `LiveSession`, `Probe`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `probe`, `read_frame`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Auth`, `Command`, `LiveSession`, `Probe`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// The certificate a server presents right now, beside the pin we hold.
 /// Read-only: nothing is trusted or written here.
@@ -33,6 +33,19 @@ Future<SessionInfo> connect({
   server: server,
   user: user,
   password: password,
+);
+
+/// Reconnect with a remembered session token (api/login.rs) instead of a
+/// password. The server still issues and returns a fresh token, so the
+/// caller should save the new one over the old.
+Future<SessionInfo> connectWithToken({
+  required String server,
+  required String user,
+  required String token,
+}) => RustLib.instance.api.crateApiSessionConnectWithToken(
+  server: server,
+  user: user,
+  token: token,
 );
 
 /// Register a Dart-side event stream for this session. The Dart
@@ -68,6 +81,40 @@ Future<void> setMicMuted({required int sessionId, required bool muted}) =>
       sessionId: sessionId,
       muted: muted,
     );
+
+/// Set one user's output volume (their voice and their share). Session-
+/// scoped: a new login starts everyone at 1.0.
+Future<void> setUserVolume({
+  required int sessionId,
+  required int userId,
+  required double gain,
+}) => RustLib.instance.api.crateApiSessionSetUserVolume(
+  sessionId: sessionId,
+  userId: userId,
+  gain: gain,
+);
+
+/// Trim the SCREEN SHARE stream of one user, on top of their volume.
+/// Their voice is untouched: the two are separate receive pipelines.
+Future<void> setShareVolume({
+  required int sessionId,
+  required int userId,
+  required double gain,
+}) => RustLib.instance.api.crateApiSessionSetShareVolume(
+  sessionId: sessionId,
+  userId: userId,
+  gain: gain,
+);
+
+/// Current per-sender peaks, for the roster's speaking glow. Missing a
+/// sender means "silent" — an offline or quiet stream has no entry.
+Future<List<VoiceLevel>> voiceLevels({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionVoiceLevels(sessionId: sessionId);
+
+/// Our own microphone peak (0..1), for the self speaking indicator.
+/// Written by the capture callback; 0 while muted or out of voice.
+Future<double> micLevel({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionMicLevel(sessionId: sessionId);
 
 /// Request the channel listing (response: "channel_list" event).
 Future<void> listChannels({required int sessionId}) =>
@@ -313,6 +360,9 @@ class SessionEvent {
   final BigInt channelId;
   final bool joined;
 
+  /// voice_state: their microphone is muted (see SetMute).
+  final bool muted;
+
   /// voice_states (the full snapshot)
   final List<VoiceEntry> states;
 
@@ -329,6 +379,7 @@ class SessionEvent {
     required this.username,
     required this.channelId,
     required this.joined,
+    required this.muted,
     required this.states,
     this.surface,
   });
@@ -344,6 +395,7 @@ class SessionEvent {
       username.hashCode ^
       channelId.hashCode ^
       joined.hashCode ^
+      muted.hashCode ^
       states.hashCode ^
       surface.hashCode;
 
@@ -361,6 +413,7 @@ class SessionEvent {
           username == other.username &&
           channelId == other.channelId &&
           joined == other.joined &&
+          muted == other.muted &&
           states == other.states &&
           surface == other.surface;
 }
@@ -438,14 +491,19 @@ class VoiceEntry {
   final BigInt channelId;
   final bool joined;
 
+  /// Their microphone is muted (announced, not inferred).
+  final bool muted;
+
   const VoiceEntry({
     required this.userId,
     required this.channelId,
     required this.joined,
+    required this.muted,
   });
 
   @override
-  int get hashCode => userId.hashCode ^ channelId.hashCode ^ joined.hashCode;
+  int get hashCode =>
+      userId.hashCode ^ channelId.hashCode ^ joined.hashCode ^ muted.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -454,5 +512,33 @@ class VoiceEntry {
           runtimeType == other.runtimeType &&
           userId == other.userId &&
           channelId == other.channelId &&
-          joined == other.joined;
+          joined == other.joined &&
+          muted == other.muted;
+}
+
+/// One sender's live output levels, for the roster's speaking glow.
+/// `voice` and `share` are peaks (0..1) of the DECODED streams — the
+/// listener's own volume does not change them.
+class VoiceLevel {
+  final int userId;
+  final double voice;
+  final double share;
+
+  const VoiceLevel({
+    required this.userId,
+    required this.voice,
+    required this.share,
+  });
+
+  @override
+  int get hashCode => userId.hashCode ^ voice.hashCode ^ share.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VoiceLevel &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          voice == other.voice &&
+          share == other.share;
 }

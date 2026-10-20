@@ -262,6 +262,10 @@ pub(crate) fn start_voice(
     // drops the chunk entirely. Session-owned, so the state survives a
     // leave/join and dies with the session.
     muted: Arc<AtomicBool>,
+    // Mic peak (f32 bits) for the UI's own speaking indicator: written
+    // by the capture callback, read by session::mic_level. Local only —
+    // nothing about it goes on the wire.
+    mic_level: Arc<AtomicU32>,
     // 7g: the mic tee routes captured chunks into this mux channel
     // while the share-audio mux owns the route flag; the mux drains it
     // and mixes the mic with the share's system audio. None when the
@@ -583,7 +587,7 @@ pub(crate) fn start_voice(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let stop_for_thread = stop.clone();
     let device_thread = std::thread::spawn(move || {
-        match build_streams(&mixer, aec, pcm_tx, muted) {
+        match build_streams(&mixer, aec, pcm_tx, muted, mic_level) {
             Ok(streams) => {
                 let AudioStreams { input, output } = streams;
                 let played = input.play().and_then(|_| output.play());
@@ -646,6 +650,7 @@ fn build_streams(
     aec: Option<Arc<webrtc_audio_processing::Processor>>,
     pcm_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
     muted: Arc<AtomicBool>,
+    mic_level: Arc<AtomicU32>,
 ) -> Result<AudioStreams, String> {
     let host = cpal::default_host();
     let in_dev = host
@@ -686,6 +691,7 @@ fn build_streams(
         let pcm_tx = pcm_tx.clone();
         let drops = drops.clone();
         let muted = muted.clone();
+        let mic_level = mic_level.clone();
         let mut first = true;
         in_dev.build_input_stream(
             cfg,
@@ -698,12 +704,18 @@ fn build_streams(
                         frames as f64 / 48.0
                     );
                 }
+                // Self meter: the peak of THIS chunk, before downmix.
+                // Muted zeroes it — the indicator must not claim a live
+                // mic while the button says muted.
+                let peak = data.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
                 // Muted: drop the chunk before the encoder. Sending
                 // nothing (rather than encoded silence) keeps the
                 // muted mic off the wire entirely.
                 if muted.load(Ordering::Relaxed) {
+                    mic_level.store(0f32.to_bits(), Ordering::Relaxed);
                     return;
                 }
+                mic_level.store(peak.to_bits(), Ordering::Relaxed);
                 // Downmix to mono (sum/channels — the terminal
                 // client's downmix).
                 let mono: Vec<f32> = if in_channels > 1 {

@@ -59,9 +59,27 @@ same trust decision.
   screen share opens above the chat and pushes it down.
 - **Chat** — the chat panel belongs to the joined channel; history
   loads on join.
+- **Stays signed in** — closing the window is not signing out: the app
+  keeps the server-issued session token in
+  `~/.config/parley/session.toml` (owner-only, never the password) and
+  reconnects to the last server by itself on the next launch. After a
+  dropped connection the login screen offers *Reconnect as …*, which uses
+  the same token. *Disconnect* is the explicit sign-out and deletes it; an
+  expired token drops back to the form with the server and account
+  prefilled.
 - **Mute** — the mic button beside *Share screen* (available while in
   voice). A muted mic sends no audio at all, and the mute survives
-  switching channels.
+  switching channels. Everyone else's roster shows a muted-mic badge as
+  soon as you press it: the state is announced, not guessed from silence.
+- **Speaking** — a name lights up in its channel while that person's audio
+  is non-silent (measured from the decoded stream, ~10 Hz), and the mic
+  button lights with your own capture level. Quiet people stay dark; a
+  turned-down person still lights up, because the meter is taken before
+  your volume is applied.
+- **Volume** — click a name in a channel's roster for their voice slider
+  (0–200%). A screen sharer also gets a *Screen share audio* slider there
+  and in the share pane: that stream is trimmed separately, so their voice
+  keeps its level.
 - **Screen share** — *Share screen* in the floating bar; the desktop's
   portal asks which monitor or window. Everyone in the same channel
   gets a card; *Watch* renders it, and the share's system audio starts

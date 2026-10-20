@@ -3,6 +3,7 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
+import 'api/login.dart';
 import 'api/session.dart';
 import 'api/video.dart';
 import 'api/video/imp.dart';
@@ -93,6 +94,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  SavedLogin dco_decode_box_autoadd_saved_login(dynamic raw);
+
+  @protected
   VideoSurfaceInfo dco_decode_box_autoadd_video_surface_info(dynamic raw);
 
   @protected
@@ -100,6 +104,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ChatEntry dco_decode_chat_entry(dynamic raw);
+
+  @protected
+  double dco_decode_f_64(dynamic raw);
 
   @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
@@ -120,13 +127,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<VoiceEntry> dco_decode_list_voice_entry(dynamic raw);
 
   @protected
+  List<VoiceLevel> dco_decode_list_voice_level(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  SavedLogin? dco_decode_opt_box_autoadd_saved_login(dynamic raw);
 
   @protected
   VideoSurfaceInfo? dco_decode_opt_box_autoadd_video_surface_info(dynamic raw);
 
   @protected
   PresenceEntry dco_decode_presence_entry(dynamic raw);
+
+  @protected
+  SavedLogin dco_decode_saved_login(dynamic raw);
 
   @protected
   ServerCertificate dco_decode_server_certificate(dynamic raw);
@@ -157,6 +173,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   VoiceEntry dco_decode_voice_entry(dynamic raw);
+
+  @protected
+  VoiceLevel dco_decode_voice_level(dynamic raw);
 
   @protected
   AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer);
@@ -215,6 +234,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  SavedLogin sse_decode_box_autoadd_saved_login(SseDeserializer deserializer);
+
+  @protected
   VideoSurfaceInfo sse_decode_box_autoadd_video_surface_info(
     SseDeserializer deserializer,
   );
@@ -224,6 +246,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ChatEntry sse_decode_chat_entry(SseDeserializer deserializer);
+
+  @protected
+  double sse_decode_f_64(SseDeserializer deserializer);
 
   @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
@@ -246,7 +271,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<VoiceEntry> sse_decode_list_voice_entry(SseDeserializer deserializer);
 
   @protected
+  List<VoiceLevel> sse_decode_list_voice_level(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  SavedLogin? sse_decode_opt_box_autoadd_saved_login(
+    SseDeserializer deserializer,
+  );
 
   @protected
   VideoSurfaceInfo? sse_decode_opt_box_autoadd_video_surface_info(
@@ -255,6 +288,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PresenceEntry sse_decode_presence_entry(SseDeserializer deserializer);
+
+  @protected
+  SavedLogin sse_decode_saved_login(SseDeserializer deserializer);
 
   @protected
   ServerCertificate sse_decode_server_certificate(SseDeserializer deserializer);
@@ -285,6 +321,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   VoiceEntry sse_decode_voice_entry(SseDeserializer deserializer);
+
+  @protected
+  VoiceLevel sse_decode_voice_level(SseDeserializer deserializer);
 
   @protected
   int sse_decode_i_32(SseDeserializer deserializer);
@@ -357,6 +396,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_saved_login(
+    SavedLogin self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_video_surface_info(
     VideoSurfaceInfo self,
     SseSerializer serializer,
@@ -367,6 +412,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_chat_entry(ChatEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_f_64(double self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
@@ -402,7 +450,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_voice_level(
+    List<VoiceLevel> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_saved_login(
+    SavedLogin? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_video_surface_info(
@@ -412,6 +472,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_presence_entry(PresenceEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_saved_login(SavedLogin self, SseSerializer serializer);
 
   @protected
   void sse_encode_server_certificate(
@@ -448,6 +511,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_voice_entry(VoiceEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_voice_level(VoiceLevel self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);

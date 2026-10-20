@@ -19,6 +19,16 @@ Your login is a username and password created by the server owner:
 
     docker compose exec parley /parley-server adduser alice 'a password'
 
+Closing the window does NOT sign you out: the app remembers the
+server-issued session token (never your password) in
+~/.config/parley/session.toml and reconnects to the last server on the
+next launch. Use the Disconnect button in the app bar to sign out — that
+deletes the token.
+
+Click a name in a channel to set that person's volume; a screen sharer
+has a second bar for their share's system audio. A muted mic shows a
+muted-mic badge, and a name lights up while that person is speaking.
+
 The first time you connect, the client pins the server's certificate
 (the same TOFU model as SSH). Compare the fingerprint the server prints
 on startup with the one the app shows after login.

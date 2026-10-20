@@ -1880,3 +1880,109 @@ async fn video_routing_is_order_robust() {
     conn_b.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
+
+/// A mute is a roster fact, not audio: it must reach every client with
+/// the flag set, show up in the snapshot, survive a leave/join, and not
+/// be re-broadcast when nothing changed. Without it the app can only
+/// guess from silence — and a muted mic sends no packets at all.
+#[tokio::test]
+async fn mute_state_is_broadcast_and_survives_rejoin() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("mute");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+
+    // Mute: everyone hears it, the muter included (self-confirmation).
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::SetMute(parley_proto::SetMute { muted: true }),
+    )
+    .await;
+    for rx in [&mut rx_a, &mut rx_b] {
+        match read_server_msg(rx).await.body {
+            Some(ServerBody::VoiceState(v)) => assert_eq!(
+                (v.user_id, v.channel_id, v.joined, v.muted),
+                (1, 1, true, true),
+                "mute must broadcast with the flag"
+            ),
+            other => panic!("expected mute broadcast, got {other:?}"),
+        }
+    }
+
+    // The snapshot carries it too, so a late joiner never shows a muted
+    // user as live.
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+    )
+    .await;
+    match read_server_msg(&mut rx_b).await.body {
+        Some(ServerBody::VoiceStateList(list)) => {
+            assert_eq!(list.states.len(), 1, "only voice members are listed");
+            let a = list
+                .states
+                .iter()
+                .find(|s| s.user_id == 1)
+                .expect("testuser in the snapshot");
+            assert!(a.muted, "snapshot must carry the announced mute");
+        }
+        other => panic!("expected voice state list, got {other:?}"),
+    }
+
+    // Nothing changed: no broadcast.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::SetMute(parley_proto::SetMute { muted: true }),
+    )
+    .await;
+    expect_silence(&mut rx_b, Duration::from_millis(150)).await;
+
+    // Leave/join keeps the preference: the join broadcast says muted.
+    send_client_msg(&mut tx_a, ClientBody::LeaveVoice(LeaveVoice {})).await;
+    expect_voice_state(&mut rx_a, 1, 0, false).await;
+    expect_voice_state(&mut rx_b, 1, 0, false).await;
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    match read_server_msg(&mut rx_b).await.body {
+        Some(ServerBody::VoiceState(v)) => assert!(
+            v.joined && v.muted,
+            "rejoining must still report the muted mic"
+        ),
+        other => panic!("expected join with mute, got {other:?}"),
+    }
+
+    // Unmute is news as well.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::SetMute(parley_proto::SetMute { muted: false }),
+    )
+    .await;
+    match read_server_msg(&mut rx_b).await.body {
+        Some(ServerBody::VoiceState(v)) => assert!(!v.muted, "unmute must clear it"),
+        other => panic!("expected unmute broadcast, got {other:?}"),
+    }
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}

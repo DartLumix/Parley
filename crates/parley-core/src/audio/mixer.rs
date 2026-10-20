@@ -88,6 +88,17 @@ impl Stream {
         let drop = self.pending.len().min(n * 2);
         self.pending.drain(..drop);
     }
+
+    /// Peak absolute sample in the next `n` audio frames, measured on the
+    /// DECODED signal — before any gain. A level meter that scaled with
+    /// the listener's volume could not tell "quiet room" from "I turned
+    /// them down".
+    fn peak(&self, n: usize) -> f32 {
+        self.pending
+            .iter()
+            .take(n * 2)
+            .fold(0.0f32, |m, &s| m.max(s.abs()))
+    }
 }
 
 /// One sender's receive state: the streams they currently have open.
@@ -118,9 +129,17 @@ impl Voice {
 
 pub struct Mixer {
     voices: HashMap<u32, Voice>,
-    /// Per-user output gain; unknown ids play at 1.0. One gain per
-    /// user — applied to both channels of a stereo voice.
+    /// Per-user output gain (the volume bar); unknown ids play at 1.0.
+    /// One gain per user — applied to every stream they send.
     gains: HashMap<u32, f32>,
+    /// Per-user trim on the SCREEN SHARE stream only (the share's own
+    /// volume bar). Multiplied with `gains`; defaults to 1.0, so a user
+    /// who never touched it follows their master volume exactly.
+    share_gains: HashMap<u32, f32>,
+    /// Last measured peak per sender: (voice, share). Written by every
+    /// `mix()` — the UI's speaking indicator polls it. Peaks are of the
+    /// decoded signal, so turning someone down never hides their glow.
+    levels: HashMap<u32, (f32, f32)>,
 }
 
 /// Shared mixer handle.
@@ -130,6 +149,8 @@ pub fn new() -> SharedMixer {
     Arc::new(Mutex::new(Mixer {
         voices: HashMap::new(),
         gains: HashMap::new(),
+        share_gains: HashMap::new(),
+        levels: HashMap::new(),
     }))
 }
 
@@ -138,6 +159,20 @@ impl Mixer {
     /// leaving/rejoining.
     pub fn set_gain(&mut self, user_id: u32, gain: f32) {
         self.gains.insert(user_id, gain);
+    }
+
+    /// Set the extra trim on a user's screen-share audio only. The
+    /// sender's VOICE is untouched — the two are separate streams.
+    pub fn set_share_gain(&mut self, user_id: u32, gain: f32) {
+        self.share_gains.insert(user_id, gain);
+    }
+
+    /// Last peak per sender, (voice, share), measured before gains.
+    pub fn levels(&self) -> Vec<(u32, f32, f32)> {
+        self.levels
+            .iter()
+            .map(|(&id, &(v, s))| (id, v, s))
+            .collect()
     }
 
     /// Drop a departed sender's decoder state (their gain setting stays).
@@ -208,17 +243,27 @@ impl Mixer {
                 s.ensure(n);
             }
         }
+        // Meters first, gains second (see `peak`). A sender with no
+        // pending audio keeps a zero entry for one callback, then drops
+        // out of the map at the next mix — the UI treats missing as 0.
+        self.levels.clear();
+        for (&id, v) in self.voices.iter() {
+            let voice_peak = v.voice.as_ref().map(|s| s.peak(n)).unwrap_or(0.0);
+            let share_peak = v.share.as_ref().map(|s| s.peak(n)).unwrap_or(0.0);
+            self.levels.insert(id, (voice_peak, share_peak));
+        }
         let mut mix = vec![0.0f32; n * 2];
         for (&id, v) in self.voices.iter() {
             let gain = self.gains.get(&id).copied().unwrap_or(1.0);
             if gain == 0.0 {
                 continue; // muted — pending still drains below, timing stays honest
             }
+            let share_gain = gain * self.share_gains.get(&id).copied().unwrap_or(1.0);
             if let Some(s) = &v.voice {
                 s.add(&mut mix, gain);
             }
             if let Some(s) = &v.share {
-                s.add(&mut mix, gain);
+                s.add(&mut mix, share_gain);
             }
         }
         for v in self.voices.values_mut() {
@@ -494,6 +539,66 @@ mod tests {
         assert!(
             after.iter().any(|&s| s.abs() > 0.01),
             "voice must survive clear_share"
+        );
+    }
+
+    /// The share's volume bar is a trim on ITS stream: zero silences the
+    /// system audio and leaves the sender's voice sample-identical to a
+    /// mixer that never received a share at all.
+    #[test]
+    fn share_gain_trims_only_the_share_stream() {
+        let with_share = new();
+        {
+            let mut m = with_share.lock().unwrap();
+            for (seq, _ts, pkt) in speech_packets(6) {
+                m.push_packet(11, seq, &pkt, false, false).unwrap();
+            }
+            for (seq, _ts, pkt) in music_packets(6) {
+                m.push_packet(11, seq, &pkt, true, true).unwrap();
+            }
+            m.set_share_gain(11, 0.0);
+            let _ = m.mix(SAMPLES_PER_FRAME); // warm both decoders
+        }
+        let voice_only = new();
+        {
+            let mut m = voice_only.lock().unwrap();
+            for (seq, _ts, pkt) in speech_packets(6) {
+                m.push_packet(11, seq, &pkt, false, false).unwrap();
+            }
+            let _ = m.mix(SAMPLES_PER_FRAME);
+        }
+        let trimmed = { with_share.lock().unwrap().mix(240) };
+        let reference = { voice_only.lock().unwrap().mix(240) };
+        assert_eq!(trimmed.len(), reference.len());
+        for (a, b) in trimmed.iter().zip(&reference) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "share trim must not touch the voice stream: {a} vs {b}"
+            );
+        }
+    }
+
+    /// The speaking indicator reads decoded peaks, not the mix: turning a
+    /// user all the way down silences them without hiding that they talk.
+    #[test]
+    fn levels_are_measured_before_gain() {
+        let mixer = new();
+        {
+            let mut m = mixer.lock().unwrap();
+            warm_up(&mut m, 9, &speech_packets(4), false);
+            m.set_gain(9, 0.0);
+        }
+        let mixed = { mixer.lock().unwrap().mix(SAMPLES_PER_FRAME) };
+        assert!(mixed.iter().all(|&s| s.abs() < 1e-6));
+        let levels = { mixer.lock().unwrap().levels() };
+        let (_, voice, _) = levels
+            .iter()
+            .find(|(id, ..)| *id == 9)
+            .copied()
+            .expect("a level entry for the sender");
+        assert!(
+            voice > 0.01,
+            "speaking must still register while turned down: {voice}"
         );
     }
 

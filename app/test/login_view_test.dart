@@ -36,6 +36,37 @@ void main() {
     expect(find.text('Parley dev'), findsOneWidget);
   });
 
+  testWidgets('offers the remembered session above the form', (tester) async {
+    final server = TextEditingController();
+    final user = TextEditingController(text: 'alice');
+    final password = TextEditingController();
+    addTearDown(server.dispose);
+    addTearDown(user.dispose);
+    addTearDown(password.dispose);
+
+    var reconnected = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: LoginView(
+            server: server,
+            user: user,
+            password: password,
+            connecting: false,
+            status: 'connection lost — press Reconnect',
+            onConnect: () {},
+            reconnectLabel: 'Reconnect as alice',
+            onReconnect: () => reconnected++,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Reconnect as alice'));
+    await tester.pump();
+    expect(reconnected, 1);
+  });
+
   testWidgets('the button is disabled while connecting', (tester) async {
     final server = TextEditingController();
     final user = TextEditingController();

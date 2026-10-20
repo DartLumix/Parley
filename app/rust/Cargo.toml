@@ -1,6 +1,6 @@
 [package]
 name = "parley_flutter"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [lib]
@@ -51,6 +51,9 @@ webrtc-audio-processing = { workspace = true, optional = true }
 irondash_texture = { workspace = true, optional = true }
 irondash_engine_context = { workspace = true, optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# Remembered login (api/login.rs): the session token in a TOML file.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # The disconnect regression test runs a real server in-process.

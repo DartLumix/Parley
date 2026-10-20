@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'rust/api/login.dart' as login_api;
 import 'rust/api/session.dart';
 import 'theme.dart';
 import 'widgets/fullscreen_share.dart';
@@ -31,6 +32,32 @@ class _HomePageState extends State<HomePage> {
   SessionInfo? _session;
   bool _connecting = false;
   StreamSubscription<SessionEvent>? _events;
+
+  /// The remembered session (Rust: ~/.config/parley/session.toml). The
+  /// token is the credential — the password is never written down. Set at
+  /// startup, refreshed on every successful login, cleared only by the
+  /// Disconnect button.
+  login_api.SavedLogin? _saved;
+
+  /// The credential this attempt is using. The trust prompt's retry must
+  /// repeat the SAME one: after a token login the password field is empty,
+  /// so retrying with a password would fail for the wrong reason.
+  String? _connectToken;
+
+  /// Per-user output volume and the extra trim on their screen-share
+  /// audio (both 1.0 = untouched). Session-scoped, like the mixer.
+  final Map<int, double> _volume = {};
+  final Map<int, double> _shareVolume = {};
+
+  /// Speaking indicator: decayed peaks polled from the Rust mixer while
+  /// in voice, keyed by user id. Missing = silent.
+  final Map<int, double> _levels = {};
+  double _selfLevel = 0;
+  Timer? _meter;
+
+  /// Users whose microphone the server says is muted (SetMute), from the
+  /// snapshot and every broadcast since.
+  final Set<int> _mutedUsers = {};
 
   // Session state assembled from events:
   final List<ChannelInfo> _channels = [];
@@ -84,6 +111,15 @@ class _HomePageState extends State<HomePage> {
       const Duration(seconds: 1),
       (_) => _checkAlive(),
     );
+    // ~10 Hz is what a speaking glow needs; the Rust side just reads the
+    // peaks its audio callback already computed.
+    _meter = Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) => _pollLevels(),
+    );
+    // Coming back up is the normal case: closing the window is not signing
+    // out, so the last server is re-entered without typing anything.
+    _restoreLogin();
     // 7g: the toggle's initial state (persisted process-wide in Rust).
     // Best-effort: featureless builds error and stay false. The toggle
     // only renders when this build can hardware-encode at all.
@@ -101,10 +137,37 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
+  /// Re-enter the last session. The token comes from the Rust side, so no
+  /// password is needed and none is stored; a refused token drops the saved
+  /// login and leaves the ordinary form in place.
+  Future<void> _restoreLogin() async {
+    login_api.SavedLogin? saved;
+    try {
+      saved = await login_api.load();
+    } catch (e) {
+      debugPrint('login: restore failed: $e');
+      return;
+    }
+    if (saved == null || !mounted) return;
+    final remembered = saved;
+    _server.text = remembered.server;
+    _user.text = remembered.user;
+    setState(() {
+      _saved = remembered;
+      _status = 'reconnecting to ${remembered.server}\u2026';
+    });
+    await _connect(token: remembered.token);
+  }
+
   @override
   void dispose() {
+    // Deliberately NO disconnect here: closing the window leaves the
+    // account signed in (the token stays valid), which is what makes the
+    // next launch reconnect on its own. The QUIC connection dies with the
+    // process either way; only the Disconnect button forgets the login.
     windowChannel.setMethodCallHandler(null);
     _liveness.cancel();
+    _meter?.cancel();
     _events?.cancel();
     _server.dispose();
     _user.dispose();
@@ -138,12 +201,176 @@ class _HomePageState extends State<HomePage> {
 
   int _pollTick = 0;
 
+  /// One outstanding meter poll at a time: the timer does not wait, and a
+  /// slow FFI round trip must not queue a second.
+  bool _polling = false;
+
+  /// Pull the current speaking peaks (and our own mic peak) and decay
+  /// them, so a single silent poll fades the glow instead of blinking it
+  /// off. Rebuilds only when a level actually moved.
+  Future<void> _pollLevels() async {
+    if (_polling) return;
+    final s = _session;
+    if (s == null || !_voiceUp) {
+      if (_levels.isNotEmpty || _selfLevel != 0) {
+        setState(() {
+          _levels.clear();
+          _selfLevel = 0;
+        });
+      }
+      return;
+    }
+    _polling = true;
+    final List<VoiceLevel> rows;
+    final double self;
+    try {
+      rows = await voiceLevels(sessionId: s.sessionId);
+      self = await micLevel(sessionId: s.sessionId);
+    } catch (_) {
+      return;
+    } finally {
+      _polling = false;
+    }
+    if (!mounted || _session?.sessionId != s.sessionId) return;
+
+    const decay = 0.55;
+    const floor = 0.03;
+    final peaks = {for (final r in rows) r.userId: r.voice};
+    final next = <int, double>{};
+    for (final id in {..._levels.keys, ...peaks.keys}) {
+      final peak = (peaks[id] ?? 0).clamp(0.0, 1.0).toDouble();
+      final faded = (_levels[id] ?? 0) * decay;
+      final v = peak > faded ? peak : faded;
+      if (v > floor) next[id] = v;
+    }
+    final selfPeak = self.clamp(0.0, 1.0).toDouble();
+    final selfFaded = _selfLevel * decay;
+    final selfNext = selfPeak > selfFaded ? selfPeak : selfFaded;
+
+    var changed = next.length != _levels.length;
+    if (!changed) {
+      for (final e in next.entries) {
+        if (((_levels[e.key] ?? 0) - e.value).abs() > 0.04) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed && (selfNext - _selfLevel).abs() > 0.04) changed = true;
+    if (!changed) return;
+    setState(() {
+      _levels
+        ..clear()
+        ..addAll(next);
+      _selfLevel = selfNext > floor ? selfNext : 0;
+    });
+  }
+
+  Future<void> _applyVolume(int userId, double gain) async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    setState(() => _volume[userId] = gain);
+    try {
+      await setUserVolume(sessionId: sessionId, userId: userId, gain: gain);
+    } catch (e) {
+      debugPrint('volume: $e');
+    }
+  }
+
+  Future<void> _applyShareVolume(int userId, double gain) async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    setState(() => _shareVolume[userId] = gain);
+    try {
+      await setShareVolume(sessionId: sessionId, userId: userId, gain: gain);
+    } catch (e) {
+      debugPrint('share volume: $e');
+    }
+  }
+
+  /// Per-user volume (their voice, their share) and — for someone who is
+  /// sharing — the trim on that share's system audio. Two sliders because
+  /// they are two independent streams in the mixer.
+  Future<void> _showVolumeDialog(int userId) async {
+    var master = _volume[userId] ?? 1.0;
+    var share = _shareVolume[userId] ?? 1.0;
+    final self = userId == _session?.userId;
+    final sharing =
+        _videos.containsKey(userId) || _shareVolume.containsKey(userId);
+    await showDialog<void>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(_nameOf(userId)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _volumeSlider('Voice', master, (v) {
+                setDialogState(() => master = v);
+                _applyVolume(userId, v);
+              }),
+              if (sharing && !self)
+                _volumeSlider('Screen share audio', share, (v) {
+                  setDialogState(() => share = v);
+                  _applyShareVolume(userId, v);
+                }),
+              const Text(
+                'The screen-share bar trims only that share\u2019s system '
+                'audio; their voice keeps its own level.',
+                style: TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _volumeSlider(
+    String label,
+    double value,
+    ValueChanged<double> onChanged,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text(
+              label,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+            const Spacer(),
+            Text(
+              '${(value * 100).round()}%',
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 12,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ],
+        ),
+        Slider(value: value, min: 0, max: 2, onChanged: onChanged),
+      ],
+    );
+  }
+
   void _handleClosed() {
     _events?.cancel();
     _events = null;
     setState(() {
       _session = null;
-      _status = 'connection lost';
+      // Not signed out: the saved token is what lets the Reconnect button
+      // (or the next launch) get back in without a password.
+      _status = 'connection lost — press Reconnect';
       _joinedChannelId = null;
       _voiceUp = false;
       _channels.clear();
@@ -156,6 +383,9 @@ class _HomePageState extends State<HomePage> {
       _fullscreen = null;
       _sharing = false;
       _micMuted = false;
+      _levels.clear();
+      _selfLevel = 0;
+      _mutedUsers.clear();
     });
     setWindowFullscreen(false);
     _muteAllShares();
@@ -178,14 +408,21 @@ class _HomePageState extends State<HomePage> {
   /// it, so the two sides move together.
   static const _pinMismatch = 'fingerprint mismatch for';
 
-  Future<void> _connect({bool offerTrust = true}) async {
+  Future<void> _connect({bool offerTrust = true, String? token}) async {
+    _connectToken = token;
     setState(() => _connecting = true);
     try {
-      final s = await connect(
-        server: _server.text,
-        user: _user.text,
-        password: _password.text,
-      );
+      final s = token != null
+          ? await connectWithToken(
+              server: _server.text,
+              user: _user.text,
+              token: token,
+            )
+          : await connect(
+              server: _server.text,
+              user: _user.text,
+              password: _password.text,
+            );
       _lastSessionId = s.sessionId;
       _events = events(sessionId: s.sessionId).listen(
         _onEvent,
@@ -197,6 +434,9 @@ class _HomePageState extends State<HomePage> {
         _session = s;
         _status = 'connected: user ${s.userId} @ ${s.server}';
       });
+      // Every login returns a fresh token: remember this one, so the next
+      // launch (and every reconnect) uses it instead of the password.
+      await _rememberLogin(s);
       // Bootstrap AFTER subscribing (deterministic ordering — the Rust
       // side no longer issues these itself).
       requestPresence(sessionId: s.sessionId);
@@ -206,6 +446,15 @@ class _HomePageState extends State<HomePage> {
       requestVoiceStates(sessionId: s.sessionId);
     } catch (e) {
       if (mounted) setState(() => _status = 'connect failed: $e');
+      // A saved token the server no longer accepts is not an error the
+      // user can fix by retyping the password in a hidden field: forget it
+      // and say so. The server/user stay prefilled.
+      if (token != null && '$e'.contains('auth denied')) {
+        await _forgetLogin();
+        if (mounted) {
+          setState(() => _status = 'saved session expired — sign in again');
+        }
+      }
       // A changed certificate is a decision, not an error to retype around.
       if (offerTrust && '$e'.contains(_pinMismatch) && mounted) {
         await _offerTrust();
@@ -213,6 +462,40 @@ class _HomePageState extends State<HomePage> {
     } finally {
       if (mounted) setState(() => _connecting = false);
     }
+  }
+
+  /// Write the token this login returned. Best-effort: a read-only config
+  /// directory must not break a working session, it only costs the
+  /// auto-reconnect.
+  Future<void> _rememberLogin(SessionInfo s) async {
+    final server = _server.text.trim();
+    final user = _user.text.trim();
+    try {
+      await login_api.save(server: server, user: user, token: s.sessionToken);
+    } catch (e) {
+      debugPrint('login: save failed: $e');
+      return;
+    }
+    // The token is the credential now; keeping the password in a live
+    // text field (and in memory for the session's lifetime) is pointless.
+    _password.clear();
+    if (!mounted) return;
+    setState(() {
+      _saved = login_api.SavedLogin(
+        server: server,
+        user: user,
+        token: s.sessionToken,
+      );
+    });
+  }
+
+  Future<void> _forgetLogin() async {
+    try {
+      await login_api.forget();
+    } catch (e) {
+      debugPrint('login: forget failed: $e');
+    }
+    _saved = null;
   }
 
   /// TOFU refused the connection: show both digests and let the user decide.
@@ -271,7 +554,7 @@ class _HomePageState extends State<HomePage> {
     try {
       final pinned = await trustServer(server: server);
       setState(() => _status = 'trusted $pinned');
-      await _connect(offerTrust: false);
+      await _connect(offerTrust: false, token: _connectToken);
     } catch (e) {
       if (mounted) setState(() => _status = 'trust failed: $e');
     }
@@ -301,9 +584,12 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// Disconnect = sign out: the saved token is deleted, so the next launch
+  /// shows the login form instead of re-entering the account.
   Future<void> _disconnect() async {
     if (_session == null) return;
     await _muteAllShares();
+    await _forgetLogin();
     _isDisconnecting = true;
     try {
       await disconnect(sessionId: _session!.sessionId);
@@ -327,6 +613,11 @@ class _HomePageState extends State<HomePage> {
       _fullscreen = null;
       _sharing = false;
       _micMuted = false;
+      _levels.clear();
+      _selfLevel = 0;
+      _mutedUsers.clear();
+      _volume.clear();
+      _shareVolume.clear();
     });
     setWindowFullscreen(false);
   }
@@ -384,11 +675,7 @@ class _HomePageState extends State<HomePage> {
     if (sessionId == null) return;
     for (final id in ids) {
       try {
-        await setShareAudio(
-          sessionId: sessionId,
-          userId: id,
-          audible: false,
-        );
+        await setShareAudio(sessionId: sessionId, userId: id, audible: false);
       } catch (_) {}
     }
   }
@@ -493,6 +780,13 @@ class _HomePageState extends State<HomePage> {
           for (final u in ev.users) {
             _usernames[u.userId] = u.username;
           }
+          // Mute state outlives leave/join, but not a session: forget ids
+          // that are no longer online so a later account cannot inherit a
+          // stale badge.
+          if (ev.users.isNotEmpty) {
+            final online = {for (final u in ev.users) u.userId};
+            _mutedUsers.removeWhere((id) => !online.contains(id));
+          }
           _pruneShares();
         });
       case 'chat':
@@ -508,12 +802,22 @@ class _HomePageState extends State<HomePage> {
             _voiceChannel[ev.userId] = ev.channelId;
           } else {
             _voiceChannel.remove(ev.userId);
+            _levels.remove(ev.userId);
+          }
+          // Announced mute state — the badge does not depend on the
+          // silenced packets (a muted client sends none at all).
+          if (ev.muted) {
+            _mutedUsers.add(ev.userId);
+          } else {
+            _mutedUsers.remove(ev.userId);
           }
           if (ev.userId == _session?.userId) {
             // 7e: the own join/leave IS the voice lifecycle — the Rust
             // side already opened/closed the devices on this event.
             _joinedChannelId = ev.joined ? ev.channelId : null;
             _voiceUp = ev.joined;
+            _levels.clear();
+            _selfLevel = 0;
             _status = ev.joined
                 ? 'in voice — mic + speakers live'
                 : 'connected';
@@ -523,8 +827,10 @@ class _HomePageState extends State<HomePage> {
       case 'voice_states':
         setState(() {
           _voiceChannel.clear();
+          _mutedUsers.clear();
           for (final st in ev.states) {
             if (st.joined) _voiceChannel[st.userId] = st.channelId;
+            if (st.muted) _mutedUsers.add(st.userId);
           }
           for (final st in ev.states) {
             if (st.userId == _session?.userId) {
@@ -711,13 +1017,20 @@ class _HomePageState extends State<HomePage> {
                   connecting: _connecting,
                   status: _status,
                   onConnect: () => _connect(),
+                  reconnectLabel: _saved == null
+                      ? null
+                      : 'Reconnect as ${_saved!.user}',
+                  onReconnect: _saved == null
+                      ? null
+                      : () => _connect(token: _saved!.token),
                 )
               else
                 _sessionView(theme),
             ],
           ),
           floatingActionButton: _session == null ? null : _actionBar(theme),
-          floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+          floatingActionButtonLocation:
+              FloatingActionButtonLocation.centerFloat,
         ),
         // The native title bar is gone; this is the replacement. It is
         // drawn over the app bar only while the pointer is at the top.
@@ -787,7 +1100,8 @@ class _HomePageState extends State<HomePage> {
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
               ),
             ),
-            if (_sharing) const Pill(text: 'sharing', color: Colors.greenAccent),
+            if (_sharing)
+              const Pill(text: 'sharing', color: Colors.greenAccent),
           ],
         ),
         const SizedBox(height: 4),
@@ -873,9 +1187,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
               Text(
-                members.isEmpty
-                    ? 'voice empty'
-                    : '${members.length} in voice',
+                members.isEmpty ? 'voice empty' : '${members.length} in voice',
                 style: const TextStyle(color: Colors.white38, fontSize: 12),
               ),
               const SizedBox(width: 4),
@@ -939,33 +1251,86 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// One roster chip. It lights up while that person is actually making
+  /// sound (local peak meter, not a flag), shows a muted mic when they say
+  /// they are muted, and opens the volume dialog on click.
   Widget _memberChip(int userId, {bool idle = false}) {
     final self = userId == _session?.userId;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.06),
+    final level = self ? _selfLevel : (_levels[userId] ?? 0.0);
+    final speaking = !idle && level > 0.05;
+    final muted = _mutedUsers.contains(userId);
+    final volume = _volume[userId] ?? 1.0;
+    final name = self ? '${_nameOf(userId)} (you)' : _nameOf(userId);
+    final hot = speaking
+        ? accentSoft
+        : (self ? accentSoft : Colors.greenAccent);
+    // Your own volume is not a thing the mix can apply (your voice never
+    // comes back to you); only other people's chips open the dialog.
+    final adjustable = !idle && !self;
+    return Tooltip(
+      message: adjustable ? '$name · click for volume' : name,
+      child: InkWell(
         borderRadius: BorderRadius.circular(6),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 6,
-            height: 6,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: idle
-                  ? Colors.white24
-                  : (self ? accentSoft : Colors.greenAccent),
+        onTap: adjustable ? () => _showVolumeDialog(userId) : null,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 110),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: speaking
+                ? accent.withValues(alpha: 0.30)
+                : Colors.white.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: speaking
+                  ? accentSoft
+                  : Colors.white.withValues(alpha: 0.06),
             ),
+            boxShadow: speaking
+                ? [
+                    BoxShadow(
+                      color: accentSoft.withValues(alpha: 0.45),
+                      blurRadius: 9,
+                      spreadRadius: 1,
+                    ),
+                  ]
+                : const [],
           ),
-          const SizedBox(width: 6),
-          Text(
-            self ? '${_nameOf(userId)} (you)' : _nameOf(userId),
-            style: const TextStyle(fontSize: 12),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (idle)
+                Container(
+                  width: 6,
+                  height: 6,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.white24,
+                  ),
+                )
+              else
+                Icon(
+                  muted
+                      ? Icons.mic_off
+                      : (speaking ? Icons.graphic_eq : Icons.mic_none),
+                  size: 13,
+                  color: muted ? Colors.white38 : hot,
+                ),
+              const SizedBox(width: 6),
+              Text(name, style: const TextStyle(fontSize: 12)),
+              if (volume != 1.0) ...[
+                const SizedBox(width: 5),
+                Text(
+                  '${(volume * 100).round()}%',
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: Colors.white54,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ],
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -1052,7 +1417,10 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  ElevatedButton(onPressed: _sendChat, child: const Text('Send')),
+                  ElevatedButton(
+                    onPressed: _sendChat,
+                    child: const Text('Send'),
+                  ),
                 ],
               ),
             ),
@@ -1065,8 +1433,9 @@ class _HomePageState extends State<HomePage> {
   // --- share pane (right side): an invitation until "Watch".
 
   Widget _sharePane(ThemeData theme) {
-    final watching =
-        _watching != null && _videos.containsKey(_watching) ? _watching : null;
+    final watching = _watching != null && _videos.containsKey(_watching)
+        ? _watching
+        : null;
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF0B0B0D),
@@ -1142,10 +1511,7 @@ class _HomePageState extends State<HomePage> {
           child: Padding(
             padding: const EdgeInsets.all(8),
             child: Center(
-              child: AspectRatio(
-                aspectRatio: v.$2 / v.$3,
-                child: texture,
-              ),
+              child: AspectRatio(aspectRatio: v.$2 / v.$3, child: texture),
             ),
           ),
         ),
@@ -1158,6 +1524,28 @@ class _HomePageState extends State<HomePage> {
                 child: Text(
                   '${_nameOf(userId)} · ${v.$2}×${v.$3}',
                   style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ),
+              // Per-stream volume: this share's system audio only. Their
+              // voice keeps its own level (the roster's volume dialog).
+              SizedBox(
+                width: 150,
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.volume_up,
+                      size: 15,
+                      color: Colors.white54,
+                    ),
+                    Expanded(
+                      child: Slider(
+                        value: _shareVolume[userId] ?? 1.0,
+                        min: 0,
+                        max: 2,
+                        onChanged: (value) => _applyShareVolume(userId, value),
+                      ),
+                    ),
+                  ],
                 ),
               ),
               IconButton(
@@ -1180,6 +1568,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _toggleMic() async {
     final sessionId = _session?.sessionId;
     if (sessionId == null) return;
+    final me = _session?.userId;
     final next = !_micMuted;
     try {
       await setMicMuted(sessionId: sessionId, muted: next);
@@ -1190,6 +1579,14 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() {
       _micMuted = next;
+      _selfLevel = 0;
+      if (me != null) {
+        if (next) {
+          _mutedUsers.add(me);
+        } else {
+          _mutedUsers.remove(me);
+        }
+      }
       _status = next ? 'mic muted' : 'mic live';
     });
   }
@@ -1218,9 +1615,7 @@ class _HomePageState extends State<HomePage> {
               color: Colors.white.withValues(alpha: 0.12),
             ),
             TextButton.icon(
-              onPressed: inVoice
-                  ? (_sharing ? _stopShare : _startShare)
-                  : null,
+              onPressed: inVoice ? (_sharing ? _stopShare : _startShare) : null,
               icon: Icon(
                 _sharing ? Icons.stop_screen_share : Icons.screen_share,
                 size: 20,

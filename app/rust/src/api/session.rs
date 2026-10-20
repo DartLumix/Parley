@@ -57,7 +57,7 @@ use parley_proto::VideoReport;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
     Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
-    ServerBody, ServerMessage, VoiceStatesRequest, PROTOCOL_VERSION,
+    ServerBody, ServerMessage, SetMute, VoiceStatesRequest, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -133,6 +133,12 @@ pub(crate) enum Command {
         before_message_id: u64,
     },
     Presence,
+    /// My microphone is (un)muted — roster news for everyone else. The
+    /// local capture flag flips first (set_mic_muted); this only makes
+    /// the state visible to the other clients.
+    SetMute {
+        muted: bool,
+    },
     /// Voice-membership snapshot ("voice_states" event). VoiceState
     /// broadcasts cover every join/leave that happens while we are
     /// connected, but a peer already sitting in a channel before we
@@ -181,6 +187,7 @@ impl Command {
                 before_message_id,
             }),
             Command::Presence => ClientBody::PresenceRequest(PresenceRequest {}),
+            Command::SetMute { muted } => ClientBody::SetMute(SetMute { muted }),
             Command::VoiceStates => ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
             #[cfg(feature = "audio-device")]
             Command::ReceiverReport { gap_rate_permille } => {
@@ -226,6 +233,10 @@ struct LiveSession {
     /// and deliberately not cleared by leave/join — muting is a user
     /// preference, not a device property.
     mic_muted: Arc<AtomicBool>,
+    /// Capture peak (f32 bits) written by the mic callback, read by the
+    /// UI's self speaking indicator. 0 while muted or out of voice.
+    #[cfg(feature = "audio-device")]
+    mic_level: Arc<AtomicU32>,
     /// 7g: event stream origin for share lifecycle events (share_
     /// started / share_ended) and the share supervisor's forwarder.
     /// Featureless builds never touch it (share fns are stubs) —
@@ -305,6 +316,18 @@ pub struct VoiceEntry {
     pub user_id: u32,
     pub channel_id: u64,
     pub joined: bool,
+    /// Their microphone is muted (announced, not inferred).
+    pub muted: bool,
+}
+
+/// One sender's live output levels, for the roster's speaking glow.
+/// `voice` and `share` are peaks (0..1) of the DECODED streams — the
+/// listener's own volume does not change them.
+#[derive(Debug, Clone)]
+pub struct VoiceLevel {
+    pub user_id: u32,
+    pub voice: f64,
+    pub share: f64,
 }
 
 /// 7f: one remote share's display surface. `texture_id` feeds a plain
@@ -336,6 +359,8 @@ pub struct SessionEvent {
     pub username: String,
     pub channel_id: u64,
     pub joined: bool,
+    /// voice_state: their microphone is muted (see SetMute).
+    pub muted: bool,
     /// voice_states (the full snapshot)
     pub states: Vec<VoiceEntry>,
     /// 7f: video_started / video_stopped (the surface)
@@ -456,6 +481,7 @@ fn closed_event(session_id: u32) -> SessionEvent {
         username: String::new(),
         channel_id: 0,
         joined: false,
+        muted: false,
         states: Vec::new(),
         surface: None,
     }
@@ -479,6 +505,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         username: String::new(),
         channel_id: 0,
         joined: false,
+        muted: false,
         states: Vec::new(),
         surface: None,
     };
@@ -617,6 +644,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             e.user_id = v.user_id;
             e.channel_id = v.channel_id;
             e.joined = v.joined;
+            e.muted = v.muted;
             extra.push(e);
             extra
         }
@@ -672,6 +700,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                     user_id: v.user_id,
                     channel_id: v.channel_id,
                     joined: v.joined,
+                    muted: v.muted,
                 })
                 .collect();
             vec![e]
@@ -787,7 +816,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
     // ladder reads; 7f adds the video feed for the same media path.)
     #[cfg(feature = "screen-capture")]
     let mic_mux_tx = Some(share_mic_mux_channel().0);
-    let (mixer, conn, my_id, loss_report, cmd_tx, video_tx, mic_muted) = {
+    let (mixer, conn, my_id, loss_report, cmd_tx, video_tx, mic_muted, mic_level) = {
         let sessions = SESSIONS.lock().unwrap();
         let Some(s) = sessions.get(&session_id) else {
             return;
@@ -810,6 +839,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             #[cfg(not(feature = "video"))]
             None,
             s.mic_muted.clone(),
+            s.mic_level.clone(),
         )
     };
 
@@ -824,6 +854,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             cmd_tx,
             video_tx,
             mic_muted,
+            mic_level,
             #[cfg(feature = "screen-capture")]
             mic_mux_tx,
         ) {
@@ -863,6 +894,11 @@ fn disable_voice(session_id: u32) {
         .unwrap()
         .get_mut(&session_id)
         .and_then(|s| s.voice.take());
+    // No capture callback will run again: the self meter must read 0
+    // rather than the last chunk it saw.
+    if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+        s.mic_level.store(0f32.to_bits(), Ordering::Relaxed);
+    }
     drop(ctrl); // Drop = teardown signal
 }
 
@@ -879,14 +915,27 @@ fn teardown_voice(_session_id: u32) {}
 /// Connect + authenticate. Blocks until the handshake completes (runs
 /// on an FRB worker thread; Dart sees a Future).
 pub fn connect(server: String, user: String, password: String) -> Result<SessionInfo, String> {
-    rt().block_on(connect_async(server, user, password))
+    rt().block_on(connect_async(server, user, Auth::Password(password)))
 }
 
-async fn connect_async(
+/// Reconnect with a remembered session token (api/login.rs) instead of a
+/// password. The server still issues and returns a fresh token, so the
+/// caller should save the new one over the old.
+pub fn connect_with_token(
     server: String,
     user: String,
-    password: String,
+    token: String,
 ) -> Result<SessionInfo, String> {
+    rt().block_on(connect_async(server, user, Auth::Token(token)))
+}
+
+/// What the auth request carries: exactly one of the two credentials.
+enum Auth {
+    Password(String),
+    Token(String),
+}
+
+async fn connect_async(server: String, user: String, auth: Auth) -> Result<SessionInfo, String> {
     // host[:port], with DNS. The user may type an IP, a LAN name or a
     // domain; the TOFU pin stays keyed by the exact string they typed.
     let (addr, server_name) = parley_client::endpoint::resolve(&server)?;
@@ -925,12 +974,16 @@ async fn connect_async(
         .await
         .map_err(|e| format!("hello ack: {e}"))?;
 
+    let (password, session_token) = match auth {
+        Auth::Password(p) => (p, String::new()),
+        Auth::Token(t) => (String::new(), t),
+    };
     session::write_message(
         &mut tx,
         &AuthRequest {
             username: user,
             password,
-            session_token: String::new(),
+            session_token,
         },
     )
     .await
@@ -1078,6 +1131,8 @@ async fn connect_async(
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
             mic_muted: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "audio-device")]
+            mic_level: Arc::new(AtomicU32::new(0)),
             #[cfg(feature = "screen-capture")]
             event_tx: event_tx.clone(),
             #[cfg(feature = "screen-capture")]
@@ -1192,7 +1247,88 @@ pub fn set_mic_muted(session_id: u32, muted: bool) -> Result<(), String> {
         .get(&session_id)
         .ok_or(format!("no session {session_id}"))?;
     s.mic_muted.store(muted, Ordering::Relaxed);
+    #[cfg(feature = "audio-device")]
+    s.mic_level.store(0f32.to_bits(), Ordering::Relaxed);
+    // Roster news: the server keeps it and broadcasts a VoiceState so the
+    // OTHER clients can show the badge. A dead writer means the session
+    // is over anyway — the local flag still took effect.
+    let _ = s.cmd_tx.send(Command::SetMute { muted });
     Ok(())
+}
+
+/// Clamp a UI slider value to something the mixer can use: 0 = silent,
+/// 1 = the sender's own level, 2 = twice as loud (before the mix clamp).
+fn volume_or_err(gain: f64) -> f32 {
+    if !gain.is_finite() {
+        return 1.0;
+    }
+    gain.clamp(0.0, 2.0) as f32
+}
+
+/// Set one user's output volume (their voice and their share). Session-
+/// scoped: a new login starts everyone at 1.0.
+pub fn set_user_volume(session_id: u32, user_id: u32, gain: f64) -> Result<(), String> {
+    let mixer = {
+        let sessions = SESSIONS.lock().unwrap();
+        let s = sessions
+            .get(&session_id)
+            .ok_or(format!("no session {session_id}"))?;
+        s.mixer.clone()
+    };
+    mixer.lock().unwrap().set_gain(user_id, volume_or_err(gain));
+    Ok(())
+}
+
+/// Trim the SCREEN SHARE stream of one user, on top of their volume.
+/// Their voice is untouched: the two are separate receive pipelines.
+pub fn set_share_volume(session_id: u32, user_id: u32, gain: f64) -> Result<(), String> {
+    let mixer = {
+        let sessions = SESSIONS.lock().unwrap();
+        let s = sessions
+            .get(&session_id)
+            .ok_or(format!("no session {session_id}"))?;
+        s.mixer.clone()
+    };
+    mixer
+        .lock()
+        .unwrap()
+        .set_share_gain(user_id, volume_or_err(gain));
+    Ok(())
+}
+
+/// Current per-sender peaks, for the roster's speaking glow. Missing a
+/// sender means "silent" — an offline or quiet stream has no entry.
+pub fn voice_levels(session_id: u32) -> Vec<VoiceLevel> {
+    let mixer = {
+        let sessions = SESSIONS.lock().unwrap();
+        match sessions.get(&session_id) {
+            Some(s) => s.mixer.clone(),
+            None => return Vec::new(),
+        }
+    };
+    let levels = mixer.lock().unwrap().levels();
+    levels
+        .into_iter()
+        .map(|(user_id, voice, share)| VoiceLevel {
+            user_id,
+            voice: voice as f64,
+            share: share as f64,
+        })
+        .collect()
+}
+
+/// Our own microphone peak (0..1), for the self speaking indicator.
+/// Written by the capture callback; 0 while muted or out of voice.
+pub fn mic_level(session_id: u32) -> f64 {
+    #[cfg(feature = "audio-device")]
+    {
+        if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+            return f32::from_bits(s.mic_level.load(Ordering::Relaxed)) as f64;
+        }
+    }
+    #[cfg(not(feature = "audio-device"))]
+    let _ = session_id;
+    0.0
 }
 
 /// Request the channel listing (response: "channel_list" event).
@@ -1787,6 +1923,70 @@ mod disconnect_tests {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Auto-reconnect, end to end: the token a password login returns is the
+/// credential the next launch uses — no password, same account, and an
+/// unknown token is refused exactly like a wrong password.
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use parley_server::{Config, Server};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("parley-bridge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_saved_token_reconnects_without_the_password() {
+        let _env = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir("resume");
+        // The remembered login and the TOFU pin both live under this.
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        let config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            data_dir: dir.join("data"),
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        {
+            let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+            db.create_user("alice", "pass_a", false).unwrap();
+        }
+        let server = rt().block_on(async { Server::bind(&config).unwrap() });
+        let addr = server.local_addr();
+        rt().spawn(server.run());
+        let address = format!("127.0.0.1:{}", addr.port());
+
+        let first =
+            connect(address.clone(), "alice".into(), "pass_a".into()).expect("password login");
+        assert!(!first.session_token.is_empty(), "auth must issue a token");
+        crate::api::login::save(&address, "alice", &first.session_token).expect("remember login");
+        disconnect(first.session_id).unwrap();
+
+        let saved = crate::api::login::load()
+            .expect("read saved login")
+            .expect("a saved login after a successful one");
+        assert_eq!(saved.server, address);
+        assert_eq!(saved.user, "alice");
+
+        let resumed = connect_with_token(saved.server, saved.user, saved.token)
+            .expect("token reconnect must work without the password");
+        assert_eq!(resumed.user_id, first.user_id, "same account");
+        disconnect(resumed.session_id).unwrap();
+
+        // A token the server never issued is refused like a bad password.
+        let err = connect_with_token(address, "alice".into(), "not-a-token".into())
+            .expect_err("an unknown token must be refused");
+        assert!(err.contains("auth denied"), "{err}");
+
+        // Signing out deletes the file; the next launch shows the form.
+        crate::api::login::forget().unwrap();
+        assert!(crate::api::login::load().unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

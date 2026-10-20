@@ -294,6 +294,10 @@ async fn serve(
         // unregistered) reaches the survivors. Generation-guarded — a
         // replaced session's death must not un-list its successor.
         registry.broadcast(presence_message(registry));
+        // Mute is a SESSION preference (the client resets it at startup):
+        // forgetting it here keeps the server's roster in step with a
+        // client that signs back in unmuted.
+        voice.clear_muted(info.id);
     }
     if still_current && voice.leave(info.id).is_some() {
         registry.broadcast(ServerMessage {
@@ -301,6 +305,7 @@ async fn serve(
                 user_id: info.id,
                 channel_id: 0,
                 joined: false,
+                muted: voice.is_muted(info.id),
             })),
         });
     }
@@ -440,6 +445,7 @@ async fn handle_client_message(
                             user_id: info.id,
                             channel_id: old,
                             joined: false,
+                            muted: voice.is_muted(info.id),
                         })),
                     });
                 }
@@ -448,6 +454,7 @@ async fn handle_client_message(
                         user_id: info.id,
                         channel_id: j.channel_id,
                         joined: true,
+                        muted: voice.is_muted(info.id),
                     })),
                 });
             }
@@ -470,6 +477,24 @@ async fn handle_client_message(
                         user_id: info.id,
                         channel_id: 0,
                         joined: false,
+                        muted: voice.is_muted(info.id),
+                    })),
+                });
+            }
+        }
+
+        Some(ClientBody::SetMute(m)) => {
+            // A mute is roster news, not channel-scoped: the whole session
+            // sees it, so "muted" is right on the first join broadcast and
+            // a state poll can never disagree with the last SetMute.
+            if voice.set_muted(info.id, m.muted) {
+                let channel = voice.channel_of(info.id);
+                registry.broadcast(ServerMessage {
+                    body: Some(ServerBody::VoiceState(PbVoiceState {
+                        user_id: info.id,
+                        channel_id: channel.unwrap_or(0),
+                        joined: channel.is_some(),
+                        muted: m.muted,
                     })),
                 });
             }
@@ -483,10 +508,11 @@ async fn handle_client_message(
                     body: Some(ServerBody::VoiceStateList(VoiceStateList {
                         states: states
                             .into_iter()
-                            .map(|(user_id, channel_id)| PbVoiceState {
+                            .map(|(user_id, channel_id, muted)| PbVoiceState {
                                 user_id,
                                 channel_id,
                                 joined: true,
+                                muted,
                             })
                             .collect(),
                     })),

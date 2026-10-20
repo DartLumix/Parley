@@ -1,5 +1,6 @@
 //! Bridge API surface — one module per feature area as the client grows.
 
+pub mod login;
 pub mod session;
 pub mod video;
 pub mod voice;

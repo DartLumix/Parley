@@ -14,6 +14,8 @@ class LoginView extends StatelessWidget {
     required this.connecting,
     required this.status,
     required this.onConnect,
+    this.onReconnect,
+    this.reconnectLabel,
   });
 
   final TextEditingController server;
@@ -22,6 +24,11 @@ class LoginView extends StatelessWidget {
   final bool connecting;
   final String status;
   final VoidCallback onConnect;
+
+  /// A remembered session exists (its token is on disk): offer the
+  /// password-free way back in. Null when this machine has no saved login.
+  final VoidCallback? onReconnect;
+  final String? reconnectLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -60,6 +67,18 @@ class LoginView extends StatelessWidget {
                 decoration: const InputDecoration(labelText: 'Password'),
               ),
               const SizedBox(height: 16),
+              if (onReconnect != null && reconnectLabel != null) ...[
+                OutlinedButton.icon(
+                  onPressed: connecting ? null : onReconnect,
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: Text(reconnectLabel!),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 13),
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               ElevatedButton(
                 onPressed: connecting ? null : onConnect,
                 style: ElevatedButton.styleFrom(
