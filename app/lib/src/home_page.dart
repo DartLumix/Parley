@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
@@ -10,9 +11,51 @@ import 'theme.dart';
 import 'widgets/fullscreen_share.dart';
 import 'widgets/login_view.dart';
 import 'widgets/pill.dart';
+import 'widgets/screens_panel.dart';
 import 'widgets/share_dialog.dart';
 import 'widgets/settings_page.dart';
 import 'window.dart';
+
+/// Whether a `voice_state` event is a real membership CHANGE in the
+/// channel this client is in — the only thing the join/leave cue is for.
+///
+/// The event carries three different kinds of news: somebody joining a
+/// channel, somebody leaving one, and somebody's mute flag flipping
+/// (the server broadcasts `SetMute` as a `VoiceState` with `joined: true`
+/// and the member's current channel). A poll or a re-announce repeats a
+/// membership that never moved. So the cue is driven by the transition,
+/// not by the event: the same channel in and out means nothing happened,
+/// and muting must be silent.
+bool isVoiceMembershipCue({
+  required int userId,
+  required int? me,
+  required BigInt? myChannel,
+  required BigInt? channelBefore,
+  required bool joined,
+  required BigInt eventChannel,
+}) {
+  if (me == null || myChannel == null || userId == me) return false;
+  final wasMine = channelBefore == myChannel;
+  final isMine = joined && eventChannel == myChannel;
+  return isMine != wasMine;
+}
+
+/// The clamp bounds for the left column (channels + rosters).
+///
+/// The column is measured to fit its longest name, but a name fits in a
+/// couple of hundred pixels and the roster reads like a squeezed strip
+/// at that width — so the floor sits near twice the old 220 px default.
+/// The ceiling keeps a long handle from eating the screens area, and
+/// both stay ordered even on the first frame, when the window can still
+/// be a few pixels wide (`clamp` throws on an inverted range).
+(double, double) channelPanelBounds(double available) {
+  final upper = math.max(160.0, math.min(560.0, available * 0.46));
+  // The floor follows the window down: a 900 px window gives the column
+  // a third of itself, not half, so the screens area never becomes the
+  // sliver on the small windows where it matters most.
+  final lower = math.min(math.max(160.0, available * 0.38), math.min(420.0, upper));
+  return (lower, upper);
+}
 
 /// The whole client: login, channels, chat, voice membership, share
 /// watching and the fullscreen viewer. One stateful page on purpose —
@@ -76,14 +119,16 @@ class _HomePageState extends State<HomePage> {
   // opens/closes the devices on the own join/leave events. The UI only
   // reflects membership; there is no listen toggle.
   bool _voiceUp = false;
-  // 7f: active remote shares — user_id → (texture_id, w, h). Driven by
-  // the video_started / video_stopped events; textures are owned by
-  // the Rust bridge (one per sender, stable across stop/re-share).
-  final Map<int, (int, int, int)> _videos = {};
-  // Which share the right-hand pane is showing. Starting a share no
-  // longer throws video onto the page: the pane offers a "Watch"
-  // button and the stream is only rendered once chosen.
-  int? _watching;
+  // 7f: active remote shares — user_id → (texture_id, w, h, fps).
+  // Driven by the video_started / video_stats / video_stopped events;
+  // textures are owned by the Rust bridge (one per sender, stable
+  // across stop/re-share).
+  final Map<int, (int, int, int, int)> _videos = {};
+  // Shares the screens area has OPEN, in the order they were opened.
+  // Several may be open: the big area splits between them and the rest
+  // wait in a strip. Every open share is audible (their system audio is
+  // a separate mixer stream), so closing one mutes only that one.
+  final List<int> _watched = [];
   // Fullscreen viewer (a whole-page mode, not a route: a share ending
   // has to close it from the same state that receives the event). The
   // GTK window goes genuinely fullscreen alongside it.
@@ -104,6 +149,10 @@ class _HomePageState extends State<HomePage> {
   // The sharer's own preview texture (Rust creates it once per process).
   video_api.SharePreview? _preview;
   String? _previewError;
+  // The running share's real shape (capture pixels + paced rate), read
+  // from the capture thread at 1 Hz while sharing. Only used for the
+  // card's "1920×1080 · 30 fps" line.
+  video_api.ShareStats? _shareStats;
   // Mic mute (the button next to Share): while set, the Rust capture
   // callback sends nothing at all. Session-scoped; a new login starts
   // unmuted.
@@ -200,6 +249,22 @@ class _HomePageState extends State<HomePage> {
     if (++_pollTick % 10 == 0) {
       requestPresence(sessionId: id);
       requestVoiceStates(sessionId: id);
+    }
+    // The own-share card's size/rate live on the capture thread; a 1 Hz
+    // read is enough and costs nothing on the media path.
+    if (_sharing) _loadShareStats();
+  }
+
+  /// Read the running share's negotiated shape (capture pixels + paced
+  /// fps). Best-effort: a build without capture reports null and the
+  /// card falls back to "your screen".
+  Future<void> _loadShareStats() async {
+    try {
+      final stats = await video_api.shareStats();
+      if (!mounted) return;
+      setState(() => _shareStats = stats);
+    } catch (e) {
+      debugPrint('share stats: $e');
     }
   }
 
@@ -383,16 +448,18 @@ class _HomePageState extends State<HomePage> {
       _usernames.clear();
       _videos.clear();
       _voiceChannel.clear();
-      _watching = null;
+      _watched.clear();
       _fullscreen = null;
       _sharing = false;
       _micMuted = false;
       _levels.clear();
       _selfLevel = 0;
       _mutedUsers.clear();
+      _shareStats = null;
     });
     setWindowFullscreen(false);
     _muteAllShares();
+    _syncScreenWatch();
     // Clean the dead registry entry (a manual Disconnect may have
     // raced us — ignore).
     try {
@@ -613,7 +680,7 @@ class _HomePageState extends State<HomePage> {
       _usernames.clear();
       _videos.clear();
       _voiceChannel.clear();
-      _watching = null;
+      _watched.clear();
       _fullscreen = null;
       _sharing = false;
       _micMuted = false;
@@ -622,36 +689,180 @@ class _HomePageState extends State<HomePage> {
       _mutedUsers.clear();
       _volume.clear();
       _shareVolume.clear();
+      _shareStats = null;
     });
     setWindowFullscreen(false);
+    _syncScreenWatch();
   }
 
   // --- fullscreen: a real window mode, with only the two controls the
   // viewer needs (exit, stop watching) over the picture.
 
+  /// Fullscreen the share that is ALREADY open.
+  ///
+  /// It must not go through `_watch`: that is a toggle, and the tile's
+  /// fullscreen button only exists on an open tile — so toggling there
+  /// CLOSED the share on the way in (it left the watched set, the
+  /// display bridge stopped converting and uploading frames, and its
+  /// system audio was muted) and left the fullscreen page painting the
+  /// one frame it had: the picture froze until the viewer was closed and
+  /// the tile watched again. Watching is idempotent here; the picture
+  /// simply follows the same texture into the fullscreen page.
+  ///
+  /// Our own share is the other half of the button: it has no received
+  /// texture and no watch state, but the capture preview it draws is a
+  /// picture like any other, so it gets the same page.
   void _enterFullscreen(int userId) {
-    _watch(userId);
+    if (userId == _session?.userId) {
+      unawaited(_enterOwnFullscreen());
+      return;
+    }
+    if (!_videos.containsKey(userId)) return;
+    _ensureWatched(userId);
     setState(() => _fullscreen = userId);
     setWindowFullscreen(true);
   }
 
-  /// Which share is on screen, and therefore audible. A screen share's
-  /// system audio is silent until its card is opened: hearing someone's
-  /// music the instant they start sharing is not the same thing as
-  /// watching the share. Their VOICE is a separate stream and keeps
-  /// coming through either way.
-  void _watch(int? userId) {
-    final previous = _watching;
-    setState(() => _watching = userId);
-    if (previous != null && previous != userId) {
-      _setShareAudio(previous, false);
+  /// Fullscreen our own share. A share started with the preview switch
+  /// off has no preview texture and the capture tap is not feeding one,
+  /// so expanding turns the preview on (it is what the page shows) and
+  /// the viewer opens on its first frame.
+  Future<void> _enterOwnFullscreen() async {
+    final me = _session?.userId;
+    if (me == null || !_sharing) return;
+    if (!_settings.showSharePreview) {
+      await _setPreviewEnabled(true);
+    } else if (_preview == null) {
+      await _loadPreview();
     }
-    if (userId != null) _setShareAudio(userId, true);
+    if (!mounted || _preview == null) return;
+    setState(() => _fullscreen = me);
+    setWindowFullscreen(true);
   }
+
+  /// What the fullscreen page shows, or null when there is nothing to
+  /// paint. Our own share draws the capture preview on a 16:9 canvas; a
+  /// remote share keeps its own aspect. Nothing is returned for a share
+  /// whose preview is off or still opening, so the window leaves
+  /// fullscreen instead of showing black.
+  ({
+    int userId,
+    String title,
+    int textureId,
+    int width,
+    int height,
+    double aspectRatio,
+    bool own,
+  })?
+  _fullscreenView() {
+    final id = _fullscreen;
+    final me = _session?.userId;
+    if (id == null || me == null) return null;
+    if (id == me) {
+      final preview = _preview;
+      if (!_sharing || preview == null) return null;
+      // The preview canvas follows the stream (it is the capture at the
+      // encoder's size), so the page uses the STREAM's shape — a 21:9
+      // screen filled the page's 16:9 box with bars before.
+      final w = _shareStats?.width.toInt() ?? preview.width.toInt();
+      final h = _shareStats?.height.toInt() ?? preview.height.toInt();
+      return (
+        userId: id,
+        title: '${_nameOf(id)} (you)',
+        textureId: preview.textureId,
+        width: w,
+        height: h,
+        aspectRatio: w > 0 && h > 0 ? w / h : 16 / 9,
+        own: true,
+      );
+    }
+    final v = _videos[id];
+    if (v == null) return null;
+    return (
+      userId: id,
+      title: _nameOf(id),
+      textureId: v.$1,
+      width: v.$2,
+      height: v.$3,
+      aspectRatio: v.$2 > 0 && v.$3 > 0 ? v.$2 / v.$3 : 16 / 9,
+      own: false,
+    );
+  }
+
+  /// Open one share without the toggle semantics of [_watch]. Used by the
+  /// fullscreen viewer, which opens a tile that is already open.
+  void _ensureWatched(int userId) {
+    if (_watched.contains(userId)) return;
+    setState(() => _watched.add(userId));
+    _syncScreenWatch();
+    if (userId != _session?.userId) _setShareAudio(userId, true);
+  }
+
+  /// Open (or close) one share in the big area. A screen share's system
+  /// audio is silent until its card is opened: hearing someone's music
+  /// the instant they start sharing is not the same thing as watching
+  /// the share. Their VOICE is a separate stream and keeps coming
+  /// through either way.
+  void _watch(int userId) {
+    if (_watched.contains(userId)) {
+      _unwatch(userId);
+      return;
+    }
+    _ensureWatched(userId);
+  }
+
+  /// Close one open share without touching the others.
+  void _unwatch(int userId) {
+    if (!_watched.remove(userId)) return;
+    setState(() {});
+    _syncScreenWatch();
+    if (userId != _session?.userId) _setShareAudio(userId, false);
+    if (_fullscreen == userId) {
+      _fullscreen = null;
+      setWindowFullscreen(false);
+    }
+  }
+
 
   /// Sharers whose share audio the Rust side is currently playing —
   /// muted again on disconnect so a later session starts silent.
   final Set<int> _audibleShares = {};
+
+  /// The shares whose picture the Rust display bridge has been told to
+  /// paint. Only an OPEN tile is on this list: a closed one costs the
+  /// bridge nothing — no RGB conversion, no texture upload, no raster
+  /// hand-off — because nothing renders it.
+  final Set<int> _rustWatched = {};
+
+  /// Push the open-share set to the display bridge (a delta, so a
+  /// rebuild never re-sends the same state). Our own share is skipped:
+  /// its picture is the capture preview, not a received texture.
+  void _syncScreenWatch() {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) {
+      _rustWatched.clear();
+      return;
+    }
+    final me = _session?.userId;
+    final want = {
+      for (final id in _watched)
+        if (id != me) id,
+    };
+    for (final id in _rustWatched.difference(want).toList()) {
+      _rustWatched.remove(id);
+      unawaited(
+        setScreenWatched(sessionId: sessionId, userId: id, watched: false)
+            .catchError((_) {}),
+      );
+    }
+    for (final id in want.difference(_rustWatched)) {
+      _rustWatched.add(id);
+      unawaited(
+        setScreenWatched(sessionId: sessionId, userId: id, watched: true)
+            .catchError((_) {}),
+      );
+    }
+  }
 
   Future<void> _setShareAudio(int userId, bool audible) async {
     final sessionId = _session?.sessionId;
@@ -697,8 +908,8 @@ class _HomePageState extends State<HomePage> {
   /// backstop for a notice that never arrived — the "card that stays
   /// there forever, Watch shows the last frame" bug.
   void _pruneShares() {
-    if (_videos.isEmpty) return;
     final me = _session?.userId;
+    if (_videos.isEmpty && !_sharing) return;
     final myChannel = _joinedChannelId;
     final online = {for (final u in _presence) u.userId};
     _videos.removeWhere((id, _) {
@@ -711,14 +922,15 @@ class _HomePageState extends State<HomePage> {
       }
       return false;
     });
-    if (_watching != null && !_videos.containsKey(_watching)) {
-      _setShareAudio(_watching!, false);
-      _watching = null;
-    }
+    // Own share: it lives in `_sharing`, not `_videos`, so "still on
+    // screen" is a different question for it.
+    bool visible(int id) => id == me ? _sharing : _videos.containsKey(id);
+    _watched.removeWhere((id) => !visible(id));
+    _syncScreenWatch();
     for (final id in _audibleShares.toList()) {
-      if (!_videos.containsKey(id)) _setShareAudio(id, false);
+      if (!visible(id)) _setShareAudio(id, false);
     }
-    if (_fullscreen != null && !_videos.containsKey(_fullscreen)) {
+    if (_fullscreen != null && _fullscreenView() == null) {
       _fullscreen = null;
       setWindowFullscreen(false);
     }
@@ -788,10 +1000,13 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Flip the preview switch from the share pane. Persisted like the
-  /// settings-page control (same value), and it takes effect mid-share:
-  /// the capture tap checks the setting per encoded frame.
+  /// Flip the preview switch on our own screen tile. Persisted like
+  /// every preference, and it takes effect mid-share: the capture tap
+  /// checks it before any frame is even handed to the preview thread.
   Future<void> _setPreviewEnabled(bool on) async {
+    // Turning the preview off takes away the only picture our own
+    // fullscreen page has: leave it first, then switch.
+    if (!on && _fullscreen == _session?.userId) _exitFullscreen();
     await _saveSettings(
       settings_api.AppSettings(
         hwEncode: _settings.hwEncode,
@@ -818,6 +1033,23 @@ class _HomePageState extends State<HomePage> {
     );
     if (options == null || !mounted || _session?.sessionId != session.sessionId) {
       return;
+    }
+    // The dialog is the same cap Settings → Video edits, so remember what
+    // was actually picked: next time it should not snap back to a stale
+    // value (a 720p60 choice that reverts to 1440p60 reads as a bug).
+    if (options.height != _settings.shareHeight ||
+        options.fps != _settings.shareFps) {
+      unawaited(
+        _saveSettings(
+          settings_api.AppSettings(
+            hwEncode: _settings.hwEncode,
+            showSharePreview: _settings.showSharePreview,
+            shareHeight: options.height,
+            shareFps: options.fps,
+            echoCancel: _settings.echoCancel,
+          ),
+        ),
+      );
     }
     try {
       await startScreenShare(
@@ -894,6 +1126,21 @@ class _HomePageState extends State<HomePage> {
         _ingestChat(ev.messages, prepend: true);
         _scrollChat();
       case 'voice_state':
+        // A cue for the people we are in a call with: somebody entered
+        // or left THIS channel. Mute changes arrive as voice_state too,
+        // and a poll or a reconnect re-announces members who never
+        // moved, so only a real transition makes a sound.
+        final mine = _joinedChannelId;
+        if (isVoiceMembershipCue(
+          userId: ev.userId,
+          me: _session?.userId,
+          myChannel: mine,
+          channelBefore: _voiceChannel[ev.userId],
+          joined: ev.joined,
+          eventChannel: ev.channelId,
+        )) {
+          unawaited(playVoiceChime(join: ev.joined).catchError((_) {}));
+        }
         setState(() {
           if (ev.joined) {
             _voiceChannel[ev.userId] = ev.channelId;
@@ -940,9 +1187,9 @@ class _HomePageState extends State<HomePage> {
       case 'video_started':
         final s0 = ev.surface;
         if (s0 != null) {
-          // A share starts silent. Watching it (the card, fullscreen)
+          // A share starts silent. Opening it (the card, fullscreen)
           // turns its sound on; the sharer's voice is unaffected.
-          _setShareAudio(s0.userId, _watching == s0.userId);
+          _setShareAudio(s0.userId, _watched.contains(s0.userId));
           setState(() {
             // FRB maps u64 → BigInt and i64 → PlatformInt64: narrow
             // for display (dev-client resolutions fit int).
@@ -950,10 +1197,29 @@ class _HomePageState extends State<HomePage> {
               s0.textureId,
               s0.width.toInt(),
               s0.height.toInt(),
+              s0.fps.toInt(),
             );
             final name = _nameOf(s0.userId);
             _status = '$name is sharing ${s0.width}×${s0.height}';
           });
+        }
+      case 'video_stats':
+        // Same surface, new dimensions and/or a measured cadence. The
+        // texture id is stable, so the card simply keeps rendering.
+        final s2 = ev.surface;
+        if (s2 != null) {
+          final old = _videos[s2.userId];
+          if (old != null) {
+            final fps = s2.fps.toInt() > 0 ? s2.fps.toInt() : old.$4;
+            setState(() {
+              _videos[s2.userId] = (
+                old.$1,
+                s2.width.toInt(),
+                s2.height.toInt(),
+                fps,
+              );
+            });
+          }
         }
       case 'video_stopped':
         final s1 = ev.surface;
@@ -961,12 +1227,21 @@ class _HomePageState extends State<HomePage> {
           _setShareAudio(s1.userId, false);
           setState(() {
             _videos.remove(s1.userId);
-            if (_watching == s1.userId) _watching = null;
+            _watched.remove(s1.userId);
             if (_fullscreen == s1.userId) {
               _fullscreen = null;
               setWindowFullscreen(false);
             }
+            // The strip must not keep advertising a share that ended.
+            if (_videos.isEmpty && !_sharing && _status.contains('sharing')) {
+              _status = 'connected';
+            }
           });
+          // The bridge forgot this sender when the stop arrived; the
+          // mirror has to as well, or a later share from the same user
+          // would look watched and never be told to paint.
+          _rustWatched.remove(s1.userId);
+          _syncScreenWatch();
         }
       case 'share_started':
         if (mounted) {
@@ -975,15 +1250,32 @@ class _HomePageState extends State<HomePage> {
           // The preview texture is fetched now, not at startup: a user
           // who never shares never pays for it.
           if (_settings.showSharePreview) _loadPreview();
+          _loadShareStats();
         }
       case 'share_ended':
         if (mounted) {
-          setState(() => _sharing = false);
+          final ownFullscreen = _fullscreen == _session?.userId;
+          setState(() {
+            _sharing = false;
+            _shareStats = null;
+            _watched.remove(_session?.userId);
+            if (ownFullscreen) _fullscreen = null;
+          });
+          // The page that was showing the preview has nothing left to
+          // paint: put the window back before the picture disappears.
+          if (ownFullscreen) setWindowFullscreen(false);
           _status = 'share ended';
         }
       case 'share_failed':
         if (mounted) {
-          setState(() => _sharing = false);
+          final ownFullscreen = _fullscreen == _session?.userId;
+          setState(() {
+            _sharing = false;
+            _shareStats = null;
+            _watched.remove(_session?.userId);
+            if (ownFullscreen) _fullscreen = null;
+          });
+          if (ownFullscreen) setWindowFullscreen(false);
           _status = 'share failed: ${ev.username}';
         }
       case 'session_closed':
@@ -1063,27 +1355,28 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final fullscreenId =
-        (_fullscreen != null && _videos.containsKey(_fullscreen))
-        ? _fullscreen
-        : null;
     // Fullscreen is its own page, not a layer over the session view: no
     // app bar, no floating share/HW bar, no padding, no window toolbar.
     // The GTK window is in real fullscreen behind it.
-    if (fullscreenId != null) {
-      final v = _videos[fullscreenId]!;
+    final fs = _fullscreenView();
+    if (fs != null) {
       return Scaffold(
         backgroundColor: Colors.black,
         body: FullscreenShare(
-          title: _nameOf(fullscreenId),
-          textureId: v.$1,
-          width: v.$2,
-          height: v.$3,
+          title: fs.title,
+          textureId: fs.textureId,
+          width: fs.width,
+          height: fs.height,
+          aspectRatio: fs.aspectRatio,
           onExit: _exitFullscreen,
-          onStopWatching: () {
-            _exitFullscreen();
-            _watch(null);
-          },
+          // Our own share has no watch state to stop — the window is
+          // showing the preview, not somebody else's stream.
+          onStopWatching: fs.own
+              ? null
+              : () {
+                  _exitFullscreen();
+                  _unwatch(fs.userId);
+                },
         ),
       );
     }
@@ -1137,18 +1430,6 @@ class _HomePageState extends State<HomePage> {
           floatingActionButtonLocation:
               FloatingActionButtonLocation.centerFloat,
         ),
-        // Watching someone else replaces the pane above the chat, so the
-        // sharer's own view rides here as a small overlay instead of
-        // disappearing mid-sentence ("did I stop sharing?").
-        if (_sharing &&
-            _watching != null &&
-            _settings.showSharePreview &&
-            _preview != null)
-          Positioned(
-            right: 24,
-            bottom: 96,
-            child: _selfPreviewPip(_preview!),
-          ),
         // The native title bar is gone; this is the replacement. It is
         // drawn over the app bar only while the pointer is at the top.
         const WindowToolbar(),
@@ -1156,13 +1437,13 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // --- connected layout: channels on the left, chat on the right, and a
-  // share pushes in ABOVE the chat (the chat keeps its width and moves
-  // down rather than the whole page re-splitting).
+  // --- connected layout: channels on the left, screens + chat on the
+  // right. The channel column is as wide as its longest name needs (see
+  // [_channelPanelWidth]) so the rest of the window is screens and chat.
 
   Widget _sessionView(ThemeData theme) {
     return Padding(
-      // Bottom room for the floating share/mute/HW bar.
+      // Bottom room for the floating share/mute bar.
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1170,13 +1451,22 @@ class _HomePageState extends State<HomePage> {
           _connectionStrip(theme),
           const SizedBox(height: 12),
           Expanded(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(flex: 4, child: _channelsPanel(theme)),
-                const SizedBox(width: 16),
-                Expanded(flex: 6, child: _rightPane(theme)),
-              ],
+            child: LayoutBuilder(
+              builder: (context, c) {
+                final channels = _channelPanelWidth(theme, c.maxWidth);
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    SizedBox(
+                      key: const ValueKey('channels-column'),
+                      width: channels,
+                      child: _channelsPanel(theme),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(child: _rightPane(theme)),
+                  ],
+                );
+              },
             ),
           ),
         ],
@@ -1184,20 +1474,97 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// The right-hand split: the share (when there is one) on top, the
-  /// chat below it. With no share the chat simply owns the pane.
+  /// The width the channel column needs: the longest name it will ever
+  /// print, plus the chrome every row carries (icon, Join button,
+  /// padding). Clamped so a long username cannot eat the screens area,
+  /// and floored so the panel stays legible.
+  ///
+  /// The floor is deliberately generous — the roster is the one list a
+  /// user reads to know who is in voice, and the same column holds the
+  /// channel cards — so between a narrow measured width and a roomy one
+  /// the panel takes the roomy one.
+  double _channelPanelWidth(ThemeData theme, double available) {
+    var needed = 0.0;
+    void measure(String text, TextStyle style, double chrome) {
+      final painter = TextPainter(
+        text: TextSpan(text: text, style: style),
+        maxLines: 1,
+        textDirection: TextDirection.ltr,
+      )..layout();
+      needed = math.max(needed, painter.width + chrome);
+      painter.dispose();
+    }
+
+    // Header: "Channels" + "N online".
+    measure(
+      'Channels',
+      theme.textTheme.titleMedium ?? const TextStyle(fontSize: 16),
+      90.0,
+    );
+    // A channel row: card padding (10+6), icon 18 + gap 8, the trailing
+    // Join/Leave button 64 + gap.
+    const channelChrome = 10.0 + 6 + 18 + 8 + 64 + 8;
+    for (final c in _channels) {
+      measure(
+        c.name,
+        const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+        channelChrome,
+      );
+    }
+    // A roster row: padding 24, icon 15 + gap 9, the volume label 34,
+    // plus breathing room so the longest name is not flush against the
+    // edge (the speaker list is the one place a long handle must stay
+    // readable).
+    const rowChrome = 24.0 + 15 + 9 + 34 + 12;
+    for (final u in _presence) {
+      final name = u.userId == _session?.userId
+          ? '${_nameOf(u.userId)} (you)'
+          : _nameOf(u.userId);
+      measure(name, const TextStyle(fontSize: 13), rowChrome);
+    }
+    // The idle card's title has only its own icon as chrome.
+    measure('Online, not in a channel', const TextStyle(fontSize: 13), 46.0);
+    final (lower, upper) = channelPanelBounds(available);
+    return needed.clamp(lower, upper);
+  }
+
+  /// The right-hand split: the screens area (sized to its content) on
+  /// top, the chat below it. With no screens the chat owns the pane.
   Widget _rightPane(ThemeData theme) {
-    // A running share of our own takes the pane too: that is where the
-    // preview and the Stop button live, even when nobody else shares.
-    final sharing = _videos.isNotEmpty || _sharing;
-    return Column(
-      children: [
-        if (sharing) ...[
-          Expanded(flex: 3, child: _sharePane(theme)),
-          const SizedBox(height: 12),
-        ],
-        Expanded(flex: sharing ? 2 : 1, child: _chatPanel(theme)),
-      ],
+    return LayoutBuilder(
+      builder: (context, c) {
+        final tiles = _screenTiles();
+        if (tiles.isEmpty) return _chatPanel(theme);
+        final ids = {for (final t in tiles) t.userId};
+        final open = [
+          for (final id in _watched)
+            if (ids.contains(id)) id,
+        ];
+        final height = ScreensPanel.heightFor(
+          tileCount: tiles.length,
+          openCount: open.length,
+          width: c.maxWidth,
+          availableHeight: c.maxHeight,
+        );
+        return Column(
+          children: [
+            SizedBox(
+              height: height,
+              child: ScreensPanel(
+                tiles: tiles,
+                open: open,
+                onWatch: _watch,
+                onClose: _unwatch,
+                onFullscreen: _enterFullscreen,
+                onPreviewEnabled: _setPreviewEnabled,
+                onVolume: _applyShareVolume,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(child: _chatPanel(theme)),
+          ],
+        );
+      },
     );
   }
 
@@ -1276,7 +1643,7 @@ class _HomePageState extends State<HomePage> {
     final accent = theme.colorScheme.primary;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.fromLTRB(12, 8, 8, 10),
+      padding: const EdgeInsets.fromLTRB(10, 6, 6, 8),
       decoration: BoxDecoration(
         color: joined
             ? accent.withValues(alpha: 0.16)
@@ -1287,7 +1654,7 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             children: [
@@ -1300,80 +1667,94 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  c.name,
-                  style: const TextStyle(fontWeight: FontWeight.w600),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      c.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15,
+                      ),
+                    ),
+                    Text(
+                      members.isEmpty
+                          ? 'voice empty'
+                          : '${members.length} in voice',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              Text(
-                members.isEmpty ? 'voice empty' : '${members.length} in voice',
-                style: const TextStyle(color: Colors.white38, fontSize: 12),
-              ),
-              const SizedBox(width: 4),
               joined
-                  ? TextButton(
-                      onPressed: _leaveChannel,
-                      child: const Text('Leave'),
-                    )
-                  : TextButton(
-                      onPressed: () => _joinChannel(c),
-                      child: const Text('Join'),
-                    ),
+                  ? _joinButton('Leave', _leaveChannel)
+                  : _joinButton('Join', () => _joinChannel(c)),
             ],
           ),
-          if (members.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(left: 26, top: 4),
-              child: Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: [for (final id in members) _memberChip(id)],
-              ),
-            ),
+          // Speakers are a VERTICAL list: one row per person, so a long
+          // roster grows downwards and names never get squeezed into a
+          // chip that wraps mid-name.
+          for (final id in members) _memberRow(id),
         ],
       ),
+    );
+  }
+
+  Widget _joinButton(String label, VoidCallback onPressed) {
+    return TextButton(
+      onPressed: onPressed,
+      style: TextButton.styleFrom(
+        minimumSize: const Size(64, 32),
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
+      ),
+      child: Text(label),
     );
   }
 
   Widget _idleCard(ThemeData theme, List<int> ids) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Row(
             children: [
               Icon(Icons.people_outline, size: 18, color: Colors.white38),
               SizedBox(width: 8),
-              Text(
-                'Online, not in a channel',
-                style: TextStyle(color: Colors.white54, fontSize: 13),
+              Expanded(
+                child: Text(
+                  'Online, not in a channel',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: Colors.white54, fontSize: 13),
+                ),
               ),
             ],
           ),
-          const SizedBox(height: 6),
-          Padding(
-            padding: const EdgeInsets.only(left: 26),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [for (final id in ids) _memberChip(id, idle: true)],
-            ),
-          ),
+          for (final id in ids) _memberRow(id, idle: true),
         ],
       ),
     );
   }
 
-  /// One roster chip. It lights up while that person is actually making
+  /// One roster row. It lights up while that person is actually making
   /// sound (local peak meter, not a flag), shows a muted mic when they say
   /// they are muted, and opens the volume dialog on click.
-  Widget _memberChip(int userId, {bool idle = false}) {
+  Widget _memberRow(int userId, {bool idle = false}) {
     final self = userId == _session?.userId;
     final level = self ? _selfLevel : (_levels[userId] ?? 0.0);
     final speaking = !idle && level > 0.05;
@@ -1384,7 +1765,7 @@ class _HomePageState extends State<HomePage> {
         ? accentSoft
         : (self ? accentSoft : Colors.greenAccent);
     // Your own volume is not a thing the mix can apply (your voice never
-    // comes back to you); only other people's chips open the dialog.
+    // comes back to you); only other people's rows open the dialog.
     final adjustable = !idle && !self;
     return Tooltip(
       message: adjustable ? '$name · click for volume' : name,
@@ -1393,16 +1774,17 @@ class _HomePageState extends State<HomePage> {
         onTap: adjustable ? () => _showVolumeDialog(userId) : null,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 110),
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          margin: const EdgeInsets.only(top: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           decoration: BoxDecoration(
             color: speaking
                 ? accent.withValues(alpha: 0.30)
-                : Colors.white.withValues(alpha: 0.06),
+                : Colors.white.withValues(alpha: 0.05),
             borderRadius: BorderRadius.circular(6),
             border: Border.all(
               color: speaking
                   ? accentSoft
-                  : Colors.white.withValues(alpha: 0.06),
+                  : Colors.white.withValues(alpha: 0.05),
             ),
             boxShadow: speaking
                 ? [
@@ -1415,12 +1797,12 @@ class _HomePageState extends State<HomePage> {
                 : const [],
           ),
           child: Row(
-            mainAxisSize: MainAxisSize.min,
             children: [
               if (idle)
                 Container(
                   width: 6,
                   height: 6,
+                  margin: const EdgeInsets.only(left: 3, right: 4),
                   decoration: const BoxDecoration(
                     shape: BoxShape.circle,
                     color: Colors.white24,
@@ -1431,22 +1813,27 @@ class _HomePageState extends State<HomePage> {
                   muted
                       ? Icons.mic_off
                       : (speaking ? Icons.graphic_eq : Icons.mic_none),
-                  size: 13,
+                  size: 15,
                   color: muted ? Colors.white38 : hot,
                 ),
-              const SizedBox(width: 6),
-              Text(name, style: const TextStyle(fontSize: 12)),
-              if (volume != 1.0) ...[
-                const SizedBox(width: 5),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+              if (volume != 1.0)
                 Text(
                   '${(volume * 100).round()}%',
                   style: const TextStyle(
-                    fontSize: 10,
+                    fontSize: 11,
                     color: Colors.white54,
                     fontFamily: 'monospace',
                   ),
                 ),
-              ],
             ],
           ),
         ),
@@ -1549,262 +1936,62 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // --- share pane (right side): an invitation until "Watch".
+  // --- screens: the 16:9 grid and its open/strip states live in
+  // widgets/screens_panel.dart (layout math and interactions are
+  // widget-tested there); this is just the session state behind it.
 
-  Widget _sharePane(ThemeData theme) {
-    final watching = _watching != null && _videos.containsKey(_watching)
-        ? _watching
-        : null;
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF0B0B0D),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: watching == null
-          ? _shareInvitations(theme)
-          : _shareView(theme, watching),
+  /// Everyone who has a screen to show: ourselves while sharing, then
+  /// the other sharers alphabetically (a stable order — cards must not
+  /// jump around on refresh).
+  List<int> _screenIds() {
+    final ids = [
+      for (final id in _videos.keys)
+        if (id != _session?.userId) id,
+    ];
+    ids.sort(
+      (a, b) => _nameOf(a).toLowerCase().compareTo(_nameOf(b).toLowerCase()),
     );
+    final me = _session?.userId;
+    if (_sharing && me != null) ids.insert(0, me);
+    return ids;
   }
 
-  Widget _shareInvitations(ThemeData theme) {
-    final ids = _videos.keys.toList()
-      ..sort((a, b) => _nameOf(a).compareTo(_nameOf(b)));
-    return ListView(
-      padding: const EdgeInsets.all(12),
-      children: [
-        if (_sharing) _selfPreviewCard(theme),
-        const Text(
-          'Screens',
-          style: TextStyle(color: Colors.white54, fontSize: 12),
+  /// The panel's model for every current share. Our own tile's picture
+  /// is the capture preview; its size/rate are the ENCODER's negotiation
+  /// (so a cap shows as the real thing), falling back to the preview's
+  /// own dimensions before the first frame.
+  List<ScreenTile> _screenTiles() {
+    final tiles = <ScreenTile>[];
+    for (final id in _screenIds()) {
+      final own = id == _session?.userId;
+      final v = own ? null : _videos[id];
+      final stats = own ? _shareStats : null;
+      final preview = own ? _preview : null;
+      final showing = !own || _settings.showSharePreview;
+      tiles.add(
+        ScreenTile(
+          userId: id,
+          name: own ? '${_nameOf(id)} (you)' : _nameOf(id),
+          own: own,
+          textureId: showing ? (own ? preview?.textureId : v?.$1) : null,
+          width: own
+              ? (stats?.width.toInt() ?? preview?.width.toInt() ?? 0)
+              : (v?.$2 ?? 0),
+          height: own
+              ? (stats?.height.toInt() ?? preview?.height.toInt() ?? 0)
+              : (v?.$3 ?? 0),
+          fps: own ? (stats?.fps.toInt() ?? 0) : (v?.$4 ?? 0),
+          notice: !showing
+              ? 'preview off'
+              : (own && preview == null
+                    ? (_previewError ?? 'waiting for the first frame\u2026')
+                    : (own ? null : 'connecting\u2026')),
+          previewEnabled: _settings.showSharePreview,
+          volume: _shareVolume[id] ?? 1.0,
         ),
-        const SizedBox(height: 8),
-        if (ids.isEmpty && !_sharing)
-          const Padding(
-            padding: EdgeInsets.only(top: 12),
-            child: Text(
-              'Nobody is sharing yet. Join a channel and press Share screen.',
-              style: TextStyle(color: Colors.white38, fontSize: 12),
-            ),
-          ),
-        for (final id in ids) _shareCard(theme, id),
-      ],
-    );
-  }
-
-  /// The small always-visible version of the preview, used while another
-  /// person's share owns the pane.
-  Widget _selfPreviewPip(video_api.SharePreview preview) {
-    return IgnorePointer(
-      child: Container(
-        width: 240,
-        decoration: BoxDecoration(
-          color: Colors.black,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: accentSoft.withValues(alpha: 0.5)),
-          boxShadow: const [
-            BoxShadow(color: Colors.black54, blurRadius: 14, spreadRadius: 1),
-          ],
-        ),
-        clipBehavior: Clip.antiAlias,
-        child: Stack(
-          children: [
-            AspectRatio(
-              aspectRatio: preview.width / preview.height,
-              child: Texture(textureId: preview.textureId),
-            ),
-            Positioned(
-              left: 6,
-              bottom: 5,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: const Text(
-                  'You',
-                  style: TextStyle(fontSize: 10, color: Colors.white70),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// What YOU are sending, from the capture tap — the same frames, before
-  /// they are encoded. Toggleable in place; off means the Rust side does
-  /// no scaling at all, not that a frame is hidden.
-  Widget _selfPreviewCard(ThemeData theme) {
-    final on = _settings.showSharePreview;
-    final preview = _preview;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: accent.withValues(alpha: 0.10),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: accentSoft.withValues(alpha: 0.35)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.podcasts, color: accentSoft, size: 18),
-              const SizedBox(width: 8),
-              const Expanded(
-                child: Text(
-                  'Your stream',
-                  style: TextStyle(fontWeight: FontWeight.w600),
-                ),
-              ),
-              Text(
-                on ? 'live' : 'preview off',
-                style: const TextStyle(color: Colors.white54, fontSize: 11),
-              ),
-              Switch(
-                value: on,
-                onChanged: _setPreviewEnabled,
-              ),
-              IconButton(
-                tooltip: 'Stop sharing',
-                icon: const Icon(Icons.stop_screen_share, size: 20),
-                onPressed: _stopShare,
-              ),
-            ],
-          ),
-          if (on)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(6),
-                child: preview != null
-                    ? AspectRatio(
-                        aspectRatio: preview.width / preview.height,
-                        child: Texture(textureId: preview.textureId),
-                      )
-                    : Container(
-                        height: 120,
-                        alignment: Alignment.center,
-                        color: Colors.black26,
-                        child: Text(
-                          _previewError ?? 'waiting for the first frame\u2026',
-                          style: const TextStyle(
-                            color: Colors.white38,
-                            fontSize: 11,
-                          ),
-                          textAlign: TextAlign.center,
-                        ),
-                      ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _shareCard(ThemeData theme, int userId) {
-    final v = _videos[userId]!;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.05),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.screen_share, color: accentSoft),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '${_nameOf(userId)} is sharing',
-                  style: const TextStyle(fontWeight: FontWeight.w600),
-                ),
-                Text(
-                  '${v.$2}×${v.$3}',
-                  style: const TextStyle(color: Colors.white38, fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          FilledButton.tonal(
-            onPressed: () => _watch(userId),
-            child: const Text('Watch'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _shareView(ThemeData theme, int userId) {
-    final v = _videos[userId]!;
-    final texture = Texture(textureId: v.$1);
-    return Column(
-      children: [
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: Center(
-              child: AspectRatio(aspectRatio: v.$2 / v.$3, child: texture),
-            ),
-          ),
-        ),
-        const Divider(height: 1),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  '${_nameOf(userId)} · ${v.$2}×${v.$3}',
-                  style: const TextStyle(color: Colors.white70, fontSize: 12),
-                ),
-              ),
-              // Per-stream volume: this share's system audio only. Their
-              // voice keeps its own level (the roster's volume dialog).
-              SizedBox(
-                width: 150,
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.volume_up,
-                      size: 15,
-                      color: Colors.white54,
-                    ),
-                    Expanded(
-                      child: Slider(
-                        value: _shareVolume[userId] ?? 1.0,
-                        min: 0,
-                        max: 2,
-                        onChanged: (value) => _applyShareVolume(userId, value),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              IconButton(
-                tooltip: 'Fullscreen',
-                icon: const Icon(Icons.fullscreen, size: 20),
-                onPressed: () => _enterFullscreen(userId),
-              ),
-              IconButton(
-                tooltip: 'Stop watching',
-                icon: const Icon(Icons.visibility_off, size: 20),
-                onPressed: () => _watch(null),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
+      );
+    }
+    return tiles;
   }
 
   Future<void> _toggleMic() async {

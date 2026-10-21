@@ -46,17 +46,30 @@ cp "$ROOT/packaging/QUICKSTART.txt" "$STAGE/$NAME/QUICKSTART.txt"
 cp "$ROOT/LICENSE" "$STAGE/$NAME/LICENSE"
 chmod +x "$STAGE/$NAME/install.sh" "$STAGE/$NAME/parley"
 
-# Portability guard. The AEC is statically linked, but if this machine has
-# a system abseil >= 20240722 the bundled WebRTC build links that instead —
-# the tarball then only runs on machines with the same abseil. The release
-# CI has no system abseil, so its builds are self-contained.
-system_linkage=$(ldd "$STAGE/$NAME/lib/libparley_flutter.so" 2>/dev/null |
-    grep -E "webrtc-audio|absl" || true)
-if [ -n "$system_linkage" ]; then
-    echo "WARNING: this build links system WebRTC/abseil libraries:" >&2
-    echo "$system_linkage" >&2
-    echo "         it will not run on a machine without them." >&2
-    echo "         Release builds run in CI, which has neither." >&2
+# Portability. If this machine has a system abseil, the WebRTC AEC links
+# those shared libraries instead of the static copy. Ship them INSIDE the
+# tarball's lib/ (the bridge carries a $ORIGIN runpath for exactly this,
+# see app/rust/build.rs) so the build does not depend on the target
+# machine having the same abseil installed.
+BRIDGE="$STAGE/$NAME/lib/libparley_flutter.so"
+bundled=0
+while IFS= read -r lib; do
+    [ -n "$lib" ] || continue
+    cp -L "$lib" "$STAGE/$NAME/lib/" && bundled=$((bundled + 1))
+done < <(ldd "$BRIDGE" 2>/dev/null |
+    awk '/=> \// {print $3}' |
+    grep -E 'lib(absl|webrtc)' || true)
+if [ "$bundled" -gt 0 ]; then
+    echo "==> bundled $bundled system WebRTC/abseil libraries into lib/"
+fi
+# The bundled copies are only found if the bridge looks in its own
+# directory; assert that instead of trusting it silently.
+if [ "$bundled" -gt 0 ] &&
+    ! readelf -d "$BRIDGE" | grep -q 'RUNPATH.*\$ORIGIN'; then
+    echo "ERROR: external libraries were bundled but the bridge has no" >&2
+    echo "       \$ORIGIN runpath, so it would still load the host's copies." >&2
+    echo "       (app/rust/build.rs sets it; a stale bridge .so is the usual cause.)" >&2
+    exit 1
 fi
 
 mkdir -p "$OUT"

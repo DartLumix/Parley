@@ -106,6 +106,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SavedLogin dco_decode_box_autoadd_saved_login(dynamic raw);
 
   @protected
+  ShareStats dco_decode_box_autoadd_share_stats(dynamic raw);
+
+  @protected
   VideoSurfaceInfo dco_decode_box_autoadd_video_surface_info(dynamic raw);
 
   @protected
@@ -145,6 +148,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SavedLogin? dco_decode_opt_box_autoadd_saved_login(dynamic raw);
 
   @protected
+  ShareStats? dco_decode_opt_box_autoadd_share_stats(dynamic raw);
+
+  @protected
   VideoSurfaceInfo? dco_decode_opt_box_autoadd_video_surface_info(dynamic raw);
 
   @protected
@@ -164,6 +170,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SharePreview dco_decode_share_preview(dynamic raw);
+
+  @protected
+  ShareStats dco_decode_share_stats(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -255,6 +264,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SavedLogin sse_decode_box_autoadd_saved_login(SseDeserializer deserializer);
 
   @protected
+  ShareStats sse_decode_box_autoadd_share_stats(SseDeserializer deserializer);
+
+  @protected
   VideoSurfaceInfo sse_decode_box_autoadd_video_surface_info(
     SseDeserializer deserializer,
   );
@@ -300,6 +312,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ShareStats? sse_decode_opt_box_autoadd_share_stats(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   VideoSurfaceInfo? sse_decode_opt_box_autoadd_video_surface_info(
     SseDeserializer deserializer,
   );
@@ -321,6 +338,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SharePreview sse_decode_share_preview(SseDeserializer deserializer);
+
+  @protected
+  ShareStats sse_decode_share_stats(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -432,6 +452,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_share_stats(
+    ShareStats self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_video_surface_info(
     VideoSurfaceInfo self,
     SseSerializer serializer,
@@ -495,6 +521,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_share_stats(
+    ShareStats? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_video_surface_info(
     VideoSurfaceInfo? self,
     SseSerializer serializer,
@@ -520,6 +552,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_share_preview(SharePreview self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_share_stats(ShareStats self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

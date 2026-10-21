@@ -186,6 +186,37 @@ Future<void> setShareAudio({
   audible: audible,
 );
 
+/// Show (or stop showing) one sender's screen picture.
+///
+/// Watching is the UI's decision, and the UI never paints a share nobody
+/// opened: an unopened tile is a name and a Watch button. This tells the
+/// display bridge exactly that, so a closed share keeps its stream
+/// decoded (opening one is then instant) but costs no per-frame pixel
+/// conversion, texture upload or raster-thread hand-off — the expensive
+/// half of showing a 1080p stream at 30 fps, per share, whether or not
+/// anybody is looking.
+///
+/// Featureless: reports the stub convention's error (no video path).
+Future<void> setScreenWatched({
+  required int sessionId,
+  required int userId,
+  required bool watched,
+}) => RustLib.instance.api.crateApiSessionSetScreenWatched(
+  sessionId: sessionId,
+  userId: userId,
+  watched: watched,
+);
+
+/// Play this machine's join/leave cue: a short rising pair when somebody
+/// enters this voice channel, the same pair falling when they leave. It
+/// is mixed into the LOCAL render only — it never reaches the wire, the
+/// AEC reference or the share-audio path.
+///
+/// Silent when no voice stream is open (there is nothing to mix into),
+/// and a request made before one opens is dropped rather than replayed.
+Future<void> playVoiceChime({required bool join}) =>
+    RustLib.instance.api.crateApiSessionPlayVoiceChime(join: join);
+
 /// Toggle hardware (VAAPI) encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
 /// re-share to switch. Returns the new state. Featureless: no-op stub
@@ -466,23 +497,31 @@ class SessionInfo {
 
 /// 7f: one remote share's display surface. `texture_id` feeds a plain
 /// Flutter `Texture` widget (pixels come from the Rust side); width /
-/// height are the decoded stream's dimensions.
+/// height are the decoded stream's dimensions and `fps` the cadence the
+/// display bridge measured (a provisional 30/60 from the stream's rate
+/// flag until the first one-second window closes).
 class VideoSurfaceInfo {
   final int userId;
   final BigInt width;
   final BigInt height;
+  final BigInt fps;
   final PlatformInt64 textureId;
 
   const VideoSurfaceInfo({
     required this.userId,
     required this.width,
     required this.height,
+    required this.fps,
     required this.textureId,
   });
 
   @override
   int get hashCode =>
-      userId.hashCode ^ width.hashCode ^ height.hashCode ^ textureId.hashCode;
+      userId.hashCode ^
+      width.hashCode ^
+      height.hashCode ^
+      fps.hashCode ^
+      textureId.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -492,6 +531,7 @@ class VideoSurfaceInfo {
           userId == other.userId &&
           width == other.width &&
           height == other.height &&
+          fps == other.fps &&
           textureId == other.textureId;
 }
 

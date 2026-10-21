@@ -98,19 +98,6 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
           _section(theme, 'Video'),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Show my own stream while sharing'),
-            subtitle: const Text(
-              'A small preview of what you are sending, so the right '
-              'window is in the frame. Turning it off stops the work '
-              'entirely, mid-share too.',
-            ),
-            value: s.showSharePreview,
-            onChanged: (v) => _update(
-              _copy(showSharePreview: v),
-            ),
-          ),
           if (widget.hwEncodeSupported)
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
@@ -210,7 +197,6 @@ class _SettingsPageState extends State<SettingsPage> {
   /// aliasing the same object.
   settings_api.AppSettings _copy({
     bool? hwEncode,
-    bool? showSharePreview,
     int? shareHeight,
     int? shareFps,
     bool? echoCancel,
@@ -218,7 +204,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final s = _settings;
     return settings_api.AppSettings(
       hwEncode: hwEncode ?? s.hwEncode,
-      showSharePreview: showSharePreview ?? s.showSharePreview,
+      showSharePreview: s.showSharePreview,
       shareHeight: shareHeight ?? s.shareHeight,
       shareFps: shareFps ?? s.shareFps,
       echoCancel: echoCancel ?? s.echoCancel,

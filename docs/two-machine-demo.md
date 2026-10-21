@@ -257,7 +257,7 @@ the very job the window breaks — so B shares in software here.
 the flag was given:
 
 ```
-video: hardware (VAAPI) encoder selected — <W>x<H>, measured <R> fps sustained (pacing at <P>), <bps> bps, keyframe self-test passed ...
+video: hardware (VAAPI) encoder selected — <W>x<H>, self-test <R> fps, pacing up to <P> fps at <bps> bps, keyframe self-test passed ...
 share: encoder ready (<W>x<H>, source <f> fps → paced <P> fps, clean rung <bps> bps); hardware=true
 ```
 
@@ -280,6 +280,18 @@ video: user 2: 120 shown (120 decoded, 0 no-picture, 0 decode errors), 0 dropped
 
 The prompt accepts `share` to start a share and `stop` to end one without
 leaving the session.
+
+**Choosing a rate.** `pacing up to P` is the profile ceiling (60 fps
+hardware, 30 fps software) lowered by the capture's own rate and the share
+dialog's cap — not a promise. What the encoder holds is what the 10 s
+`share: encoded N frames (R fps)` line and the sharer's own tile report
+(the tile replaces the negotiated rate with the measured one after the
+first second). On this project's RX 590 the VAAPI path measured ~14.8 ms
+per 720p frame and ~30 ms per 1080p frame, so 720p is the size that
+reaches 60 and 1080p tops out around 30. The software encoder does 1080p
+in ~19 ms, which is why 1080p30 in software is smoother than 1080p in
+hardware on that GPU — hardware is worth it for the CPU it frees, not for
+the rate it adds there.
 
 ---
 

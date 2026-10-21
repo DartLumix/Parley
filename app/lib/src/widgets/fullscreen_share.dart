@@ -8,6 +8,10 @@ import 'package:flutter/services.dart';
 /// a few idle seconds and comes back on pointer movement. Nothing else
 /// — no app bar, no session chrome, no floating action bar, no window
 /// toolbar.
+///
+/// It shows either a received share or the sharer's own preview; the
+/// only difference is [onStopWatching], which is null for your own share
+/// (there is no watch state to stop) and drops the button with it.
 class FullscreenShare extends StatefulWidget {
   const FullscreenShare({
     super.key,
@@ -15,16 +19,25 @@ class FullscreenShare extends StatefulWidget {
     required this.textureId,
     required this.width,
     required this.height,
+    required this.aspectRatio,
     required this.onExit,
-    required this.onStopWatching,
+    this.onStopWatching,
   });
 
   final String title;
   final int textureId;
+
+  /// The stream's size, for the caption. Zero until it is known.
   final int width;
   final int height;
+
+  /// What the picture is letterboxed to. Our own preview is a fixed
+  /// 16:9 canvas whatever the stream's shape; a received share keeps
+  /// its own.
+  final double aspectRatio;
+
   final VoidCallback onExit;
-  final VoidCallback onStopWatching;
+  final VoidCallback? onStopWatching;
 
   @override
   State<FullscreenShare> createState() => _FullscreenShareState();
@@ -88,7 +101,7 @@ class _FullscreenShareState extends State<FullscreenShare> {
             children: [
               Center(
                 child: AspectRatio(
-                  aspectRatio: widget.width / widget.height,
+                  aspectRatio: widget.aspectRatio,
                   child: Texture(textureId: widget.textureId),
                 ),
               ),
@@ -103,12 +116,14 @@ class _FullscreenShareState extends State<FullscreenShare> {
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        _button(
-                          Icons.visibility_off,
-                          'Stop watching',
-                          widget.onStopWatching,
-                        ),
-                        const SizedBox(width: 8),
+                        if (widget.onStopWatching != null) ...[
+                          _button(
+                            Icons.visibility_off,
+                            'Stop watching',
+                            widget.onStopWatching!,
+                          ),
+                          const SizedBox(width: 8),
+                        ],
                         _button(
                           Icons.fullscreen_exit,
                           'Exit fullscreen',
@@ -126,7 +141,12 @@ class _FullscreenShareState extends State<FullscreenShare> {
                   opacity: _controls ? 1 : 0,
                   duration: const Duration(milliseconds: 180),
                   child: Text(
-                    '${widget.title} · ${widget.width}×${widget.height} · Esc to exit',
+                    [
+                      widget.title,
+                      if (widget.width > 0 && widget.height > 0)
+                        '${widget.width}\u00d7${widget.height}',
+                      'Esc to exit',
+                    ].join(' \u00b7 '),
                     style: const TextStyle(color: Colors.white60, fontSize: 12),
                   ),
                 ),

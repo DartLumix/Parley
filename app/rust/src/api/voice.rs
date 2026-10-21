@@ -92,6 +92,51 @@ use crate::api::session::Command;
 #[cfg(feature = "audio-device")]
 const PERIOD_FRAMES: u32 = 1024;
 
+/// A pending join/leave cue: 0 none, 1 somebody joined, 2 somebody left.
+/// Written by the UI thread, consumed by the render callback — an atomic
+/// swap, because the audio callback must never take a lock that a
+/// control path can hold.
+#[cfg(feature = "audio-device")]
+static CHIME_REQUEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Ask the next render callback for a join (true) or leave (false) cue.
+/// Silent until a voice render stream exists, which is exactly the only
+/// time a cue means anything.
+#[cfg(feature = "audio-device")]
+pub(crate) fn play_chime(join: bool) {
+    CHIME_REQUEST.store(u8::from(!join) + 1, Ordering::Relaxed);
+}
+
+/// The two cues, rendered once at 48 kHz: a rising pair for a join, the
+/// same pair falling for a leave. 75 ms per note with raised-cosine
+/// edges, so a short device period cannot click.
+#[cfg(feature = "audio-device")]
+fn cues() -> &'static [Vec<f32>; 2] {
+    static CUES: std::sync::OnceLock<[Vec<f32>; 2]> = std::sync::OnceLock::new();
+    CUES.get_or_init(|| {
+        let note = |freq: f32| {
+            const RATE: f32 = 48_000.0;
+            const LEN: usize = (RATE * 0.075) as usize;
+            const EDGE: f32 = LEN as f32 * 0.10;
+            (0..LEN)
+                .map(|s| {
+                    let env = if (s as f32) < EDGE {
+                        s as f32 / EDGE
+                    } else if (LEN - s) as f32 <= EDGE {
+                        (LEN - s) as f32 / EDGE
+                    } else {
+                        1.0
+                    };
+                    0.17 * env * (std::f32::consts::TAU * freq * s as f32 / RATE).sin()
+                })
+                .collect::<Vec<f32>>()
+        };
+        let rising = [note(660.0), note(880.0)].concat();
+        let falling = [note(880.0), note(660.0)].concat();
+        [rising, falling]
+    })
+}
+
 /// Live voice state for one session. Dropping it stops everything —
 /// that IS the shutdown path (see the module docs). All fields are
 /// Send+Sync handles; the cpal streams themselves never leave the
@@ -761,11 +806,20 @@ fn build_streams(
         buffer_size: cpal::BufferSize::Fixed(PERIOD_FRAMES),
     };
     let default_out: cpal::StreamConfig = out_cfg.into();
+    // A cue requested before this stream existed would fire on the first
+    // callback — a chime for a join that happened while we were not in
+    // voice. Start clean.
+    CHIME_REQUEST.store(0, Ordering::Relaxed);
     let build_output = |cfg: &cpal::StreamConfig| {
         let mixer = mixer.clone();
         let aec = aec.clone();
         let mut first = true;
         let mut render_carry: Vec<f32> = Vec::new();
+        // The cue being played: its samples and how far in the callback
+        // is. Advances by whole device periods, so a period too short to
+        // finish a note just continues it next time.
+        let mut cue: Option<&'static [f32]> = None;
+        let mut cue_pos = 0usize;
         out_dev.build_output_stream(
             cfg,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
@@ -803,6 +857,33 @@ fn build_streams(
                         *s = if c == 0 { pair[0] } else { pair[1] };
                     }
                 }
+                // The join/leave cue rides on top of the mix, LOCAL only:
+                // it is added after the AEC/share-echo reference, so it is
+                // never subtracted from the mic and never sent to peers.
+                match CHIME_REQUEST.swap(0, Ordering::Relaxed) {
+                    1 => {
+                        cue = Some(cues()[0].as_slice());
+                        cue_pos = 0;
+                    }
+                    2 => {
+                        cue = Some(cues()[1].as_slice());
+                        cue_pos = 0;
+                    }
+                    _ => {}
+                }
+                if let Some(samples) = cue {
+                    for (i, frame) in data.chunks_mut(out_channels.max(1)).enumerate() {
+                        if let Some(s) = samples.get(cue_pos + i) {
+                            for x in frame.iter_mut() {
+                                *x += s;
+                            }
+                        }
+                    }
+                    cue_pos += frames;
+                    if cue_pos >= samples.len() {
+                        cue = None;
+                    }
+                }
             },
             |e| eprintln!("voice: render stream error: {e}"),
             None,
@@ -825,6 +906,37 @@ fn build_streams(
     println!("voice: render \"{out_name}\" 48 kHz {out_channels}ch (stereo mix)");
 
     Ok(AudioStreams { input, output })
+}
+
+/// The join/leave cue is synthesised, not an asset: 48 kHz, two 75 ms
+/// notes with raised-cosine edges. These pin the shape the render
+/// callback mixes (length, level, and that join rises while leave falls).
+#[cfg(all(test, feature = "audio-device"))]
+mod cue_tests {
+    use super::cues;
+
+    #[test]
+    fn the_cues_are_two_short_notes() {
+        let [join, leave] = cues();
+        assert_eq!(join.len(), 3600 * 2, "two 75 ms notes at 48 kHz");
+        assert_eq!(leave.len(), join.len());
+        for cue in [join, leave] {
+            let peak = cue.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            assert!((0.05..=0.25).contains(&peak), "cue peak {peak}");
+            // Edges are silent: a note that starts at full amplitude
+            // clicks on a short device period.
+            assert!(cue[0].abs() < 0.01 && cue[cue.len() - 1].abs() < 0.01);
+            assert!(cue.iter().any(|s| s.abs() > 0.1), "cue is audible");
+        }
+        // Rising vs falling: the same two pitches, in the other order.
+        assert_ne!(join, leave);
+        let corr =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() };
+        assert!(
+            corr(&join[..3600], &leave[3600..]) > 0.0,
+            "join's first note is leave's second"
+        );
+    }
 }
 
 /// 7e2: the ladder's pure state machine — the two thresholds, both

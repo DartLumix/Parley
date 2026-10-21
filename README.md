@@ -48,7 +48,7 @@ Voice is the product; everything else grows later.
 | 7j | Zero-copy capture — compositor DMA-BUF straight into the encoder | ✅ |
 | 7k | Share teardown notices, ghost-card race, real fullscreen, app chrome | ✅ |
 | 0.2 | First downloadable release — client tarball, container kit, release CI | ✅ |
-| 0.3 | Settings page, own-stream preview, share size/rate dialog | ✅ |
+| 0.3 | Settings page, screens grid with own-stream preview, share size/rate dialog | ✅ |
 | 7+ | Android / Windows / iOS bring-up, file transfer | ⏳ |
 
 ---
@@ -81,7 +81,7 @@ Connect to `your-server` (port 4443, the client default). The full runbooks are
 ## ✨ What it is
 
 - 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera video
-- 👀 While sharing, see what you are sending (and turn the preview off) · pick a resolution/rate cap before the portal opens · settings for video, audio and your account
+- 👀 Every share is a live 16:9 tile — including yours while you send — with *Watch*, several open at once, and per-share audio · pick a resolution/rate cap before the portal opens · settings for video, audio and your account
 - 🐧 Native clients: **Linux → Android → Windows → iOS** — no Electron, no webviews, ever
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
 - 🐳 Deploy with `docker compose up` · one TOML config · one UDP port

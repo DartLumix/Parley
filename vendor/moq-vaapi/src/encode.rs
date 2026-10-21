@@ -49,6 +49,7 @@ use crate::{
 	EncPictureParameter, EncPictureParameterBufferH264, EncSequenceParameter, EncSequenceParameterBufferH264,
 	EncSliceParameter, EncSliceParameterBufferH264, H264EncFrameCropOffsets, H264EncPicFields, H264EncSeqFields,
 	H264VuiFields, Image, MappedCodedBuffer, Picture, PictureH264, RcFlags, Surface, SurfaceMemoryDescriptor,
+	VAImageFormat,
 	UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile, VA_ATTRIB_NOT_SUPPORTED,
 	VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE, VA_FOURCC_ARGB, VA_FOURCC_BGRA, VA_FOURCC_BGRX,
 	VA_FOURCC_NV12, VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_XRGB, VA_INVALID_ID, VA_PICTURE_H264_INVALID,
@@ -166,6 +167,11 @@ pub struct Encoder {
 	/// The video processor converting and scaling DMA-BUF input, opened on the
 	/// first frame that needs it.
 	processor: Option<Processor>,
+	/// PARLEY PATCH — the driver's NV12 (resp. BGRX) image format, queried
+	/// once. `vaQueryImageFormats` is a driver round trip, and the upload
+	/// path used to make it on EVERY frame.
+	nv12_format: Option<VAImageFormat>,
+	bgrx_format: Option<VAImageFormat>,
 	/// Set by a bitrate change, and cleared by the next frame, which asks the
 	/// driver to restart its rate controller at the new target.
 	reset_rate_control: bool,
@@ -259,6 +265,8 @@ impl Encoder {
 			height_mbs,
 			input: Some(input),
 			rgb_input: None,
+			nv12_format: None,
+			bgrx_format: None,
 			recon,
 			reference: None,
 			counter: 0,
@@ -286,8 +294,15 @@ impl Encoder {
 			anyhow::bail!("NV12 frame is {} bytes, {width}x{height} needs {expected}", nv12.len());
 		}
 		let input = self.input.take().expect("input surface present");
-		let result = upload_nv12(&self.display, &input, self.config.width, self.config.height, nv12)
-			.and_then(|()| self.encode_surface(&input, keyframe));
+		let result = upload_nv12(
+			&self.display,
+			&input,
+			self.config.width,
+			self.config.height,
+			nv12,
+			&mut self.nv12_format,
+		)
+		.and_then(|()| self.encode_surface(&input, keyframe));
 		self.input = Some(input);
 		result
 	}
@@ -341,7 +356,16 @@ impl Encoder {
 			_ => make_rgb_surface(&self.display, width, height)?,
 		};
 		let color = self.config.color;
-		let result = upload_bgrx(&self.display, &rgb, width, height, stride, bgra).and_then(|()| {
+		let result = upload_bgrx(
+			&self.display,
+			&rgb,
+			width,
+			height,
+			stride,
+			bgra,
+			&mut self.bgrx_format,
+		)
+		.and_then(|()| {
 			let input = self.input.take().expect("input surface present");
 			let blit = self
 				.processor()
@@ -744,6 +768,30 @@ fn make_surface(display: &Arc<Display>, config: &Config) -> anyhow::Result<Surfa
 	surfaces.pop().ok_or_else(|| anyhow::anyhow!("no surface created"))
 }
 
+/// The driver's image format for `fourcc`, queried once per encoder.
+///
+/// PARLEY PATCH — `vaQueryImageFormats` is a driver round trip; the
+/// upload paths called it on every frame.
+fn image_format(
+	display: &Arc<Display>,
+	fourcc: u32,
+	name: &str,
+	cached: &mut Option<VAImageFormat>,
+) -> anyhow::Result<VAImageFormat> {
+	if let Some(format) = cached {
+		return Ok(*format);
+	}
+	let formats = display
+		.query_image_formats()
+		.map_err(|e| anyhow::anyhow!("query image formats: {e:?}"))?;
+	let format = formats
+		.into_iter()
+		.find(|f| f.fourcc == fourcc)
+		.ok_or_else(|| anyhow::anyhow!("driver has no {name} image format"))?;
+	*cached = Some(format);
+	Ok(format)
+}
+
 /// Upload tightly-packed NV12 into a surface. Ported from cros-codecs
 /// `upload_nv12_img` (honors the image's per-plane offsets + pitches).
 fn upload_nv12(
@@ -752,16 +800,13 @@ fn upload_nv12(
 	width: u32,
 	height: u32,
 	data: &[u8],
+	cached: &mut Option<VAImageFormat>,
 ) -> anyhow::Result<()> {
-	let formats = display
-		.query_image_formats()
-		.map_err(|e| anyhow::anyhow!("query image formats: {e:?}"))?;
-	let format = formats
-		.into_iter()
-		.find(|f| f.fourcc == VA_FOURCC_NV12)
-		.ok_or_else(|| anyhow::anyhow!("driver has no NV12 image format"))?;
+	let format = image_format(display, VA_FOURCC_NV12, "NV12", cached)?;
 
-	let mut image = Image::create_from(surface, format, surface.size(), surface.size())
+	// Scratch image: every visible byte is written below, so the
+	// `vaGetImage` copy `create_from` makes would only be overwritten.
+	let mut image = Image::create_scratch(surface, format, surface.size())
 		.map_err(|e| anyhow::anyhow!("create image: {e:?}"))?;
 	let va_image = *image.image();
 	let dest: &mut [u8] = image.as_mut();
@@ -820,16 +865,13 @@ fn upload_bgrx(
 	height: u32,
 	stride: usize,
 	data: &[u8],
+	cached: &mut Option<VAImageFormat>,
 ) -> anyhow::Result<()> {
-	let formats = display
-		.query_image_formats()
-		.map_err(|e| anyhow::anyhow!("query image formats: {e:?}"))?;
-	let format = formats
-		.into_iter()
-		.find(|f| f.fourcc == VA_FOURCC_BGRX)
-		.ok_or_else(|| anyhow::anyhow!("driver has no BGRX image format"))?;
+	let format = image_format(display, VA_FOURCC_BGRX, "BGRX", cached)?;
 
-	let mut image = Image::create_from(surface, format, surface.size(), surface.size())
+	// Scratch image: every visible row is written below, so the
+	// `vaGetImage` copy `create_from` makes would only be overwritten.
+	let mut image = Image::create_scratch(surface, format, surface.size())
 		.map_err(|e| anyhow::anyhow!("create image: {e:?}"))?;
 	let va_image = *image.image();
 	let dest: &mut [u8] = image.as_mut();

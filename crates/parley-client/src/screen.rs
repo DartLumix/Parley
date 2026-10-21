@@ -143,28 +143,84 @@ pub struct ShareOptions {
     pub max_fps: Option<f64>,
 }
 
-/// One downscaled frame for the sharer's own preview, BGRA, tightly
-/// packed, already letterboxed into [`PREVIEW_WIDTH`]×[`PREVIEW_HEIGHT`].
-#[derive(Debug, Clone)]
-pub struct PreviewFrame {
+/// One preview frame for the sharer's own view: RGBA, tightly packed,
+/// in the stream's own shape (see [`preview_target`]). Borrowed from the
+/// preview thread's reusable canvas — valid for the duration of the
+/// callback only.
+pub struct PreviewFrame<'a> {
     pub width: usize,
     pub height: usize,
-    pub bgra: Vec<u8>,
+    pub rgba: &'a [u8],
 }
 
-/// Called from the encoder thread at preview rate (≤10 fps). Must not
-/// block: the app's sink drops the frame into a latest-wins slot.
-pub type PreviewSink = Arc<dyn Fn(PreviewFrame) + Send + Sync>;
+/// The shape of the running share — the STREAM's pixels, after the
+/// profile's own size cap and the dialog's — and the rate it is really
+/// being sent at. Sent on the encode thread at every format change and
+/// then once a second while the measured rate differs from the last
+/// one reported.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
 
-/// Preview canvas. Fixed so the Flutter texture is created once per
-/// process and never re-created when the sharer picks another window;
-/// frames are letterboxed into it.
+/// What the app can observe about a running share: the sharer's own
+/// preview, plus the metadata the UI shows. Implemented by the desktop
+/// bridge; the terminal client passes `None`.
+///
+/// Everything here runs on the share's own threads. `stream_info` is
+/// called at format negotiation; preview frames come from a DEDICATED
+/// thread, never the encoder's, so a slow texture can never delay a
+/// datagram.
+pub trait ShareTap: Send + Sync {
+    /// Whether the sharer wants their own frames right now. Checked on
+    /// the encode thread before a frame is even cloned, so turning the
+    /// preview off stops all of its work, not just its display.
+    fn preview_enabled(&self) -> bool {
+        true
+    }
+
+    /// The stream's shape, or the rate it is really being sent at:
+    /// called at every format negotiation (and on a capture resize),
+    /// then about once a second when the measured rate moves — a card
+    /// that showed the negotiated ceiling would claim 60 fps while the
+    /// encoder sent 47. Called even while the preview is off.
+    fn stream_info(&self, _info: StreamInfo) {}
+
+    /// One finished preview frame. Must not block: the preview thread
+    /// is the only caller and drops a frame rather than queueing.
+    fn preview_frame(&self, _frame: PreviewFrame<'_>) {}
+}
+
+/// The app's tap into a running share (see [`ShareTap`]).
+pub type PreviewSink = Arc<dyn ShareTap>;
+
+/// The preview canvas a texture is seeded with, before the stream's
+/// first frame says what shape it really is. The provider carries each
+/// frame's own dimensions, so this is a placeholder rather than a size:
+/// a share started on a 21:9 window replaces it immediately.
 pub const PREVIEW_WIDTH: usize = 640;
 pub const PREVIEW_HEIGHT: usize = 360;
 
-/// Preview cadence: the sharer is checking framing, not watching a
-/// movie — 10 fps off a 1080p capture costs a fraction of one encode.
-const PREVIEW_INTERVAL: Duration = Duration::from_millis(100);
+/// Ceiling for the preview canvas. The canvas FOLLOWS the stream (see
+/// [`preview_target`]) so the sharer's own view is as sharp as what
+/// viewers get; a fixed 640×360 canvas was cheap and stable but made
+/// the sharer's own picture look soft in its own window and unusable on
+/// a fullscreen page (a 3440×1440 capture was squeezed into 640×268
+/// inside black bars, then blown back up to fill the screen). A 4K or
+/// ultrawide stream stops here instead, at the same aspect: 2560×1440
+/// is 14 MB, which the preview thread owns and reuses, and the picture
+/// is as sharp as what the encoder actually sends.
+pub const PREVIEW_MAX_WIDTH: usize = 2560;
+pub const PREVIEW_MAX_HEIGHT: usize = 1440;
+
+/// Preview cadence: the share's own rate, so the preview is the one
+/// place a sharer can judge whether the stream is smooth. The scaling
+/// runs on its own thread (see [`spawn_preview_thread`]) with a
+/// latest-wins hand-off, so it costs the encode loop nothing and a slow
+/// preview can only drop preview frames.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Stop switch for a running share.
 ///
@@ -231,15 +287,104 @@ struct ShareEncoder {
     video_loss: Arc<AtomicU32>,
     /// The pre-share dialog's caps (see [`ShareOptions`]).
     options: ShareOptions,
-    /// The sharer's own preview tap, when the app asked for one.
-    preview: Option<PreviewSink>,
+    /// The sharer's own tap, when the app asked for one. Frames are
+    /// handed to [`PreviewJob`], never scaled here.
+    tap: Option<PreviewSink>,
+    /// Hand-off to the preview thread (depth 1: a busy preview drops a
+    /// frame instead of delaying the encoder).
+    preview_tx: Option<SyncSender<PreviewJob>>,
     /// Capture dimensions of the frame currently being encoded (set by
     /// `negotiate`); the encoder may be smaller when `options` capped it.
     source: (usize, usize),
     /// Reused downscale target for a capped encode.
     scaled: Vec<u8>,
-    /// When the last preview frame went out (10 fps throttle).
+    /// When the last preview frame was handed off.
     last_preview: Option<std::time::Instant>,
+    /// The encoder's own size, for the sharer's card (see
+    /// [`StreamInfo`]) — the STREAM's shape, not the capture's.
+    stream: (u32, u32),
+    /// The rate the sharer's own card currently shows.
+    shown_fps: f64,
+    /// Frames sent, and when the current measurement second began: the
+    /// card reports what this machine ACTUALLY delivers, not the profile
+    /// it hoped for (a hardware share paced at 60 that encodes 47 must
+    /// say 47).
+    report_start: std::time::Instant,
+    report_frames: u32,
+}
+
+/// One captured frame on its way to the preview thread. The pixels are
+/// shared with the encoder (an `Arc` clone, not a copy), so a preview
+/// costs the encode loop one atomic increment per frame and nothing
+/// else.
+struct PreviewJob {
+    data: Arc<Vec<u8>>,
+    stride: usize,
+    width: usize,
+    height: usize,
+    /// The encoder's output size: the preview is drawn in the shape of
+    /// what viewers receive, not in the shape of a fixed canvas.
+    target: (usize, usize),
+}
+
+/// The preview thread: BGRA capture → RGBA canvas → tap, off the
+/// encoder's timeline.
+///
+/// This is the whole point of the separate thread. Preview work used to
+/// run inside `ShareEncoder::encode_bgra`, i.e. between two datagrams of
+/// a 30 fps stream: a 1440p capture scaled to the canvas could push a
+/// frame past its pacing deadline every 100 ms, which reads as a small
+/// hitch. Here a slow preview can only drop preview frames.
+fn spawn_preview_thread(tap: PreviewSink) -> SyncSender<PreviewJob> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PreviewJob>(1);
+    let spawned = std::thread::Builder::new()
+        .name("parley-share-preview".into())
+        .spawn(move || {
+            // Opaque-black canvas, (re)allocated when the stream's shape
+            // changes — the letterbox bars (a capture whose aspect the
+            // encoder rounded) stay black without being rewritten per
+            // frame, and a share that never changes size allocates once.
+            let mut canvas: Vec<u8> = Vec::new();
+            let mut size = (0usize, 0usize);
+            while let Ok(job) = rx.recv() {
+                if !tap.preview_enabled() {
+                    continue;
+                }
+                let target = preview_target(job.target.0, job.target.1);
+                if target != size {
+                    canvas.clear();
+                    canvas.resize(target.0 * target.1 * 4, 0);
+                    for px in canvas.chunks_exact_mut(4) {
+                        px[3] = 255;
+                    }
+                    size = target;
+                }
+                if !render_preview(
+                    &job.data,
+                    job.width,
+                    job.height,
+                    job.stride,
+                    &mut canvas,
+                    target.0,
+                    target.1,
+                ) {
+                    continue;
+                }
+                tap.preview_frame(PreviewFrame {
+                    width: target.0,
+                    height: target.1,
+                    rgba: &canvas,
+                });
+            }
+        });
+    if let Err(e) = spawned {
+        // No preview is a degraded UI, not a broken share: the encoder
+        // keeps going and the sender just gets an empty channel.
+        eprintln!("share: preview thread failed: {e}");
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<PreviewJob>(1);
+        return tx;
+    }
+    tx
 }
 
 /// The connection-side handles the capture thread needs when it owns the
@@ -253,7 +398,12 @@ struct ShareSenderArgs {
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
     options: ShareOptions,
-    preview: Option<PreviewSink>,
+    /// Metadata + preview tap. Only the non-DMA-BUF path spawns the
+    /// preview thread; the capture thread keeps the tap for `negotiate`.
+    tap: Option<PreviewSink>,
+    /// Set on the encoder thread by [`spawn_preview_thread`]; `None` on
+    /// the DMA-BUF path, which has no CPU frame to preview.
+    preview_tx: Option<SyncSender<PreviewJob>>,
 }
 
 /// The pipewire side, on its own thread: loop, stream, listener.
@@ -505,7 +655,7 @@ fn pw_thread(
                         padded.resize(dst + row.len(), 0);
                         padded[dst..dst + row.len()].copy_from_slice(row);
                     }
-                    if !share.encode_bgra(&padded, stride) {
+                    if !share.encode_bgra(&Arc::new(padded), stride) {
                         let _ = share.die.send(());
                     }
                 }
@@ -869,39 +1019,111 @@ fn scale_bgra(
     true
 }
 
-/// Scale a capture frame into the fixed preview canvas, preserving the
-/// aspect ratio and centring it on black (letterbox/pillarbox), so the
-/// Flutter texture never changes size mid-share.
-fn letterbox_preview(src: &[u8], sw: usize, sh: usize, stride: usize) -> Option<Vec<u8>> {
-    let (pw, ph) = fit_encoder_dims(sw, sh, Some(PREVIEW_HEIGHT as u32));
-    let (pw, ph) = if pw > PREVIEW_WIDTH {
-        // A capture narrower than 16:9 would otherwise be as wide as the
-        // canvas allows and taller than it; fit by width in that case.
-        let even = |v: usize| (v & !1).max(2);
-        (even(PREVIEW_WIDTH), even(PREVIEW_WIDTH * sh / sw.max(1)))
+/// The canvas a stream of `w`×`h` is previewed in: the stream's own
+/// shape, scaled down only past [`PREVIEW_MAX_WIDTH`]/
+/// [`PREVIEW_MAX_HEIGHT`] (both axes by the same factor, or the preview
+/// would distort what is being sent). Dimensions are even and at least
+/// 2 px.
+fn preview_target(w: usize, h: usize) -> (usize, usize) {
+    if w < 2 || h < 2 {
+        return (PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    }
+    if w <= PREVIEW_MAX_WIDTH && h <= PREVIEW_MAX_HEIGHT {
+        return (w, h);
+    }
+    let scale = (PREVIEW_MAX_WIDTH as f64 / w as f64).min(PREVIEW_MAX_HEIGHT as f64 / h as f64);
+    let tw = ((w as f64 * scale) as usize).max(2) & !1;
+    let th = ((h as f64 * scale) as usize).max(2) & !1;
+    (tw, th)
+}
+
+/// The region of the preview canvas a capture fills, preserving the
+/// aspect ratio and centring it on black (letterbox/pillarbox). Only a
+/// rounding difference between the capture and the encoder normally
+/// shows bars at all — the canvas follows the stream's shape. `None`
+/// when the capture is unusable (an empty frame).
+fn preview_region(
+    sw: usize,
+    sh: usize,
+    tw: usize,
+    th: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if sw == 0 || sh == 0 || tw < 2 || th < 2 {
+        return None;
+    }
+    let (pw, ph);
+    if sw * th > sh * tw {
+        // Wider than the canvas: fit by width.
+        pw = tw;
+        ph = (pw * sh / sw).max(2);
     } else {
-        (pw, ph)
+        // Taller than the canvas: fit by height, keep the source's shape.
+        ph = th;
+        pw = (ph * sw / sh).max(2);
+    }
+    if pw > tw || ph > th {
+        return None;
+    }
+    Some(((tw - pw) / 2, (th - ph) / 2, pw, ph))
+}
+
+/// Render a capture frame into the preview canvas as RGBA.
+///
+/// The common case is a capture the encoder did not touch: same shape,
+/// so this is one BGRA→RGBA swizzle pass with no sampling at all — the
+/// picture the sharer sees is the picture that is sent. A capped stream
+/// (a 4K capture encoded at 1440p) is nearest-neighbour scaled, the
+/// same sampling the encoder itself uses. `canvas` is reused across
+/// frames; the letterbox bars were primed opaque black at creation.
+fn render_preview(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    stride: usize,
+    canvas: &mut [u8],
+    tw: usize,
+    th: usize,
+) -> bool {
+    let Some((x0, y0, pw, ph)) = preview_region(sw, sh, tw, th) else {
+        return false;
     };
-    if pw > PREVIEW_WIDTH || ph > PREVIEW_HEIGHT {
-        return None;
+    if canvas.len() < tw * th * 4 {
+        return false;
     }
-    let mut scaled = Vec::with_capacity(pw * ph * 4);
-    if !scale_bgra(src, sw, sh, stride, pw, ph, &mut scaled) {
-        return None;
+    if (sw, sh) == (pw, ph) {
+        // Unscaled: one load and one store per pixel, rows only.
+        for y in 0..ph {
+            let Some(row) = src.get(y * stride..y * stride + pw * 4) else {
+                return false;
+            };
+            let start = ((y + y0) * tw + x0) * 4;
+            let dst_row = &mut canvas[start..start + pw * 4];
+            for (d, s) in dst_row.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 255;
+            }
+        }
+        return true;
     }
-    // Opaque black canvas, then the frame centred.
-    let mut canvas = vec![0u8; PREVIEW_WIDTH * PREVIEW_HEIGHT * 4];
-    for px in canvas.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
-    let x0 = (PREVIEW_WIDTH - pw) / 2;
-    let y0 = (PREVIEW_HEIGHT - ph) / 2;
     for y in 0..ph {
-        let dst = ((y + y0) * PREVIEW_WIDTH + x0) * 4;
-        let src_row = &scaled[y * pw * 4..(y + 1) * pw * 4];
-        canvas[dst..dst + pw * 4].copy_from_slice(src_row);
+        let sy = (y * sh / ph).min(sh - 1);
+        let Some(row) = src.get(sy * stride..sy * stride + sw * 4) else {
+            return false;
+        };
+        let dst_row = &mut canvas[((y + y0) * tw + x0) * 4..((y + y0) * tw + x0 + pw) * 4];
+        for x in 0..pw {
+            let sx = (x * sw / pw).min(sw - 1) * 4;
+            let (b, g, r) = (row[sx], row[sx + 1], row[sx + 2]);
+            let d = &mut dst_row[x * 4..x * 4 + 4];
+            d[0] = r;
+            d[1] = g;
+            d[2] = b;
+            d[3] = 255;
+        }
     }
-    Some(canvas)
+    true
 }
 
 impl ShareEncoder {
@@ -923,10 +1145,15 @@ impl ShareEncoder {
             force_idr: sender.force_idr,
             video_loss: sender.video_loss,
             options: sender.options,
-            preview: sender.preview,
+            tap: sender.tap,
+            preview_tx: sender.preview_tx,
             source: (0, 0),
             scaled: Vec::new(),
             last_preview: None,
+            stream: (0, 0),
+            shown_fps: 0.0,
+            report_start: std::time::Instant::now(),
+            report_frames: 0,
             last_encode: None,
         }
     }
@@ -979,12 +1206,19 @@ impl ShareEncoder {
     fn negotiate(&mut self, width: u32, height: u32, f: f64) {
         self.fps = f;
         self.source = (width as usize, height as usize);
-        let (enc_w, enc_h) =
+        let (wanted_w, wanted_h) =
             fit_encoder_dims(width as usize, height as usize, self.options.max_height);
-        match create_encoder_auto(enc_w, enc_h) {
+        match create_encoder_auto(wanted_w, wanted_h) {
             Ok(e) => {
+                // The backend has the last word on dimensions: software
+                // fits itself into the profile it can actually encode in
+                // real time (see `SOFTWARE_MAX_HEIGHT`). Everything below
+                // — the bitrate ladder, the timestamp clock, what the
+                // sharer's tile reports — is about the STREAM, so it is
+                // the encoder's size, never the capture's.
+                let (enc_w, enc_h) = e.dimensions();
                 let eff = self.paced_fps();
-                let base = bitrate_for(width as usize, height as usize, eff as f32);
+                let base = bitrate_for(enc_w, enc_h, eff as f32);
                 let applied = self.ladder.set_base(base);
                 println!(
                     "share: encoder ready ({enc_w}x{enc_h}, source {width}x{height} @ {f:.0} fps \
@@ -998,6 +1232,22 @@ impl ShareEncoder {
                     println!("share: bitrate → {applied} bps (robust rung, scaled to profile)");
                 }
                 self.encoder = Some(e);
+                self.stream = (enc_w as u32, enc_h as u32);
+                self.shown_fps = eff;
+                self.report_start = std::time::Instant::now();
+                self.report_frames = 0;
+                // Metadata after the encoder exists, so the sharer's own
+                // tile shows the size viewers get ("1440p source, 1080p
+                // stream" must not look like 1440p). The rate is the
+                // negotiated ceiling until the first measured second
+                // replaces it with what the encoder really delivers.
+                if let Some(tap) = &self.tap {
+                    tap.stream_info(StreamInfo {
+                        width: enc_w as u32,
+                        height: enc_h as u32,
+                        fps: eff,
+                    });
+                }
             }
             Err(e) => eprintln!("share: encoder init failed: {e}"),
         }
@@ -1023,14 +1273,15 @@ impl ShareEncoder {
 
     /// Encode one BGRA frame (strided) and send it. Returns false when the
     /// connection is gone; a dropped frame returns true.
-    fn encode_bgra(&mut self, data: &[u8], stride: usize) -> bool {
+    fn encode_bgra(&mut self, data: &Arc<Vec<u8>>, stride: usize) -> bool {
         let Some((w, h)) = self.encoder.as_ref().map(|e| e.dimensions()) else {
             return true;
         };
         self.last_encode = Some(std::time::Instant::now());
         // The preview sees the CAPTURE, before any resolution cap — it is
         // the sharer checking "is the right window in the frame", not a
-        // second viewer of the stream.
+        // second viewer of the stream. Handing the shared buffer to the
+        // preview thread is all the encode loop does for it.
         self.preview_tick(data, stride);
         let (sw, sh) = self.source;
         if (sw, sh) == (w, h) || w == 0 || h == 0 {
@@ -1051,14 +1302,13 @@ impl ShareEncoder {
         alive
     }
 
-    /// Downscale to the preview canvas and hand it to the sink, at most
-    /// every [`PREVIEW_INTERVAL`]. Off the encode path's critical work:
-    /// at 10 fps a 640x360 canvas is ~0.9 MB per frame, and the sink
-    /// recycles its own RGBA slot, so the only per-frame allocation is
-    /// this handoff. Nothing runs at all when the app asked for no
-    /// preview, or the user turned it off.
-    fn preview_tick(&mut self, data: &[u8], stride: usize) {
-        let Some(sink) = self.preview.clone() else {
+    /// Hand the shared capture buffer to the preview thread, at most
+    /// every [`PREVIEW_INTERVAL`]. The throttle and the on/off switch are
+    /// both checked HERE, on the encode thread, so a preview nobody is
+    /// looking at costs a `RwLock` read and nothing else; when it is on,
+    /// the cost is one `Arc` clone (no pixel is touched on this thread).
+    fn preview_tick(&mut self, data: &Arc<Vec<u8>>, stride: usize) {
+        let (Some(tap), Some(tx)) = (&self.tap, &self.preview_tx) else {
             return;
         };
         if let Some(t) = self.last_preview
@@ -1066,18 +1316,24 @@ impl ShareEncoder {
         {
             return;
         }
+        if !tap.preview_enabled() {
+            return;
+        }
         let (sw, sh) = self.source;
         if sw == 0 || sh == 0 {
             return;
         }
-        if let Some(bgra) = letterbox_preview(data, sw, sh, stride) {
-            self.last_preview = Some(std::time::Instant::now());
-            sink(PreviewFrame {
-                width: PREVIEW_WIDTH,
-                height: PREVIEW_HEIGHT,
-                bgra,
-            });
-        }
+        self.last_preview = Some(std::time::Instant::now());
+        // Depth 1 + try_send: a preview thread that is still rendering
+        // the last frame drops this one instead of queueing frames the
+        // sharer would see seconds later.
+        let _ = tx.try_send(PreviewJob {
+            data: data.clone(),
+            stride,
+            width: sw,
+            height: sh,
+            target: (self.stream.0 as usize, self.stream.1 as usize),
+        });
     }
 
     /// 7j: encode one frame in the producer's DMA-BUF. The descriptor is
@@ -1184,6 +1440,29 @@ impl ShareEncoder {
             }
         }
         self.encoded += 1;
+        // What this share actually delivers, reported to the sharer's own
+        // card once a second. The negotiated rate is an upper bound; the
+        // encoder decides what it can hold, and a card that shows the
+        // request instead of the stream is how a 47 fps share claimed 60.
+        self.report_frames += 1;
+        let report = self.report_start.elapsed();
+        if report >= Duration::from_secs(1) {
+            let raw = f64::from(self.report_frames) / report.as_secs_f64();
+            // Nearest 5 fps: one burst must not print "43 fps".
+            let measured = ((raw / 5.0).round() * 5.0).max(1.0);
+            self.report_start = std::time::Instant::now();
+            self.report_frames = 0;
+            if (measured - self.shown_fps).abs() >= 2.0 {
+                self.shown_fps = measured;
+                if let Some(tap) = &self.tap {
+                    tap.stream_info(StreamInfo {
+                        width: self.stream.0,
+                        height: self.stream.1,
+                        fps: measured,
+                    });
+                }
+            }
+        }
         let el = self.window.elapsed();
         if el.as_secs() >= 10 {
             println!(
@@ -1219,15 +1498,19 @@ fn encoder_thread(
     video_loss: Arc<AtomicU32>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     options: ShareOptions,
-    preview: Option<PreviewSink>,
+    tap: Option<PreviewSink>,
 ) {
+    // The preview gets its own thread for the life of this share; it
+    // ends when the encoder drops the channel (share teardown).
+    let preview_tx = tap.as_ref().map(|t| spawn_preview_thread(t.clone()));
     let mut share = ShareEncoder::new(ShareSenderArgs {
         conn,
         die,
         force_idr,
         video_loss,
         options,
-        preview,
+        tap,
+        preview_tx,
     });
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -1272,7 +1555,9 @@ fn encoder_thread(
                 if let Some((width, height, f)) = renegotiate {
                     share.negotiate(width, height, f);
                 }
-                if !share.encode_bgra(&bgra, stride) {
+                // One allocation-free wrap: the preview thread shares
+                // these pixels with the encoder instead of copying them.
+                if !share.encode_bgra(&Arc::new(bgra), stride) {
                     // The connection itself is gone: nothing left to do.
                     let _ = share.die.send(());
                     return;
@@ -1787,7 +2072,8 @@ pub async fn start(
         force_idr: force_idr.clone(),
         video_loss: video_loss.clone(),
         options,
-        preview: preview.clone(),
+        tap: preview.clone(),
+        preview_tx: None,
     };
 
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
@@ -2021,21 +2307,144 @@ mod tests {
         assert!(!scale_bgra(&src[..6], 2, 2, 2 * 4, 1, 1, &mut out));
     }
 
-    #[test]
-    fn preview_fits_the_fixed_canvas() {
-        // 16:9 fills the canvas exactly.
-        let src = vec![255u8; 1920 * 1080 * 4];
-        let canvas = letterbox_preview(&src, 1920, 1080, 1920 * 4).expect("preview frame");
-        assert_eq!(canvas.len(), PREVIEW_WIDTH * PREVIEW_HEIGHT * 4);
-        assert_eq!(canvas[0], 255, "no letterbox bar on a 16:9 capture");
+    /// An opaque-black preview canvas, primed the way the preview thread
+    /// primes it (the letterbox bars stay black without being rewritten).
+    fn blank_canvas(w: usize, h: usize) -> Vec<u8> {
+        let mut canvas = vec![0u8; w * h * 4];
+        for px in canvas.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        canvas
+    }
 
-        // 4:3 pillarboxes: the canvas' left edge is black, the centre is
-        // the capture. Alpha stays opaque either way.
+    #[test]
+    fn preview_canvas_follows_the_stream() {
+        // The sharpness fix: a 1080p stream is previewed at 1080p, so the
+        // sharer sees what viewers get and a fullscreen page has pixels
+        // to show. The old fixed canvas was 640x360 whatever the stream.
+        assert_eq!(preview_target(1920, 1080), (1920, 1080));
+        // An ultrawide capture (the polaris box's 3440x1440) keeps its
+        // shape instead of being squeezed into 16:9 with bars: the page
+        // then uses the preview's real aspect rather than 16:9.
+        let (tw, th) = preview_target(3440, 1440);
+        assert_eq!(tw, 2560, "the ceiling, not the 640 placeholder");
+        assert!(th.abs_diff(1072) <= 2, "even and near 21:9: {tw}x{th}");
+        assert!((tw as f64 / th as f64 - 3440.0 / 1440.0).abs() < 0.01);
+        // 4K stops at the ceiling, both axes by one factor.
+        assert_eq!(preview_target(3840, 2160), (2560, 1440));
+        // Unknown geometry falls back to the seeded placeholder.
+        assert_eq!(preview_target(0, 0), (PREVIEW_WIDTH, PREVIEW_HEIGHT));
+    }
+
+    #[test]
+    fn preview_is_unscaled_when_the_encoder_keeps_the_capture_size() {
+        // 16:9 fills the canvas exactly, and the swizzle is BGRA→RGBA.
+        let src = [10u8, 20, 30, 255].repeat(1920 * 1080);
+        let mut canvas = blank_canvas(1920, 1080);
+        assert!(render_preview(
+            &src,
+            1920,
+            1080,
+            1920 * 4,
+            &mut canvas,
+            1920,
+            1080
+        ));
+        assert_eq!(&canvas[0..4], &[30, 20, 10, 255]);
+        let last = (1080 * 1920 - 1) * 4;
+        assert_eq!(&canvas[last..last + 4], &[30, 20, 10, 255], "last pixel");
+
+        // A 4:3 capture into a 4:3 canvas of the same size: no bars, and
+        // the last row is written (the 1:1 path must not stop early).
         let src = vec![255u8; 800 * 600 * 4];
-        let canvas = letterbox_preview(&src, 800, 600, 800 * 4).expect("preview frame");
-        assert_eq!(canvas[0], 0, "pillarbox bar");
-        assert_eq!(canvas[3], 255, "bars are opaque, not transparent");
-        let mid = (PREVIEW_HEIGHT / 2 * PREVIEW_WIDTH + PREVIEW_WIDTH / 2) * 4;
-        assert_eq!(canvas[mid], 255, "the frame is centred");
+        let mut canvas = blank_canvas(800, 600);
+        assert!(render_preview(
+            &src,
+            800,
+            600,
+            800 * 4,
+            &mut canvas,
+            800,
+            600
+        ));
+        let last = (600 * 800 - 1) * 4;
+        assert_eq!(&canvas[last..last + 4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn preview_letterboxes_only_when_the_shapes_differ() {
+        // A portrait capture into a 16:9 canvas keeps its shape, centred
+        // on the opaque black the thread primed.
+        let src = vec![255u8; 1080 * 1920 * 4];
+        let mut canvas = blank_canvas(1920, 1080);
+        assert!(render_preview(
+            &src,
+            1080,
+            1920,
+            1080 * 4,
+            &mut canvas,
+            1920,
+            1080
+        ));
+        assert_eq!(&canvas[0..4], &[0, 0, 0, 255], "pillarbox bar");
+        let mid = (1080 / 2 * 1920 + 1920 / 2) * 4;
+        assert_eq!(&canvas[mid..mid + 4], &[255, 255, 255, 255], "centred");
+
+        let (_, _, pw, ph) = preview_region(1080, 1920, 1920, 1080).expect("region");
+        assert_eq!(ph, 1080);
+        assert!((pw as f64 / ph as f64 - 1080.0 / 1920.0).abs() < 0.01);
+        // And an ultrawide stream almost fills the canvas the ceiling
+        // gives it: a rounding row, not a letterbox.
+        let (tw, th) = preview_target(3440, 1440);
+        let (x0, y0, pw, ph) = preview_region(3440, 1440, tw, th).expect("region");
+        // A couple of rows/columns of rounding, not a letterbox: the
+        // whole canvas (and so the fullscreen page) is picture.
+        assert!(
+            x0 <= 2 && pw.abs_diff(tw) <= 4,
+            "{x0},{y0} {pw}x{ph} in {tw}x{th}"
+        );
+        assert_eq!((y0, ph), (0, th));
+    }
+
+    /// Informational, like the core crate's `*_cost` tests: the preview
+    /// thread's per-frame cost now that the canvas follows the stream.
+    /// A number, not an assertion — but the number is what says whether
+    /// "the sharer sees what is sent" is affordable at 60 fps. Run with
+    /// `--release`; a debug build is not a measurement.
+    #[test]
+    fn preview_render_cost() {
+        for (w, h) in [(1920usize, 1080usize), (2560, 1070)] {
+            let src = vec![7u8; w * h * 4];
+            let mut canvas = blank_canvas(w, h);
+            let n = 20u32;
+            let started = std::time::Instant::now();
+            for _ in 0..n {
+                assert!(render_preview(&src, w, h, w * 4, &mut canvas, w, h));
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+            println!(
+                "  {w}x{h}: preview {ms:.2} ms/frame ({:.0} fps ceiling)",
+                1000.0 / ms
+            );
+        }
+    }
+
+    #[test]
+    fn preview_scales_a_capped_stream_like_the_encoder_does() {
+        // Capture 3840x2160 encoded at 1920x1080: nearest-neighbour, so
+        // the preview's top-left pixel is the capture's.
+        let mut src = vec![0u8; 3840 * 2160 * 4];
+        src[0..4].copy_from_slice(&[1, 2, 3, 255]);
+        let mut canvas = blank_canvas(1920, 1080);
+        assert!(render_preview(
+            &src,
+            3840,
+            2160,
+            3840 * 4,
+            &mut canvas,
+            1920,
+            1080
+        ));
+        assert_eq!(&canvas[0..4], &[3, 2, 1, 255]);
     }
 }

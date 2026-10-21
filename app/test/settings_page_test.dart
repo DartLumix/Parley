@@ -30,20 +30,28 @@ void main() {
     );
   }
 
-  testWidgets('toggling the preview persists exactly that change',
+  testWidgets('toggling a switch persists exactly that change',
       (tester) async {
     final saved = <AppSettings>[];
     await tester.pumpWidget(host(saved));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Show my own stream while sharing'));
+    await tester.tap(find.text('Echo cancellation'));
     await tester.pumpAndSettle();
 
     expect(saved, hasLength(1));
-    expect(saved.single.showSharePreview, isFalse);
+    expect(saved.single.echoCancel, isFalse);
     // Everything else is carried over, not reset to defaults.
     expect(saved.single.shareHeight, initial.shareHeight);
-    expect(saved.single.echoCancel, initial.echoCancel);
+    expect(saved.single.showSharePreview, initial.showSharePreview);
+  });
+
+  testWidgets('the preview lives on the screen tile, not in Settings',
+      (tester) async {
+    await tester.pumpWidget(host(<AppSettings>[]));
+    await tester.pumpAndSettle();
+    expect(find.text('Show my own stream while sharing'), findsNothing);
+    expect(find.textContaining('small preview'), findsNothing);
   });
 
   testWidgets('resolution and frame-rate choices persist', (tester) async {

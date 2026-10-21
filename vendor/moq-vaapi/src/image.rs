@@ -159,6 +159,43 @@ impl<'a> Image<'a> {
 		}
 	}
 
+	/// Create a new image from `surface` using `vaCreateImage` and map it,
+	/// WITHOUT the `vaGetImage` copy [`create_from`](Self::create_from)
+	/// performs.
+	///
+	/// PARLEY PATCH — for an upload the old surface contents are irrelevant:
+	/// every visible byte is overwritten before the image is dropped (whose
+	/// `vaPutImage` writes it back). `create_from` therefore copied the whole
+	/// frame out of the surface only to overwrite it, which on this project's
+	/// VCE path measured 3-5 ms per 720p frame and 6-8 ms per 1080p one.
+	///
+	/// The image's padding (pitch beyond the visible width) is NOT
+	/// initialized; a caller that only writes the visible region is fine,
+	/// because the driver copies the image as a whole and padding never
+	/// reaches the picture.
+	pub fn create_scratch<D: SurfaceMemoryDescriptor>(
+		surface: &'a Surface<D>,
+		mut format: bindings::VAImageFormat,
+		coded_resolution: (u32, u32),
+	) -> Result<Image<'a>, VaError> {
+		// An all-zero byte-pattern is a valid initial value for `VAImage`.
+		let mut image: bindings::VAImage = Default::default();
+		let dpy = surface.display().handle();
+
+		// Safe because `dpy` is a valid display handle.
+		va_check(unsafe {
+			bindings::va().vaCreateImage(
+				dpy,
+				&mut format,
+				coded_resolution.0 as i32,
+				coded_resolution.1 as i32,
+				&mut image,
+			)
+		})?;
+
+		Self::new(surface, image, false, coded_resolution)
+	}
+
 	/// Get a reference to the underlying `VAImage` that describes this image.
 	pub fn image(&self) -> &bindings::VAImage {
 		&self.image

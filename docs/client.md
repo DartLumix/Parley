@@ -55,8 +55,9 @@ same trust decision.
 - **Voice** — click *Join* on a channel: joining opens the microphone
   and speakers (TeamSpeak shape, no separate listen toggle). *Leave*
   closes them. The channel card lists who is in voice.
-- **Layout** — channels fill the left pane, chat sits on the right. A
-  screen share opens above the chat and pushes it down.
+- **Layout** — channels and their rosters fill the left pane (a wide
+  column, 420 px at the default window size), screens and chat sit on the
+  right. A screen share opens above the chat and pushes it down.
 - **Chat** — the chat panel belongs to the joined channel; history
   loads on join.
 - **Stays signed in** — closing the window is not signing out: the app
@@ -77,29 +78,51 @@ same trust decision.
   turned-down person still lights up, because the meter is taken before
   your volume is applied.
 - **Volume** — click a name in a channel's roster for their voice slider
-  (0–200%). A screen sharer also gets a *Screen share audio* slider there
-  and in the share pane: that stream is trimmed separately, so their voice
+  (0–200%). A screen sharer also gets a *Screen share audio* slider on
+  their open tile: that stream is trimmed separately, so their voice
   keeps its level.
 - **Screen share** — *Share screen* in the floating bar asks for a
   resolution and frame-rate cap first (defaults from Settings, *Source*
   means the capture's own size and rate — caps never upscale), then the
-  desktop's portal asks which monitor or window. Everyone in the same
-  channel gets a card; *Watch* renders it, and the share's system audio
-  starts only once you are watching.
-- **Your own stream** — while sharing, the share pane shows what you are
-  sending, straight from the capture (before encoding), with a switch to
-  turn it off. Watching someone else at the same time moves it to a small
-  overlay in the corner so it never disappears. Turning it off stops the
-  scaling work as well as the picture.
-- **Settings** — the gear in the app bar: video (own-stream preview,
-  hardware encoding, default share resolution and frame rate), audio
-  (echo cancellation, which applies to the next channel you join), and
-  account (the connected server and account, plus *Sign out*). Every
-  control saves immediately to `~/.config/parley/settings.toml`; a
-  preference that only takes effect at encoder/AEC creation says so on
-  the page.
-- **Fullscreen** — the expand button on a watched share. It is real
-  window fullscreen: the compositor's own shortcuts work, Esc exits.
+  desktop's portal asks which monitor or window. The software encoder
+  (openh264) is capped at 1080p whatever *Source* says: measured at
+  1440p it needs ~35 ms per frame against a 33 ms slot, so half the
+  frames would be dropped. With *Hardware encoding* on, the cap is
+  gone and source 1440p60/1080p60 is reachable. The tile's resolution
+  line is the stream viewers get, not the capture.
+- **Screens** — everyone sharing in your channel (you included) is a 16:9
+  tile in the section above the chat: name, resolution, measured frame
+  rate, and a *Watch* button. A remote share is a poster until *Watch* is
+  pressed — the stream is decoded and measured behind it (so the tile's
+  numbers are real and opening is instant) but nothing is converted,
+  uploaded or painted until somebody is looking. One share fills the
+  section; two split it left/right; three put two on top and centre the
+  third below; four make a cross, and so on. *Watch* makes that share big
+  and leaves the others as posters in a strip along the bottom — click one
+  to open it too. Several can be open: they split the big area, each keeps
+  its own system-audio slider, and the close button mutes only that share.
+  The big tile's expand button opens real window fullscreen.
+- **Your own stream** — while sharing, your tile is fed by the capture tap
+  and drawn at the stream's own size and shape (a 21:9 screen stays 21:9;
+  the canvas follows the encoder up to 2560×1440), so it shows exactly what
+  is being sent rather than a 360p thumbnail of it (a remote share's poster
+  does not apply to it). The switch on the tile turns it off, and off stops
+  the scaling work rather than just hiding the picture.
+  It is an ordinary tile: open it to watch yourself big, expand it for
+  the fullscreen page, or leave it small and keep an eye on the others. Its rate line is measured from the frames
+  actually sent, so a 60 fps request on a machine that encodes 47 says 47.
+- **Settings** — the gear in the app bar: video (hardware encoding,
+  default share resolution and frame rate), audio (echo cancellation,
+  which applies to the next channel you join), and account (the connected
+  server and account, plus *Sign out*). Every control saves immediately
+  to `~/.config/parley/settings.toml`; a preference that only takes effect
+  at encoder/AEC creation says so on the page.
+- **Fullscreen** — the expand button on an open share, your own
+  included (yours draws the capture preview, and turning the preview
+  switch back on first if it was off). It is real window fullscreen: the
+  compositor's own shortcuts work, Esc exits. Opening it never
+  interrupts the stream — it is the same open share, drawn on the
+  fullscreen page — and only *Stop watching* closes somebody else's.
   Nothing is drawn over the picture except two fading controls.
 - **Window bar** — the window has no title bar. Move the pointer to the
   very top edge and a thin toolbar slides down with minimise, maximise
@@ -124,7 +147,10 @@ same trust decision.
 | a watched share is black | sender side: the share's `encoder ready` line; receiver side: frames arriving but not decoding means keyframe/stream shape |
 | hardware encoding switch missing | the build lacks `hw-encode`, or VAAPI has no encoder (`vainfo`) |
 | share starts but looks blocky after picking a cap | the cap scales the capture down on the CPU; pick *Source* or a larger height on a slow machine |
+| *Source* on a 1440p/4K display streams 1080p | the software encoder's ceiling (see *Screen share*); enable *Hardware encoding* to send the full size |
+| a share stutters while the sender's CPU is busy | software 1080p30 is near the limit on eight cores (~19 ms per frame, p95 ~35 ms). Lower the share height/frame rate, or use hardware encoding |
 | own preview stays black | frames are only produced once capture delivers its first buffer — check the `share: encoder ready` line |
+| a share's tile says "connecting…" | the first decoded frame has not reached the display yet; if it stays there, check the receiver's `video:` lines |
 
 Logs: run `~/.local/opt/parley/parley` from a terminal to see
 `video:`/`voice:`/`window:` lines; the login page shows the build

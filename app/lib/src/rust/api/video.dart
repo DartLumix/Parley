@@ -7,8 +7,8 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `preview_sink`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
+// These functions are ignored because they are not marked as `pub`: `clear_share_stats`, `share_tap`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `eq`, `fmt`, `fmt`
 
 /// One-time startup: validate the engine-context plugin (a main-thread
 /// hop to `EngineContext::get()`) and store the engine handle for the
@@ -19,9 +19,16 @@ Future<void> videoPrepare({required PlatformInt64 engineHandle}) =>
 
 /// Create (once) and describe the preview texture. Call after
 /// `video_prepare`; the id is stable for the life of the process.
-/// Featureless: the 7d-convention error string.
+/// Featureless: the 7d-convention error string. `video` alone is not
+/// enough — the frames come from the capture crate, so a receive-only
+/// build has no preview to describe.
 Future<SharePreview> sharePreview() =>
     RustLib.instance.api.crateApiVideoSharePreview();
+
+/// The running share's negotiated shape, or None when nothing is being
+/// shared (or the featureless build has no capture at all).
+Future<ShareStats?> shareStats() =>
+    RustLib.instance.api.crateApiVideoShareStats();
 
 /// The sharer's own view of the running share (7l). One fixed-size
 /// texture per process — the frames are the capture, downscaled and
@@ -51,4 +58,32 @@ class SharePreview {
           textureId == other.textureId &&
           width == other.width &&
           height == other.height;
+}
+
+/// The shape of the running share, for the sharer's own card: capture
+/// pixels and the rate the encoder actually paces at (after the profile
+/// ceiling and the share dialog's cap). `None` before the first format
+/// negotiation, and not shared (somebody else's share).
+class ShareStats {
+  final BigInt width;
+  final BigInt height;
+  final BigInt fps;
+
+  const ShareStats({
+    required this.width,
+    required this.height,
+    required this.fps,
+  });
+
+  @override
+  int get hashCode => width.hashCode ^ height.hashCode ^ fps.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ShareStats &&
+          runtimeType == other.runtimeType &&
+          width == other.width &&
+          height == other.height &&
+          fps == other.fps;
 }

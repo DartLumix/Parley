@@ -30,7 +30,10 @@ Future<ShareOptions?> showShareOptionsDialog(
             children: [
               const Text(
                 'Pick the source in the desktop dialog that opens next. '
-                'These are caps, not upscales.',
+                'These are caps, not upscales — the stream runs at the '
+                'fastest rate the encoder can hold up to the frame rate '
+                'chosen here, and the screen tile shows the rate actually '
+                'being sent.',
                 style: TextStyle(color: Colors.white54, fontSize: 12),
               ),
               const SizedBox(height: 12),

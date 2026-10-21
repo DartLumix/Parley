@@ -3,36 +3,173 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
-## [0.3.0] — 2026-10-21
+## [Unreleased]
 
-Settings, a share you can see, and a share you choose the size of.
+Smoother shares, a screens section that survives a small window, and
+nothing playing until you ask it to.
 
 ### Added
 
-- **See your own stream while sharing.** The capture taps a downscaled
-  frame (fixed 640×360 canvas, letterboxed, ≤10 fps) into a Flutter
-  texture before encoding, so the share pane shows exactly what is being
-  sent — the wrong-window mistakes this catches. A switch turns it off,
-  and off means no scaling work at all, mid-share included. Watching
-  someone else moves it to a corner overlay instead of hiding it.
-- **Settings page.** Video: own-stream preview, hardware (VAAPI) encode,
-  default share resolution and frame rate. Audio: echo cancellation
-  (speech channels; music channels never used it and still do not).
-  Account: the connected server and account, and *Sign out*. Saved
-  immediately to `~/.config/parley/settings.toml`; the hardware-encode
-  preference is re-applied at launch, and the file is read with defaults
-  for missing keys so an older file keeps working.
+- **A join/leave cue.** Somebody entering or leaving the voice channel
+  you are in plays a short rising (join) or falling (leave) pair,
+  mixed into this machine's render only — never sent to peers, never
+  in the AEC reference, never in a screen share's audio. Silent when
+  you are not in voice, which is the only time it would have
+  somewhere to play.
+
+### Changed
+
+- **The sharer's own picture is the stream's own pixels.** The preview
+  was a fixed 640×360 canvas with the capture letterboxed into it, so a
+  3440×1440 screen became 640×268 inside black bars and was then scaled
+  back up — soft in the tile, and unusable on the new fullscreen page,
+  which blew 360p across the whole screen. The canvas now follows the
+  encoder's output size (same aspect, up to 2560×1440), the tile and the
+  fullscreen page use that shape instead of assuming 16:9, and the
+  hand-off is a straight BGRA→RGBA swizzle when the encoder keeps the
+  capture size: 3.3 ms/frame at 1080p and 4.3 ms at 2560×1070 on the
+  preview thread (`preview_render_cost`), against a 16.7 ms slot. The
+  preview also follows the share's own rate instead of a fixed 30 fps.
+- **An unopened share shows a poster, not the stream.** A remote tile
+  used to play the live picture behind its Watch button, so "watch"
+  was a label rather than a choice. It is now a dark plate with the
+  sharer's name, the stream's size and rate, and Watch; opening it is
+  what starts the picture. The display bridge is told which senders
+  are on screen, so a closed share costs no RGB conversion, no
+  texture upload and no raster-thread hand-off per frame — on a 1080p
+  stream that is 8 MB and a platform-thread hop, 30 times a second,
+  per share nobody is watching. Decoding is deliberately not gated:
+  opening a tile shows its next frame instead of waiting for the next
+  IDR.
+
+### Fixed
+
+- **The join/leave cue fired on news that was not a join.** The server
+  sends a mute as the same `VoiceState` a join uses (`joined: true`,
+  the member's current channel), and any re-announce — the 10 s roster
+  poll, a reconnect, a second device — repeats a membership that never
+  moved. The cue now follows the *transition*: a member who was not in
+  your channel and now is (or the reverse), never a mute, never a
+  member re-announced, never your own events. `isVoiceMembershipCue`
+  is the whole rule, and it is unit-tested.
+- **Fullscreen froze the share it was showing.** The viewer's
+  fullscreen button lives on an open tile and entered through the same
+  call the Watch button uses — which is a toggle. So opening fullscreen
+  CLOSED the share on the way in: the display bridge was told nobody
+  was looking, stopped converting and uploading frames, and the
+  fullscreen page painted the one frame it already had until the viewer
+  was  dismissed. Opening is now idempotent, so the picture follows the
+  same texture into fullscreen and keeps running.
+- **Expanding your own share closed it.** Your tile's expand button ran
+  the same toggle, so on your own share it did the worst possible pair:
+  it closed the tile (back to *Watch*) and put the window into
+  fullscreen showing the session. Your own share now gets the same
+  fullscreen page as anyone else's, drawing the capture preview on its
+  16:9 canvas (the preview switch is turned on first if it was off),
+  with *Exit fullscreen* and no *Stop watching* — there is no watch
+  state to stop. When the share ends, the page closes and the window
+  leaves fullscreen on its own.
+- **A hardware share paced at the rate the encoder measured during
+  its own cold start.** The self-test times the encoder's first
+  frames, which pay for the video processor's context, the BGRX
+  surface and the driver's shaders — so a machine whose encoder ran
+  at ~60 fps paced its whole share at 50, and one at 1080p read as 30.
+  Worse, the 60 fps choice in the share dialog could not exceed it: a
+  60 fps request was silently a 30 fps stream. The measured rate is
+  diagnostic now; pacing uses the profile ceiling (60 fps hardware,
+  30 fps software) lowered only by the capture's own rate and the
+  dialog's cap, and the sharer's tile reports the rate actually being
+  sent rather than the one requested.
+- **The VAAPI upload copied every frame out of the surface before
+  overwriting it.** `vaGetImage` is a full-frame read-back, and the
+  upload path overwrote all of it a moment later (the image format
+  was also re-queried from the driver on every frame). 720p encodes
+  went from 16.8 to 14.8 ms per frame and 1080p from 33.6 to 30.1 ms
+  (`crates/parley-core/tests/vaapi_encode_cost.rs`).
+
+- **1080p30 software encoding now fits its frame budget.** openh264
+  encoded each frame as one slice on one core: measured against a
+  screen-content workload at 1080p, mean 23.5 ms with a 48 ms p95 and
+  117 of 240 frames over the 33 ms slot, which the sender's
+  skip-to-newest pacing turned into visible stepping. Frames are now
+  split into ~4 KB slices across four threads — 19 ms mean, 34.5 ms
+  p95, 17 of 240 over — and 720p has comfortable headroom (mean 9 ms).
+  `crates/parley-core/tests/software_encode_cost.rs` reproduces the
+  measurement.
+- **The software encoder no longer accepts more than 1080p.** A
+  *Source* share on a 1440p/4K display used to hand openh264 the whole
+  frame; at 1440p the same test measures 35 ms mean / 62 ms p95, so
+  more than half the frames missed their slot. Software shares are
+  downscaled to 1080p (aspect preserved, even dimensions); hardware
+  encoding is not capped. The sharer's tile reports the stream's real
+  size, so a capped share never claims a resolution viewers do not get.
+- **The own-share preview runs at the stream's own 30 fps.** At 15 fps
+  the only place a sharer can judge smoothness looked like a
+  stuttering stream; the scaling still happens on its own thread with
+  a latest-wins hand-off, so the encoder never waits for it.
+- **A short window keeps a usable chat.** With a share open the screens
+  section took 84% of the pane regardless of its height, leaving the
+  chat a header and an input under the floating bar. The chat now has
+  a floor (200 px); the screens section takes what is left.
+- **Speakers are easier to read.** One row per person is a little
+  taller, with 13 px names and 15 px icons; channel names and the
+  "N in voice" line grew with it, and the column's measured width
+  follows the new sizes. The column is wider too — more padding per
+  row, more room after the mic icon, and a floor of 420 px (near double
+  the old 220) with the cap at 560, so the roster is a comfortable
+  list rather than a strip of names fitted to their own width.
+
+## [0.3.0] — 2026-10-21
+
+A screens section that holds every share, settings that stick, and a
+preview that costs the stream nothing.
+
+### Added
+
+- **A screens section that actually contains the screens.** Every share
+  — yours included — is a 16:9 tile with the sharer's name, the stream's
+  real resolution and frame rate, a live thumbnail and a *Watch* button.
+  One share fills the section; two split it left/right; three put two on
+  top and centre the third below; four make a cross, and so on. Opening
+  a share makes it big and leaves the rest as thumbnails in a strip
+  along the bottom, so watching one stream never hides that others are
+  still sharing. Several can be open at once; each one's system audio
+  has its own slider, and closing one mutes only that one.
+- **See your own stream while sharing.** Your tile is fed by the capture
+  tap (fixed 640×360 canvas, letterboxed) before encoding, so it shows
+  exactly what is being sent. The switch on the tile turns it off — off
+  means no capture-side scaling work at all, mid-share included. The
+  preview is rendered on its own thread and shares the captured buffer
+  with the encoder (one `Arc`, no copy), so it can never delay a frame.
+- **Settings page.** Video: hardware (VAAPI) encode, default share
+  resolution and frame rate. Audio: echo cancellation (speech channels;
+  music channels never used it and still do not). Account: the connected
+  server and account, and *Sign out*. Saved immediately to
+  `~/.config/parley/settings.toml`; the hardware-encode preference is
+  re-applied at launch, and the file is read with defaults for missing
+  keys so an older file keeps working.
 - **Share options dialog.** Starting a share asks for a resolution cap
   (source/1440p/1080p/720p/480p) and frame-rate cap (source/60/30/15)
   before the portal opens. Both are caps: the capture is downscaled with
   nearest-neighbour sampling (aspect preserved, even dimensions), never
   enlarged, and pacing never exceeds the rate the encoder can hold.
+- **A roster that reads downwards, in a column sized to its names.**
+  Speakers are one per row inside their channel instead of inline chips,
+  and the channel column is measured from the longest name (with a floor
+  and a ceiling) so screens and chat get the rest of the window.
 
 ### Changed
 
 - The hardware-encode switch moved from the floating bar to Settings →
   Video. One persisted source of truth; it still applies on the next
   share.
+- The own-preview switch lives on your screen tile, not in Settings, and
+  the corner overlay is gone: your share is one of the tiles, big or
+  small like everyone else's.
+- Remote tiles keep up with the stream: a one-second arrival window
+  measures the real frame rate (so a limping encoder shows what it is
+  actually delivering), and a shared window resized mid-share updates
+  the tile's resolution instead of showing the old one.
 
 ## [0.2.3] — 2026-10-20
 

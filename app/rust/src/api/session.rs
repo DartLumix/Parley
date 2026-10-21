@@ -332,12 +332,15 @@ pub struct VoiceLevel {
 
 /// 7f: one remote share's display surface. `texture_id` feeds a plain
 /// Flutter `Texture` widget (pixels come from the Rust side); width /
-/// height are the decoded stream's dimensions.
+/// height are the decoded stream's dimensions and `fps` the cadence the
+/// display bridge measured (a provisional 30/60 from the stream's rate
+/// flag until the first one-second window closes).
 #[derive(Debug, Clone)]
 pub struct VideoSurfaceInfo {
     pub user_id: u32,
     pub width: u64,
     pub height: u64,
+    pub fps: u64,
     pub texture_id: i64,
 }
 
@@ -618,6 +621,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                         user_id: v.user_id,
                         width: 0,
                         height: 0,
+                        fps: 0,
                         texture_id: 0,
                     });
                     extra.push(e);
@@ -746,6 +750,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                     user_id: s.user_id,
                     width: 0,
                     height: 0,
+                    fps: 0,
                     texture_id: 0,
                 });
                 vec![e]
@@ -1435,6 +1440,50 @@ pub fn set_share_audio(session_id: u32, user_id: u32, audible: bool) -> Result<(
     }
 }
 
+/// Show (or stop showing) one sender's screen picture.
+///
+/// Watching is the UI's decision, and the UI never paints a share nobody
+/// opened: an unopened tile is a name and a Watch button. This tells the
+/// display bridge exactly that, so a closed share keeps its stream
+/// decoded (opening one is then instant) but costs no per-frame pixel
+/// conversion, texture upload or raster-thread hand-off — the expensive
+/// half of showing a 1080p stream at 30 fps, per share, whether or not
+/// anybody is looking.
+///
+/// Featureless: reports the stub convention's error (no video path).
+pub fn set_screen_watched(session_id: u32, user_id: u32, watched: bool) -> Result<(), String> {
+    #[cfg(feature = "video")]
+    {
+        let sessions = SESSIONS.lock().unwrap();
+        let s = sessions
+            .get(&session_id)
+            .ok_or(format!("no session {session_id}"))?;
+        if let Some(display) = s.display.as_ref() {
+            display.set_watching(user_id, watched);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "video"))]
+    {
+        let _ = (session_id, user_id, watched);
+        Err("video feature off".into())
+    }
+}
+
+/// Play this machine's join/leave cue: a short rising pair when somebody
+/// enters this voice channel, the same pair falling when they leave. It
+/// is mixed into the LOCAL render only — it never reaches the wire, the
+/// AEC reference or the share-audio path.
+///
+/// Silent when no voice stream is open (there is nothing to mix into),
+/// and a request made before one opens is dropped rather than replayed.
+pub fn play_voice_chime(join: bool) {
+    #[cfg(feature = "audio-device")]
+    crate::api::voice::play_chime(join);
+    #[cfg(not(feature = "audio-device"))]
+    let _ = join;
+}
+
 // ===== 7g: in-app screen share =====
 //
 // The Dart side calls start_screen_share after joining a channel; the
@@ -1497,6 +1546,9 @@ pub fn start_screen_share(_session_id: u32, _max_height: u32, _max_fps: u32) -> 
 /// is not an error: the share still starts, just larger or faster.
 #[cfg(feature = "screen-capture")]
 pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Result<(), String> {
+    // The own-share card reads the NEW share's shape, not the last one's
+    // while the portal picker is still open.
+    crate::api::video::clear_share_stats();
     let (event_tx, share_loss, conn, poke_slot, ctrl_slot) = {
         let sessions = SESSIONS.lock().unwrap();
         let s = sessions
@@ -1556,10 +1608,10 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
                 max_height: (max_height > 0).then_some(max_height),
                 max_fps: (max_fps > 0).then(|| f64::from(max_fps)),
             };
-            // The sharer's own preview: the sink is always installed and
+            // The sharer's own preview: the tap is always installed and
             // checks the settings switch per frame, so toggling it mid-
             // share costs nothing and needs no restart.
-            let preview = crate::api::video::preview_sink();
+            let preview = crate::api::video::share_tap();
             match parley_client::screen::start(
                 conn.clone(),
                 share_loss,
@@ -1628,6 +1680,7 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
         // server and clean the slots.
         let _ = ended_rx.recv().await;
         let _ = send_command(session_id, Command::StopShare);
+        crate::api::video::clear_share_stats();
         {
             let sessions = SESSIONS.lock().unwrap();
             if let Some(s) = sessions.get(&session_id) {
@@ -1760,6 +1813,7 @@ fn start_share_watchdog(
                     user_id: *id,
                     width: 0,
                     height: 0,
+                    fps: 0,
                     texture_id: 0,
                 });
                 println!(

@@ -8,8 +8,8 @@ import '../../lib.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `consumer_loop`, `create_texture`, `new`, `prepare`, `preview_view`, `push_preview`, `put_frame`, `rgb24_to_rgba_into`, `rgb24_to_rgba`, `share_preview`, `take_buffer`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `FrameProvider`, `PreviewView`, `SenderView`
+// These functions are ignored because they are not marked as `pub`: `consumer_loop`, `create_texture`, `new`, `prepare`, `preview_view`, `push_preview`, `put_frame`, `rgb24_to_rgba_into`, `rgb24_to_rgba`, `share_preview`, `surface_event`, `take_buffer`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Cadence`, `FrameProvider`, `PreviewView`, `SenderView`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `drop`, `get_payload`
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<DisplayBridge>>
@@ -27,6 +27,18 @@ abstract class DisplayBridge implements RustOpaqueInterface {
   Future<void> hide_({required int senderId});
 
   Future<void> senderStopped({required int senderId, required bool forget});
+
+  /// Show (or stop showing) one sender's picture. Called when a tile
+  /// is opened or closed — the UI never renders an unopened share, so
+  /// there is no reason to convert, upload or paint its frames.
+  ///
+  /// The decoder is deliberately NOT gated: a stream decoded from its
+  /// first keyframe is what makes opening a tile show a picture on the
+  /// next frame instead of waiting for the next IDR. What is gated is
+  /// everything downstream of the decode, which on a 1080p share is
+  /// the 8 MB RGBA conversion and the platform-thread texture upload
+  /// per frame.
+  Future<void> setWatching({required int senderId, required bool watching});
 
   /// Spawn the consumer thread. `events` is the session's event
   /// channel (video_started flows through it); `hub` the receive

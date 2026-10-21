@@ -55,9 +55,11 @@ Product gaps, roughly in the order a small community would notice:
    (input/output), no deafen/push-to-talk, no notifications.
 3. **Chat depth** — no DMs, mentions, rich text, search, attachments or
    file transfer.
-4. **Share depth** — no remote control, no per-window "watch this one"
-   pinning in the app, and no preview of someone else's screen before
-   watching (your own stream is previewed while sharing).
+4. **Share depth** — no remote control, and no per-window "watch this
+   one" pinning: *Watch* opens a share, the tile itself is a poster (the
+   stream is decoded and measured behind it, but not painted) before
+   that. Your own stream is one of the tiles while you share, and its
+   preview is live because it is your own capture.
 5. **Operations** — no metrics endpoint, log rotation, or admin UI; one
    channel is created by default (`general`) and channels are created by
    editing SQLite.

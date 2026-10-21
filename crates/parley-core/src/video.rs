@@ -26,6 +26,30 @@ pub const VIDEO_HEIGHT: usize = 720;
 /// openh264 tops out around 32 fps at 1080p on this class of machine,
 /// so promising more would just mean dropping frames.
 pub const VIDEO_FPS_SOFTWARE: f32 = 30.0;
+/// Tallest frame the SOFTWARE encoder is handed.
+///
+/// Above 1080p openh264 cannot hold a 30 fps budget on this class of
+/// machine: measured at 2560x1440 it averages ~33 ms per frame with a
+/// ~58 ms p95, so half the frames miss their slot and the sender's
+/// skip-to-newest pacing turns that into visible stepping. A "Source"
+/// share on a 1440p/4K display is therefore downscaled to 1080p rather
+/// than offered as a stutter; hardware encode (VAAPI) is not capped and
+/// does the full 1440p60. The share dialog's own cap still applies on
+/// top, and a capture below this is never grown.
+pub const SOFTWARE_MAX_HEIGHT: usize = 1080;
+/// Largest NAL the software encoder emits, i.e. the slice size that lets
+/// openh264 encode a frame on several threads.
+///
+/// Measured at 1080p30 (`tests/software_encode_cost.rs`): a single-slice
+/// frame misses its 33 ms slot 117/240 times (p95 48 ms); split into
+/// ~4 KB slices over 4 threads that drops to 17/240 (p95 34.5 ms). The
+/// boundary is a visible cost only if slices get small, which is why
+/// this is 4 KB and not the datagram budget (~1.2 KB).
+const SOFTWARE_SLICE_BYTES: u32 = 4000;
+/// Encoder threads for the software profile. Past four the frame stops
+/// getting faster (measured: 8 threads buys 0.1 ms) because the slices
+/// that remain are already in flight.
+const SOFTWARE_THREADS: u16 = 4;
 /// 7h HD: frame rate the share path targets once a HARDWARE encoder is
 /// live. VCE/QuickSync do 1080p60 and 1440p60 without noticing; the
 /// roadmap's "1440p60 with hardware encode" is gated on exactly this.
@@ -208,39 +232,38 @@ pub fn hardware_encoder_active() -> bool {
 /// measured). See [`hardware_measured_fps`].
 static HW_MEASURED_MFPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The hardware encoder's MEASURED sustained throughput, if one was
-/// measured at creation.
+/// The hardware encoder's MEASURED throughput over a short self-test
+/// at encoder creation, in fps (diagnostic only — see [`target_fps`]).
 ///
-/// 7h HD: the profile rate is not a constant to assume. On this
-/// project's VCE the same code path measured 720p at 60 fps, 1080p at
-/// 30 and 1440p at 19 — 1080p60 is not a setting that exists here, and
-/// advertising it would mean the share path paces 60 fps while the
-/// encoder delivers 30, i.e. every frame arrives late and the latency
-/// ladder calls a healthy path lossy. The second device will measure
-/// differently, and this is what makes the profile follow the machine
-/// rather than the machine following the profile.
+/// It is logged and shown by the hardware test tools, but it no longer
+/// CAPS the stream. It used to: the share path paced at this number, and
+/// because it is measured during the encoder's first, cold frames (the
+/// video processor's context, the BGRX surface and the driver's shaders
+/// are all created inside the timing window) it read well under the
+/// sustained rate — a machine whose encoder ran at ~60 fps paced its
+/// whole share at 50, and a 1080p share read as 30. The encoder's real
+/// deliverable rate is simply what it delivers: the pacing loop skips a
+/// frame it cannot encode in time and viewers measure the arrival
+/// cadence, so a cap only ever made the stream slower than the machine
+/// and slower than the viewer's own report.
 ///
 /// The measurement happens once, at creation (see
-/// [`create_encoder_auto`]): the same self-test frames the decodability
-/// check already encodes are timed.
+/// [`create_encoder_auto`]).
 pub fn hardware_measured_fps() -> Option<f32> {
     let m = HW_MEASURED_MFPS.load(Ordering::Relaxed);
     (m > 0).then(|| m as f32 / 1000.0)
 }
 
 /// Frame rate the share path should pace and timestamp at, given the
-/// backend in use. Read at the moment a frame is sent, so it is always
-/// the rate of the live encoder: the software ceiling, or what the
-/// hardware encoder was measured to sustain (capped by the hardware
-/// profile, floored so a driver hiccup cannot collapse the stream).
+/// backend in use: the profile ceiling (60 fps hardware, 30 fps
+/// software), lowered by the capture's own rate and by the share
+/// dialog's cap. See [`hardware_measured_fps`] for why the measured
+/// rate is not a factor.
 pub fn target_fps() -> f32 {
     if !hardware_encoder_active() {
         return VIDEO_FPS_SOFTWARE;
     }
-    match hardware_measured_fps() {
-        Some(fps) => fps.clamp(VIDEO_FPS_MIN, VIDEO_FPS_HARDWARE),
-        None => VIDEO_FPS_HARDWARE,
-    }
+    VIDEO_FPS_HARDWARE
 }
 
 /// A stream below this is not worth sending as video.
@@ -325,7 +348,25 @@ fn encoder_config(bps: u32, fps: f32) -> EncoderConfig {
         ))
         .adaptive_quantization(false) // unsupported for screen content
         .background_detection(false) // unsupported for screen content
-        .num_threads(0) // auto
+        // Slice-based parallelism: 1080p30 is not reachable in real time
+        // on one core (see SOFTWARE_SLICE_BYTES for the measurement).
+        .num_threads(SOFTWARE_THREADS)
+        .max_slice_len(SOFTWARE_SLICE_BYTES)
+}
+
+/// Fit a capture into [`SOFTWARE_MAX_HEIGHT`], preserving the aspect
+/// ratio and never growing it. Even dimensions only: openh264 rejects an
+/// odd width, and a 2:1 downscale of an odd height is not worth a
+/// special case.
+pub fn fit_software_dims(width: usize, height: usize) -> (usize, usize) {
+    if height <= SOFTWARE_MAX_HEIGHT || height == 0 {
+        return (width, height);
+    }
+    let even = |v: usize| (v & !1).max(2);
+    (
+        even((width * SOFTWARE_MAX_HEIGHT) / height),
+        even(SOFTWARE_MAX_HEIGHT),
+    )
 }
 
 /// Software encoder (openh264). The universal fallback — available on
@@ -601,6 +642,7 @@ fn measure_encoder_fps(enc: &mut dyn VideoEncoder) -> Option<f32> {
     if w == 0 || h == 0 {
         return None;
     }
+    const WARMUP: usize = 3;
     const FRAMES: usize = 12;
     // Padded rows, like a compositor's buffer: the strided path is the
     // one a real share uses, so it is the one to measure.
@@ -615,13 +657,24 @@ fn measure_encoder_fps(enc: &mut dyn VideoEncoder) -> Option<f32> {
         px[3] = 255;
     }
     let mut out = Vec::new();
-    let started = std::time::Instant::now();
-    for _ in 0..FRAMES {
+    // Warm-up frames are NOT timed: the first frames pay for the video
+    // processor's context, the BGRX surface and the driver's shader
+    // uploads — one-time costs that otherwise land inside the window and
+    // make a 60 fps encoder measure ~50 (and pace the whole share at 50).
+    for _ in 0..WARMUP {
         enc.encode_bgra_strided(&bgra, w, h, stride, &mut out)
             .ok()?;
     }
-    let secs = started.elapsed().as_secs_f64();
-    (secs > 0.0).then(|| FRAMES as f32 / secs as f32)
+    // Per-frame times, median: one scheduler hiccup or a GPU frequency
+    // dip must not move the rate the live share is paced at.
+    let mut total = 0.0;
+    for _ in 0..FRAMES {
+        let t = std::time::Instant::now();
+        enc.encode_bgra_strided(&bgra, w, h, stride, &mut out)
+            .ok()?;
+        total += t.elapsed().as_secs_f64();
+    }
+    (total > 0.0).then(|| (FRAMES as f64 / total) as f32)
 }
 
 /// Construct the best available encoder for this platform.
@@ -655,10 +708,9 @@ pub fn create_encoder_auto(width: usize, height: usize) -> Result<Box<dyn VideoE
             Ok(mut e) => match encoder_produces_decodable_keyframe(&mut e) {
                 Ok(()) => {
                     // 7h HD: the decodability self-test says the stream
-                    // is usable; this says how fast it is. Measured
-                    // before the first real frame, so the share path's
-                    // pacing, timestamps and rate hint all reflect the
-                    // machine instead of the datasheet.
+                    // is usable; this says roughly how fast it is. It is
+                    // diagnostic (the log line below), never a pacing
+                    // cap — see `hardware_measured_fps` for why.
                     let measured = measure_encoder_fps(&mut e);
                     // The tests consumed frames and left the encoder
                     // mid-GOP: make the first REAL frame an IDR so a
@@ -670,20 +722,11 @@ pub fn create_encoder_auto(width: usize, height: usize) -> Result<Box<dyn VideoE
                     } else {
                         HW_MEASURED_MFPS.store(0, Ordering::Relaxed);
                     }
-                    // The session was opened at the hardware profile's
-                    // top rate; if the measured rate is lower, the
-                    // bitrate target moves with it. A 60 fps budget spent
-                    // over 30 fps of frames is just a bigger coded buffer
-                    // and a rate controller chasing a rate nobody sends.
-                    let effective = bitrate_for(width, height, target_fps());
-                    if effective != bitrate_for(width, height, VIDEO_FPS_HARDWARE) {
-                        e.set_bitrate(effective);
-                    }
                     eprintln!(
-                        "video: hardware (VAAPI) encoder selected — {width}x{height}, measured \
-                         {:.1} fps sustained (pacing at {:.0}), {} bps, keyframe self-test \
-                         passed (verified decodable by a fresh decoder); if the GPU wedges, \
-                         this is why",
+                        "video: hardware (VAAPI) encoder selected — {width}x{height}, self-test \
+						 {:.1} fps, pacing up to {:.0} fps at {} bps, keyframe self-test \
+						 passed (verified decodable by a fresh decoder); if the GPU wedges, \
+						 this is why",
                         measured.unwrap_or(0.0),
                         target_fps(),
                         bitrate_for(width, height, target_fps())
@@ -706,6 +749,7 @@ pub fn create_encoder_auto(width: usize, height: usize) -> Result<Box<dyn VideoE
     }
     HW_ACTIVE.store(false, Ordering::Relaxed);
     HW_MEASURED_MFPS.store(0, Ordering::Relaxed);
+    let (width, height) = fit_software_dims(width, height);
     let e = SoftwareEncoder::new(width, height)?;
     eprintln!(
         "video: software (openh264) encoder selected — {width}x{height} @ {VIDEO_FPS_SOFTWARE} \
@@ -734,6 +778,23 @@ mod tests {
             px[3] = 255; // A
         }
         bgra
+    }
+
+    /// The software profile's ceiling: aspect preserved, even, never
+    /// grown, and a capture that already fits is untouched (a 720p
+    /// window must not be upscaled to 1080p just because it is smaller).
+    #[test]
+    fn software_dims_fit_the_profile() {
+        assert_eq!(fit_software_dims(1280, 720), (1280, 720));
+        assert_eq!(fit_software_dims(1920, 1080), (1920, 1080));
+        assert_eq!(fit_software_dims(2560, 1440), (1920, 1080));
+        assert_eq!(fit_software_dims(3440, 1440), (2580, 1080));
+        assert_eq!(fit_software_dims(3840, 2160), (1920, 1080));
+        assert_eq!(fit_software_dims(1080, 1920), (606, 1080));
+        // Odd results are snapped even, never to zero.
+        let (w, h) = fit_software_dims(1001, 1440);
+        assert_eq!((w % 2, h % 2), (0, 0));
+        assert!(w >= 2 && h >= 2);
     }
 
     #[test]
