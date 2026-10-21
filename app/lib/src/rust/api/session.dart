@@ -206,9 +206,19 @@ Future<bool> hwEncodeEnabled() =>
 Future<bool> hwEncodeSupported() =>
     RustLib.instance.api.crateApiSessionHwEncodeSupported();
 
-/// Real impl — see the stub above.
-Future<void> startScreenShare({required int sessionId}) =>
-    RustLib.instance.api.crateApiSessionStartScreenShare(sessionId: sessionId);
+/// Real impl — see the stub above. `max_height` / `max_fps` are the
+/// pre-share dialog's caps; 0 means "the capture's own" (never
+/// upscaled, never sped up). A cap the running encoder cannot honour
+/// is not an error: the share still starts, just larger or faster.
+Future<void> startScreenShare({
+  required int sessionId,
+  required int maxHeight,
+  required int maxFps,
+}) => RustLib.instance.api.crateApiSessionStartScreenShare(
+  sessionId: sessionId,
+  maxHeight: maxHeight,
+  maxFps: maxFps,
+);
 
 /// Real impl — see the stub above.
 Future<void> stopScreenShare({required int sessionId}) =>

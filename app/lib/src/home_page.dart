@@ -4,10 +4,14 @@ import 'package:flutter/material.dart';
 
 import 'rust/api/login.dart' as login_api;
 import 'rust/api/session.dart';
+import 'rust/api/settings.dart' as settings_api;
+import 'rust/api/video.dart' as video_api;
 import 'theme.dart';
 import 'widgets/fullscreen_share.dart';
 import 'widgets/login_view.dart';
 import 'widgets/pill.dart';
+import 'widgets/share_dialog.dart';
+import 'widgets/settings_page.dart';
 import 'window.dart';
 
 /// The whole client: login, channels, chat, voice membership, share
@@ -84,10 +88,22 @@ class _HomePageState extends State<HomePage> {
   // has to close it from the same state that receives the event). The
   // GTK window goes genuinely fullscreen alongside it.
   int? _fullscreen;
-  // 7g: our own share state (start/stop button) + the hw-encode toggle.
+  // 7g: our own share state (start/stop button).
   bool _sharing = false;
-  bool _hwEncode = false;
   bool _hwEncodeSupported = false;
+  // Persisted preferences (Rust: ~/.config/parley/settings.toml). The
+  // share dialog's defaults and the preview switch read from here; the
+  // hardware-encode toggle moved to the settings page.
+  settings_api.AppSettings _settings = const settings_api.AppSettings(
+    hwEncode: false,
+    showSharePreview: true,
+    shareHeight: 0,
+    shareFps: 0,
+    echoCancel: true,
+  );
+  // The sharer's own preview texture (Rust creates it once per process).
+  video_api.SharePreview? _preview;
+  String? _previewError;
   // Mic mute (the button next to Share): while set, the Rust capture
   // callback sends nothing at all. Session-scoped; a new login starts
   // unmuted.
@@ -120,21 +136,9 @@ class _HomePageState extends State<HomePage> {
     // Coming back up is the normal case: closing the window is not signing
     // out, so the last server is re-entered without typing anything.
     _restoreLogin();
-    // 7g: the toggle's initial state (persisted process-wide in Rust).
-    // Best-effort: featureless builds error and stay false. The toggle
-    // only renders when this build can hardware-encode at all.
-    try {
-      hwEncodeSupported().then((supported) {
-        if (!mounted || !supported) return;
-        hwEncodeEnabled().then((v) {
-          if (!mounted) return;
-          setState(() {
-            _hwEncodeSupported = true;
-            _hwEncode = v;
-          });
-        });
-      });
-    } catch (_) {}
+    // Persisted preferences. Best-effort: a featureless build reports no
+    // hardware encoder, and the preview is simply unavailable.
+    _loadSettings();
   }
 
   /// Re-enter the last session. The token comes from the Rust side, so no
@@ -720,14 +724,107 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // 7g: share lifecycle. Start: portal dialog opens (compositor's
-  // picker); share_started/share_ended events flip the button.
-  // FRB exposes these as async (even though the Rust side returns
-  // instantly) — the portal dialog blocks start for seconds.
-  Future<void> _startShare() async {
-    if (_session == null) return;
+  Future<void> _loadSettings() async {
     try {
-      await startScreenShare(sessionId: _session!.sessionId);
+      final loaded = await settings_api.load();
+      final supported = await hwEncodeSupported();
+      if (!mounted) return;
+      setState(() {
+        _settings = loaded;
+        _hwEncodeSupported = supported;
+      });
+    } catch (e) {
+      debugPrint('settings: load failed: $e');
+    }
+  }
+
+  /// Persist one preference change. The Rust side writes the file and
+  /// applies what it can immediately (the preview switch applies to a
+  /// running share); the rest lands on the next share or voice join.
+  Future<void> _saveSettings(settings_api.AppSettings next) async {
+    final prev = _settings;
+    setState(() => _settings = next);
+    try {
+      await settings_api.save(settings: next);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _settings = prev;
+        _status = 'could not save settings: $e';
+      });
+    }
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsPage(
+          settings: _settings,
+          hwEncodeSupported: _hwEncodeSupported,
+          server: _session?.server,
+          user: _session == null ? null : _ownName,
+          onSignOut: _session == null ? null : _disconnect,
+        ),
+      ),
+    );
+    // The page saves as it goes; re-read so a value applied there (and a
+    // failed write) is reflected here too.
+    if (mounted) await _loadSettings();
+  }
+
+  /// The sharer's own preview texture, created on first use and reused
+  /// for every later share in this process.
+  Future<void> _loadPreview() async {
+    try {
+      final preview = await video_api.sharePreview();
+      if (!mounted) return;
+      setState(() {
+        _preview = preview;
+        _previewError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _previewError = 'preview unavailable: $e');
+    }
+  }
+
+  /// Flip the preview switch from the share pane. Persisted like the
+  /// settings-page control (same value), and it takes effect mid-share:
+  /// the capture tap checks the setting per encoded frame.
+  Future<void> _setPreviewEnabled(bool on) async {
+    await _saveSettings(
+      settings_api.AppSettings(
+        hwEncode: _settings.hwEncode,
+        showSharePreview: on,
+        shareHeight: _settings.shareHeight,
+        shareFps: _settings.shareFps,
+        echoCancel: _settings.echoCancel,
+      ),
+    );
+    if (on && _preview == null && _sharing) await _loadPreview();
+  }
+
+  // 7g: share lifecycle. Start: options dialog → portal dialog
+  // (compositor's picker); share_started/share_ended events flip the
+  // button. FRB exposes the start as async (even though the Rust side
+  // returns instantly) — the portal dialog blocks for seconds.
+  Future<void> _startShare() async {
+    final session = _session;
+    if (session == null) return;
+    final options = await showShareOptionsDialog(
+      context,
+      height: _settings.shareHeight,
+      fps: _settings.shareFps,
+    );
+    if (options == null || !mounted || _session?.sessionId != session.sessionId) {
+      return;
+    }
+    try {
+      await startScreenShare(
+        sessionId: session.sessionId,
+        maxHeight: options.height,
+        maxFps: options.fps,
+      );
       // share_started arrives as an event; the button flips there.
     } catch (e) {
       setState(() => _status = 'share failed: $e');
@@ -875,6 +972,9 @@ class _HomePageState extends State<HomePage> {
         if (mounted) {
           setState(() => _sharing = true);
           _status = 'sharing this screen';
+          // The preview texture is fetched now, not at startup: a user
+          // who never shares never pays for it.
+          if (_settings.showSharePreview) _loadPreview();
         }
       case 'share_ended':
         if (mounted) {
@@ -993,6 +1093,11 @@ class _HomePageState extends State<HomePage> {
           appBar: AppBar(
             title: const Text('Parley'),
             actions: [
+              IconButton(
+                tooltip: 'Settings',
+                icon: const Icon(Icons.settings_outlined, size: 20),
+                onPressed: _openSettings,
+              ),
               if (_session != null) ...[
                 Text(
                   '$_ownName · id ${_session!.userId}',
@@ -1032,6 +1137,18 @@ class _HomePageState extends State<HomePage> {
           floatingActionButtonLocation:
               FloatingActionButtonLocation.centerFloat,
         ),
+        // Watching someone else replaces the pane above the chat, so the
+        // sharer's own view rides here as a small overlay instead of
+        // disappearing mid-sentence ("did I stop sharing?").
+        if (_sharing &&
+            _watching != null &&
+            _settings.showSharePreview &&
+            _preview != null)
+          Positioned(
+            right: 24,
+            bottom: 96,
+            child: _selfPreviewPip(_preview!),
+          ),
         // The native title bar is gone; this is the replacement. It is
         // drawn over the app bar only while the pointer is at the top.
         const WindowToolbar(),
@@ -1070,7 +1187,9 @@ class _HomePageState extends State<HomePage> {
   /// The right-hand split: the share (when there is one) on top, the
   /// chat below it. With no share the chat simply owns the pane.
   Widget _rightPane(ThemeData theme) {
-    final sharing = _videos.isNotEmpty;
+    // A running share of our own takes the pane too: that is where the
+    // preview and the Stop button live, even when nobody else shares.
+    final sharing = _videos.isNotEmpty || _sharing;
     return Column(
       children: [
         if (sharing) ...[
@@ -1454,13 +1573,136 @@ class _HomePageState extends State<HomePage> {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
+        if (_sharing) _selfPreviewCard(theme),
         const Text(
           'Screens',
           style: TextStyle(color: Colors.white54, fontSize: 12),
         ),
         const SizedBox(height: 8),
+        if (ids.isEmpty && !_sharing)
+          const Padding(
+            padding: EdgeInsets.only(top: 12),
+            child: Text(
+              'Nobody is sharing yet. Join a channel and press Share screen.',
+              style: TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
         for (final id in ids) _shareCard(theme, id),
       ],
+    );
+  }
+
+  /// The small always-visible version of the preview, used while another
+  /// person's share owns the pane.
+  Widget _selfPreviewPip(video_api.SharePreview preview) {
+    return IgnorePointer(
+      child: Container(
+        width: 240,
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: accentSoft.withValues(alpha: 0.5)),
+          boxShadow: const [
+            BoxShadow(color: Colors.black54, blurRadius: 14, spreadRadius: 1),
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          children: [
+            AspectRatio(
+              aspectRatio: preview.width / preview.height,
+              child: Texture(textureId: preview.textureId),
+            ),
+            Positioned(
+              left: 6,
+              bottom: 5,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Text(
+                  'You',
+                  style: TextStyle(fontSize: 10, color: Colors.white70),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// What YOU are sending, from the capture tap — the same frames, before
+  /// they are encoded. Toggleable in place; off means the Rust side does
+  /// no scaling at all, not that a frame is hidden.
+  Widget _selfPreviewCard(ThemeData theme) {
+    final on = _settings.showSharePreview;
+    final preview = _preview;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: accentSoft.withValues(alpha: 0.35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.podcasts, color: accentSoft, size: 18),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Your stream',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              Text(
+                on ? 'live' : 'preview off',
+                style: const TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+              Switch(
+                value: on,
+                onChanged: _setPreviewEnabled,
+              ),
+              IconButton(
+                tooltip: 'Stop sharing',
+                icon: const Icon(Icons.stop_screen_share, size: 20),
+                onPressed: _stopShare,
+              ),
+            ],
+          ),
+          if (on)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: preview != null
+                    ? AspectRatio(
+                        aspectRatio: preview.width / preview.height,
+                        child: Texture(textureId: preview.textureId),
+                      )
+                    : Container(
+                        height: 120,
+                        alignment: Alignment.center,
+                        color: Colors.black26,
+                        child: Text(
+                          _previewError ?? 'waiting for the first frame\u2026',
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 11,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
@@ -1622,25 +1864,9 @@ class _HomePageState extends State<HomePage> {
               ),
               label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
             ),
-            if (_hwEncodeSupported) ...[
-              Container(
-                width: 1,
-                height: 24,
-                color: Colors.white.withValues(alpha: 0.12),
-              ),
-              const SizedBox(width: 6),
-              const Text('HW', style: TextStyle(fontSize: 12)),
-              Switch(
-                value: _hwEncode,
-                onChanged: (v) async {
-                  final now = await setHwEncode(enable: v);
-                  setState(() => _hwEncode = now);
-                  _status = v
-                      ? 'hw encode: ON (next share; if the GPU wedges, this is why)'
-                      : 'hw encode: off (software)';
-                },
-              ),
-            ],
+            // The hardware-encode switch moved to Settings → Video: one
+            // source of truth for a preference that is already persisted
+            // and only takes effect on the NEXT share.
           ],
         ),
       ),

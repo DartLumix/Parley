@@ -7,9 +7,48 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These functions are ignored because they are not marked as `pub`: `preview_sink`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
+
 /// One-time startup: validate the engine-context plugin (a main-thread
 /// hop to `EngineContext::get()`) and store the engine handle for the
 /// texture machinery. Dart calls this right after `RustLib.init()`.
 /// Featureless builds return the 7d-convention error string.
 Future<void> videoPrepare({required PlatformInt64 engineHandle}) =>
     RustLib.instance.api.crateApiVideoVideoPrepare(engineHandle: engineHandle);
+
+/// Create (once) and describe the preview texture. Call after
+/// `video_prepare`; the id is stable for the life of the process.
+/// Featureless: the 7d-convention error string.
+Future<SharePreview> sharePreview() =>
+    RustLib.instance.api.crateApiVideoSharePreview();
+
+/// The sharer's own view of the running share (7l). One fixed-size
+/// texture per process — the frames are the capture, downscaled and
+/// letterboxed by the capture crate, so switching the shared window
+/// never re-creates the texture. Dart renders it while sharing and
+/// hides it when the user turns the preview off; the Rust side keeps
+/// producing only while that switch is on.
+class SharePreview {
+  final PlatformInt64 textureId;
+  final BigInt width;
+  final BigInt height;
+
+  const SharePreview({
+    required this.textureId,
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  int get hashCode => textureId.hashCode ^ width.hashCode ^ height.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SharePreview &&
+          runtimeType == other.runtimeType &&
+          textureId == other.textureId &&
+          width == other.width &&
+          height == other.height;
+}

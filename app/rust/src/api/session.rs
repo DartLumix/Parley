@@ -1487,13 +1487,16 @@ pub fn hw_encode_supported() -> bool {
 /// path). Acceptance: share_started event, then the peer's Screens
 /// panel shows this machine.
 #[cfg(not(feature = "screen-capture"))]
-pub fn start_screen_share(_session_id: u32) -> Result<(), String> {
+pub fn start_screen_share(_session_id: u32, _max_height: u32, _max_fps: u32) -> Result<(), String> {
     Err("screen-capture feature off".into())
 }
 
-/// Real impl — see the stub above.
+/// Real impl — see the stub above. `max_height` / `max_fps` are the
+/// pre-share dialog's caps; 0 means "the capture's own" (never
+/// upscaled, never sped up). A cap the running encoder cannot honour
+/// is not an error: the share still starts, just larger or faster.
 #[cfg(feature = "screen-capture")]
-pub fn start_screen_share(session_id: u32) -> Result<(), String> {
+pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Result<(), String> {
     let (event_tx, share_loss, conn, poke_slot, ctrl_slot) = {
         let sessions = SESSIONS.lock().unwrap();
         let s = sessions
@@ -1549,12 +1552,22 @@ pub fn start_screen_share(session_id: u32) -> Result<(), String> {
             // The app keeps the mapped-copy capture path: DMA-BUF capture
             // (`--dmabuf` on the CLI) needs the encoder on the capture
             // thread, which the bridge's share pipeline does not do yet.
+            let options = parley_client::screen::ShareOptions {
+                max_height: (max_height > 0).then_some(max_height),
+                max_fps: (max_fps > 0).then(|| f64::from(max_fps)),
+            };
+            // The sharer's own preview: the sink is always installed and
+            // checks the settings switch per frame, so toggling it mid-
+            // share costs nothing and needs no restart.
+            let preview = crate::api::video::preview_sink();
             match parley_client::screen::start(
                 conn.clone(),
                 share_loss,
                 share_event_tx,
                 sys_tx,
                 false,
+                options,
+                preview,
             )
             .await
             {

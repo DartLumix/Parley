@@ -3,6 +3,37 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [Unreleased]
+
+Settings, a share you can see, and a share you choose the size of.
+
+### Added
+
+- **See your own stream while sharing.** The capture taps a downscaled
+  frame (fixed 640×360 canvas, letterboxed, ≤10 fps) into a Flutter
+  texture before encoding, so the share pane shows exactly what is being
+  sent — the wrong-window mistakes this catches. A switch turns it off,
+  and off means no scaling work at all, mid-share included. Watching
+  someone else moves it to a corner overlay instead of hiding it.
+- **Settings page.** Video: own-stream preview, hardware (VAAPI) encode,
+  default share resolution and frame rate. Audio: echo cancellation
+  (speech channels; music channels never used it and still do not).
+  Account: the connected server and account, and *Sign out*. Saved
+  immediately to `~/.config/parley/settings.toml`; the hardware-encode
+  preference is re-applied at launch, and the file is read with defaults
+  for missing keys so an older file keeps working.
+- **Share options dialog.** Starting a share asks for a resolution cap
+  (source/1440p/1080p/720p/480p) and frame-rate cap (source/60/30/15)
+  before the portal opens. Both are caps: the capture is downscaled with
+  nearest-neighbour sampling (aspect preserved, even dimensions), never
+  enlarged, and pacing never exceeds the rate the encoder can hold.
+
+### Changed
+
+- The hardware-encode switch moved from the floating bar to Settings →
+  Video. One persisted source of truth; it still applies on the next
+  share.
+
 ## [0.2.3] — 2026-10-20
 
 Staying signed in, and a roster that shows what people are actually doing.

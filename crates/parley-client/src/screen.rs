@@ -127,6 +127,45 @@ impl ShareHandle {
     }
 }
 
+/// What the sharer asked for before the portal opened (the app's
+/// "share screen" dialog). Both are CAPS, never upscales: the encoder
+/// is created at the capture's own size unless `max_height` lowers it,
+/// and the stream paces at the compositor's rate unless `max_fps`
+/// lowers it. A share that cannot honour the request still runs —
+/// unlike `--dmabuf`, nothing here changes the pixels' route, only
+/// their size and rate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShareOptions {
+    /// Height cap for the encoded frame. The capture's aspect ratio is
+    /// preserved; a capture already at or below it is untouched.
+    pub max_height: Option<u32>,
+    /// Frame rate cap for the encode/pacing loop.
+    pub max_fps: Option<f64>,
+}
+
+/// One downscaled frame for the sharer's own preview, BGRA, tightly
+/// packed, already letterboxed into [`PREVIEW_WIDTH`]×[`PREVIEW_HEIGHT`].
+#[derive(Debug, Clone)]
+pub struct PreviewFrame {
+    pub width: usize,
+    pub height: usize,
+    pub bgra: Vec<u8>,
+}
+
+/// Called from the encoder thread at preview rate (≤10 fps). Must not
+/// block: the app's sink drops the frame into a latest-wins slot.
+pub type PreviewSink = Arc<dyn Fn(PreviewFrame) + Send + Sync>;
+
+/// Preview canvas. Fixed so the Flutter texture is created once per
+/// process and never re-created when the sharer picks another window;
+/// frames are letterboxed into it.
+pub const PREVIEW_WIDTH: usize = 640;
+pub const PREVIEW_HEIGHT: usize = 360;
+
+/// Preview cadence: the sharer is checking framing, not watching a
+/// movie — 10 fps off a 1080p capture costs a fraction of one encode.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Stop switch for a running share.
 ///
 /// `request_stop` only ASKS: completion is reported later as
@@ -190,6 +229,17 @@ struct ShareEncoder {
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
+    /// The pre-share dialog's caps (see [`ShareOptions`]).
+    options: ShareOptions,
+    /// The sharer's own preview tap, when the app asked for one.
+    preview: Option<PreviewSink>,
+    /// Capture dimensions of the frame currently being encoded (set by
+    /// `negotiate`); the encoder may be smaller when `options` capped it.
+    source: (usize, usize),
+    /// Reused downscale target for a capped encode.
+    scaled: Vec<u8>,
+    /// When the last preview frame went out (10 fps throttle).
+    last_preview: Option<std::time::Instant>,
 }
 
 /// The connection-side handles the capture thread needs when it owns the
@@ -202,6 +252,8 @@ struct ShareSenderArgs {
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
+    options: ShareOptions,
+    preview: Option<PreviewSink>,
 }
 
 /// The pipewire side, on its own thread: loop, stream, listener.
@@ -644,7 +696,7 @@ fn pw_thread(
     #[cfg(feature = "vaapi")]
     let objects = dmabuf_objects.unwrap_or_else(|| vec![obj]);
     #[cfg(not(feature = "vaapi"))]
-    let objects = vec![obj];
+    let objects = [obj];
 
     // The serialized bytes must outlive the Pods that borrow them.
     let values: Vec<Vec<u8>> = objects
@@ -764,13 +816,92 @@ fn buffers_data_type_property() -> spa::pod::Property {
 // behind this module's feature gate.
 use crate::video::fragment_budget_for;
 
-/// The rate the share actually encodes and paces at: the compositor's,
-/// clamped by the encoder's profile ceiling (30 fps software, 60 fps
-/// hardware). Both the pacing interval and the frame timestamps read
-/// this, so a 60 Hz compositor on a software encoder cannot stretch
-/// every timestamp to 1/60 s.
-fn paced_fps(capture_fps: f64) -> f64 {
-    capture_fps.min(f64::from(target_fps()))
+/// Encoder dimensions for a capture, given the dialog's height cap.
+///
+/// Aspect ratio is preserved and the frame is never grown: a 2560x1080
+/// capture capped at 720 becomes 1706x720. Even dimensions only —
+/// openh264 requires them, and a VAAPI surface with an odd width is a
+/// driver-dependent failure. A cap at or above the capture's height
+/// returns the capture untouched.
+fn fit_encoder_dims(width: usize, height: usize, max_height: Option<u32>) -> (usize, usize) {
+    let Some(cap) = max_height.map(|h| h as usize).filter(|h| *h > 0) else {
+        return (width, height);
+    };
+    if height == 0 || height <= cap {
+        return (width, height);
+    }
+    let even = |v: usize| (v & !1).max(2);
+    let scaled = (width * cap) / height;
+    (even(scaled), even(cap))
+}
+
+/// Nearest-neighbour BGRA downscale (strided source → tight dest).
+///
+/// Nearest, not bilinear, on purpose: this runs for text-heavy screen
+/// content, where averaging neighbouring pixels is what makes a
+/// downscaled screenshot unreadable — and it keeps the hot path to one
+/// load and one store per pixel. Returns false on a truncated buffer.
+fn scale_bgra(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    stride: usize,
+    dw: usize,
+    dh: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return false;
+    }
+    out.clear();
+    out.resize(dw * dh * 4, 0);
+    for y in 0..dh {
+        let sy = (y * sh / dh).min(sh - 1);
+        let Some(row) = src.get(sy * stride..sy * stride + sw * 4) else {
+            return false;
+        };
+        let dst_row = &mut out[y * dw * 4..(y + 1) * dw * 4];
+        for x in 0..dw {
+            let sx = (x * sw / dw).min(sw - 1);
+            dst_row[x * 4..x * 4 + 4].copy_from_slice(&row[sx * 4..sx * 4 + 4]);
+        }
+    }
+    true
+}
+
+/// Scale a capture frame into the fixed preview canvas, preserving the
+/// aspect ratio and centring it on black (letterbox/pillarbox), so the
+/// Flutter texture never changes size mid-share.
+fn letterbox_preview(src: &[u8], sw: usize, sh: usize, stride: usize) -> Option<Vec<u8>> {
+    let (pw, ph) = fit_encoder_dims(sw, sh, Some(PREVIEW_HEIGHT as u32));
+    let (pw, ph) = if pw > PREVIEW_WIDTH {
+        // A capture narrower than 16:9 would otherwise be as wide as the
+        // canvas allows and taller than it; fit by width in that case.
+        let even = |v: usize| (v & !1).max(2);
+        (even(PREVIEW_WIDTH), even(PREVIEW_WIDTH * sh / sw.max(1)))
+    } else {
+        (pw, ph)
+    };
+    if pw > PREVIEW_WIDTH || ph > PREVIEW_HEIGHT {
+        return None;
+    }
+    let mut scaled = Vec::with_capacity(pw * ph * 4);
+    if !scale_bgra(src, sw, sh, stride, pw, ph, &mut scaled) {
+        return None;
+    }
+    // Opaque black canvas, then the frame centred.
+    let mut canvas = vec![0u8; PREVIEW_WIDTH * PREVIEW_HEIGHT * 4];
+    for px in canvas.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    let x0 = (PREVIEW_WIDTH - pw) / 2;
+    let y0 = (PREVIEW_HEIGHT - ph) / 2;
+    for y in 0..ph {
+        let dst = ((y + y0) * PREVIEW_WIDTH + x0) * 4;
+        let src_row = &scaled[y * pw * 4..(y + 1) * pw * 4];
+        canvas[dst..dst + pw * 4].copy_from_slice(src_row);
+    }
+    Some(canvas)
 }
 
 impl ShareEncoder {
@@ -791,13 +922,32 @@ impl ShareEncoder {
             die: sender.die,
             force_idr: sender.force_idr,
             video_loss: sender.video_loss,
+            options: sender.options,
+            preview: sender.preview,
+            source: (0, 0),
+            scaled: Vec::new(),
+            last_preview: None,
             last_encode: None,
+        }
+    }
+
+    /// The rate the share actually encodes and paces at: the compositor's,
+    /// clamped by the encoder's profile ceiling (30 fps software, 60 fps
+    /// hardware) and by what the sharer picked in the dialog. Both the
+    /// pacing interval and the frame timestamps read this, so a 60 Hz
+    /// compositor on a software encoder cannot stretch every timestamp
+    /// to 1/60 s.
+    fn paced_fps(&self) -> f64 {
+        let cap = self.options.max_fps.filter(|f| *f > 0.0);
+        match cap {
+            Some(f) => self.fps.min(f64::from(target_fps())).min(f),
+            None => self.fps.min(f64::from(target_fps())),
         }
     }
 
     /// The pacing interval the stream is being held to.
     fn interval(&self) -> Duration {
-        Duration::from_nanos((1_000_000_000.0 / paced_fps(self.fps)) as u64)
+        Duration::from_nanos((1_000_000_000.0 / self.paced_fps()) as u64)
     }
 
     /// How long until the next frame is due (zero when it already is).
@@ -828,14 +978,17 @@ impl ShareEncoder {
     /// with the pixels and rate the encoder is actually being asked for.
     fn negotiate(&mut self, width: u32, height: u32, f: f64) {
         self.fps = f;
-        match create_encoder_auto(width as usize, height as usize) {
+        self.source = (width as usize, height as usize);
+        let (enc_w, enc_h) =
+            fit_encoder_dims(width as usize, height as usize, self.options.max_height);
+        match create_encoder_auto(enc_w, enc_h) {
             Ok(e) => {
-                let eff = paced_fps(f);
+                let eff = self.paced_fps();
                 let base = bitrate_for(width as usize, height as usize, eff as f32);
                 let applied = self.ladder.set_base(base);
                 println!(
-                    "share: encoder ready ({width}x{height}, source {f:.0} fps → paced {eff:.0} fps, \
-                     clean rung {base} bps); hardware={}",
+                    "share: encoder ready ({enc_w}x{enc_h}, source {width}x{height} @ {f:.0} fps \
+                     → paced {eff:.0} fps, clean rung {base} bps); hardware={}",
                     parley_core::video::hardware_encoder_active()
                 );
                 if applied != base {
@@ -875,7 +1028,56 @@ impl ShareEncoder {
             return true;
         };
         self.last_encode = Some(std::time::Instant::now());
-        self.frame_encode(|enc, out| enc.encode_bgra_strided(data, w, h, stride, out))
+        // The preview sees the CAPTURE, before any resolution cap — it is
+        // the sharer checking "is the right window in the frame", not a
+        // second viewer of the stream.
+        self.preview_tick(data, stride);
+        let (sw, sh) = self.source;
+        if (sw, sh) == (w, h) || w == 0 || h == 0 {
+            return self.frame_encode(|enc, out| enc.encode_bgra_strided(data, w, h, stride, out));
+        }
+        // Resolution cap: nearest-neighbour downscale into the reused
+        // buffer, then the tight encode path. A capped stream is a lower
+        // bar for the ladder, so this runs once per sent frame, not per
+        // captured one.
+        let mut scaled = std::mem::take(&mut self.scaled);
+        let alive = if scale_bgra(data, sw, sh, stride, w, h, &mut scaled) {
+            let tight = w * 4;
+            self.frame_encode(|enc, out| enc.encode_bgra_strided(&scaled, w, h, tight, out))
+        } else {
+            true // truncated capture: skip this frame, keep the share up
+        };
+        self.scaled = scaled;
+        alive
+    }
+
+    /// Downscale to the preview canvas and hand it to the sink, at most
+    /// every [`PREVIEW_INTERVAL`]. Off the encode path's critical work:
+    /// at 10 fps a 640x360 canvas is ~0.9 MB per frame, and the sink
+    /// recycles its own RGBA slot, so the only per-frame allocation is
+    /// this handoff. Nothing runs at all when the app asked for no
+    /// preview, or the user turned it off.
+    fn preview_tick(&mut self, data: &[u8], stride: usize) {
+        let Some(sink) = self.preview.clone() else {
+            return;
+        };
+        if let Some(t) = self.last_preview
+            && t.elapsed() < PREVIEW_INTERVAL
+        {
+            return;
+        }
+        let (sw, sh) = self.source;
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        if let Some(bgra) = letterbox_preview(data, sw, sh, stride) {
+            self.last_preview = Some(std::time::Instant::now());
+            sink(PreviewFrame {
+                width: PREVIEW_WIDTH,
+                height: PREVIEW_HEIGHT,
+                bgra,
+            });
+        }
     }
 
     /// 7j: encode one frame in the producer's DMA-BUF. The descriptor is
@@ -937,7 +1139,7 @@ impl ShareEncoder {
         // The codec clock the receiver sees must advance at the rate we
         // actually pace at (see `paced_fps`), not the compositor's and not
         // a constant.
-        let eff_fps = paced_fps(self.fps);
+        let eff_fps = self.paced_fps();
         let timestamp = (self.frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
         let dgs = fragment_frame_with_max(
             self.frame_id,
@@ -1016,12 +1218,16 @@ fn encoder_thread(
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
+    options: ShareOptions,
+    preview: Option<PreviewSink>,
 ) {
     let mut share = ShareEncoder::new(ShareSenderArgs {
         conn,
         die,
         force_idr,
         video_loss,
+        options,
+        preview,
     });
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -1482,7 +1688,10 @@ pub fn spawn_share_audio_mux(
 /// Entry point: portal dance → threads → supervisor.
 ///
 /// `sys_tx` = Some ⇒ share WITH audio (the default-output capture
-/// starts alongside video, same stop flag). Returns the keyframe
+/// starts alongside video, same stop flag). `options` is the pre-share
+/// dialog's caps (see [`ShareOptions`]) and `preview` the sharer's own
+/// view of the capture (see [`PreviewSink`]); neither changes the
+/// pixels' route, so both are best-effort. Returns the keyframe
 /// handle + stop controller. Completion of a stop (user-initiated or
 /// desktop-initiated) is reported as ShareEvent::Ended on `events` —
 /// only after full teardown.
@@ -1492,6 +1701,8 @@ pub async fn start(
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
     sys_tx: Option<SyncSender<Vec<f32>>>,
     dmabuf: bool,
+    options: ShareOptions,
+    preview: Option<PreviewSink>,
 ) -> Result<(ShareHandle, ShareController), String> {
     // 7j: a request for zero-copy is refused up front when this build or
     // this run cannot honor it. Silently downgrading would make the caller
@@ -1575,6 +1786,8 @@ pub async fn start(
         die: die_tx.clone(),
         force_idr: force_idr.clone(),
         video_loss: video_loss.clone(),
+        options,
+        preview: preview.clone(),
     };
 
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
@@ -1598,7 +1811,9 @@ pub async fn start(
         None
     } else {
         Some(std::thread::spawn(move || {
-            encoder_thread(frame_rx, conn, force_idr, video_loss, die_tx)
+            encoder_thread(
+                frame_rx, conn, force_idr, video_loss, die_tx, options, preview,
+            )
         }))
     };
 
@@ -1765,19 +1980,62 @@ mod dmabuf_negotiation_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::paced_fps;
+    use super::*;
 
     #[test]
-    fn paced_rate_is_the_reachable_one() {
-        // 7h HD: the rate the share paces and timestamps at is the
-        // capture rate CLAMPED by the live profile. A 60 Hz compositor on
-        // a software encoder must encode at 30 — otherwise every frame
-        // timestamp would advance at 1/60 s while frames leave at 1/30,
-        // and the receiver's clock would run at half speed.
-        let profile = f64::from(parley_core::video::target_fps());
-        assert_eq!(paced_fps(30.0), 30.0f64.min(profile));
-        assert_eq!(paced_fps(60.0), 60.0f64.min(profile));
-        assert_eq!(paced_fps(120.0), profile, "never above the profile");
-        assert_eq!(paced_fps(1.0), 1.0, "a slow source stays a slow source");
+    fn resolution_cap_preserves_aspect_and_never_upscales() {
+        assert_eq!(fit_encoder_dims(1920, 1080, None), (1920, 1080));
+        assert_eq!(fit_encoder_dims(1920, 1080, Some(720)), (1280, 720));
+        assert_eq!(fit_encoder_dims(1920, 1080, Some(480)), (852, 480));
+        assert_eq!(
+            fit_encoder_dims(1280, 720, Some(1080)),
+            (1280, 720),
+            "a cap above the capture leaves it alone"
+        );
+        assert_eq!(
+            fit_encoder_dims(2560, 1080, Some(720)),
+            (1706, 720),
+            "ultrawide keeps its shape"
+        );
+        let (w, h) = fit_encoder_dims(1366, 769, Some(480));
+        assert!(
+            w.is_multiple_of(2) && h.is_multiple_of(2),
+            "openh264 needs even dimensions, got {w}x{h}"
+        );
+    }
+
+    #[test]
+    fn downscale_is_nearest_neighbour() {
+        // 2x2 source, each pixel a distinct byte pattern → 1x1 picks the
+        // top-left sample; no averaging.
+        let src: Vec<u8> = (0..4u8)
+            .flat_map(|i| [i * 10, i * 10 + 1, i * 10 + 2, 255])
+            .collect();
+        let mut out = Vec::new();
+        assert!(scale_bgra(&src, 2, 2, 2 * 4, 1, 1, &mut out));
+        assert_eq!(out, vec![0, 1, 2, 255]);
+        // A tight destination from a strided source.
+        let mut out = Vec::new();
+        assert!(scale_bgra(&src, 2, 2, 2 * 4, 2, 2, &mut out));
+        assert_eq!(out, src);
+        assert!(!scale_bgra(&src[..6], 2, 2, 2 * 4, 1, 1, &mut out));
+    }
+
+    #[test]
+    fn preview_fits_the_fixed_canvas() {
+        // 16:9 fills the canvas exactly.
+        let src = vec![255u8; 1920 * 1080 * 4];
+        let canvas = letterbox_preview(&src, 1920, 1080, 1920 * 4).expect("preview frame");
+        assert_eq!(canvas.len(), PREVIEW_WIDTH * PREVIEW_HEIGHT * 4);
+        assert_eq!(canvas[0], 255, "no letterbox bar on a 16:9 capture");
+
+        // 4:3 pillarboxes: the canvas' left edge is black, the centre is
+        // the capture. Alpha stays opaque either way.
+        let src = vec![255u8; 800 * 600 * 4];
+        let canvas = letterbox_preview(&src, 800, 600, 800 * 4).expect("preview frame");
+        assert_eq!(canvas[0], 0, "pillarbox bar");
+        assert_eq!(canvas[3], 255, "bars are opaque, not transparent");
+        let mid = (PREVIEW_HEIGHT / 2 * PREVIEW_WIDTH + PREVIEW_WIDTH / 2) * 4;
+        assert_eq!(canvas[mid], 255, "the frame is centred");
     }
 }

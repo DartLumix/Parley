@@ -1189,6 +1189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             events.clone(),
                                             sys_tx,
                                             args.dmabuf,
+                                            screen::ShareOptions::default(),
+                                            None,
                                         )
                                         .await
                                         {

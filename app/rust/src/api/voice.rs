@@ -361,8 +361,14 @@ pub(crate) fn start_voice(
     // processing). None for music — same rationale as the terminal
     // client's main.rs. Init failure degrades to uncancellable mic
     // rather than failing the join (the terminal client's behavior).
+    // The settings page can turn AEC off globally (headphones, a studio
+    // mic, or a machine where the filter does more harm than good). Music
+    // channels ignore it either way — they are transparent by design.
     let aec: Option<Arc<webrtc_audio_processing::Processor>> = if music {
         println!("voice: aec off (music channel)");
+        None
+    } else if !crate::api::settings::echo_cancel() {
+        println!("voice: aec off (settings)");
         None
     } else {
         match parley_client::aec::new_processor() {

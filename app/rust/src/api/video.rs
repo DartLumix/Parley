@@ -67,6 +67,59 @@ pub fn video_prepare(engine_handle: i64) -> Result<(), String> {
     }
 }
 
+/// The sharer's own view of the running share (7l). One fixed-size
+/// texture per process — the frames are the capture, downscaled and
+/// letterboxed by the capture crate, so switching the shared window
+/// never re-creates the texture. Dart renders it while sharing and
+/// hides it when the user turns the preview off; the Rust side keeps
+/// producing only while that switch is on.
+#[derive(Debug, Clone)]
+pub struct SharePreview {
+    pub texture_id: i64,
+    pub width: u64,
+    pub height: u64,
+}
+
+/// Create (once) and describe the preview texture. Call after
+/// `video_prepare`; the id is stable for the life of the process.
+/// Featureless: the 7d-convention error string. `video` alone is not
+/// enough — the frames come from the capture crate, so a receive-only
+/// build has no preview to describe.
+pub fn share_preview() -> Result<SharePreview, String> {
+    #[cfg(feature = "screen-capture")]
+    {
+        imp::share_preview()
+    }
+    #[cfg(not(feature = "screen-capture"))]
+    {
+        Err("screen-capture feature off".into())
+    }
+}
+
+/// The capture pipeline's preview tap, or None on builds without
+/// screen capture. The sink itself is cheap when the user turned the
+/// preview off: the switch is checked per encoded frame, before any
+/// scaling.
+#[cfg(feature = "screen-capture")]
+pub(crate) fn preview_sink() -> Option<parley_client::screen::PreviewSink> {
+    Some(std::sync::Arc::new(
+        |frame: parley_client::screen::PreviewFrame| {
+            if !crate::api::settings::show_share_preview() {
+                return;
+            }
+            if let Err(e) = imp::push_preview(&frame) {
+                // Once per share is enough — a missing texture is a startup
+                // problem, not a per-frame one.
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("preview: {e}");
+                }
+            }
+        },
+    ))
+}
+
 /// Session-owned display bridge (consumer thread + per-sender
 /// textures). Re-exported for session.rs; the type itself is opaque
 /// to codegen (never in a pub fn signature).
@@ -156,6 +209,108 @@ pub mod imp {
     /// name-only: codegen may or may not reference it per cfg set.
     #[allow(dead_code)]
     pub(crate) type UnboundedSenderSessionEvent = tokio::sync::mpsc::UnboundedSender<SessionEvent>;
+
+    /// The sharer's own preview: one texture, created on first use on
+    /// the platform thread, fed latest-frame-wins exactly like a remote
+    /// sender's view. Gated on screen-capture: a receive-only build has
+    /// no capture frames to feed it (and cannot name the frame type).
+    #[cfg(feature = "screen-capture")]
+    static PREVIEW: Mutex<Option<Arc<PreviewView>>> = Mutex::new(None);
+
+    #[cfg(feature = "screen-capture")]
+    struct PreviewView {
+        texture: Arc<SendableTexture<BoxedPixelData>>,
+        provider: Arc<FrameProvider>,
+        texture_id: i64,
+    }
+
+    #[cfg(feature = "screen-capture")]
+    pub(super) fn share_preview() -> Result<super::SharePreview, String> {
+        let view = preview_view()?;
+        Ok(super::SharePreview {
+            texture_id: view.texture_id,
+            width: parley_client::screen::PREVIEW_WIDTH as u64,
+            height: parley_client::screen::PREVIEW_HEIGHT as u64,
+        })
+    }
+
+    #[cfg(feature = "screen-capture")]
+    fn preview_view() -> Result<Arc<PreviewView>, String> {
+        let mut slot = PREVIEW.lock().unwrap();
+        if let Some(view) = slot.as_ref() {
+            return Ok(view.clone());
+        }
+        let handle = *ENGINE_HANDLE
+            .get()
+            .ok_or("video_prepare was never called")?;
+        let (w, h) = (
+            parley_client::screen::PREVIEW_WIDTH,
+            parley_client::screen::PREVIEW_HEIGHT,
+        );
+        // Opaque black until the first capture frame lands — the pane
+        // shows a placeholder, not a 1x1 white flash.
+        let provider = Arc::new(FrameProvider::new(
+            w as i32,
+            h as i32,
+            [0, 0, 0, 255].repeat(w * h),
+        ));
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Result<(i64, Arc<SendableTexture<BoxedPixelData>>), String>,
+        >();
+        let provider_for_main = provider.clone();
+        EngineContext::perform_on_main_thread(move || {
+            if let Err(e) = EngineContext::get() {
+                let _ = tx.send(Err(e.to_string()));
+                return;
+            }
+            match irondash_texture::Texture::new_with_provider(handle, provider_for_main) {
+                Ok(texture) => {
+                    let id = texture.id();
+                    let _ = tx.send(Ok((id, texture.into_sendable_texture())));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                }
+            }
+        })
+        .map_err(|e| format!("main-thread hop: {e}"))?;
+        let (texture_id, texture) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| format!("preview texture: {e}"))?
+            .map_err(|e| format!("preview texture: {e}"))?;
+        let view = Arc::new(PreviewView {
+            texture,
+            provider,
+            texture_id,
+        });
+        *slot = Some(view.clone());
+        Ok(view)
+    }
+
+    /// BGRA (letterboxed by the capture crate) → the preview texture's
+    /// RGBA slot. Latest-frame-wins: a frame the raster thread has not
+    /// pulled yet is dropped here, which is what keeps the preview from
+    /// queueing behind a slow compositor.
+    #[cfg(feature = "screen-capture")]
+    pub(super) fn push_preview(frame: &parley_client::screen::PreviewFrame) -> Result<(), String> {
+        let view = preview_view()?;
+        let mut rgba = view.provider.take_buffer();
+        let need = frame.width * frame.height * 4;
+        if rgba.len() != need {
+            rgba.clear();
+            rgba.resize(need, 255);
+        }
+        for (dst, src) in rgba.chunks_exact_mut(4).zip(frame.bgra.chunks_exact(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = 255;
+        }
+        view.provider
+            .put_frame(frame.width as i32, frame.height as i32, rgba);
+        view.texture.mark_frame_available();
+        Ok(())
+    }
 
     pub(super) fn prepare(engine_handle: i64) -> Result<(), String> {
         // Plugin-presence check must run on the platform thread; hop

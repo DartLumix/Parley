@@ -5,6 +5,7 @@
 
 import 'api/login.dart';
 import 'api/session.dart';
+import 'api/settings.dart';
 import 'api/video.dart';
 import 'api/video/imp.dart';
 
@@ -91,7 +92,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  AppSettings dco_decode_app_settings(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
+
+  @protected
+  AppSettings dco_decode_box_autoadd_app_settings(dynamic raw);
 
   @protected
   SavedLogin dco_decode_box_autoadd_saved_login(dynamic raw);
@@ -152,6 +159,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SessionInfo dco_decode_session_info(dynamic raw);
+
+  @protected
+  SharePreview dco_decode_share_preview(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -231,7 +241,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  AppSettings sse_decode_app_settings(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
+  AppSettings sse_decode_box_autoadd_app_settings(SseDeserializer deserializer);
 
   @protected
   SavedLogin sse_decode_box_autoadd_saved_login(SseDeserializer deserializer);
@@ -300,6 +316,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SessionInfo sse_decode_session_info(SseDeserializer deserializer);
+
+  @protected
+  SharePreview sse_decode_share_preview(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -393,7 +412,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_app_settings(AppSettings self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_app_settings(
+    AppSettings self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_saved_login(
@@ -487,6 +515,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_session_info(SessionInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_share_preview(SharePreview self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

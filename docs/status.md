@@ -50,13 +50,14 @@ Product gaps, roughly in the order a small community would notice:
 1. **User management** — no RPC and no UI: accounts are created with
    `parley-server adduser` inside the container. No roles, bans, kicks
    or per-channel permissions.
-2. **Client robustness** — no automatic reconnect with backoff, no
-   remembered servers, no device pickers (input/output), no
-   mute/deafen/push-to-talk, no notifications.
+2. **Client robustness** — no automatic reconnect with backoff (a
+   dropped connection waits for *Reconnect*), no device pickers
+   (input/output), no deafen/push-to-talk, no notifications.
 3. **Chat depth** — no DMs, mentions, rich text, search, attachments or
    file transfer.
 4. **Share depth** — no remote control, no per-window "watch this one"
-   pinning in the app, no share preview before watching.
+   pinning in the app, and no preview of someone else's screen before
+   watching (your own stream is previewed while sharing).
 5. **Operations** — no metrics endpoint, log rotation, or admin UI; one
    channel is created by default (`general`) and channels are created by
    editing SQLite.

@@ -80,10 +80,24 @@ same trust decision.
   (0–200%). A screen sharer also gets a *Screen share audio* slider there
   and in the share pane: that stream is trimmed separately, so their voice
   keeps its level.
-- **Screen share** — *Share screen* in the floating bar; the desktop's
-  portal asks which monitor or window. Everyone in the same channel
-  gets a card; *Watch* renders it, and the share's system audio starts
-  only once you are watching.
+- **Screen share** — *Share screen* in the floating bar asks for a
+  resolution and frame-rate cap first (defaults from Settings, *Source*
+  means the capture's own size and rate — caps never upscale), then the
+  desktop's portal asks which monitor or window. Everyone in the same
+  channel gets a card; *Watch* renders it, and the share's system audio
+  starts only once you are watching.
+- **Your own stream** — while sharing, the share pane shows what you are
+  sending, straight from the capture (before encoding), with a switch to
+  turn it off. Watching someone else at the same time moves it to a small
+  overlay in the corner so it never disappears. Turning it off stops the
+  scaling work as well as the picture.
+- **Settings** — the gear in the app bar: video (own-stream preview,
+  hardware encoding, default share resolution and frame rate), audio
+  (echo cancellation, which applies to the next channel you join), and
+  account (the connected server and account, plus *Sign out*). Every
+  control saves immediately to `~/.config/parley/settings.toml`; a
+  preference that only takes effect at encoder/AEC creation says so on
+  the page.
 - **Fullscreen** — the expand button on a watched share. It is real
   window fullscreen: the compositor's own shortcuts work, Esc exits.
   Nothing is drawn over the picture except two fading controls.
@@ -93,9 +107,10 @@ same trust decision.
   drag can be done with the compositor's own binding (e.g. Mod+drag on
   Hyprland) — the toolbar's drag area works where the protocol allows
   it.
-- **HW encode toggle** — visible only in builds with the `hw-encode`
-  feature and usable only where VAAPI works. It applies the next time
-  an encoder is created: stop and re-share to switch.
+- **Hardware encoding** — the switch in Settings → Video, shown only in
+  builds with the `hw-encode` feature and usable only where VAAPI works.
+  It applies the next time an encoder is created (the next share); a
+  share in flight keeps the backend it started with.
 
 ## Troubleshooting
 
@@ -107,7 +122,9 @@ same trust decision.
 | join a channel, no sound | check the system mixer; joining opens the default devices |
 | share asks nothing / `portal` error | install the ScreenCast backend for your desktop and restart `xdg-desktop-portal` |
 | a watched share is black | sender side: the share's `encoder ready` line; receiver side: frames arriving but not decoding means keyframe/stream shape |
-| hardware toggle missing | the build lacks `hw-encode`, or VAAPI has no encoder (`vainfo`) |
+| hardware encoding switch missing | the build lacks `hw-encode`, or VAAPI has no encoder (`vainfo`) |
+| share starts but looks blocky after picking a cap | the cap scales the capture down on the CPU; pick *Source* or a larger height on a slow machine |
+| own preview stays black | frames are only produced once capture delivers its first buffer — check the `share: encoder ready` line |
 
 Logs: run `~/.local/opt/parley/parley` from a terminal to see
 `video:`/`voice:`/`window:` lines; the login page shows the build
