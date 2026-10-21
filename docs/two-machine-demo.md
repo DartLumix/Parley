@@ -336,9 +336,10 @@ same log is the same CPU starvation. A release build of the identical code
 holds 28–30 fps with no pause cycling.
 
 In the app: connect to `<A-ip>:4443`, log in, join a voice channel, then use the
-screen-share control. The **HW-encode toggle only exists** in a build with the
-`hw-encode` feature, and it applies at the next encoder creation — stop and
-re-share to switch it. Share from B to A and from A to B.
+screen-share control. The **hardware-encoding switch (Settings → Video) only
+exists** in a build with the `hw-encode` feature, and it applies at the next
+encoder creation — stop and re-share to switch it. Share from B to A and from
+A to B.
 
 **Pass**: the receiving window shows the shared screen as a texture. A black
 window is diagnosed from the sender's `encoder ready` line plus the receiver's

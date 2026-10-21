@@ -1,6 +1,6 @@
 [package]
 name = "parley_flutter"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 
 [lib]
@@ -28,9 +28,9 @@ video = ["dep:irondash_texture", "dep:irondash_engine_context", "parley-core/vid
 # screen module). Builds ashpd/pipewire into the bridge .so.
 screen-capture = ["parley-client/screen-capture", "video"]
 # 7g: hardware (VAAPI) encode support — build the moq-vaapi backend in
-# and let the app's HW-encode toggle do something. Without it the
-# toggle is hidden (hw_encode_supported() = false) and encoding is
-# always software. Opt-in like the CLI's --hw-encode: CI and the musl
+# and let the app's hardware-encoding setting (Settings → Video) do
+# something. Without it the switch is hidden (hw_encode_supported() =
+# false) and encoding is always software. Opt-in like the CLI's --hw-encode: CI and the musl
 # server build never touch libva.
 hw-encode = ["parley-client/vaapi", "video"]
 

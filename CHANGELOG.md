@@ -3,7 +3,7 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-21
 
 Settings, a share you can see, and a share you choose the size of.
 

@@ -280,9 +280,10 @@ flutter run -d linux          # CMake install() re-bundles the .so
 ```
 
 In the app: connect + log in, join a voice channel, then use the screen-share
-control. The HW-encode toggle is only visible in a build that has the
-`hw-encode` feature (that is what `hw_encode_supported()` reports), and it
-takes effect at the next encoder creation — stop and re-share to switch.
+control. The hardware-encoding switch is in **Settings → Video**, and is only
+visible in a build that has the `hw-encode` feature (that is what
+`hw_encode_supported()` reports). It takes effect at the next encoder
+creation — stop and re-share to switch.
 
 On the receiving machine the shared screen appears in the app window
 (texture); the same three-way accounting applies, printed on the sender's
