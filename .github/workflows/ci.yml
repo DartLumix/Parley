@@ -71,6 +71,22 @@ jobs:
           flutter analyze
           flutter test
           flutter build linux --release --dart-define=PARLEY_VERSION=ci
+      # A green Linux build is only useful if the bundle can be picked
+      # up and run. This is the raw Flutter bundle (no install.sh, no
+      # WebRTC/abseil copying) — release.yml makes the real tarball; this
+      # one exists so a branch push leaves something downloadable.
+      - name: archive bundle
+        run: |
+          mkdir -p dist
+          tar czf dist/parley-linux-x86_64-ci.tar.gz \
+            -C app/build/linux/x64/release/bundle .
+          tar tzf dist/parley-linux-x86_64-ci.tar.gz | head -5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: dist/parley-linux-x86_64-ci.tar.gz
+          retention-days: 7
+          if-no-files-found: error
 
   # The second desktop target. It builds the reduced feature set Windows
   # can actually link: `audio-device` (WASAPI) and `video` (receive and
@@ -130,6 +146,21 @@ jobs:
             throw "no flutter_assets in the bundle"
           }
           Write-Host "bundle ok: parley.exe + parley_flutter.dll + assets"
+      # Downloadable without cutting a tag: the zip is the same layout
+      # release.yml ships, minus the version in the name. Short retention
+      # because this is a smoke build, not a distribution channel.
+      - name: archive bundle
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "app/build/windows/x64/runner/Release/*" `
+            -DestinationPath "dist/parley-windows-x86_64-ci.zip"
+          Get-ChildItem dist | Format-Table Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle
+          path: dist/parley-windows-x86_64-ci.zip
+          retention-days: 7
+          if-no-files-found: error
 
   docker:
     name: image boots + client handshake
