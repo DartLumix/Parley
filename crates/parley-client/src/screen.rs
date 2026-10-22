@@ -354,7 +354,7 @@ fn spawn_preview_thread(tap: PreviewSink) -> SyncSender<PreviewJob> {
                 if target != size {
                     canvas.clear();
                     canvas.resize(target.0 * target.1 * 4, 0);
-                    for px in canvas.chunks_exact_mut(4) {
+                    for px in canvas.as_chunks_mut::<4>().0 {
                         px[3] = 255;
                     }
                     size = target;
@@ -1098,7 +1098,12 @@ fn render_preview(
             };
             let start = ((y + y0) * tw + x0) * 4;
             let dst_row = &mut canvas[start..start + pw * 4];
-            for (d, s) in dst_row.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+            for (d, s) in dst_row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(row.as_chunks::<4>().0)
+            {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];
@@ -2311,7 +2316,7 @@ mod tests {
     /// primes it (the letterbox bars stay black without being rewritten).
     fn blank_canvas(w: usize, h: usize) -> Vec<u8> {
         let mut canvas = vec![0u8; w * h * 4];
-        for px in canvas.chunks_exact_mut(4) {
+        for px in canvas.as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
         canvas
