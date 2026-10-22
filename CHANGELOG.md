@@ -3,7 +3,7 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
-## [Unreleased]
+## [0.3.5] — 2026-10-22
 
 Smoother shares, a screens section that survives a small window, and
 nothing playing until you ask it to.
