@@ -12,7 +12,7 @@ NAME="parley-cli-${VERSION}-linux-x86_64"
 
 echo "==> terminal client (release, all features)"
 (cd "$ROOT" && cargo build --release -p parley-client \
-    --features audio-device,video,screen-capture,vaapi)
+    --features audio-device,aec,video,screen-capture,vaapi)
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT

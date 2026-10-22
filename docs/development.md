@@ -69,7 +69,7 @@ cargo test --workspace
 PARLEY_ADMIN_PASSWORD=secret cargo run -p parley-server
 
 # terminal client
-cargo run -p parley-client --features audio-device,video,screen-capture \
+cargo run -p parley-client --features audio-device,aec,video,screen-capture \
     -- --server 127.0.0.1:4443 --user alice --password 'secret'
 ```
 
@@ -78,16 +78,17 @@ link device libraries):
 
 | feature | what it adds |
 |:--|:--|
-| `audio-device` | cpal I/O + WebRTC AEC/NS |
+| `audio-device` | cpal I/O (WASAPI on Windows) |
+| `aec` | WebRTC AEC/NS/HPF on the mic path — Unix-only build deps |
 | `video` | openh264 encode/decode + the video receive hub |
-| `screen-capture` | portal capture (ashpd + PipeWire) |
-| `vaapi` | hardware encode via the vendored crate (`--hw-encode`) |
+| `screen-capture` | portal capture (ashpd + PipeWire) — Linux only |
+| `vaapi` | hardware encode via the vendored crate (`--hw-encode`) — Linux only |
 
 ## Flutter client
 
 ```sh
 cargo build --release -p parley_flutter \
-    --features audio-device,video,screen-capture,hw-encode
+    --features audio-device,aec,video,screen-capture,hw-encode
 cd app
 flutter pub get
 flutter run --release -d linux        # or: flutter build linux --release
@@ -108,6 +109,44 @@ signature break the generated code.
 Checks: `flutter analyze`, `flutter test`, plus a launch (`flutter run`)
 for anything touching the GTK window, the texture bridge or the audio
 devices.
+
+### Windows client
+
+The second desktop target builds the feature set Windows can link:
+`audio-device` (WASAPI) and `video`. Two features are left off, and
+neither is a packaging choice:
+
+- **`aec`** — `webrtc-audio-processing-sys` copies its sources with
+  `cp -a` and configures them with meson into Unix-shaped install
+  paths, so the APM has never been built on Windows. `aec.rs` compiles
+  to a pass-through instead: voice works, echo is not cancelled. Use
+  headphones.
+- **`screen-capture`** — portal + PipeWire capture and the
+  `stream.capture.sink` share-audio tap. A Windows capture backend
+  (WGC/DXGI + WASAPI loopback) is not written yet, so the app hides the
+  Share button there (`screen_share_supported()`). Watching shares is
+  `video`, which does build.
+
+Hardware encode is VAAPI, so it is off too; software H.264 handles
+1080p30. The custom title bar is Linux-only by design: the Windows
+runner keeps its native frame, and the fullscreen button falls back to
+filling the window.
+
+```sh
+cargo build --release -p parley_flutter --features audio-device,video
+cd app
+flutter config --enable-windows-desktop
+flutter pub get
+flutter build windows --release
+# app/build/windows/x64/runner/Release/parley.exe, with
+# parley_flutter.dll installed next to it (windows/runner/CMakeLists.txt)
+```
+
+The bundle must be built on Windows (MSVC + the Windows SDK); it cannot
+be cross-compiled from Linux. CI builds it on `windows-latest`
+(`.github/workflows/ci.yml`) and the release workflow attaches the zip.
+The app's config (remembered session, TOFU pins) lives in
+`%APPDATA%\parley`, not the current directory.
 
 ## Native / hardware
 

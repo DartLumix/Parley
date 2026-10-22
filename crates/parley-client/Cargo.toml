@@ -6,8 +6,15 @@ edition.workspace = true
 [features]
 # Off by default so `cargo test --workspace` (CI, no ALSA) builds the
 # control-only client. Local voice runs:
-#   cargo run -p parley-client --features audio-device -- ...
-audio-device = ["dep:cpal", "parley-core/audio-device", "dep:webrtc-audio-processing"]
+#   cargo run -p parley-client --features audio-device,aec -- ...
+audio-device = ["dep:cpal", "parley-core/audio-device"]
+# WebRTC APM: AEC + noise suppression + high-pass on the mic path. Its
+# build script copies with `cp` and configures with meson into Unix-shaped
+# install paths, so no Windows build has ever produced it. Separate from
+# `audio-device` for exactly that reason: the device layer works there,
+# the filter does not (aec.rs then compiles to a pass-through). Implies
+# `audio-device` — it exists to clean up streams captured through it.
+aec = ["audio-device", "dep:webrtc-audio-processing"]
 video = ["parley-core/video"]
 # 7g: opt-in hardware encode (--hw-encode). NOT part of any default
 # build — the server/CI configs must never link libva. §8 containment.

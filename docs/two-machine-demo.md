@@ -207,7 +207,7 @@ client) or `~/.config/parley/known_hosts` (each client's own pins).
 
 ```sh
 cd ~/Documents/Parley
-cargo build --release -p parley-client --features audio-device,video,screen-capture,vaapi
+cargo build --release -p parley-client --features audio-device,aec,video,screen-capture,vaapi
 tools/hw-probe.sh
 tools/hw-probe.sh --encode h264
 ```
@@ -242,7 +242,7 @@ cargo run --release -p parley-client --features video -- \
 
 ```sh
 cd ~/Documents/Parley
-cargo run --release -p parley-client --features audio-device,video,screen-capture,vaapi -- \
+cargo run --release -p parley-client --features audio-device,aec,video,screen-capture,vaapi -- \
     --server <A-ip>:4443 --user <sender> --password <sender-pass>
 
 # at the prompt:  share
@@ -309,7 +309,7 @@ cargo run --release -p parley-client --features video -- \
 **On A**:
 
 ```sh
-cargo run --release -p parley-client --features audio-device,video,screen-capture,vaapi -- \
+cargo run --release -p parley-client --features audio-device,aec,video,screen-capture,vaapi -- \
     --server <A-ip>:4443 --user <viewer> --password <viewer-pass> --hw-encode
 # at the prompt:  share
 ```
@@ -324,7 +324,7 @@ After that machine's CLI round passes:
 
 ```sh
 cd ~/Documents/Parley
-cargo build --release -p parley_flutter --features audio-device,video,screen-capture,hw-encode
+cargo build --release -p parley_flutter --features audio-device,aec,video,screen-capture,hw-encode
 cd app
 flutter pub get
 flutter run --release -d linux

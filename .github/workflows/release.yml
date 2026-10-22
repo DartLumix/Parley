@@ -175,12 +175,12 @@ jobs:
       - name: clippy with shipping features
         run: |
           cargo clippy -p parley_flutter --all-targets \
-            --features audio-device,video,screen-capture,hw-encode \
+            --features audio-device,aec,video,screen-capture,hw-encode \
             -- -D warnings
       - name: feature tests
         run: |
           cargo test -p parley-core --features video
-          cargo test -p parley-client --features audio-device
+          cargo test -p parley-client --features audio-device,aec
       # The deploy kit ships the server image inside it: one download,
       # one extract, one `docker load` — no hunting for a matching
       # image asset afterwards.
@@ -227,6 +227,65 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Second desktop client. The reduced feature set is not a shortcut:
+  # the WebRTC APM (aec) and the portal/PipeWire capture path do not build
+  # outside Unix, so Windows ships voice without echo cancellation and
+  # can watch shares but not start one. docs/development.md has the why.
+  windows:
+    name: Windows client
+    needs: [meta]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: bridge (voice + video)
+        run: cargo build --release -p parley_flutter --features audio-device,video
+      - name: flutter bundle
+        working-directory: app
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter build windows --release --dart-define=PARLEY_VERSION=$env:VERSION
+      - name: package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $bundle = "app/build/windows/x64/runner/Release"
+          if (-not (Test-Path "$bundle/parley_flutter.dll")) {
+            throw "parley_flutter.dll is not next to parley.exe — the bundle would not start"
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$bundle/*" `
+            -DestinationPath "dist/parley-$env:VERSION-windows-x86_64.zip"
+          Get-ChildItem dist | Format-Table Name, Length
+      # The zip must open to a runnable app, not to a folder inside a
+      # folder: extract it and check the layout the user gets.
+      - name: archive layout
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $tmp = Join-Path $env:RUNNER_TEMP "unzip"
+          Expand-Archive -Path "dist/parley-$env:VERSION-windows-x86_64.zip" -DestinationPath $tmp
+          foreach ($f in @("parley.exe", "parley_flutter.dll", "data/flutter_assets")) {
+            if (-not (Test-Path (Join-Path $tmp $f))) { throw "missing $f in the zip" }
+          }
+          Write-Host "zip ok"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: dist/*
+          if-no-files-found: error
+
   smoke:
     name: functional test
     needs: [meta, server, client]
@@ -263,7 +322,7 @@ jobs:
 
   publish:
     name: GitHub release
-    needs: [meta, verify, server, client, smoke]
+    needs: [meta, verify, server, client, windows, smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -325,13 +384,14 @@ jobs:
             echo "## Assets"
             echo
             echo "- \`parley-${VERSION}-linux-x86_64.tar.gz\` — desktop client (extract, run \`./install.sh\`)"
+            echo "- \`parley-${VERSION}-windows-x86_64.zip\` — Windows desktop client (extract, run \`parley.exe\`; voice without echo cancellation, no screen sharing)"
             echo "- \`parley-cli-${VERSION}-linux-x86_64.tar.gz\` — terminal client and \`--check\` smoke tool"
             echo "- \`parley-server-${VERSION}-x86_64-linux-musl\` — static server, if you do not want Docker"
             echo "- \`parley-deploy-${VERSION}.tar.gz\` — deploy kit: compose file, env template, VPS runbook, AND the server image"
             echo "- \`SHA256SUMS\`"
             echo
             echo "Deploy: \`tar xf parley-deploy-${VERSION}.tar.gz\`, \`docker load -i parley-deploy-${VERSION}/parley-image-${VERSION}.tar.gz\`, \`docker compose up -d\`."
-            echo "Client: \`tar xf parley-${VERSION}-linux-x86_64.tar.gz && cd parley-${VERSION}-linux-x86_64 && ./install.sh\`."
+            echo "Client: \`tar xf parley-${VERSION}-linux-x86_64.tar.gz && cd parley-${VERSION}-linux-x86_64 && ./install.sh\`. Windows: unzip and run \`parley.exe\`."
           } >> notes.md
           cat notes.md
       - name: publish

@@ -52,13 +52,18 @@ git push origin v0.2.0
    CLI and the deploy kit (with the server image inside it), then checks
    the bundle's shared libraries on a clean Ubuntu 24.04 (and that the
    system WebRTC dependency is gone).
-5. **smoke** — extracts the kit, loads its image, boots it, adds a user through
+5. **windows** — builds the bridge and the Flutter bundle on
+   `windows-latest` with `audio-device,video` (no AEC, no capture), and
+   zips the bundle. The archive layout is checked by extracting it: a
+   `parley.exe` without `parley_flutter.dll` next to it would start and
+   then fail on the first bridge call.
+6. **smoke** — extracts the kit, loads its image, boots it, adds a user through
    `/parley-server adduser`, logs in as two accounts and proves a wrong
    password is refused (`tools/e2e-container.sh`).
-6. **publish** — writes `SHA256SUMS`, extracts the changelog section
+7. **publish** — writes `SHA256SUMS`, extracts the changelog section
    and creates the GitHub release with every asset attached.
 
-Only after all six jobs pass does anything become public. Re-running a
+Only after all seven jobs pass does anything become public. Re-running a
 tag (workflow dispatch) uploads assets with `--clobber` and updates the
 notes.
 
@@ -67,6 +72,7 @@ notes.
 | asset | use |
 |:--|:--|
 | `parley-<v>-linux-x86_64.tar.gz` | desktop client; `./install.sh` |
+| `parley-<v>-windows-x86_64.zip` | Windows desktop client; extract, run `parley.exe` |
 | `parley-cli-<v>-linux-x86_64.tar.gz` | terminal client, `--check` smoke test |
 | `parley-server-<v>-x86_64-linux-musl` | static server without Docker |
 | `parley-deploy-<v>.tar.gz` | deploy kit: compose file, env template, runbook **and** `parley-image-<v>.tar.gz` |
@@ -92,3 +98,8 @@ Or against the running server, with the shipped CLI:
 ```sh
 ./parley-cli --server 127.0.0.1 --user admin --password secret --check
 ```
+
+The Windows zip is unsigned, so SmartScreen warns on first run
+("More info" → "Run anyway"). It carries voice without echo
+cancellation and cannot start a screen share — both are stated in the
+release notes rather than left for the user to discover.

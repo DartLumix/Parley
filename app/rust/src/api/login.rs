@@ -23,6 +23,13 @@ pub struct SavedLogin {
 }
 
 fn config_dir() -> PathBuf {
+    // Windows has neither XDG_CONFIG_HOME nor HOME: %APPDATA% is the
+    // per-user root there. Without this the token file would land in the
+    // process's working directory.
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
     std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())

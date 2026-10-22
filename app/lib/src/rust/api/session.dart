@@ -237,6 +237,15 @@ Future<bool> hwEncodeEnabled() =>
 Future<bool> hwEncodeSupported() =>
     RustLib.instance.api.crateApiSessionHwEncodeSupported();
 
+/// Whether this build can share a screen at all (the `screen-capture`
+/// feature pulls the portal + PipeWire capture path, which is Linux
+/// only). The Dart side hides the share entry points when this is false:
+/// on such a build the call could only ever return "screen-capture
+/// feature off". Viewing other people's shares is `video`, a different
+/// feature — a client without this one still watches.
+Future<bool> screenShareSupported() =>
+    RustLib.instance.api.crateApiSessionScreenShareSupported();
+
 /// Real impl — see the stub above. `max_height` / `max_fps` are the
 /// pre-share dialog's caps; 0 means "the capture's own" (never
 /// upscaled, never sped up). A cap the running encoder cannot honour

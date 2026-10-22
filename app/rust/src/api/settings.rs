@@ -58,6 +58,12 @@ impl Default for AppSettings {
 }
 
 fn config_dir() -> PathBuf {
+    // Windows has neither XDG_CONFIG_HOME nor HOME; %APPDATA% is the
+    // per-user root there (same rule as login.rs).
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
     std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())

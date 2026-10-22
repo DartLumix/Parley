@@ -19,6 +19,14 @@ fn fingerprint(cert: &CertificateDer<'_>) -> String {
 }
 
 fn known_hosts_path() -> PathBuf {
+    // Windows sets neither of the XDG variables below; %APPDATA% is the
+    // per-user root there (%APPDATA%\parley\known_hosts). Falling through
+    // would put the pins in the current directory, which is not a place
+    // a trust decision should live.
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir).join("parley").join("known_hosts");
+    }
     let config = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())

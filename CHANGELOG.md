@@ -3,6 +3,27 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [Unreleased]
+
+### Added
+
+- **A Windows client.** The same Rust core and Flutter UI, built on
+  `windows-latest` and attached to releases as
+  `parley-<v>-windows-x86_64.zip`: chat, voice through WASAPI, and
+  watching other people's shares through openh264. Echo cancellation
+  and screen sharing are not there yet — the WebRTC APM's build script
+  and the portal/PipeWire capture path have no Windows equivalent — so
+  the Share button is absent rather than failing when pressed, and
+  software H.264 carries video.
+
+### Changed
+
+- **The AEC is its own cargo feature (`aec`).** `audio-device` is now
+  device I/O alone, which is what lets a Windows build have voice
+  without the APM. Desktop builds enable both; on Linux,
+  `screen-capture` without `aec` is a compile error, so a release can
+  never quietly lose echo cancellation.
+
 ## [0.3.5] — 2026-10-22
 
 Smoother shares, a screens section that survives a small window, and

@@ -136,6 +136,10 @@ class _HomePageState extends State<HomePage> {
   // 7g: our own share state (start/stop button).
   bool _sharing = false;
   bool _hwEncodeSupported = false;
+  // False in builds without the capture backend (Windows): viewing
+  // shares still works, starting one cannot, so the button is absent
+  // rather than failing with "screen-capture feature off".
+  bool _screenShareSupported = false;
   // Persisted preferences (Rust: ~/.config/parley/settings.toml). The
   // share dialog's defaults and the preview switch read from here; the
   // hardware-encode toggle moved to the settings page.
@@ -940,10 +944,12 @@ class _HomePageState extends State<HomePage> {
     try {
       final loaded = await settings_api.load();
       final supported = await hwEncodeSupported();
+      final canShare = await screenShareSupported();
       if (!mounted) return;
       setState(() {
         _settings = loaded;
         _hwEncodeSupported = supported;
+        _screenShareSupported = canShare;
       });
     } catch (e) {
       debugPrint('settings: load failed: $e');
@@ -2038,19 +2044,22 @@ class _HomePageState extends State<HomePage> {
               icon: Icon(_micMuted ? Icons.mic_off : Icons.mic, size: 20),
               label: Text(_micMuted ? 'Unmute' : 'Mute'),
             ),
-            Container(
-              width: 1,
-              height: 24,
-              color: Colors.white.withValues(alpha: 0.12),
-            ),
-            TextButton.icon(
-              onPressed: inVoice ? (_sharing ? _stopShare : _startShare) : null,
-              icon: Icon(
-                _sharing ? Icons.stop_screen_share : Icons.screen_share,
-                size: 20,
+            if (_screenShareSupported) ...[
+              Container(
+                width: 1,
+                height: 24,
+                color: Colors.white.withValues(alpha: 0.12),
               ),
-              label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
-            ),
+              TextButton.icon(
+                onPressed:
+                    inVoice ? (_sharing ? _stopShare : _startShare) : null,
+                icon: Icon(
+                  _sharing ? Icons.stop_screen_share : Icons.screen_share,
+                  size: 20,
+                ),
+                label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
+              ),
+            ],
             // The hardware-encode switch moved to Settings → Video: one
             // source of truth for a preference that is already persisted
             // and only takes effect on the NEXT share.

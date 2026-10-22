@@ -1691,7 +1691,6 @@ dependencies = [
  "serde",
  "tokio",
  "toml 0.8.23",
- "webrtc-audio-processing",
 ]
 
 [[package]]

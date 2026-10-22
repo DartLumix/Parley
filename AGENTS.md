@@ -17,9 +17,10 @@ cargo test --workspace
 (cd app && flutter analyze && flutter test)
 ```
 
-Shipping-feature changes (`audio-device`, `video`, `screen-capture`,
-`hw-encode`) also need the feature builds and tests in
-`.github/workflows/ci.yml`. Container-facing changes need
+Shipping-feature changes (`audio-device`, `aec`, `video`,
+`screen-capture`, `hw-encode`) also need the feature builds and tests in
+`.github/workflows/ci.yml` — including the `windows` job, which builds
+the reduced `audio-device,video` set. Container-facing changes need
 `tools/e2e-container.sh`.
 
 Build dependencies and the AEC/abseil caveats are in

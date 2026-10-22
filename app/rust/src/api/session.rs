@@ -1530,6 +1530,16 @@ pub fn hw_encode_supported() -> bool {
     cfg!(feature = "hw-encode")
 }
 
+/// Whether this build can share a screen at all (the `screen-capture`
+/// feature pulls the portal + PipeWire capture path, which is Linux
+/// only). The Dart side hides the share entry points when this is false:
+/// on such a build the call could only ever return "screen-capture
+/// feature off". Viewing other people's shares is `video`, a different
+/// feature — a client without this one still watches.
+pub fn screen_share_supported() -> bool {
+    cfg!(feature = "screen-capture")
+}
+
 /// Start sharing this machine's screen (portal dialog opens). The
 /// share runs regardless of channel membership — viewers see it when
 /// they're in the same voice channel (FLAG_VIDEO rides the media

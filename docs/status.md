@@ -24,8 +24,10 @@ were verified in 6g and have not regressed since; see the README table.
 
 ## Limits and unverified things
 
-- **Linux only.** Android / Windows / iOS are parked; macOS has never
-  been built.
+- **Linux is the reference client.** Windows ships voice (without echo
+  cancellation: the WebRTC APM does not build there), chat and share
+  *viewing*; starting a share needs a capture backend that does not
+  exist yet. Android and iOS are parked; macOS has never been built.
 - **Hardware encode is VAAPI only**, and one known driver window (the
   polaris box) must not pass `--hw-encode` — the probe enforces that.
 - **Fullscreen state readback** was proven on one compositor
@@ -65,7 +67,9 @@ Product gaps, roughly in the order a small community would notice:
    editing SQLite.
 6. **Distribution** — no AppImage/Flatpak/AUR package and no
    auto-update; the tarball is the only client artifact.
-7. **Other platforms** — Android and Windows are the next clients;
+7. **Other platforms** — Windows now builds (voice + viewing, see the
+   limits above); what it lacks is capture (WGC/DXGI + WASAPI loopback)
+   and a Windows-capable AEC build. Android and iOS are after that;
    camera video is parked until a client can preview it.
 
 ## Next milestone suggestions

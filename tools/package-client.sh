@@ -22,7 +22,7 @@ BUNDLE="$ROOT/app/build/linux/x64/release/bundle"
 
 echo "==> bridge (release, all features)"
 (cd "$ROOT" && cargo build --release -p parley_flutter \
-    --features audio-device,video,screen-capture,hw-encode)
+    --features audio-device,aec,video,screen-capture,hw-encode)
 
 echo "==> Flutter bundle"
 (cd "$ROOT/app" && flutter build linux --release \

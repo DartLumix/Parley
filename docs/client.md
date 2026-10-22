@@ -27,6 +27,13 @@ ships; Ubuntu 22.04's 0.3.48 cannot run this build).
 Screen sharing additionally needs a ScreenCast portal backend matching
 the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`, `-gnome`).
 
+**Windows.** Download `parley-<version>-windows-x86_64.zip`, extract it
+anywhere and run `parley.exe` — nothing to install. Voice, chat and
+watching other people's shares work; echo cancellation and starting a
+share of your own do not yet (the Share button is absent, not broken),
+and the zip is unsigned, so SmartScreen warns on the first run. Settings
+and the remembered login live in `%APPDATA%\parley`.
+
 ## Connect
 
     Server:   host or IP, port optional — the default is 4443, so

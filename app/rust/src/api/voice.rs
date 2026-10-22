@@ -286,7 +286,10 @@ fn apply_profile(send: &mut SendPipeline, robust: bool) {
 /// the device thread (if it started) holds no stream past its scope
 /// exit.
 #[cfg(feature = "audio-device")]
-#[cfg_attr(feature = "screen-capture", allow(clippy::too_many_arguments))]
+// The argument list is the session's plumbing; the share tee is one more
+// cfg-gated slot, so allow it in every feature shape (not just the ones
+// that build with screen-capture).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_voice(
     mixer: SharedMixer,
     conn: quinn::Connection,
@@ -409,7 +412,7 @@ pub(crate) fn start_voice(
     // The settings page can turn AEC off globally (headphones, a studio
     // mic, or a machine where the filter does more harm than good). Music
     // channels ignore it either way — they are transparent by design.
-    let aec: Option<Arc<webrtc_audio_processing::Processor>> = if music {
+    let aec: Option<Arc<parley_client::aec::Processor>> = if music {
         println!("voice: aec off (music channel)");
         None
     } else if !crate::api::settings::echo_cancel() {
@@ -698,7 +701,7 @@ struct AudioStreams {
 #[cfg(feature = "audio-device")]
 fn build_streams(
     mixer: &SharedMixer,
-    aec: Option<Arc<webrtc_audio_processing::Processor>>,
+    aec: Option<Arc<parley_client::aec::Processor>>,
     pcm_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
     muted: Arc<AtomicBool>,
     mic_level: Arc<AtomicU32>,

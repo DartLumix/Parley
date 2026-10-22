@@ -5,7 +5,7 @@
 //! the processor a delayed attenuated copy as "capture", expect the
 //! processor to cancel it.
 
-#![cfg(feature = "audio-device")]
+#![cfg(feature = "aec")]
 
 use std::f32::consts::PI;
 

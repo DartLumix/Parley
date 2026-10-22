@@ -25,9 +25,11 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "screen-capture")]
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{LazyLock, Mutex};
 
+#[cfg(feature = "screen-capture")]
 use parley_client::aec::{self, FrameAssembler};
 
 /// True while a share-audio filter owns the reference ring. The render
@@ -71,6 +73,7 @@ pub(crate) fn push_render(mono: &[f32]) {
 /// `out` feeds `spawn_share_audio_mux`. AEC init failure degrades to a
 /// straight pass-through with a loud line: share audio keeps working,
 /// the loop guard does not.
+#[cfg(feature = "screen-capture")]
 pub(crate) fn spawn_filter(raw: Receiver<Vec<f32>>, out: SyncSender<Vec<f32>>) {
     std::thread::spawn(move || {
         let (left_aec, right_aec) = match (aec::new_echo_canceller(), aec::new_echo_canceller()) {
@@ -163,7 +166,7 @@ pub(crate) fn spawn_filter(raw: Receiver<Vec<f32>>, out: SyncSender<Vec<f32>>) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "screen-capture", feature = "aec"))]
 mod tests {
     use super::*;
     use std::sync::mpsc::sync_channel;

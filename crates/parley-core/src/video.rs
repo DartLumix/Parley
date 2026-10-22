@@ -152,6 +152,11 @@ pub trait VideoEncoder: Send {
     /// capture side asks BEFORE it negotiates a stream format: a
     /// producer that hands out DMA-BUFs and a software encoder are an
     /// incompatible pair, so the decision has to be made up front.
+    ///
+    /// Unix-only, like the frame type: DMA-BUF is a kernel interface
+    /// with no Windows equivalent (a Windows capture backend will hand
+    /// over CPU frames, or share textures another way).
+    #[cfg(unix)]
     fn dmabuf_supported(&self) -> bool {
         false
     }
@@ -164,6 +169,7 @@ pub trait VideoEncoder: Send {
     /// The default is a loud error rather than a silent copy: a backend
     /// that does not override this must never be handed a DMA-BUF, and
     /// `dmabuf_supported` is what callers check.
+    #[cfg(unix)]
     fn encode_dmabuf(&mut self, frame: DmaBufFrame, out: &mut Vec<u8>) -> Result<bool, Error> {
         let _ = (frame, out);
         Err(Error::Codec(
@@ -173,6 +179,7 @@ pub trait VideoEncoder: Send {
 }
 
 /// One plane of a [`DmaBufFrame`], within the single fd holding them all.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmaBufPlane {
     /// Byte offset of the plane from the start of the buffer.
@@ -192,6 +199,7 @@ pub struct DmaBufPlane {
 /// `b"XR24"` for packed `B G R X`), and `modifier` is the DRM format
 /// modifier the producer negotiated — a driver will refuse to import a
 /// tiling it cannot address, which is a fact the caller cannot paper over.
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct DmaBufFrame {
     /// The exported descriptor; held open until the encoder returns.

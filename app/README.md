@@ -6,7 +6,7 @@ screen capture live in Rust behind `flutter_rust_bridge`.
 ```sh
 # From the repository root:
 cargo build --release -p parley_flutter \
-    --features audio-device,video,screen-capture,hw-encode
+    --features audio-device,aec,video,screen-capture,hw-encode
 
 cd app
 flutter pub get

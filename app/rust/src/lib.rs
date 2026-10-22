@@ -5,3 +5,12 @@
 
 mod api;
 mod frb_generated;
+
+// The desktop client ships echo cancellation: voice on open speakers
+// without it is a feedback loop. A Linux build that forgot the feature
+// compiles cleanly otherwise, so fail loudly here instead of shipping
+// a quieter regression. Gated on `screen-capture` — the marker of the
+// shipping desktop feature set — so the reduced voice-only shape can
+// still be built to check it. (Windows has no APM build; see aec.rs.)
+#[cfg(all(target_os = "linux", feature = "screen-capture", not(feature = "aec")))]
+compile_error!("the Linux desktop build must enable the `aec` feature");

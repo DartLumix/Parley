@@ -47,16 +47,16 @@ jobs:
       - name: bridge (all features)
         run: |
           cargo build --release -p parley_flutter \
-            --features audio-device,video,screen-capture,hw-encode
+            --features audio-device,aec,video,screen-capture,hw-encode
           cargo clippy -p parley_flutter --all-targets \
-            --features audio-device,video,screen-capture,hw-encode \
+            --features audio-device,aec,video,screen-capture,hw-encode \
             -- -D warnings
       # The shipping features are the ones that must actually run, not
       # just compile: video decode/assembly and the bundled AEC.
       - name: feature tests
         run: |
           cargo test -p parley-core --features video
-          cargo test -p parley-client --features audio-device
+          cargo test -p parley-client --features audio-device,aec
           # The disconnect/presence regression only reproduces with the
           # video task running (it holds a session-lifetime sender).
           cargo test -p parley_flutter --features video
@@ -67,6 +67,58 @@ jobs:
           flutter analyze
           flutter test
           flutter build linux --release --dart-define=PARLEY_VERSION=ci
+
+  # The second desktop target. It builds the reduced feature set Windows
+  # can actually link: `audio-device` (WASAPI) and `video` (receive and
+  # display), without `aec` (the WebRTC APM's build script is Unix-only)
+  # or `screen-capture` (portal + PipeWire). Voice works, echo is not
+  # cancelled; shares can be watched, not started.
+  windows:
+    name: windows build (voice + video)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: bridge (voice + video)
+        run: |
+          cargo build --release -p parley_flutter --features audio-device,video
+          cargo clippy -p parley_flutter --all-targets --features audio-device,video -- -D warnings
+      # These are the suites that can run in this shape: video
+      # assembly/decoding through openh264, and the AEC-less mic path
+      # (aec_off.rs) — the two halves Windows actually ships.
+      - name: feature tests
+        run: |
+          cargo test -p parley-core --features video
+          cargo test -p parley-client --features audio-device
+      - name: flutter checks
+        working-directory: app
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter analyze
+          flutter test
+          flutter build windows --release --dart-define=PARLEY_VERSION=ci
+      # A bundle that built but cannot load the bridge is the failure this
+      # job exists to catch: the DLL has to sit next to parley.exe.
+      - name: bundle contains the bridge
+        run: |
+          $bundle = "app/build/windows/x64/runner/Release"
+          if (-not (Test-Path "$bundle/parley.exe")) { throw "no parley.exe" }
+          if (-not (Test-Path "$bundle/parley_flutter.dll")) {
+            throw "parley_flutter.dll is not next to parley.exe"
+          }
+          if (-not (Test-Path "$bundle/data/flutter_assets")) {
+            throw "no flutter_assets in the bundle"
+          }
+          Write-Host "bundle ok: parley.exe + parley_flutter.dll + assets"
 
   docker:
     name: image boots + client handshake

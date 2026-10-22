@@ -49,7 +49,7 @@ Voice is the product; everything else grows later.
 | 7k | Share teardown notices, ghost-card race, real fullscreen, app chrome | ✅ |
 | 0.2 | First downloadable release — client tarball, container kit, release CI | ✅ |
 | 0.3 | Settings page, screens grid with own-stream preview, share size/rate dialog | ✅ |
-| 7+ | Android / Windows / iOS bring-up, file transfer | ⏳ |
+| 7+ | Windows capture + AEC, Android / iOS bring-up, file transfer | ⏳ |
 
 ---
 
@@ -82,7 +82,7 @@ Connect to `your-server` (port 4443, the client default). The full runbooks are
 
 - 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera video
 - 👀 Every share is a live 16:9 tile — including yours while you send — with *Watch*, several open at once, and per-share audio · pick a resolution/rate cap before the portal opens · settings for video, audio and your account
-- 🐧 Native clients: **Linux → Android → Windows → iOS** — no Electron, no webviews, ever
+- 🐧 Native clients: **Linux → Windows → Android → iOS** — no Electron, no webviews, ever. The Windows client (voice, chat, watching shares; capture and AEC still to come) builds from the same code
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
 - 🐳 Deploy with `docker compose up` · one TOML config · one UDP port
 
@@ -236,13 +236,13 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       the platform thread), `video_started`/`video_stopped` events drive
       a plain Texture widget; viewer-side VideoReport (5 s worst gap
       rate) feeds the sharer's 6e ladder; feature `video` default-off,
-      build with `--features audio-device,video`
+      build with `--features audio-device,aec,video`
 - [x] 7g Screen-share send — portal capture through the bridge in the app: start/stop
       from the UI (`start_screen_share` + `share_started`/`share_ended`/`share_failed`
       events), share-audio mux, keyframe poke for a late joiner, and the HW-encode
       setting gated on `hw_encode_supported()` (feature `screen-capture`, which implies
       `video`; the Rust side is parley-client's screen module, the same one the CLI
-      uses). Verified by build + clippy with `audio-device,video,screen-capture,hw-encode`;
+      uses). Verified by build + clippy with `audio-device,aec,video,screen-capture,hw-encode`;
       the on-screen run is step 3 of [docs/hd-encode-runs.md](docs/hd-encode-runs.md)
 - [x] 7j Zero-copy capture — `--dmabuf` asks for the compositor's own buffers
       (a `Buffers` param whose memory-type mask is `1 << SPA_DATA_DmaBuf`, plus the
@@ -258,7 +258,8 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       default, and the offer's format/modifier list has to match the producer
       (LINEAR alone fails against a portal that only speaks `MOD_INVALID`;
       the transcript is in docs/hd-encode-runs.md)
-- [ ] Android / Windows / iOS bring-up
+- [x] Windows client — voice without AEC, chat, share viewing (capture and AEC pending)
+- [ ] Android / iOS bring-up
 - [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
 
 **Parked indefinitely** : camera video — returns after the client has adecent foundation (it needs UI preview; the pipeline exists).
@@ -271,7 +272,7 @@ backend feature through `flutter_rust_bridge` before any real UI design.
 cargo test --workspace
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 PARLEY_ADMIN_PASSWORD=secret cargo run -p parley-server   # listens :4443
-cargo run -p parley-client --features audio-device,video,screen-capture \
+cargo run -p parley-client --features audio-device,aec,video,screen-capture \
     -- --server 127.0.0.1:4443 --user alice --password 'secret'
 ```
 
@@ -282,7 +283,7 @@ probe and the container functional test are in
 
 ```sh
 cargo build --release -p parley_flutter \
-    --features audio-device,video,screen-capture,hw-encode
+    --features audio-device,aec,video,screen-capture,hw-encode
 cd app && flutter run --release -d linux
 ```
 

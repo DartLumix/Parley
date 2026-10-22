@@ -15,12 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::sync::mpsc::Receiver;
 
-use webrtc_audio_processing::Processor;
-
 use parley_core::audio::device::{PREFERRED_RATE, preferred_input_config, preferred_output_config};
 use parley_proto::{ClientBody, ClientMessage, SendChat};
 
-use crate::aec;
+use crate::aec::{self, Processor};
 use crate::mixer::{self, SharedMixer};
 
 /// Click spec for --measure: 1.4 kHz near-full-scale burst, 5 ms — rare
