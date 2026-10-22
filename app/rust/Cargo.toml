@@ -7,23 +7,27 @@ edition = "2021"
 crate-type = ["cdylib", "staticlib"]
 
 [features]
-# Device I/O (cpal) + AEC (parley-client's `aec`: webrtc-audio-processing)
-# — default OFF so workspace-wide CI clippy and the server's musl Docker
-# build never touch alsa-sys (the §11 convention, extended to the bridge
-# crate). The Flutter app builds with --features audio-device; without
-# it, voice_start returns an error and everything else works. The Windows
-# build leaves `aec` off (the APM does not build there) — voice works,
-# echo cancellation does not.
+# Device I/O (cpal) — default OFF so workspace-wide CI clippy and the
+# server's musl Docker build never touch alsa-sys (the §11 convention,
+# extended to the bridge crate). The Flutter app builds with --features
+# audio-device; without it, voice_start returns an error and everything
+# else works. Echo cancellation is a separate feature, one per backend:
+# `aec` on Unix, `aec-rust` on Windows.
 audio-device = [
     "dep:cpal",
     "parley-core/audio-device",
     "parley-client/audio-device",
 ]
-# WebRTC APM (echo cancellation). Split out because the APM has never
-# built on Windows; desktop builds enable it alongside audio-device, the
-# Windows build does not. Linux without it is a compile error below, so
-# a release can never quietly ship without echo cancellation.
+# Echo cancellation, Unix: the WebRTC Audio Processing Module. Split out
+# because its build needs meson and a C++ toolchain. Linux without it is a
+# compile error below, so a release can never quietly ship without echo
+# cancellation.
 aec = ["audio-device", "parley-client/aec"]
+# Echo cancellation, Windows: Sonora's pure-Rust port of the same AEC3
+# pipeline, because the C++ APM's build script is Unix-only. Same API,
+# same call sites (`parley-client::aec`) — only the filter differs, and
+# aec.rs refuses a build that enables both.
+aec-rust = ["audio-device", "parley-client/aec-rust"]
 # 7f: video receive (openh264 decode via parley-core/video) + the
 # Flutter texture display bridge (irondash_texture). Default off: CI
 # and the musl server build never touch openh264 or the texture glue.

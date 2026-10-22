@@ -53,8 +53,8 @@ git push origin v0.2.0
    the bundle's shared libraries on a clean Ubuntu 24.04 (and that the
    system WebRTC dependency is gone).
 5. **windows** — builds the bridge and the Flutter bundle on
-   `windows-latest` with `audio-device,video` (no AEC, no capture), and
-   zips the bundle. The archive layout is checked by extracting it: a
+   `windows-latest` with `audio-device,aec-rust,video` (echo cancellation
+   through the pure-Rust AEC3 port; no capture), and zips the bundle. The archive layout is checked by extracting it: a
    `parley.exe` without `parley_flutter.dll` next to it would start and
    then fail on the first bridge call.
 6. **smoke** — extracts the kit, loads its image, boots it, adds a user through
@@ -100,6 +100,6 @@ Or against the running server, with the shipped CLI:
 ```
 
 The Windows zip is unsigned, so SmartScreen warns on first run
-("More info" → "Run anyway"). It carries voice without echo
-cancellation and cannot start a screen share — both are stated in the
-release notes rather than left for the user to discover.
+("More info" → "Run anyway"). It carries voice with echo cancellation
+but cannot start a screen share — both stated in the release notes
+rather than left for the user to discover.

@@ -88,11 +88,13 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # The second desktop target. It builds the reduced feature set Windows
-  # can actually link: `audio-device` (WASAPI) and `video` (receive and
-  # display), without `aec` (the WebRTC APM's build script is Unix-only)
-  # or `screen-capture` (portal + PipeWire). Voice works, echo is not
-  # cancelled; shares can be watched, not started.
+  # The second desktop target. Windows links `audio-device` (WASAPI),
+  # `video` (receive and display) and `aec-rust`: echo cancellation from
+  # the pure-Rust AEC3 port, because the C++ APM's build script is
+  # Unix-only. aec.rs swaps the backend and keeps the same API, so the
+  # call sites and the synthetic-echo test are identical on both. Still
+  # no `screen-capture` (portal + PipeWire): shares can be watched, not
+  # started.
   windows:
     name: windows build (voice + video)
     runs-on: windows-latest
@@ -114,17 +116,20 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: bridge (voice + video)
+      - name: bridge (voice + video + aec)
         run: |
-          cargo build --release -p parley_flutter --features audio-device,video
-          cargo clippy -p parley_flutter --all-targets --features audio-device,video -- -D warnings
+          cargo build --release -p parley_flutter --features audio-device,aec-rust,video
+          cargo clippy -p parley_flutter --all-targets --features audio-device,aec-rust,video -- -D warnings
       # These are the suites that can run in this shape: video
-      # assembly/decoding through openh264, and the AEC-less mic path
-      # (aec_off.rs) — the two halves Windows actually ships.
+      # assembly/decoding through openh264, the synthetic-echo test against
+      # the Rust AEC (tests/aec.rs — the same >10 dB assertion the Unix
+      # backend has to pass), and the pass-through stub that a build with
+      # no AEC feature ships (aec_off.rs).
       - name: feature tests
         run: |
           cargo test -p parley-core --features video
-          cargo test -p parley-client --features audio-device
+          cargo test -p parley-client --features audio-device,aec-rust
+          cargo test -p parley-client --features audio-device --test aec_off
       - name: flutter checks
         working-directory: app
         run: |

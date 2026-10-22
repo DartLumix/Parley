@@ -1,10 +1,14 @@
-//! The reduced build has no WebRTC APM: aec.rs is a pass-through, and the
-//! one thing that must stay true is that the mic audio reaches the
-//! encoder untouched. This is the shape Windows ships (`audio-device`
-//! without `aec`), so it is worth its own test rather than trusting that
-//! the stub compiles.
+//! The reduced build has no processor at all: aec.rs is a pass-through,
+//! and the one thing that must stay true is that the mic audio reaches the
+//! encoder untouched. That is the shape any build without a backend
+//! feature takes — `audio-device` alone, as the musl CLI and a quick
+//! `cargo build` do — so it is worth its own test rather than trusting
+//! that the stub compiles.
 
-#![cfg(all(feature = "audio-device", not(feature = "aec")))]
+#![cfg(all(
+    feature = "audio-device",
+    not(any(feature = "aec", feature = "aec-rust"))
+))]
 
 use parley_client::aec;
 

@@ -8,6 +8,16 @@ tool/assistant credit to commits, tags, PR descriptions or release
 notes. A commit message ends with its last line of prose. History that
 already contains such trailers is cleaned, not amended going forward.
 
+## Cross-component upgrades
+
+Components ship separately (server, Linux client, Windows client, the
+Flutter bridge, packaging, the deploy kit) but share a wire protocol.
+Whenever a change in one forces a change in another — protocol or
+handshake version, capability bits, the feature sets in the workflows,
+files one side reads from the other — say so in the reply: which
+component, what exactly, and whether the two can ship independently.
+Silence means nothing else has to move.
+
 ## Before committing
 
 ```sh

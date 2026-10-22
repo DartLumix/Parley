@@ -231,10 +231,10 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Second desktop client. The reduced feature set is not a shortcut:
-  # the WebRTC APM (aec) and the portal/PipeWire capture path do not build
-  # outside Unix, so Windows ships voice without echo cancellation and
-  # can watch shares but not start one. docs/development.md has the why.
+  # Second desktop client. This is not a shortcut: the C++ APM (aec) and
+  # the portal/PipeWire capture path do not build outside Unix, so Windows
+  # takes `aec-rust` — the pure-Rust AEC3 port — for echo cancellation,
+  # and can watch shares but not start one. docs/development.md has the why.
   windows:
     name: Windows client
     needs: [meta]
@@ -254,8 +254,8 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
-      - name: bridge (voice + video)
-        run: cargo build --release -p parley_flutter --features audio-device,video
+      - name: bridge (voice + video + aec)
+        run: cargo build --release -p parley_flutter --features audio-device,aec-rust,video
       - name: flutter bundle
         working-directory: app
         env:
@@ -392,7 +392,7 @@ jobs:
             echo "## Assets"
             echo
             echo "- \`parley-${VERSION}-linux-x86_64.tar.gz\` — desktop client (extract, run \`./install.sh\`)"
-            echo "- \`parley-${VERSION}-windows-x86_64.zip\` — Windows desktop client (extract, run \`parley.exe\`; voice without echo cancellation, no screen sharing)"
+            echo "- \`parley-${VERSION}-windows-x86_64.zip\` — Windows desktop client (extract, run \`parley.exe\`; voice with echo cancellation, no screen sharing)"
             echo "- \`parley-cli-${VERSION}-linux-x86_64.tar.gz\` — terminal client and \`--check\` smoke tool"
             echo "- \`parley-server-${VERSION}-x86_64-linux-musl\` — static server, if you do not want Docker"
             echo "- \`parley-deploy-${VERSION}.tar.gz\` — deploy kit: compose file, env template, VPS runbook, AND the server image"

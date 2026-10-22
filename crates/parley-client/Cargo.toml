@@ -10,11 +10,15 @@ edition.workspace = true
 audio-device = ["dep:cpal", "parley-core/audio-device"]
 # WebRTC APM: AEC + noise suppression + high-pass on the mic path. Its
 # build script copies with `cp` and configures with meson into Unix-shaped
-# install paths, so no Windows build has ever produced it. Separate from
-# `audio-device` for exactly that reason: the device layer works there,
-# the filter does not (aec.rs then compiles to a pass-through). Implies
-# `audio-device` — it exists to clean up streams captured through it.
+# install paths, so no Windows build has ever produced it. The Unix
+# backend. Implies `audio-device` — it exists to clean up streams captured
+# through it. `aec-rust` is the Windows one; exactly one at a time.
 aec = ["audio-device", "dep:webrtc-audio-processing"]
+# Sonora's pure-Rust port of the same AEC3 pipeline — what Windows ships,
+# because the C++ APM cannot build there. Pure Rust, so it also builds on
+# Linux, which is how tests/aec.rs exercises this backend without a
+# Windows machine. Enabling it together with `aec` is a compile error.
+aec-rust = ["audio-device", "dep:sonora"]
 video = ["parley-core/video"]
 # 7g: opt-in hardware encode (--hw-encode). NOT part of any default
 # build — the server/CI configs must never link libva. §8 containment.
@@ -32,6 +36,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 cpal = { workspace = true, optional = true }
 webrtc-audio-processing = { workspace = true, optional = true }
+sonora = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
 ashpd = { workspace = true, optional = true, features = ["screencast"] }
 pipewire = { workspace = true, optional = true }

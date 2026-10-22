@@ -4,8 +4,11 @@
 //! constructs the echo path mathematically instead: render a tone, feed
 //! the processor a delayed attenuated copy as "capture", expect the
 //! processor to cancel it.
+//!
+//! Runs against both backends: `aec` (WebRTC APM, Unix) and `aec-rust`
+//! (the port Windows ships, which compiles on any host).
 
-#![cfg(feature = "aec")]
+#![cfg(any(feature = "aec", feature = "aec-rust"))]
 
 use std::f32::consts::PI;
 
@@ -67,6 +70,10 @@ fn synthetic_echo_is_cancelled() {
     }
 
     let reduction_db = 10.0 * (in_energy / out_energy.max(1e-12)).log10();
+    // Not shown on a green run (the harness captures stdout); it is here
+    // so a failing assertion has the number next to it, and so the two
+    // backends can be compared by running this test with each feature.
+    println!("echo reduction: {reduction_db:.1} dB");
     assert!(
         reduction_db > 10.0,
         "echo reduction only {reduction_db:.1} dB after {warmup} frames warmup"

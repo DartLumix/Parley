@@ -93,6 +93,7 @@ link device libraries):
 |:--|:--|
 | `audio-device` | cpal I/O (WASAPI on Windows) |
 | `aec` | WebRTC AEC/NS/HPF on the mic path — Unix-only build deps |
+| `aec-rust` | the same DSP from the pure-Rust AEC3 port — what Windows builds |
 | `video` | openh264 encode/decode + the video receive hub |
 | `screen-capture` | portal capture (ashpd + PipeWire) — Linux only |
 | `vaapi` | hardware encode via the vendored crate (`--hw-encode`) — Linux only |
@@ -125,15 +126,25 @@ devices.
 
 ### Windows client
 
-The second desktop target builds the feature set Windows can link:
-`audio-device` (WASAPI) and `video`. Two features are left off, and
-neither is a packaging choice:
+The second desktop target builds `audio-device` (WASAPI), `video` and
+`aec-rust`. One feature is left off, and it is not a packaging choice:
 
 - **`aec`** — `webrtc-audio-processing-sys` copies its sources with
   `cp -a` and configures them with meson into Unix-shaped install
-  paths, so the APM has never been built on Windows. `aec.rs` compiles
-  to a pass-through instead: voice works, echo is not cancelled. Use
-  headphones.
+  paths, so the C++ APM has never been built on Windows. Windows takes
+  the other backend instead: **`aec-rust`**, Sonora's pure-Rust port of
+  the same AEC3 pipeline (AEC3 + noise suppression + high-pass).
+  `aec.rs` picks it by feature and keeps one API, so the call sites and
+  the synthetic-echo test are the same on both platforms; what differs
+  is the filter implementation. Pure Rust also means the Windows
+  backend is testable on Linux:
+
+  ```sh
+  cargo test -p parley-client --features audio-device,aec-rust
+  ```
+
+  Enabling `aec` and `aec-rust` together is a compile error, so a build
+  cannot compile one and silently run the other.
 - **`screen-capture`** — portal + PipeWire capture and the
   `stream.capture.sink` share-audio tap. A Windows capture backend
   (WGC/DXGI + WASAPI loopback) is not written yet, so the app hides the
@@ -146,7 +157,7 @@ runner keeps its native frame, and the fullscreen button falls back to
 filling the window.
 
 ```sh
-cargo build --release -p parley_flutter --features audio-device,video
+cargo build --release -p parley_flutter --features audio-device,aec-rust,video
 cd app
 flutter config --enable-windows-desktop
 flutter pub get

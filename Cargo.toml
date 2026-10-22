@@ -46,6 +46,10 @@ cpal = "0.15"
 # there. Build requirement: meson, ninja, a C++ toolchain and libclang
 # (bindgen); runtime requirement: none.
 webrtc-audio-processing = { version = "2.1", features = ["bundled"] }
+# The Windows AEC: a pure-Rust port of the same AEC3 pipeline, for the
+# platform where the C++ APM's meson build script does not exist. Needs
+# rustc >= 1.91 (rust-version in its manifest).
+sonora = "0.2"
 openh264 = "0.9"
 ashpd = "0.13"
 pipewire = "0.10"

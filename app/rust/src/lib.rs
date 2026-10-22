@@ -11,6 +11,11 @@ mod frb_generated;
 // compiles cleanly otherwise, so fail loudly here instead of shipping
 // a quieter regression. Gated on `screen-capture` — the marker of the
 // shipping desktop feature set — so the reduced voice-only shape can
-// still be built to check it. (Windows has no APM build; see aec.rs.)
-#[cfg(all(target_os = "linux", feature = "screen-capture", not(feature = "aec")))]
+// still be built to check it. (Windows takes the same guard through the
+// release workflow: `aec-rust`, the pure-Rust filter; see aec.rs.)
+#[cfg(all(
+    target_os = "linux",
+    feature = "screen-capture",
+    not(any(feature = "aec", feature = "aec-rust"))
+))]
 compile_error!("the Linux desktop build must enable the `aec` feature");
