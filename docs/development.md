@@ -53,6 +53,19 @@ sets that plus `LIBOPUS_NO_PKG=1` so the bundled Opus is built (cmake
 < 4 — its CMakeLists predates policy 3.5) and linked statically, which
 24.04's non-PIC `libopus.a` cannot be.
 
+Bundled Opus and CMake 4: audiopus_sys builds Opus 1.3, whose
+`CMakeLists.txt` says `cmake_minimum_required(VERSION 3.1)`, and CMake 4
+refuses anything below 3.5 outright ("Compatibility with CMake < 3.5
+has been removed"). Windows runners already ship CMake 4, and any
+distribution rolling it forward will hit the same wall, so the builds
+that use the bundled Opus set
+`CMAKE_POLICY_VERSION_MINIMUM=3.5`. Setting it yourself is enough:
+
+```sh
+CMAKE_POLICY_VERSION_MINIMUM=3.5 LIBOPUS_NO_PKG=1 LIBOPUS_STATIC=1 \
+    cargo build --release -p parley_flutter --features audio-device,aec
+```
+
 Building the shipping features also needs PipeWire >= 0.3.65 headers:
 pipewire-rs uses `spa_video_info_raw.flags`, which 22.04's 0.3.48 does
 not have. 24.04 (1.0.5) is therefore the build and runtime baseline for

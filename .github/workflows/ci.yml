@@ -26,6 +26,10 @@ jobs:
   app:
     name: flutter analyze + test + release build
     runs-on: ubuntu-latest
+    env:
+      # Bundled Opus needs CMake < 3.5 compatibility; see the windows job
+      # below (and docs/development.md). No effect on CMake 3.x.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,6 +80,13 @@ jobs:
   windows:
     name: windows build (voice + video)
     runs-on: windows-latest
+    env:
+      # audiopus_sys builds Opus 1.3, whose CMakeLists still asks for
+      # CMake < 3.5 — which CMake 4 (the runner's) rejects outright:
+      # "Compatibility with CMake < 3.5 has been removed". This is the
+      # sanctioned way to keep such a project configuring, and there is
+      # no newer audiopus to move to. Harmless on CMake 3.x.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

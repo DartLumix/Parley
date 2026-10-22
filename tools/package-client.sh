@@ -20,6 +20,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NAME="parley-${VERSION}-linux-x86_64"
 BUNDLE="$ROOT/app/build/linux/x64/release/bundle"
 
+# Bundled Opus asks for CMake < 3.5 and CMake 4 refuses it (see
+# docs/development.md). Harmless on older CMake, required on newer.
+export CMAKE_POLICY_VERSION_MINIMUM=${CMAKE_POLICY_VERSION_MINIMUM:-3.5}
+
 echo "==> bridge (release, all features)"
 (cd "$ROOT" && cargo build --release -p parley_flutter \
     --features audio-device,aec,video,screen-capture,hw-encode)
