@@ -566,6 +566,7 @@ async fn handle_client_message(
                     body: Some(ServerBody::VideoReport(VideoReport {
                         reporter_id: info.id,
                         gap_rate_permille: rep.gap_rate_permille,
+                        viewer_fps: rep.viewer_fps,
                     })),
                 };
                 for member in voice.members_of(channel_id) {

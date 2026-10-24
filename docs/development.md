@@ -199,5 +199,6 @@ The root `docker-compose.yml` builds and runs from a checkout;
 | `parley-core` `video_receive` tests | display hub: one stale frame after a stop (the ghost card) |
 | `parley-server/tests/transport.rs` | SFU routing, scoping, presence, generations |
 | `parley-client/tests/aec.rs` | synthetic echo cancellation, no hardware needed |
+| `parley-client/tests/share_echo.rs` | share-audio digital guard: own playback subtracted, other audio preserved |
 | `parley-core/tests/vaapi_*.rs` | hardware path (skipped without a capable GPU) |
 | `app/test/` | window toolbar behaviour, login form |

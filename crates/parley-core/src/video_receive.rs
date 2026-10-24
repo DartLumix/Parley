@@ -43,11 +43,36 @@ use parley_proto::video::{VideoAssembler, decode_fragment};
 
 use crate::video::VideoDecoder;
 
+/// Pixel layout the hub decodes into.
+///
+/// `Rgb24` is what the terminal client's mpv feeder and the existing
+/// tests speak. `Rgba` is what Flutter's texture wants — decoding
+/// straight into it removes a second full-frame RGB→RGBA pass on the
+/// viewer (`write_rgba8` writes the opaque channel inline).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoPixelFormat {
+    #[default]
+    Rgb24,
+    Rgba,
+}
+
+impl VideoPixelFormat {
+    pub fn bytes_per_pixel(self) -> u8 {
+        match self {
+            Self::Rgb24 => 3,
+            Self::Rgba => 4,
+        }
+    }
+}
+
 /// One decoded frame, ready for any consumer.
 pub struct VideoFrame {
     pub sender_id: u32,
-    /// RGB24, row-major, `width * height * 3` bytes.
+    /// Row-major pixels in the hub's [`VideoPixelFormat`]: either
+    /// `width * height * 3` (RGB24) or `width * height * 4` (RGBA).
     pub rgb: Vec<u8>,
+    /// [`VideoPixelFormat::bytes_per_pixel`] for the buffer above.
+    pub channels: u8,
     pub width: usize,
     pub height: usize,
     /// 7h HD: the sender's cadence is above ~45 fps (hardware encode at
@@ -175,6 +200,14 @@ struct RecvStream {
     fed_since_picture: u64,
     /// When the decoder was last rebuilt (cooldown bookkeeping).
     last_reset: Option<std::time::Instant>,
+    /// Decode-rate measurement for the viewer's VideoReport: pictures in
+    /// the current second, when that second began, and the last
+    /// completed measurement. This is the number a CPU-starved viewer
+    /// must tell the sender — loss reports alone cannot distinguish
+    /// "packets never arrived" from "arrived and could not be decoded".
+    decoded_window: u64,
+    fps_window: std::time::Instant,
+    decoded_fps: u32,
     /// When the last fragment for this sender arrived — the stall
     /// detector's clock. A share whose sender went away without a stop
     /// notice (crash, killed capture) never sends again; a viewer that
@@ -184,6 +217,10 @@ struct RecvStream {
 
 #[derive(Default)]
 struct HubInner {
+    /// Pixel layout every stream in this hub decodes into. Fixed for the
+    /// hub's life: a consumer wants one layout, and switching per frame
+    /// would only add branches to the hot path.
+    format: VideoPixelFormat,
     streams: HashMap<u32, RecvStream>,
     /// 6a stopped-set: ShareStopped was seen for this sender; straggler
     /// datagrams are suppressed until their next keyframe fragment
@@ -213,9 +250,22 @@ impl Default for VideoReceiveHub {
 }
 
 impl VideoReceiveHub {
+    /// RGB24 hub (the terminal client and the tests).
     pub fn new() -> Self {
+        Self::with_format(VideoPixelFormat::Rgb24)
+    }
+
+    /// RGBA hub: what the Flutter text bridge wants, decoded in one pass.
+    pub fn new_rgba() -> Self {
+        Self::with_format(VideoPixelFormat::Rgba)
+    }
+
+    fn with_format(format: VideoPixelFormat) -> Self {
         Self {
-            inner: Mutex::new(HubInner::default()),
+            inner: Mutex::new(HubInner {
+                format,
+                ..HubInner::default()
+            }),
             frame_ready: Condvar::new(),
         }
     }
@@ -223,6 +273,11 @@ impl VideoReceiveHub {
     /// Convenience: hub behind an Arc.
     pub fn shared() -> SharedVideoReceiveHub {
         Arc::new(Self::new())
+    }
+
+    /// RGB24 hub behind an Arc.
+    pub fn shared_rgba() -> SharedVideoReceiveHub {
+        Arc::new(Self::new_rgba())
     }
 
     /// Feed one FLAG_VIDEO datagram payload (the media header already
@@ -286,6 +341,9 @@ impl VideoReceiveHub {
                             decode_errors: 0,
                             fed_since_picture: 0,
                             last_reset: None,
+                            decoded_window: 0,
+                            fps_window: std::time::Instant::now(),
+                            decoded_fps: 0,
                             last_packet: std::time::Instant::now(),
                         });
                     }
@@ -325,7 +383,13 @@ impl VideoReceiveHub {
     /// - Consumer keeping up → decode everything in order (identical
     ///   to the pre-3b behavior).
     fn drain_streams(inner: &mut HubInner) -> bool {
-        let HubInner { streams, queue, .. } = &mut *inner;
+        let HubInner {
+            streams,
+            queue,
+            format,
+            ..
+        } = &mut *inner;
+        let format = *format;
         let mut pushed = false;
         for (&sender_id, stream) in streams.iter_mut() {
             loop {
@@ -349,13 +413,30 @@ impl VideoReceiveHub {
                 if frame.keyframe {
                     keyframe_dump::keyframe(sender_id, frame.frame_id, &frame.data);
                 }
-                match stream.decoder.decode_with_dims(&frame.data) {
+                let decoded = match format {
+                    VideoPixelFormat::Rgb24 => stream.decoder.decode_with_dims(&frame.data),
+                    VideoPixelFormat::Rgba => stream.decoder.decode_rgba_with_dims(&frame.data),
+                };
+                match decoded {
                     Ok(Some((rgb, w, h))) => {
                         stream.decoded += 1;
                         stream.fed_since_picture = 0;
+                        // Viewer-side rate, measured where pictures come
+                        // out of the decoder. One window per second, then
+                        // the completed rate is what VideoReport carries.
+                        stream.decoded_window += 1;
+                        let elapsed = stream.fps_window.elapsed();
+                        if elapsed >= Duration::from_secs(1) {
+                            stream.decoded_fps = (stream.decoded_window as f64
+                                / elapsed.as_secs_f64())
+                            .round() as u32;
+                            stream.decoded_window = 0;
+                            stream.fps_window = std::time::Instant::now();
+                        }
                         queue.push_back(VideoFrame {
                             sender_id,
                             rgb,
+                            channels: format.bytes_per_pixel(),
                             width: w,
                             height: h,
                             high_rate: frame.high_rate,
@@ -537,6 +618,26 @@ impl VideoReceiveHub {
         let mut v: Vec<u32> = inner.streams.keys().copied().collect();
         v.sort_unstable();
         v
+    }
+
+    /// Slowest active sender's decoded-picture rate, in fps.
+    ///
+    /// This is the viewer's real decode capacity — not the rate the
+    /// sender paced at, and not the gap rate. A viewer whose machine is
+    /// busy reports, say, 8 here while the sender is still sending 60;
+    /// the sender's new rate governor uses it to stop outrunning the
+    /// viewer instead of letting the picture collapse to a slideshow.
+    /// None when no stream has arrived recently.
+    pub fn decoded_fps(&self) -> Option<u32> {
+        let now = std::time::Instant::now();
+        let inner = self.inner.lock().unwrap();
+        let rates: Vec<u32> = inner
+            .streams
+            .values()
+            .filter(|s| now.duration_since(s.last_packet) < Duration::from_secs(5))
+            .map(|s| s.decoded_fps)
+            .collect();
+        rates.into_iter().min()
     }
 
     /// Worst per-sender video gap rate since the last call (resets each
@@ -932,5 +1033,36 @@ mod tests {
             hub.push_datagram(6, &p);
         }
         assert!(hub.pop_frame(Duration::from_millis(500)).is_some());
+    }
+
+    /// The RGBA hub exists so the Flutter bridge does not pay an extra
+    /// full-frame pass. If `write_rgba8` were wired to the RGB path the
+    /// buffer would be a third of the expected size and every texture
+    /// upload would be short — this test catches both, and the alpha
+    /// byte (the channel the old conversion used to write) too.
+    #[test]
+    fn rgba_hub_decodes_four_channels() {
+        let (w, h) = (320, 240);
+        let mut enc = crate::video::create_encoder(w, h).unwrap();
+        let (annexb, _) = enc.encode_bgra(&flat_bgra(w, h, 40)).unwrap();
+        let hub = VideoReceiveHub::new_rgba();
+        for p in payloads(&fragment_frame(0, true, &annexb, 0, 0, 42)) {
+            hub.push_datagram(7, &p);
+        }
+        let f = hub
+            .pop_frame(Duration::from_secs(1))
+            .expect("decoded frame");
+        assert_eq!(f.channels, 4);
+        assert_eq!(f.rgb.len(), w * h * 4);
+        assert_eq!(f.rgb[3], 255, "RGBA alpha must be opaque");
+        let g = f.rgb[1] as i32;
+        assert!((g - 40).abs() <= 12, "green off: {g} (expected ~40)");
+    }
+
+    /// No streams means no report: sending "0 fps" would look like a
+    /// stalled viewer to the sender's governor instead of an idle one.
+    #[test]
+    fn decoded_fps_is_none_without_streams() {
+        assert_eq!(VideoReceiveHub::new().decoded_fps(), None);
     }
 }

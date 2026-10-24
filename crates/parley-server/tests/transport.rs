@@ -1606,6 +1606,7 @@ async fn video_report_routed_to_channel_members_only() {
         ClientBody::VideoReport(VideoReport {
             gap_rate_permille: 77,
             reporter_id: 0, // server stamps
+            viewer_fps: 42, // must survive the server's rebuild
         }),
     )
     .await;
@@ -1615,6 +1616,11 @@ async fn video_report_routed_to_channel_members_only() {
         Some(ServerBody::VideoReport(rep)) => {
             assert_eq!(rep.reporter_id, 1, "stamped with authenticated id");
             assert_eq!(rep.gap_rate_permille, 77);
+            assert_eq!(
+                rep.viewer_fps, 42,
+                "the viewer's sustainable rate must survive server routing — \
+                 dropping it silently leaves a CPU-bound viewer at 60 fps"
+            );
         }
         other => panic!("expected video report, got {other:?}"),
     }

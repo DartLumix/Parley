@@ -161,6 +161,9 @@ pub(crate) enum Command {
     #[cfg(feature = "video")]
     VideoReport {
         gap_rate_permille: u32,
+        /// Pictures per second this viewer sustains (0 = unknown). The
+        /// sharer's rate governor paces to it; see `screen::FpsGovernor`.
+        viewer_fps: u32,
     },
     /// 7g: after the local share's supervisor reported Ended, tell the
     /// server (never before Ended — no datagram may follow the notice).
@@ -197,12 +200,14 @@ impl Command {
                 })
             }
             #[cfg(feature = "video")]
-            Command::VideoReport { gap_rate_permille } => {
-                ClientBody::VideoReport(VideoReport {
-                    gap_rate_permille,
-                    reporter_id: 0, // server stamps the authenticated id
-                })
-            }
+            Command::VideoReport {
+                gap_rate_permille,
+                viewer_fps,
+            } => ClientBody::VideoReport(VideoReport {
+                gap_rate_permille,
+                reporter_id: 0, // server stamps the authenticated id
+                viewer_fps,
+            }),
             #[cfg(feature = "screen-capture")]
             Command::StopShare => ClientBody::StopShare(parley_proto::StopShare {}),
         }
@@ -252,6 +257,15 @@ struct LiveSession {
     share_poke: Arc<Mutex<Option<parley_client::screen::ShareHandle>>>,
     #[cfg(feature = "screen-capture")]
     share_loss: Arc<AtomicU32>,
+    /// Worst decode rate reported by a viewer (0 = none yet). Read by
+    /// the share's rate governor; written by to_event.
+    #[cfg(feature = "screen-capture")]
+    share_viewer_fps: Arc<AtomicU32>,
+    /// When each viewer last reported and what it said, so the minimum
+    /// of the ACTIVE viewers steers the pace (a viewer who stopped
+    /// reporting must not pin the stream at its old rate).
+    #[cfg(feature = "screen-capture")]
+    viewer_fps_reports: Mutex<HashMap<u32, (u32, std::time::Instant)>>,
     /// The channel listing as seen by the last channel_list event —
     /// 7e profile selection: the mode of the channel being joined
     /// picks speech (mono + AEC) vs music (stereo 256 kbps, no AEC).
@@ -686,6 +700,21 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 if !is_echo {
                     if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
                         s.share_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
+                        if rep.viewer_fps > 0 {
+                            let now = std::time::Instant::now();
+                            let mut reports = s.viewer_fps_reports.lock().unwrap();
+                            reports.retain(|_, (_, when)| {
+                                now.duration_since(*when) < Duration::from_secs(15)
+                            });
+                            reports.insert(rep.reporter_id, (rep.viewer_fps, now));
+                            let worst = reports
+                                .values()
+                                .map(|(fps, _)| *fps)
+                                .filter(|&fps| fps > 0)
+                                .min()
+                                .unwrap_or(0);
+                            s.share_viewer_fps.store(worst, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1022,7 +1051,8 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     // 7f: the video receive hub — always on while connected (the
     // display bridge and the FLAG_VIDEO datagram feed gate on it).
     #[cfg(feature = "video")]
-    let session_hub: SharedVideoReceiveHub = parley_core::video_receive::VideoReceiveHub::shared();
+    let session_hub: SharedVideoReceiveHub =
+        parley_core::video_receive::VideoReceiveHub::shared_rgba();
     // --- event path: reader → channel → forwarder → sinks ---
     let sinks: SinkList = Arc::new(Mutex::new(Vec::new()));
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
@@ -1146,6 +1176,10 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
             share_poke: Arc::new(Mutex::new(None)),
             #[cfg(feature = "screen-capture")]
             share_loss: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "screen-capture")]
+            share_viewer_fps: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "screen-capture")]
+            viewer_fps_reports: Mutex::new(HashMap::new()),
             channels: Vec::new(),
             #[cfg(feature = "audio-device")]
             loss_report: Arc::new(AtomicU32::new(0)),
@@ -1559,7 +1593,7 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
     // The own-share card reads the NEW share's shape, not the last one's
     // while the portal picker is still open.
     crate::api::video::clear_share_stats();
-    let (event_tx, share_loss, conn, poke_slot, ctrl_slot) = {
+    let (event_tx, share_loss, share_viewer_fps, conn, poke_slot, ctrl_slot) = {
         let sessions = SESSIONS.lock().unwrap();
         let s = sessions
             .get(&session_id)
@@ -1570,6 +1604,7 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
         (
             s.event_tx.clone(),
             s.share_loss.clone(),
+            s.share_viewer_fps.clone(),
             s._conn.clone(),
             s.share_poke.clone(),
             s.share_ctrl.clone(),
@@ -1601,7 +1636,7 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
                 // degrades to a pass-through instead of silence.
                 let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
                 let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
-                crate::api::share_echo::spawn_filter(raw_rx, tx.clone());
+                parley_client::share_echo::spawn_filter(raw_rx, tx.clone());
                 (Some(raw_tx), Some(rx))
             };
             // No share audio in this build: the mux below is cfg'd out
@@ -1625,6 +1660,7 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
             match parley_client::screen::start(
                 conn.clone(),
                 share_loss,
+                share_viewer_fps,
                 share_event_tx,
                 sys_tx,
                 false,
@@ -1850,6 +1886,9 @@ fn start_video_reporter(
 ) {
     rt().spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        // One log line every 10 s: the viewer side's accounting must be
+        // visible while a share is bad, not only after it recovers.
+        let mut log_every_other = true;
         loop {
             tick.tick().await;
             // The reporter holds a command sender, which would otherwise
@@ -1858,12 +1897,42 @@ fn start_video_reporter(
             if !SESSIONS.lock().unwrap().contains_key(&session_id) {
                 break;
             }
+            // Expire viewers whose report stopped arriving (they left, or
+            // their app died): a departed viewer must not pin this
+            // machine's share at its old rate forever. The same 15 s
+            // window `to_event` uses, applied even when no new report
+            // arrives to trigger it.
+            #[cfg(feature = "screen-capture")]
+            if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                let mut reports = s.viewer_fps_reports.lock().unwrap();
+                reports.retain(|_, (_, when)| {
+                    std::time::Instant::now().duration_since(*when) < Duration::from_secs(15)
+                });
+                let worst = reports
+                    .values()
+                    .map(|(fps, _)| *fps)
+                    .filter(|&fps| fps > 0)
+                    .min()
+                    .unwrap_or(0);
+                s.share_viewer_fps.store(worst, Ordering::Relaxed);
+            }
             let Some(worst) = hub.gap_rate_permille() else {
                 continue; // no active streams: nothing to report
             };
+            // The viewer's own decode rate. 0 means "not measured yet"
+            // and the sender keeps its profile pace — never "zero fps".
+            let fps = hub.decoded_fps().unwrap_or(0);
+            if log_every_other {
+                println!(
+                    "video: viewer sustaining {fps} fps, gap rate {worst}‰, senders {:?}",
+                    hub.senders()
+                );
+            }
+            log_every_other = !log_every_other;
             if cmd_tx
                 .send(Command::VideoReport {
                     gap_rate_permille: worst,
+                    viewer_fps: fps,
                 })
                 .is_err()
             {

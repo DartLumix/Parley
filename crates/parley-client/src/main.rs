@@ -566,6 +566,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     body: Some(ClientBody::VideoReport(VideoReport {
                         gap_rate_permille: worst,
                         reporter_id: 0, // server stamps the authenticated id
+                        // The terminal viewer's mpv pipe declares one fixed
+                        // raw-video rate; it cannot follow a cadence that
+                        // changes mid-share, so it does not steer one. The
+                        // Flutter viewer reports its real decode rate.
+                        viewer_fps: 0,
                     })),
                 });
             }
@@ -1174,18 +1179,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let mux_spawn = mux_spawn_tx.clone();
                                     tokio::spawn(async move {
                                         let (sys_tx, sys_rx) = if share_audio {
-                                                                                    let (tx, rx) =
-                                                                                        std::sync::mpsc::sync_channel::<Vec<f32>>(8);
-                                                                                    (
-                                                                                        Some(tx),
-                                                                                        Some(rx),
-                                                                                    )
-                                                                                } else {
-                                                                                    (None, None)
-                                                                                };
+                                            // Our own playback is in the monitor too;
+                                            // the guard subtracts it before the mux.
+                                            let (raw_tx, raw_rx) =
+                                                std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+                                            let (tx, rx) =
+                                                std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+                                            parley_client::share_echo::spawn_filter(
+                                                raw_rx,
+                                                tx.clone(),
+                                            );
+                                            (Some(raw_tx), Some(rx))
+                                        } else {
+                                            (None, None)
+                                        };
                                         match screen::start(
                                             conn,
                                             vloss,
+                                            // CLI shares keep the profile pace;
+                                            // the Flutter app is the viewer
+                                            // adaptation target (mpv's raw
+                                            // pipe declares a fixed rate).
+                                            Arc::new(std::sync::atomic::AtomicU32::new(0)),
                                             events.clone(),
                                             sys_tx,
                                             args.dmabuf,
@@ -1277,7 +1292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     cmd_mic_route.clone(),
                                 ));
                                 println!("share-audio: mic + system audio mux running");
-                                println!("share-audio: capturing the DEFAULT OUTPUT — any client playing to it on this machine (e.g. a local test listener) creates a feedback loop; route listeners to another sink");
+                                println!("share-audio: capturing the DEFAULT OUTPUT — this client's own playback is subtracted; a SECOND local Parley instance still loops, route it to another sink");
                             }
                             #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
                             {

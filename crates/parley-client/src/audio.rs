@@ -126,12 +126,18 @@ fn output_cb(state: &mut OutputState, data: &mut [f32], info: &cpal::OutputCallb
     // 6d: the mix is interleaved stereo (mono voices duplicated at the
     // mixer); frames = per-channel frames.
     let mixed = mixer::mix(&state.mixer, frames);
-    // Far-end reference for the AEC: what this callback plays, downmixed
-    // to mono. Speech clients' voices are mono-duplicated, so this is
-    // exactly the old reference; music clients run without AEC.
-    if let Some(ap) = &state.aec {
+    // Far-end reference: what this callback plays, downmixed to mono.
+    // Two consumers — the mic's AEC (speech only) and the share-audio
+    // echo guard, which subtracts the same mix from the captured
+    // default-output monitor. Speech clients' voices are mono-
+    // duplicated, so this is exactly the old reference; music clients
+    // run without AEC but still need it while sharing.
+    if state.aec.is_some() || crate::share_echo::active() {
         let mono: Vec<f32> = mixed.chunks(2).map(|p| (p[0] + p[1]) * 0.5).collect();
-        aec::analyze_render(ap, &mut state.render_carry, &mono);
+        if let Some(ap) = &state.aec {
+            aec::analyze_render(ap, &mut state.render_carry, &mono);
+        }
+        crate::share_echo::push_render(&mono);
     }
     // --report: loudest sample above threshold = the click.
     let now = now_micros();

@@ -91,7 +91,10 @@ same trust decision.
 - **Screen share** — *Share screen* in the floating bar asks for a
   resolution and frame-rate cap first (defaults from Settings, *Source*
   means the capture's own size and rate — caps never upscale), then the
-  desktop's portal asks which monitor or window. The software encoder
+  desktop's portal asks which monitor or window. The share's audio is
+  the default output; this client's own playback — the voice channel and
+  any other share you are watching — is subtracted from it first, so a
+  viewer never hears themselves back. The software encoder
   (openh264) is capped at 1080p whatever *Source* says: measured at
   1440p it needs ~35 ms per frame against a 33 ms slot, so half the
   frames would be dropped. With *Hardware encoding* on, the cap is
@@ -156,6 +159,8 @@ same trust decision.
 | share starts but looks blocky after picking a cap | the cap scales the capture down on the CPU; pick *Source* or a larger height on a slow machine |
 | *Source* on a 1440p/4K display streams 1080p | the software encoder's ceiling (see *Screen share*); enable *Hardware encoding* to send the full size |
 | a share stutters while the sender's CPU is busy | software 1080p30 is near the limit on eight cores (~19 ms per frame, p95 ~35 ms). Lower the share height/frame rate, or use hardware encoding |
+| a viewer hears their own voice in the shared stream | the sharer's default-output monitor is capturing the sharer's playback of that voice. The guard subtracts this client's own playback (80 dB on centred voice); if it persists, a **second** Parley instance is playing to the same sink — route it to another output device |
+| a share stutters while the **viewer's** CPU is busy | the viewer reports its decode rate every 5 s and the sharer paces down one rung at a time (down to 5 fps) instead of outrunning it; the `video: viewer sustaining … fps` line in the viewer's log names the number. If it stays low at a small share, the machine has no decode headroom left |
 | own preview stays black | frames are only produced once capture delivers its first buffer — check the `share: encoder ready` line |
 | a share's tile says "connecting…" | the first decoded frame has not reached the display yet; if it stays there, check the receiver's `video:` lines |
 

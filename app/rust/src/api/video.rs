@@ -254,7 +254,9 @@ pub mod imp {
     // inside imp via pub use here.
     pub use super::SessionEvent;
     use irondash_engine_context::EngineContext;
-    use irondash_texture::{BoxedPixelData, PayloadProvider, SendableTexture, SimplePixelData};
+    use irondash_texture::{
+        BoxedPixelData, PayloadProvider, PixelData, PixelDataProvider, SendableTexture,
+    };
     pub use parley_core::video_receive::{SharedVideoReceiveHub, VideoFrame};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -420,51 +422,86 @@ pub mod imp {
             .map_err(|_| "video_prepare called twice".to_string())
     }
 
-    /// Latest-frame slot behind the texture's payload provider. The
-    /// raster thread clones the buffer out (one frame copy per
-    /// displayed frame — unavoidable: a payload owns its bytes — but
-    /// the producer no longer allocates one).
+    /// (width, height, RGBA pixels) — published and pulled as a whole.
+    type FrameSlot = (i32, i32, Arc<Vec<u8>>);
+
+    /// Latest-frame slot behind the texture's payload provider.
     ///
-    /// The slot must NEVER be empty while a texture exists. Recycling its
-    /// buffer by `take()`ing the slot (the first version of this) left it
-    /// empty for the whole RGB→RGBA conversion — milliseconds at 1080p —
-    /// and `get_payload` answered those pulls with a 1x1 black pixel, so
-    /// the viewer saw the shared screen flash black for a single frame.
-    /// Conversion therefore happens in a separate `spare` buffer that is
-    /// swapped in under the lock.
+    /// Both the video path and the preview publish an `Arc`, and
+    /// `get_payload` hands that `Arc` to the raster thread — no pixel
+    /// copy. (The old provider cloned the whole frame per pull: 8.3 MB
+    /// at 1080p, ~400 MB/s at 48 fps, for bytes that are only read.)
+    ///
+    /// The slot must NEVER be empty while a texture exists: an earlier
+    /// version emptied it while recycling the buffer, and `get_payload`
+    /// answered those pulls with a 1x1 black pixel — the shared screen
+    /// flashed black for one frame. Publishing replaces the whole slot
+    /// under one lock, so that race cannot return.
     struct FrameProvider {
-        frame: Mutex<Option<(i32, i32, Vec<u8>)>>,
+        /// `Arc` so a decoded frame reaches the raster thread without a
+        /// second full-frame copy: the old code cloned 8.3 MB per pull at
+        /// 1080p, ~400 MB/s at 48 fps, for bytes that were only read.
+        frame: Mutex<Option<FrameSlot>>,
+        /// Preview only: the capture preview copies its canvas into a
+        /// reused Vec, so its data buffer survives between frames. The
+        /// texture path (`put_shared`) never needs it.
         spare: Mutex<Vec<u8>>,
+    }
+
+    /// One raster pull's view of a shared frame. Holds the `Arc` for as
+    /// long as the payload lives, so the producer can publish the next
+    /// frame while this one is still being uploaded.
+    struct SharedPixelData {
+        width: i32,
+        height: i32,
+        data: Arc<Vec<u8>>,
+    }
+
+    impl PixelDataProvider for SharedPixelData {
+        fn get(&self) -> PixelData<'_> {
+            PixelData {
+                width: self.width,
+                height: self.height,
+                data: &self.data,
+            }
+        }
     }
 
     impl FrameProvider {
         fn new(width: i32, height: i32, rgba: Vec<u8>) -> Self {
             Self {
-                frame: Mutex::new(Some((width, height, rgba))),
+                frame: Mutex::new(Some((width, height, Arc::new(rgba)))),
                 spare: Mutex::new(Vec::new()),
             }
         }
 
-        /// 7h HD: hand the producer the previous frame's buffer, so the
-        /// next RGB→RGBA conversion writes into it. At 1080p the old
-        /// code allocated 8.3 MB per frame — at the 48 fps a hardware
-        /// encoder now delivers that is ~400 MB/s of allocator traffic
-        /// for a buffer that is overwritten one frame later.
-        ///
-        /// Empty only until the first `put_frame` hands one back; the
-        /// conversion resizes in that case.
+        /// 7h HD: hand the preview producer the previous frame's buffer,
+        /// so its copy writes into it. Empty only until the first
+        /// `put_frame` hands one back.
         fn take_buffer(&self) -> Vec<u8> {
             std::mem::take(&mut *self.spare.lock().unwrap())
         }
 
         /// Publish the newest frame (latest-frame-wins: whatever the
         /// raster thread has not pulled yet is dropped here). The frame
-        /// being replaced becomes the next conversion buffer.
+        /// being replaced becomes the next preview buffer when nothing
+        /// else still holds it.
         fn put_frame(&self, width: i32, height: i32, rgba: Vec<u8>) {
-            let old = self.frame.lock().unwrap().replace((width, height, rgba));
+            let old = self
+                .frame
+                .lock()
+                .unwrap()
+                .replace((width, height, Arc::new(rgba)));
             if let Some((_, _, old)) = old {
-                *self.spare.lock().unwrap() = old;
+                if let Ok(buf) = Arc::try_unwrap(old) {
+                    *self.spare.lock().unwrap() = buf;
+                }
             }
+        }
+
+        /// Publish an already-decoded frame without copying its pixels.
+        fn put_shared(&self, width: i32, height: i32, rgba: Arc<Vec<u8>>) {
+            *self.frame.lock().unwrap() = Some((width, height, rgba));
         }
     }
 
@@ -477,7 +514,11 @@ pub mod imp {
         fn get_payload(&self) -> BoxedPixelData {
             let slot = self.frame.lock().unwrap();
             match &*slot {
-                Some((w, h, rgba)) => SimplePixelData::new_boxed(*w, *h, rgba.clone()),
+                Some((w, h, rgba)) => Box::new(SharedPixelData {
+                    width: *w,
+                    height: *h,
+                    data: rgba.clone(),
+                }),
                 None => {
                     let n = EMPTY_PULLS.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || n.is_multiple_of(100) {
@@ -486,7 +527,11 @@ pub mod imp {
                              (display-bridge race)"
                         );
                     }
-                    SimplePixelData::new_boxed(1, 1, vec![0, 0, 0, 255])
+                    Box::new(SharedPixelData {
+                        width: 1,
+                        height: 1,
+                        data: Arc::new(vec![0, 0, 0, 255]),
+                    })
                 }
             }
         }
@@ -647,30 +692,6 @@ pub mod imp {
         }
     }
 
-    /// RGB24 → RGBA (the Linux embedder's pixel order).
-    fn rgb24_to_rgba(rgb: &[u8]) -> Vec<u8> {
-        let mut rgba = Vec::new();
-        rgb24_to_rgba_into(rgb, &mut rgba);
-        rgba
-    }
-
-    /// 7h HD: the conversion into a REUSED buffer (see
-    /// [`FrameProvider::take_buffer`]). A correctly sized buffer is
-    /// overwritten in full, so only a geometry change resizes it.
-    fn rgb24_to_rgba_into(rgb: &[u8], out: &mut Vec<u8>) {
-        let need = rgb.len() / 3 * 4;
-        if out.len() != need {
-            out.clear();
-            out.resize(need, 255);
-        }
-        for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
-            out[i * 4] = px[0];
-            out[i * 4 + 1] = px[1];
-            out[i * 4 + 2] = px[2];
-            out[i * 4 + 3] = 255;
-        }
-    }
-
     /// The display consumer: hub frames → per-sender textures. Same
     /// skeleton as the terminal client's mpv_consumer (1 s poll, dead
     /// set), minus mpv: instead of a child process, a texture + frame
@@ -698,7 +719,7 @@ pub mod imp {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let Some(frame) = hub.pop_frame(Duration::from_secs(1)) else {
+            let Some(mut frame) = hub.pop_frame(Duration::from_secs(1)) else {
                 continue; // idle poll; also the stop-flag heartbeat
             };
             if stop.load(Ordering::Relaxed) {
@@ -802,9 +823,15 @@ pub mod imp {
             // ping. The frames were decoded for the tile's size/rate
             // label and for an instant first picture when it opens.
             if watching.lock().unwrap().contains(&sender) {
-                let mut rgba = provider.take_buffer();
-                rgb24_to_rgba_into(&frame.rgb, &mut rgba);
-                provider.put_frame(frame.width as i32, frame.height as i32, rgba);
+                // The hub decoded this frame as RGBA already; hand the
+                // buffer to the texture provider instead of copying it
+                // into a second one (the pass this used to pay every
+                // frame at 1080p).
+                provider.put_shared(
+                    frame.width as i32,
+                    frame.height as i32,
+                    Arc::new(std::mem::take(&mut frame.rgb)),
+                );
                 // SendableTexture's mark_frame_available has no error
                 // channel (it returns unit — the run-loop hop's failure is
                 // swallowed there), so a torn-down engine surfaces as a
@@ -904,10 +931,13 @@ pub mod imp {
         let handle = *ENGINE_HANDLE
             .get()
             .ok_or("video_prepare was never called")?;
+        // The hub decodes RGBA for this bridge, so the texture is seeded
+        // with the decoded bytes — one clone at texture birth, never per
+        // frame.
         let provider = Arc::new(FrameProvider::new(
             frame.width as i32,
             frame.height as i32,
-            rgb24_to_rgba(&frame.rgb),
+            frame.rgb.clone(),
         ));
         let (tx, rx) = std::sync::mpsc::channel::<
             Result<(i64, Arc<SendableTexture<BoxedPixelData>>), String>,
@@ -957,19 +987,23 @@ pub mod imp {
             let seeded = provider.get_payload();
             assert_eq!((seeded.get().width, seeded.get().height), (4, 2));
 
-            // The producer takes its conversion buffer; the last frame
-            // must still be on offer meanwhile.
+            // The preview producer takes its conversion buffer; the last
+            // frame must still be on offer meanwhile.
             let _spare = provider.take_buffer();
             let during = provider.get_payload();
             assert_eq!((during.get().width, during.get().height), (4, 2));
             assert_eq!(during.get().data, &[7u8; 32][..]);
 
-            // Publishing swaps the buffers and hands the replaced one
-            // back for the next conversion.
-            provider.put_frame(4, 2, vec![9u8; 32]);
+            // Publishing a decoded frame swaps the slot with no pixel
+            // copy; the payload already handed out stays readable.
+            provider.put_shared(4, 2, Arc::new(vec![9u8; 32]));
             let after = provider.get_payload();
             assert_eq!(after.get().data, &[9u8; 32][..]);
-            assert_eq!(provider.take_buffer(), vec![7u8; 32]);
+            assert_eq!(
+                during.get().data,
+                &[7u8; 32][..],
+                "a frame being uploaded must keep its own buffer"
+            );
             assert_eq!(EMPTY_PULLS.load(Ordering::Relaxed), 0);
         }
     }

@@ -846,12 +846,12 @@ fn build_streams(
                 // share) back out as a feedback loop. Speech clients'
                 // voices are mono-duplicated, so this is exactly the
                 // terminal client's reference.
-                if aec.is_some() || crate::api::share_echo::active() {
+                if aec.is_some() || parley_client::share_echo::active() {
                     let mono: Vec<f32> = mixed.chunks(2).map(|p| (p[0] + p[1]) * 0.5).collect();
                     if let Some(ap) = &aec {
                         parley_client::aec::analyze_render(ap, &mut render_carry, &mono);
                     }
-                    crate::api::share_echo::push_render(&mono);
+                    parley_client::share_echo::push_render(&mono);
                 }
                 // ch0 = L, everything else = R (the terminal client's
                 // mapping; a mono output device gets L only).

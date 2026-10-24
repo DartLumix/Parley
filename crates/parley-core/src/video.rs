@@ -560,6 +560,32 @@ impl VideoDecoder {
     pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         Ok(self.decode_with_dims(frame)?.map(|(rgb, _, _)| rgb))
     }
+
+    /// 7m: decode straight to RGBA8 instead of RGB8.
+    ///
+    /// The Flutter bridge's texture wants RGBA, and converting RGB→RGBA
+    /// afterwards is a second full-frame pass over the picture (plus a
+    /// 6 MB intermediate at 1080p). `write_rgba8` is the same SIMD
+    /// converter with a fourth, opaque channel written inline — one pass
+    /// instead of two, and no intermediate buffer to allocate.
+    pub fn decode_rgba_with_dims(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<(Vec<u8>, usize, usize)>, Error> {
+        match self
+            .decoder
+            .decode(frame)
+            .map_err(|e| Error::Codec(e.to_string()))?
+        {
+            Some(yuv) => {
+                let (w, h) = yuv.dimensions();
+                let mut rgba = vec![0u8; w * h * 4];
+                yuv.write_rgba8(&mut rgba);
+                Ok(Some((rgba, w, h)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 /// 7g: opt-in hardware selection state. NOT a global default — the
 /// client sets this from `--hw-encode` BEFORE creating any encoder.

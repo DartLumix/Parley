@@ -127,6 +127,13 @@ message VideoReport {
   uint32 gap_rate_permille = 1;
   // Server-stamped authenticated reporter id (clients send 0).
   uint32 reporter_id = 2;
+  // Decoded pictures per second, as this viewer actually sustains them
+  // (worst active sender). 0 = not reported (an older client). The
+  // sender's rate governor paces at this instead of outrunning a
+  // CPU-bound viewer until the picture collapses. Additive: a server
+  // that predates it forwards 0, and a sender that predates it ignores
+  // the field.
+  uint32 viewer_fps = 3;
 }
 
 // --- Envelopes ---

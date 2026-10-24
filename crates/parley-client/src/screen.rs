@@ -262,6 +262,99 @@ struct UserData {
     modifier: u64,
 }
 
+/// Frame-rate rungs the sender will pace at when a viewer says it cannot
+/// decode what it is being sent. The top is the encoder's own ceiling;
+/// the bottom is still recognisably live.
+const FPS_RUNGS: [f64; 11] = [
+    60.0, 50.0, 40.0, 30.0, 24.0, 20.0, 15.0, 12.0, 10.0, 8.0, 5.0,
+];
+
+/// A hysteretic rate governor driven by the viewer's measured decode
+/// rate.
+///
+/// Why pace down instead of lowering the bitrate? A viewer whose machine
+/// is busy is not short of bits — it is short of time. Handing it the
+/// same 60 pictures at a lower bitrate changes nothing; sending fewer
+/// pictures until it can keep up is what stops the collapse into a
+/// slideshow. The target bitrate is unchanged, so the encoder spends it
+/// on those fewer pictures: the stream gets sharper as the cadence
+/// drops, which is the right trade for screen content.
+///
+/// Hysteresis: a step down needs the viewer to miss 20% of the current
+/// rate and waits two seconds; a step up needs it to hold 95% for
+/// fifteen seconds. Both gates matter — a viewer transiently stalled by
+/// one compile must not renegotiate the stream every report, and a
+/// recovered one must not ping-pong.
+struct FpsGovernor {
+    /// Current cap; 0 = follow the profile (no report yet).
+    cap: f64,
+    last_change: std::time::Instant,
+}
+
+impl FpsGovernor {
+    fn new() -> Self {
+        Self {
+            cap: 0.0,
+            last_change: std::time::Instant::now(),
+        }
+    }
+
+    /// `base` is what the profile and the share dialog allow. `reported`
+    /// is 0 when no viewer has reported — no cap, the profile decides.
+    fn step(&mut self, base: f64, reported: u32) -> f64 {
+        if reported == 0 {
+            self.cap = 0.0;
+            return base;
+        }
+        let r = f64::from(reported);
+        let now = std::time::Instant::now();
+        let current = if self.cap > 0.0 {
+            self.cap.min(base)
+        } else {
+            base
+        };
+        if r < current * 0.8 {
+            // Highest rung the viewer reported it can hold, never above
+            // what we were already pacing at.
+            let target = FPS_RUNGS
+                .iter()
+                .copied()
+                .filter(|&f| f <= r)
+                .fold(0.0, f64::max)
+                .min(current);
+            if target > 0.0
+                && target + 0.5 < current
+                && now.duration_since(self.last_change) >= Duration::from_secs(2)
+            {
+                self.cap = target;
+                self.last_change = now;
+                println!("share: viewer reports {reported} fps → pacing at {target:.0} fps");
+            }
+        } else if r >= current * 0.95
+            && current + 0.5 < base
+            && now.duration_since(self.last_change) >= Duration::from_secs(15)
+        {
+            // Next rung up, capped by the profile/dialog base.
+            let target = FPS_RUNGS
+                .iter()
+                .copied()
+                .filter(|&f| f > current + 0.5)
+                .fold(base, f64::min)
+                .min(base);
+            if target > current + 0.5 {
+                self.cap = target;
+                self.last_change = now;
+                println!("share: viewer recovered ({reported} fps) → pacing at {target:.0} fps");
+            }
+        }
+        if self.cap > 0.0 {
+            self.cap.min(base)
+        } else {
+            base
+        }
+    }
+}
+
 /// Everything the sender half needs, shared by both capture paths.
 ///
 /// The memfd path owns one on `encoder_thread`; the DMA-BUF path owns one
@@ -273,6 +366,10 @@ struct ShareEncoder {
     encoder: Option<Box<dyn VideoEncoder>>,
     ladder: VideoLadder,
     fps: f64,
+    /// Viewer-reported sustainable rate and the cap it produced.
+    viewer_fps: Arc<AtomicU32>,
+    fps_cap: f64,
+    governor: FpsGovernor,
     seq: u16,
     frame_id: u32,
     annexb: Vec<u8>,
@@ -397,6 +494,10 @@ struct ShareSenderArgs {
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
+    /// The worst decode rate a viewer reported (0 = none). See
+    /// [`FpsGovernor`]: a busy viewer needs fewer pictures, not fewer
+    /// bits.
+    viewer_fps: Arc<AtomicU32>,
     options: ShareOptions,
     /// Metadata + preview tap. Only the non-DMA-BUF path spawns the
     /// preview thread; the capture thread keeps the tap for `negotiate`.
@@ -1139,6 +1240,9 @@ impl ShareEncoder {
             encoder: None,
             ladder: VideoLadder::new(),
             fps: 30.0,
+            viewer_fps: sender.viewer_fps,
+            fps_cap: 0.0,
+            governor: FpsGovernor::new(),
             seq: 0x8000,
             frame_id: 0,
             annexb: Vec::with_capacity(1 << 20),
@@ -1169,11 +1273,22 @@ impl ShareEncoder {
     /// pacing interval and the frame timestamps read this, so a 60 Hz
     /// compositor on a software encoder cannot stretch every timestamp
     /// to 1/60 s.
-    fn paced_fps(&self) -> f64 {
+    fn base_fps(&self) -> f64 {
         let cap = self.options.max_fps.filter(|f| *f > 0.0);
         match cap {
             Some(f) => self.fps.min(f64::from(target_fps())).min(f),
             None => self.fps.min(f64::from(target_fps())),
+        }
+    }
+
+    /// What the stream is paced at: the profile/dialog ceiling, lowered
+    /// by the viewer's reported decode rate when it cannot hold that.
+    fn paced_fps(&self) -> f64 {
+        let base = self.base_fps();
+        if self.fps_cap > 0.0 {
+            base.min(self.fps_cap)
+        } else {
+            base
         }
     }
 
@@ -1260,6 +1375,9 @@ impl ShareEncoder {
 
     /// Ladder step + pending keyframe requests, applied to the next frame.
     fn prepare(&mut self) -> Option<&mut Box<dyn VideoEncoder>> {
+        let base = self.base_fps();
+        let reported = self.viewer_fps.load(Ordering::Relaxed);
+        self.fps_cap = self.governor.step(base, reported);
         let enc = self.encoder.as_mut()?;
         if let Some(bps) = self.ladder.step(self.video_loss.load(Ordering::Relaxed)) {
             enc.set_bitrate(bps);
@@ -1496,11 +1614,17 @@ impl ShareEncoder {
 /// 2. Skip-to-newest: drain anything that queued during the sleep and
 ///    keep only the latest capture — encoding a stale frame while a
 ///    fresher one sits behind it is pure added latency.
+// Eight arguments, deliberately: this is the encoder side's whole
+// environment (connection, control flags, rate feedback, dialogs caps,
+// preview tap), and a params struct here would only move the same list
+// one line up. Same convention as the fragmenter.
+#[allow(clippy::too_many_arguments)]
 fn encoder_thread(
     rx: Receiver<ToEncoder>,
     conn: quinn::Connection,
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
+    viewer_fps: Arc<AtomicU32>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     options: ShareOptions,
     tap: Option<PreviewSink>,
@@ -1513,6 +1637,7 @@ fn encoder_thread(
         die,
         force_idr,
         video_loss,
+        viewer_fps,
         options,
         tap,
         preview_tx,
@@ -1985,9 +2110,16 @@ pub fn spawn_share_audio_mux(
 /// handle + stop controller. Completion of a stop (user-initiated or
 /// desktop-initiated) is reported as ShareEvent::Ended on `events` —
 /// only after full teardown.
+// Eight arguments by design: the connection, the two feedback slots the
+// control reader owns (loss and viewer rate), the event sink, optional
+// share audio, the DMA-BUF switch, the dialog's caps, and the preview
+// tap. They are deliberately separate — folding them into a struct at
+// the one call site that has all of them (the bridge) buys nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     conn: quinn::Connection,
     video_loss: Arc<AtomicU32>,
+    viewer_fps: Arc<AtomicU32>,
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
     sys_tx: Option<SyncSender<Vec<f32>>>,
     dmabuf: bool,
@@ -2076,6 +2208,7 @@ pub async fn start(
         die: die_tx.clone(),
         force_idr: force_idr.clone(),
         video_loss: video_loss.clone(),
+        viewer_fps: viewer_fps.clone(),
         options,
         tap: preview.clone(),
         preview_tx: None,
@@ -2103,7 +2236,14 @@ pub async fn start(
     } else {
         Some(std::thread::spawn(move || {
             encoder_thread(
-                frame_rx, conn, force_idr, video_loss, die_tx, options, preview,
+                frame_rx,
+                conn,
+                force_idr,
+                video_loss,
+                viewer_fps.clone(),
+                die_tx,
+                options,
+                preview,
             )
         }))
     };
@@ -2451,5 +2591,52 @@ mod tests {
             1080
         ));
         assert_eq!(&canvas[0..4], &[3, 2, 1, 255]);
+    }
+
+    /// No report is not "zero fps": an older viewer (or none in the
+    /// channel yet) must leave the profile's own pace alone.
+    #[test]
+    fn no_viewer_report_keeps_the_profile_pace() {
+        let mut g = FpsGovernor::new();
+        assert_eq!(g.step(60.0, 0), 60.0);
+        assert_eq!(g.step(30.0, 0), 30.0);
+    }
+
+    /// A viewer that reports 20 fps while being paced at 60 must be sent
+    /// 20, not 60-with-fewer-bits — that is the whole point of the
+    /// governor. The 2 s gate is opened explicitly (a fresh governor
+    /// cannot step down immediately by design).
+    #[test]
+    fn a_slow_viewer_lowers_the_send_rate() {
+        let mut g = FpsGovernor::new();
+        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
+        assert_eq!(g.step(60.0, 20), 20.0);
+        // And the next report holds it there rather than ratcheting to 5.
+        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
+        assert_eq!(g.step(60.0, 20), 20.0);
+    }
+
+    /// A viewer that recovers is probed upward one rung per 15 s, not
+    /// jumped back to 60 the moment one report looks healthy.
+    #[test]
+    fn recovery_walks_up_one_rung_at_a_time() {
+        let mut g = FpsGovernor::new();
+        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
+        assert_eq!(g.step(60.0, 20), 20.0);
+        g.last_change = std::time::Instant::now() - Duration::from_secs(20);
+        assert_eq!(g.step(60.0, 60), 24.0);
+        g.last_change = std::time::Instant::now() - Duration::from_secs(20);
+        assert_eq!(g.step(60.0, 60), 30.0);
+    }
+
+    /// The governor never invents a rate the profile cannot hold (a 30
+    /// fps software profile stays 30 even if a viewer reports 60).
+    #[test]
+    fn the_cap_never_exceeds_the_profile() {
+        let mut g = FpsGovernor::new();
+        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
+        assert_eq!(g.step(30.0, 8), 8.0);
+        g.last_change = std::time::Instant::now() - Duration::from_secs(20);
+        assert!(g.step(30.0, 60) <= 30.0);
     }
 }

@@ -3,7 +3,10 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
-## [Unreleased]
+## [0.4.0] — 2026-10-24
+
+A Windows client, shares that pace to the viewer instead of collapsing,
+and a share that no longer carries the sharer's own playback back.
 
 ### Added
 
@@ -15,8 +18,43 @@ All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
   no Windows equivalent — so the Share button is absent rather than
   failing when pressed, and software H.264 carries video.
 
+### Fixed
+
+- **A share no longer sends the sharer's own playback back out.** The
+  share-audio tap is the default output's monitor, so it also captures
+  this client — the voice channel and any other share — and a viewer
+  heard their own voice in the stream. The old guard used the mic's
+  AEC3, which plateaus around 30 dB on a digital loop: still audible on
+  headphones. It is replaced by a purpose-built digital canceller (a
+  normalised-LMS FIR on the exact played mix, with a sample-resolution
+  delay lock). Measured: 80 dB on centred voice, 38 dB with other audio
+  playing, 37.6 dB on a fractional-sample path, and the other audio is
+  unchanged. The terminal client applies the same guard, which it never
+  had.
+
 ### Changed
 
+- **A busy viewer now steers the share instead of watching it collapse.**
+  The receiver measures pictures per second coming out of the decoder and
+  carries that in the existing five-second video report
+  (`VideoReport.viewer_fps`). The sender steps its pace down one rung at a
+  time (60 → 50 → 40 → 30 → 24 → 20 → 15 → 12 → 10 → 8 → 5) when the viewer
+  misses 20% of it, and probes back up after fifteen seconds at 95%. The
+  target bitrate is unchanged, so the fewer pictures are sharper; full
+  resolution is kept and only the cadence gives way. This is what a
+  CPU-starved viewer needed — the old ladder lowered the bitrate, which
+  does not make decoding cost less. The field is additive: a server that
+  predates it forwards 0 and a sender that predates it ignores it, so all
+  components still ship independently; only a rebuilt server forwards the
+  number.
+- **The Flutter viewer decodes H.264 straight to RGBA.**
+  `write_rgba8` writes the alpha channel inline, removing the second
+  full-frame RGB→RGBA pass (and its 6 MB intermediate at 1080p): measured
+  10.84 ms/frame against 15.66 ms for decode-plus-conversion at 1080p, a
+  31% cut. The texture provider now holds that buffer behind an `Arc`
+  instead of cloning 8.3 MB per raster pull, and the viewer prints its
+  decode rate and gap rate every ten seconds (`video: viewer sustaining …`)
+  so a slump names its stage.
 - **The AEC is its own cargo feature, one per backend.**
   `audio-device` is now device I/O alone; `aec` is the WebRTC APM (Unix)
   and `aec-rust` is the pure-Rust AEC3 port (Windows), with `aec.rs`

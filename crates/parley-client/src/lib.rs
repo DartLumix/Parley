@@ -5,6 +5,11 @@
 pub mod cert;
 pub mod endpoint;
 
+/// The share-audio echo guard: subtract this app's playback from the
+/// default-output monitor. Pure DSP, no device dependency — both the
+/// Flutter app and the terminal client run it.
+pub mod share_echo;
+
 #[cfg(feature = "audio-device")]
 pub mod aec;
 #[cfg(feature = "audio-device")]
