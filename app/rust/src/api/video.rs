@@ -444,7 +444,9 @@ pub mod imp {
         frame: Mutex<Option<FrameSlot>>,
         /// Preview only: the capture preview copies its canvas into a
         /// reused Vec, so its data buffer survives between frames. The
-        /// texture path (`put_shared`) never needs it.
+        /// texture path (`put_shared`) never needs it — and a viewer-only
+        /// build (no `screen-capture`) has no preview to feed.
+        #[cfg(feature = "screen-capture")]
         spare: Mutex<Vec<u8>>,
     }
 
@@ -471,6 +473,7 @@ pub mod imp {
         fn new(width: i32, height: i32, rgba: Vec<u8>) -> Self {
             Self {
                 frame: Mutex::new(Some((width, height, Arc::new(rgba)))),
+                #[cfg(feature = "screen-capture")]
                 spare: Mutex::new(Vec::new()),
             }
         }
@@ -478,6 +481,7 @@ pub mod imp {
         /// 7h HD: hand the preview producer the previous frame's buffer,
         /// so its copy writes into it. Empty only until the first
         /// `put_frame` hands one back.
+        #[cfg(feature = "screen-capture")]
         fn take_buffer(&self) -> Vec<u8> {
             std::mem::take(&mut *self.spare.lock().unwrap())
         }
@@ -486,6 +490,7 @@ pub mod imp {
         /// raster thread has not pulled yet is dropped here). The frame
         /// being replaced becomes the next preview buffer when nothing
         /// else still holds it.
+        #[cfg(feature = "screen-capture")]
         fn put_frame(&self, width: i32, height: i32, rgba: Vec<u8>) {
             let old = self
                 .frame
@@ -989,6 +994,7 @@ pub mod imp {
 
             // The preview producer takes its conversion buffer; the last
             // frame must still be on offer meanwhile.
+            #[cfg(feature = "screen-capture")]
             let _spare = provider.take_buffer();
             let during = provider.get_payload();
             assert_eq!((during.get().width, during.get().height), (4, 2));
