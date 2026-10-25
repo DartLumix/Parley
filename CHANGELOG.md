@@ -5,6 +5,8 @@ All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-25
+
 A slow viewer now costs resolution instead of frame rate, and the
 server can take over the re-encode for that viewer without changing the
 sharer's stream.
