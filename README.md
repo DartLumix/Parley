@@ -104,7 +104,7 @@ Connect to `your-server` (port 4443, the client default). The full runbooks are
 | Transport | **QUIC** (quinn) | TLS 1.3 built in · streams for control, datagrams for media · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
 | Voice | **SFU, no transcoding** | Server forwards packets; clients mix — per-user volume, near-zero server CPU |
 | Audio codec | Opus | Speech: 64 kbps ↔ 24 kbps + in-band FEC, adaptive via gap-rate feedback · Music channels: 256 kbps stereo (Application::Audio) |
-| Video codec | **H.264** | openh264 (software, universal fallback) behind an encoder trait — hardware backends (VAAPI/MediaCodec/VideoToolbox) slot in per-platform · fragmented datagrams + drop-until-IDR loss recovery |
+| Video codec | **H.264, SFU + optional server transcode** | openh264 (software, universal fallback) behind an encoder trait — hardware backends (VAAPI/MediaCodec/VideoToolbox) slot in per-platform · fragmented datagrams + drop-until-IDR loss recovery · the server re-encodes a lower tier only for a viewer that reports it cannot keep up |
 | AEC / NS | **WebRTC APM** (Sonora AEC3 on Windows) | Echo cancellation + noise suppression on the mic path; far-end reference from the render mix |
 | Auth | **Argon2id** | Per-server username + password · TOFU cert pinning (share the fingerprint with the invite) |
 | Storage | **SQLite** (WAL) | Zero-config persistence |
@@ -301,7 +301,7 @@ cd app && flutter run --release -d linux
 | Server idle RSS | ≤ 64 MB — **current: 54.8 MB (info logging), 48.1 MB at RUST_LOG=warn; container 1.4 MiB idle** |
 | 10 active talkers | ≤ 50% of one core — **current: 43% at 10× occupancy (10 senders × 10 recipients, 5000 forwarded pps, loopback; 100% delivery; perf-profiled: cost is per-datagram kernel sendmsg + loopback softirq, not parley code)** |
 | Login → connected | ≤ 400 ms — **current: 70 ms (loopback); 1.0–2.2 s laptop first join over Wi-Fi/internet (re-login with --token is faster)** |
-| Binary size | ≤ 15 MB — **current: 6.2 MB binary; docker image 9.6 MB** |
+| Binary size | ≤ 15 MB — **current: 6.2 MB relay binary; the transcode build adds openh264 (docker image ~12 MB)** |
 
 A regression is a bug, tracked as one.
 

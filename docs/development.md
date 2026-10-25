@@ -35,7 +35,10 @@ sudo apt install clang cmake ninja-build meson nasm pkg-config libclang-dev \
 
 The WebRTC AEC is built from source (`bundled`) — hence meson, ninja,
 a C++ toolchain and libclang — so the binaries carry no system WebRTC
-dependency. One caveat: the crate prefers a **system abseil >= 20240722**
+dependency. The **server** now links openh264 for its per-viewer
+transcode path, so a C++ compiler (and, for a musl server build, a
+musl C++ toolchain with the static `libstdc++`) is required there too;
+the Docker image installs them on Alpine. One caveat: the crate prefers a **system abseil >= 20240722**
 when pkg-config finds one (Arch ships it; Ubuntu does not) and otherwise
 fetches abseil via a meson wrap during the build. A local packaging run
 on such a machine produces a binary that links system absl; the release

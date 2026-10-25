@@ -61,7 +61,42 @@ docker compose exec parley /parley-server adduser bob 'another password'
 A `BUSY` error means the write raced the server's own connection —
 retry. Names and passwords are case-sensitive.
 
-## 4. Verify from outside
+## 4. Screen-share transcode
+
+A viewer that cannot decode the sharer's original stream (a low
+`viewer_fps` in its five-second report) can be given a server-encoded
+tier instead. The sharer's stream is untouched: capable viewers keep
+1080p/60, the struggling viewer gets 720p or 480p at 30 fps. The
+server pays one worker thread per active share, and only while a
+viewer is below the threshold.
+
+It is on by default. The defaults are one concurrent transcode,
+720p then 480p, and one encoder thread:
+
+```toml
+[video]
+transcode = true
+max_transcodes = 1
+min_viewer_fps = 24
+first_height = 720
+second_height = 480
+threads = 1
+```
+
+`max_transcodes` is host-wide, not per channel and is the CPU/memory
+ceiling: one job holds the decoded frame plus one encoder per active
+tier (roughly 30–60 MB at 1080p). A second share that needs help falls
+back to the sharer's own resolution ladder. To stay a pure relay (no
+openh264 work at all), set `transcode = false`. The
+container's `/config.toml` is baked; mount your own file over it to
+change these values:
+
+```yaml
+    volumes:
+      - ./config.toml:/config.toml:ro
+```
+
+## 5. Verify from outside
 
 Download `parley-cli-<version>-linux-x86_64.tar.gz` on any machine, or
 use a checkout (`tools/vps-check.sh`):
@@ -76,7 +111,7 @@ tar xf parley-cli-<version>-linux-x86_64.tar.gz
 `--check` does QUIC + TLS + TOFU + password auth + channel list and
 exits 0. It opens no audio or video devices, so it works on any machine.
 
-## 5. Hand the client to the team
+## 6. Hand the client to the team
 
 Download `parley-<version>-linux-x86_64.tar.gz` on each machine:
 
@@ -131,4 +166,7 @@ docker compose up -d          # the root compose file builds and runs
 
 The musl binary can also be built directly:
 `cargo build --release --target x86_64-unknown-linux-musl -p parley-server`
-(needs the `x86_64-unknown-linux-musl` target and `musl-tools`).
+(needs the `x86_64-unknown-linux-musl` target, `musl-tools` **and** a
+musl C++ toolchain with the static `libstdc++` — openh264 is linked
+into the server). The image itself builds on Alpine, which provides
+that toolchain natively.

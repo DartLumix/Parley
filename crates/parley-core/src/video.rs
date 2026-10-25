@@ -346,7 +346,7 @@ impl openh264::formats::BGRA8Source for PwStridedBgra<'_> {}
 
 /// The openh264 encoder configuration, shared by construction and
 /// bitrate changes (the latter recreates the encoder).
-fn encoder_config(bps: u32, fps: f32) -> EncoderConfig {
+fn encoder_config(bps: u32, fps: f32, threads: u16) -> EncoderConfig {
     EncoderConfig::new()
         .bitrate(openh264::encoder::BitRate::from_bps(bps))
         .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
@@ -358,7 +358,9 @@ fn encoder_config(bps: u32, fps: f32) -> EncoderConfig {
         .background_detection(false) // unsupported for screen content
         // Slice-based parallelism: 1080p30 is not reachable in real time
         // on one core (see SOFTWARE_SLICE_BYTES for the measurement).
-        .num_threads(SOFTWARE_THREADS)
+        // The server's transcode worker bounds this to one thread so a
+        // single viewer cannot fan out across the host.
+        .num_threads(threads.max(1))
         .max_slice_len(SOFTWARE_SLICE_BYTES)
 }
 
@@ -384,6 +386,8 @@ pub struct SoftwareEncoder {
     width: usize,
     height: usize,
     current_bitrate: u32,
+    /// Slice-parallelism budget; a server transcode job passes 1.
+    threads: u16,
     /// 7g: reused YUV conversion buffer (saves a 1.3–2 MB alloc+copy
     /// per frame over `YUVBuffer::from_bgra8_source`).
     yuv: YUVBuffer,
@@ -402,9 +406,22 @@ impl SoftwareEncoder {
     /// share path, scaling for resolution) does not go through the
     /// 720p30 baseline.
     pub fn with_bitrate(width: usize, height: usize, bps: u32) -> Result<Self, Error> {
+        Self::with_bitrate_threads(width, height, bps, SOFTWARE_THREADS)
+    }
+
+    /// Explicit encoder parallelism. Used by the server's transcode
+    /// worker: one share's re-encode must not spend four cores, so it
+    /// asks for one thread even though the client profile uses four.
+    pub fn with_bitrate_threads(
+        width: usize,
+        height: usize,
+        bps: u32,
+        threads: u16,
+    ) -> Result<Self, Error> {
+        let threads = threads.max(1);
         let encoder = Encoder::with_api_config(
             openh264::OpenH264API::from_source(),
-            encoder_config(bps, VIDEO_FPS_SOFTWARE),
+            encoder_config(bps, VIDEO_FPS_SOFTWARE, threads),
         )
         .map_err(|e| Error::Codec(e.to_string()))?;
         Ok(Self {
@@ -412,6 +429,7 @@ impl SoftwareEncoder {
             width,
             height,
             current_bitrate: bps,
+            threads,
             yuv: YUVBuffer::new(width, height),
         })
     }
@@ -503,7 +521,7 @@ impl VideoEncoder for SoftwareEncoder {
         }
         match Encoder::with_api_config(
             openh264::OpenH264API::from_source(),
-            encoder_config(bps, VIDEO_FPS_SOFTWARE),
+            encoder_config(bps, VIDEO_FPS_SOFTWARE, self.threads),
         ) {
             Ok(encoder) => {
                 self.encoder = encoder;

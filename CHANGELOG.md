@@ -3,6 +3,48 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [Unreleased]
+
+A slow viewer now costs resolution instead of frame rate, and the
+server can take over the re-encode for that viewer without changing the
+sharer's stream.
+
+### Added
+
+- **Per-viewer server transcode.** A viewer whose five-second
+  `VideoReport` says it cannot sustain the original gets a server-encoded
+  720p (then 480p) tier; viewers that keep up still receive the sharer's
+  untouched stream. The sharer only encodes once. Jobs are host-wide
+  capped (`max_transcodes`, default 1), one worker thread each, and only
+  start when a viewer is below `min_viewer_fps` (default 24). The weak
+  viewer's report is consumed by the server so the sharer's own ladder
+  does not also lower the stream. A tier runs for at least a minute
+  before three healthy reports hand the viewer back to the original as
+  a probe, so a low-cadence source cannot flap between the two. The
+  tier also re-keys every two seconds and repairs a stalled viewer
+  (zero decoded pictures) with an immediate IDR. Server-only feature and
+  wire-additive (no protocol bump); disable with `[video] transcode =
+  false`.
+
+### Fixed
+
+- **A decode-starved viewer no longer turns the share into a perfect
+  slideshow.** The sender's governor now steps resolution down
+  (1080p → 720p → 480p) before it lowers cadence, and only cuts cadence
+  at the 480p floor; the bitrate ladder gets the first response when the
+  report shows loss. The viewer rate is measured over five seconds, so
+  one bad second cannot pin the stream at 5 fps. This remains the
+  fallback when the server is old, at its transcode cap, or the source
+  itself is running slowly.
+
+### Changed
+
+- **The server image builds openh264 on Alpine.** The transcode path is
+  C++; the image now uses a musl-native C++ toolchain and statically
+  links `libstdc++`, so the final image stays `scratch`/no-libc. The
+  relay-only binary no longer describes the image size (~12 MB instead
+  of 9.6 MB).
+
 ## [0.4.0] — 2026-10-24
 
 A Windows client, shares that pace to the viewer instead of collapsing,

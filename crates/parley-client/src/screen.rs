@@ -269,90 +269,253 @@ const FPS_RUNGS: [f64; 11] = [
     60.0, 50.0, 40.0, 30.0, 24.0, 20.0, 15.0, 12.0, 10.0, 8.0, 5.0,
 ];
 
-/// A hysteretic rate governor driven by the viewer's measured decode
-/// rate.
+/// The viewer-feedback rate governor.
 ///
-/// Why pace down instead of lowering the bitrate? A viewer whose machine
-/// is busy is not short of bits — it is short of time. Handing it the
-/// same 60 pictures at a lower bitrate changes nothing; sending fewer
-/// pictures until it can keep up is what stops the collapse into a
-/// slideshow. The target bitrate is unchanged, so the encoder spends it
-/// on those fewer pictures: the stream gets sharper as the cadence
-/// drops, which is the right trade for screen content.
+/// The first version lowered cadence only, keeping resolution and
+/// bitrate. That is the wrong lever for almost every real slump:
 ///
-/// Hysteresis: a step down needs the viewer to miss 20% of the current
-/// rate and waits two seconds; a step up needs it to hold 95% for
-/// fifteen seconds. Both gates matter — a viewer transiently stalled by
-/// one compile must not renegotiate the stream every report, and a
-/// recovered one must not ping-pong.
-struct FpsGovernor {
-    /// Current cap; 0 = follow the profile (no report yet).
-    cap: f64,
-    last_change: std::time::Instant,
+/// - A path short of bandwidth loses fragment-bearing frames, so
+///   spending the same bits on fewer pictures makes each picture bigger
+///   and no easier to deliver. The loss ladder must cut the bitrate
+///   first; this governor gives it one report to do so.
+/// - A viewer short of decode time is short of pixels, not pictures.
+///   Fewer, sharper 1080p frames still cost the same per frame, so the
+///   stream settles at the floor (5 fps) looking perfect and moving like
+///   a slideshow. Resolution is the lever that actually makes a frame
+///   cheaper to decode.
+///
+/// So: lower resolution one standard rung at a time while the viewer
+/// misses 20% of the target rate, and only cut the cadence once the
+/// stream is at 480p (or the capture is already that small). Raise a
+/// rung back only after fifteen seconds at 95%, with a cooldown, so one
+/// compile or one keyframe cannot make it ping-pong.
+struct PaceGovernor {
+    /// Absolute cadence cap; 0 = the profile/dialog base.
+    fps_cap: f64,
+    /// Height cap chosen here; None = the profile/dialog base.
+    height_cap: Option<u32>,
+    /// The viewer reports every five seconds; sample at that cadence.
+    last_sample: std::time::Instant,
+    low: u32,
+    good: u32,
+    /// The last cadence/resolution change was a probe upward. A low
+    /// report after it backs off for longer than a normal step down.
+    probing: bool,
+    retry_after: Option<std::time::Instant>,
 }
 
-impl FpsGovernor {
+/// The shortest frame this governor will trade down to before it starts
+/// dropping cadence. 480p is still recognisably a desktop at 60 fps.
+const MIN_HEIGHT: u32 = 480;
+
+/// Standard height rungs, tallest first. A capture between two rungs
+/// steps to the next one below it (900p -> 720p, 600p -> 480p).
+const HEIGHT_RUNGS: [u32; 5] = [2160, 1440, 1080, 720, 480];
+
+/// The viewer's report cadence; one decision per report, no faster.
+const SAMPLE_EVERY: Duration = Duration::from_secs(5);
+/// After a successful upward probe, wait this long before the next one.
+const PROBE_COOLDOWN: Duration = Duration::from_secs(30);
+/// After a probe that immediately fell back, leave it alone for longer.
+const FAILED_PROBE_COOLDOWN: Duration = Duration::from_secs(60);
+
+impl PaceGovernor {
     fn new() -> Self {
         Self {
-            cap: 0.0,
-            last_change: std::time::Instant::now(),
+            fps_cap: 0.0,
+            height_cap: None,
+            last_sample: std::time::Instant::now(),
+            low: 0,
+            good: 0,
+            probing: false,
+            retry_after: None,
         }
     }
 
-    /// `base` is what the profile and the share dialog allow. `reported`
-    /// is 0 when no viewer has reported — no cap, the profile decides.
-    fn step(&mut self, base: f64, reported: u32) -> f64 {
-        if reported == 0 {
-            self.cap = 0.0;
-            return base;
-        }
-        let r = f64::from(reported);
-        let now = std::time::Instant::now();
-        let current = if self.cap > 0.0 {
-            self.cap.min(base)
-        } else {
-            base
-        };
-        if r < current * 0.8 {
-            // Highest rung the viewer reported it can hold, never above
-            // what we were already pacing at.
-            let target = FPS_RUNGS
-                .iter()
-                .copied()
-                .filter(|&f| f <= r)
-                .fold(0.0, f64::max)
-                .min(current);
-            if target > 0.0
-                && target + 0.5 < current
-                && now.duration_since(self.last_change) >= Duration::from_secs(2)
-            {
-                self.cap = target;
-                self.last_change = now;
-                println!("share: viewer reports {reported} fps → pacing at {target:.0} fps");
-            }
-        } else if r >= current * 0.95
-            && current + 0.5 < base
-            && now.duration_since(self.last_change) >= Duration::from_secs(15)
-        {
-            // Next rung up, capped by the profile/dialog base.
-            let target = FPS_RUNGS
-                .iter()
-                .copied()
-                .filter(|&f| f > current + 0.5)
-                .fold(base, f64::min)
-                .min(base);
-            if target > current + 0.5 {
-                self.cap = target;
-                self.last_change = now;
-                println!("share: viewer recovered ({reported} fps) → pacing at {target:.0} fps");
-            }
-        }
-        if self.cap > 0.0 {
-            self.cap.min(base)
+    fn current_fps(&self, base: f64) -> f64 {
+        if self.fps_cap > 0.0 {
+            self.fps_cap.min(base)
         } else {
             base
         }
     }
+
+    /// `reported` is 0 when no viewer has reported. `current_h` and
+    /// `base_h` are encoder heights; `loss` is the viewer's gap rate;
+    /// `robust` says the loss ladder has already cut the bitrate.
+    fn step(
+        &mut self,
+        base: f64,
+        reported: u32,
+        current_h: u32,
+        base_h: u32,
+        loss: u32,
+        robust: bool,
+    ) -> (f64, Option<u32>) {
+        self.step_at(
+            std::time::Instant::now(),
+            base,
+            reported,
+            current_h,
+            base_h,
+            loss,
+            robust,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_at(
+        &mut self,
+        now: std::time::Instant,
+        base: f64,
+        reported: u32,
+        current_h: u32,
+        base_h: u32,
+        loss: u32,
+        robust: bool,
+    ) -> (f64, Option<u32>) {
+        if now.duration_since(self.last_sample) < SAMPLE_EVERY {
+            return (self.fps_cap, self.height_cap);
+        }
+        self.last_sample = now;
+        // A cap above the current base is stale (the capture shrank).
+        if self.height_cap.is_some_and(|h| h >= base_h) {
+            self.height_cap = None;
+        }
+        if reported == 0 {
+            self.fps_cap = 0.0;
+            self.height_cap = None;
+            self.low = 0;
+            self.good = 0;
+            self.probing = false;
+            return (0.0, None);
+        }
+        let current = self.current_fps(base);
+        let r = f64::from(reported);
+        if r < current * 0.8 {
+            self.low += 1;
+            self.good = 0;
+            if self.low < 2 {
+                return (self.fps_cap, self.height_cap);
+            }
+            // Loss? Give the bitrate ladder this report to answer. One
+            // response at a time: a bandwidth problem must not be
+            // mistaken for a decode problem and cost resolution too.
+            if !robust && loss > 50 {
+                return (self.fps_cap, self.height_cap);
+            }
+            if let Some(h) = lower_height(current_h, base_h) {
+                self.height_cap = Some(h);
+                self.low = 0;
+                if self.probing {
+                    self.retry_after = Some(now + FAILED_PROBE_COOLDOWN);
+                    self.probing = false;
+                }
+                println!(
+                    "share: viewer reports {reported} fps at {current:.0} → {h}p (loss {loss}‰, \
+                     was {current_h}p)"
+                );
+            } else if let Some(f) = lower_fps(current) {
+                self.fps_cap = f;
+                self.low = 0;
+                if self.probing {
+                    self.retry_after = Some(now + FAILED_PROBE_COOLDOWN);
+                    self.probing = false;
+                }
+                println!(
+                    "share: viewer reports {reported} fps at {current_h}p → pacing at {f:.0} fps"
+                );
+            }
+            return (self.fps_cap, self.height_cap);
+        }
+        if r >= current * 0.95 {
+            self.good += 1;
+            self.low = 0;
+            let ready = self.retry_after.is_none_or(|t| now >= t);
+            if self.good >= 3 && ready {
+                if current_h < base_h {
+                    if let Some(cap) = raise_height(current_h, base_h) {
+                        self.height_cap = cap;
+                        self.good = 0;
+                        self.probing = true;
+                        self.retry_after = Some(now + PROBE_COOLDOWN);
+                        println!(
+                            "share: viewer recovered ({reported} fps) → probing {}p",
+                            cap.map_or(base_h, |h| h)
+                        );
+                    }
+                } else if current < base {
+                    if let Some(f) = raise_fps(current, base) {
+                        self.fps_cap = f;
+                        self.good = 0;
+                        self.probing = true;
+                        self.retry_after = Some(now + PROBE_COOLDOWN);
+                        println!(
+                            "share: viewer recovered ({reported} fps) → pacing at {:.0} fps",
+                            if f > 0.0 { f } else { base }
+                        );
+                    }
+                } else {
+                    self.good = 0;
+                    self.probing = false;
+                }
+            }
+        } else {
+            // Somewhere between 80% and 95%: hold, but do not let
+            // unrelated reports accumulate into a step.
+            self.low = 0;
+            self.good = 0;
+        }
+        (self.fps_cap, self.height_cap)
+    }
+}
+
+/// The next standard height below `current`, never below [`MIN_HEIGHT`]
+/// and never at or above `base` (the profile/dialog ceiling). None when
+/// the stream is already as small as this governor goes.
+fn lower_height(current: u32, base: u32) -> Option<u32> {
+    if current <= MIN_HEIGHT || base <= MIN_HEIGHT {
+        return None;
+    }
+    HEIGHT_RUNGS
+        .iter()
+        .copied()
+        .filter(|&h| h < current && h >= MIN_HEIGHT)
+        .max()
+}
+
+/// The next standard height above `current`, capped at `base`. `Some(None)`
+/// means "back to the base cap"; `None` means already at base.
+fn raise_height(current: u32, base: u32) -> Option<Option<u32>> {
+    if current >= base {
+        return None;
+    }
+    let next = HEIGHT_RUNGS
+        .iter()
+        .copied()
+        .filter(|&h| h > current && h < base)
+        .min();
+    Some(next.map(Some).unwrap_or(None))
+}
+
+/// The next rung below `current` on the cadence ladder.
+fn lower_fps(current: f64) -> Option<f64> {
+    FPS_RUNGS
+        .iter()
+        .copied()
+        .filter(|&f| f < current - 0.5)
+        .fold(None, |acc, f| Some(acc.map_or(f, |a: f64| a.max(f))))
+}
+
+/// The next rung above `current`, capped at `base`. `Some(0.0)` means
+/// "back to the base rate" (the no-cap sentinel).
+fn raise_fps(current: f64, base: f64) -> Option<f64> {
+    let next = FPS_RUNGS
+        .iter()
+        .copied()
+        .filter(|&f| f > current + 0.5 && f <= base + 0.5)
+        .fold(base, f64::min);
+    (next > current + 0.5).then_some(if (next - base).abs() < 0.5 { 0.0 } else { next })
 }
 
 /// Everything the sender half needs, shared by both capture paths.
@@ -369,7 +532,11 @@ struct ShareEncoder {
     /// Viewer-reported sustainable rate and the cap it produced.
     viewer_fps: Arc<AtomicU32>,
     fps_cap: f64,
-    governor: FpsGovernor,
+    governor: PaceGovernor,
+    /// Governor-chosen height cap; None = the profile/dialog cap.
+    height_cap: Option<u32>,
+    /// Encoder height at the base cap: the height a probe can return to.
+    base_height: u32,
     seq: u16,
     frame_id: u32,
     annexb: Vec<u8>,
@@ -408,6 +575,9 @@ struct ShareEncoder {
     /// say 47).
     report_start: std::time::Instant,
     report_frames: u32,
+    /// When this share started, for the no-feedback diagnostic.
+    started: std::time::Instant,
+    warned_no_feedback: bool,
 }
 
 /// One captured frame on its way to the preview thread. The pixels are
@@ -495,8 +665,8 @@ struct ShareSenderArgs {
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
     /// The worst decode rate a viewer reported (0 = none). See
-    /// [`FpsGovernor`]: a busy viewer needs fewer pictures, not fewer
-    /// bits.
+    /// [`PaceGovernor`]: a busy viewer needs fewer pixels per picture
+    /// before it needs fewer pictures.
     viewer_fps: Arc<AtomicU32>,
     options: ShareOptions,
     /// Metadata + preview tap. Only the non-DMA-BUF path spawns the
@@ -1242,7 +1412,9 @@ impl ShareEncoder {
             fps: 30.0,
             viewer_fps: sender.viewer_fps,
             fps_cap: 0.0,
-            governor: FpsGovernor::new(),
+            governor: PaceGovernor::new(),
+            height_cap: None,
+            base_height: 0,
             seq: 0x8000,
             frame_id: 0,
             annexb: Vec::with_capacity(1 << 20),
@@ -1263,6 +1435,8 @@ impl ShareEncoder {
             shown_fps: 0.0,
             report_start: std::time::Instant::now(),
             report_frames: 0,
+            started: std::time::Instant::now(),
+            warned_no_feedback: false,
             last_encode: None,
         }
     }
@@ -1326,10 +1500,18 @@ impl ShareEncoder {
     fn negotiate(&mut self, width: u32, height: u32, f: f64) {
         self.fps = f;
         self.source = (width as usize, height as usize);
-        let (wanted_w, wanted_h) =
+        // Two caps compose here: the dialog/profile ceiling
+        // (`options.max_height`) and the governor's current height rung.
+        // Every rebuild goes through this one rule, so a probe, a capture
+        // format change and a stop/start all size the encoder the same.
+        let (_, base_h) =
             fit_encoder_dims(width as usize, height as usize, self.options.max_height);
+        let cap = self
+            .height_cap
+            .map_or(base_h as u32, |h| h.min(base_h as u32));
+        let (wanted_w, wanted_h) = fit_encoder_dims(width as usize, height as usize, Some(cap));
         match create_encoder_auto(wanted_w, wanted_h) {
-            Ok(e) => {
+            Ok(mut e) => {
                 // The backend has the last word on dimensions: software
                 // fits itself into the profile it can actually encode in
                 // real time (see `SOFTWARE_MAX_HEIGHT`). Everything below
@@ -1337,6 +1519,19 @@ impl ShareEncoder {
                 // sharer's tile reports — is about the STREAM, so it is
                 // the encoder's size, never the capture's.
                 let (enc_w, enc_h) = e.dimensions();
+                // The height a probe can return to: the dialog/profile cap,
+                // further limited by what the software profile can encode
+                // in real time. The backend has the last word above; this
+                // is the height it would have chosen without a governor
+                // cap, so the governor never probes above the profile.
+                let (base_w, base_h) =
+                    fit_encoder_dims(width as usize, height as usize, self.options.max_height);
+                let base_h = if parley_core::video::hardware_encoder_active() {
+                    base_h
+                } else {
+                    parley_core::video::fit_software_dims(base_w, base_h).1
+                };
+                self.base_height = base_h as u32;
                 let eff = self.paced_fps();
                 let base = bitrate_for(enc_w, enc_h, eff as f32);
                 let applied = self.ladder.set_base(base);
@@ -1349,6 +1544,7 @@ impl ShareEncoder {
                     // The ladder was already on the robust rung: keep the
                     // encoder there rather than pretending the rebuild
                     // restored the clean target.
+                    e.set_bitrate(applied);
                     println!("share: bitrate → {applied} bps (robust rung, scaled to profile)");
                 }
                 self.encoder = Some(e);
@@ -1375,9 +1571,40 @@ impl ShareEncoder {
 
     /// Ladder step + pending keyframe requests, applied to the next frame.
     fn prepare(&mut self) -> Option<&mut Box<dyn VideoEncoder>> {
+        self.encoder.as_ref()?;
         let base = self.base_fps();
         let reported = self.viewer_fps.load(Ordering::Relaxed);
-        self.fps_cap = self.governor.step(base, reported);
+        let loss = self.video_loss.load(Ordering::Relaxed);
+        let (fps_cap, height_cap) = self.governor.step(
+            base,
+            reported,
+            self.stream.1,
+            self.base_height,
+            loss,
+            self.ladder.on_robust_rung(),
+        );
+        self.fps_cap = fps_cap;
+        self.height_cap = height_cap;
+        if reported == 0
+            && self.encoded > 0
+            && self.started.elapsed() >= Duration::from_secs(20)
+            && !self.warned_no_feedback
+        {
+            self.warned_no_feedback = true;
+            eprintln!(
+                "share: no viewer fps report after 20 s of streaming — a viewer behind a server \
+                 older than 0.4.0 cannot steer this share"
+            );
+        }
+        // A cap change rebuilds the encoder at the new height; the capture
+        // thread keeps handing over full-size frames and `encode_bgra`
+        // scales them. Compare against the LIVE stream height so a rebuild
+        // that failed is retried instead of leaving the governor's state
+        // and the encoder permanently out of step.
+        let want_h = height_cap.map_or(self.base_height, |h| h.min(self.base_height));
+        if want_h != self.stream.1 && self.source.0 > 0 {
+            self.negotiate(self.source.0 as u32, self.source.1 as u32, self.fps);
+        }
         let enc = self.encoder.as_mut()?;
         if let Some(bps) = self.ladder.step(self.video_loss.load(Ordering::Relaxed)) {
             enc.set_bitrate(bps);
@@ -2593,50 +2820,95 @@ mod tests {
         assert_eq!(&canvas[0..4], &[3, 2, 1, 255]);
     }
 
+    /// A governor whose first `step_at` is exactly one sample after `t0`
+    /// (the constructor stamps `last_sample` with the real clock, which
+    /// is a hair after a test's `t0` and would swallow the first call).
+    fn fresh_governor(t0: std::time::Instant) -> PaceGovernor {
+        let mut g = PaceGovernor::new();
+        g.last_sample = t0;
+        g
+    }
+
     /// No report is not "zero fps": an older viewer (or none in the
     /// channel yet) must leave the profile's own pace alone.
     #[test]
     fn no_viewer_report_keeps_the_profile_pace() {
-        let mut g = FpsGovernor::new();
-        assert_eq!(g.step(60.0, 0), 60.0);
-        assert_eq!(g.step(30.0, 0), 30.0);
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        let step = g.step_at(t0 + SAMPLE_EVERY, 60.0, 0, 1080, 1080, 0, false);
+        assert_eq!(step, (0.0, None));
+        let step = g.step_at(t0 + 2 * SAMPLE_EVERY, 30.0, 0, 1080, 1080, 0, false);
+        assert_eq!(step, (0.0, None));
     }
 
-    /// A viewer that reports 20 fps while being paced at 60 must be sent
-    /// 20, not 60-with-fewer-bits — that is the whole point of the
-    /// governor. The 2 s gate is opened explicitly (a fresh governor
-    /// cannot step down immediately by design).
+    /// A decode-starved viewer costs resolution, never cadence, until the
+    /// 480p floor. Two low reports are needed to step (one bad report is
+    /// noise), then one rung per report.
     #[test]
-    fn a_slow_viewer_lowers_the_send_rate() {
-        let mut g = FpsGovernor::new();
-        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
-        assert_eq!(g.step(60.0, 20), 20.0);
-        // And the next report holds it there rather than ratcheting to 5.
-        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
-        assert_eq!(g.step(60.0, 20), 20.0);
+    fn a_slow_viewer_lowers_resolution_before_cadence() {
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        assert_eq!(
+            g.step_at(t0 + SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false),
+            (0.0, None)
+        );
+        assert_eq!(
+            g.step_at(t0 + 2 * SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false),
+            (0.0, Some(720))
+        );
+        // Each rung also needs two low reports: one bad report is noise.
+        assert_eq!(
+            g.step_at(t0 + 3 * SAMPLE_EVERY, 60.0, 20, 720, 1080, 0, false),
+            (0.0, Some(720))
+        );
+        assert_eq!(
+            g.step_at(t0 + 4 * SAMPLE_EVERY, 60.0, 20, 720, 1080, 0, false),
+            (0.0, Some(480))
+        );
+        // At the floor the only lever left is cadence.
+        assert_eq!(
+            g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 20, 480, 1080, 0, false),
+            (0.0, Some(480))
+        );
+        assert_eq!(
+            g.step_at(t0 + 6 * SAMPLE_EVERY, 60.0, 20, 480, 1080, 0, false),
+            (50.0, Some(480))
+        );
     }
 
-    /// A viewer that recovers is probed upward one rung per 15 s, not
-    /// jumped back to 60 the moment one report looks healthy.
+    /// Loss is the bitrate ladder's problem first: while the viewer is
+    /// losing datagrams, the pace governor must not also spend resolution.
+    #[test]
+    fn loss_gets_the_bitrate_ladder_first() {
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        for i in 1..5 {
+            assert_eq!(
+                g.step_at(t0 + i * SAMPLE_EVERY, 60.0, 20, 1080, 1080, 100, false),
+                (0.0, None)
+            );
+        }
+    }
+
+    /// A viewer that recovers is probed back up one rung at a time, and
+    /// not until three healthy reports have landed.
     #[test]
     fn recovery_walks_up_one_rung_at_a_time() {
-        let mut g = FpsGovernor::new();
-        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
-        assert_eq!(g.step(60.0, 20), 20.0);
-        g.last_change = std::time::Instant::now() - Duration::from_secs(20);
-        assert_eq!(g.step(60.0, 60), 24.0);
-        g.last_change = std::time::Instant::now() - Duration::from_secs(20);
-        assert_eq!(g.step(60.0, 60), 30.0);
-    }
-
-    /// The governor never invents a rate the profile cannot hold (a 30
-    /// fps software profile stays 30 even if a viewer reports 60).
-    #[test]
-    fn the_cap_never_exceeds_the_profile() {
-        let mut g = FpsGovernor::new();
-        g.last_change = std::time::Instant::now() - Duration::from_secs(3);
-        assert_eq!(g.step(30.0, 8), 8.0);
-        g.last_change = std::time::Instant::now() - Duration::from_secs(20);
-        assert!(g.step(30.0, 60) <= 30.0);
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        g.step_at(t0 + SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false);
+        g.step_at(t0 + 2 * SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false);
+        assert_eq!(
+            g.step_at(t0 + 3 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
+            (0.0, Some(720))
+        );
+        assert_eq!(
+            g.step_at(t0 + 4 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
+            (0.0, Some(720))
+        );
+        assert_eq!(
+            g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
+            (0.0, None)
+        );
     }
 }

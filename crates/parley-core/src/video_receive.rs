@@ -201,10 +201,16 @@ struct RecvStream {
     /// When the decoder was last rebuilt (cooldown bookkeeping).
     last_reset: Option<std::time::Instant>,
     /// Decode-rate measurement for the viewer's VideoReport: pictures in
-    /// the current second, when that second began, and the last
-    /// completed measurement. This is the number a CPU-starved viewer
-    /// must tell the sender — loss reports alone cannot distinguish
-    /// "packets never arrived" from "arrived and could not be decoded".
+    /// the current five-second window, when that window began, and the
+    /// last completed measurement. This is the number a CPU-starved
+    /// viewer must tell the sender — loss reports alone cannot
+    /// distinguish "packets never arrived" from "arrived and could not
+    /// be decoded".
+    ///
+    /// Five seconds, not one: the report itself is sent every five
+    /// seconds, and a single slow second (a keyframe, a scheduler
+    /// hiccup) must not read as "this viewer can only do 5 fps" and send
+    /// the sender's governor running for the floor.
     decoded_window: u64,
     fps_window: std::time::Instant,
     decoded_fps: u32,
@@ -426,7 +432,7 @@ impl VideoReceiveHub {
                         // the completed rate is what VideoReport carries.
                         stream.decoded_window += 1;
                         let elapsed = stream.fps_window.elapsed();
-                        if elapsed >= Duration::from_secs(1) {
+                        if elapsed >= Duration::from_secs(5) {
                             stream.decoded_fps = (stream.decoded_window as f64
                                 / elapsed.as_secs_f64())
                             .round() as u32;
@@ -625,8 +631,8 @@ impl VideoReceiveHub {
     /// This is the viewer's real decode capacity — not the rate the
     /// sender paced at, and not the gap rate. A viewer whose machine is
     /// busy reports, say, 8 here while the sender is still sending 60;
-    /// the sender's new rate governor uses it to stop outrunning the
-    /// viewer instead of letting the picture collapse to a slideshow.
+    /// the sender's pace governor uses it to stop sending more pixels
+    /// than the viewer can decode, instead of collapsing to 5 fps.
     /// None when no stream has arrived recently.
     pub fn decoded_fps(&self) -> Option<u32> {
         let now = std::time::Instant::now();

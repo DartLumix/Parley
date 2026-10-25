@@ -31,6 +31,9 @@ use tokio::time::timeout;
 use parley_proto::frame;
 
 use parley_core::audio::jitter::PopOutcome;
+use parley_core::video::{SoftwareEncoder, VideoDecoder, VideoEncoder};
+use parley_proto::video::VideoAssembler;
+use parley_server::config::VideoConfig;
 
 async fn send_client_msg(tx: &mut quinn::SendStream, body: parley_proto::ClientBody) {
     session::write_message(tx, &parley_proto::ClientMessage { body: Some(body) })
@@ -232,9 +235,14 @@ fn test_dir(tag: &str) -> PathBuf {
 }
 
 fn setup_server_with_user(tag: &str) -> (Config, Server) {
+    setup_server_with_video(tag, VideoConfig::default())
+}
+
+fn setup_server_with_video(tag: &str, video: VideoConfig) -> (Config, Server) {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir(tag),
+        video,
     };
     std::fs::create_dir_all(&config.data_dir).unwrap();
     let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
@@ -355,6 +363,7 @@ async fn presence_shows_connected_users() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir("presence"),
+        video: Default::default(),
     };
     std::fs::create_dir_all(&config.data_dir).unwrap();
     let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
@@ -512,6 +521,7 @@ async fn fingerprint_survives_restart() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir("restart"),
+        video: Default::default(),
     };
 
     let fp1 = Server::bind(&config).unwrap().fingerprint().to_string();
@@ -871,6 +881,129 @@ async fn video_fragments_routed_between_members() {
     // A does not receive its own video back.
     let loopback = timeout(Duration::from_millis(200), conn_a.read_datagram()).await;
     assert!(loopback.is_err(), "no video loopback to sender");
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// A viewer reporting 5 fps gets a server-encoded tier at 120p while the
+/// sharer keeps sending its 320x180 stream. The report is consumed by
+/// the server, so the sharer's own ladder never sees it.
+#[tokio::test]
+async fn a_slow_viewer_gets_a_transcoded_tier() {
+    init_logs();
+
+    let (config, server) = setup_server_with_video(
+        "transcode-tier",
+        VideoConfig {
+            transcode: true,
+            max_transcodes: 1,
+            min_viewer_fps: 24,
+            first_height: 120,
+            second_height: 90,
+            threads: 1,
+        },
+    );
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // A real H.264 source. 320x180 keeps the test quick; the server's
+    // first tier is 120p, so the re-encode is a genuine downscale.
+    let (w, h) = (320usize, 180usize);
+    let mut bgra = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            bgra[i] = (x % 251) as u8;
+            bgra[i + 1] = (y % 241) as u8;
+            bgra[i + 2] = 96;
+            bgra[i + 3] = 255;
+        }
+    }
+    let mut encoder = SoftwareEncoder::new(w, h).expect("source encoder");
+    let mut seq: u16 = 0x8000;
+    let mut reported = false;
+    for frame_id in 0..75u32 {
+        let (data, key) = encoder.encode_bgra(&bgra).expect("source encode");
+        let dgs = parley_proto::video::fragment_frame(
+            frame_id,
+            key,
+            &data,
+            seq,
+            (f64::from(frame_id) / 30.0 * 48_000.0) as u32,
+            0,
+        );
+        seq = seq.wrapping_add(dgs.len() as u16);
+        for dg in dgs {
+            conn_a.send_datagram(dg.into()).unwrap();
+        }
+        if frame_id == 10 {
+            send_client_msg(
+                &mut tx_b,
+                ClientBody::VideoReport(VideoReport {
+                    gap_rate_permille: 0,
+                    reporter_id: 0,
+                    viewer_fps: 5,
+                }),
+            )
+            .await;
+            reported = true;
+        }
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    assert!(reported, "the viewer must report the slump");
+
+    // B sees the original until the transcoded keyframe is ready, then
+    // the 120p tier. Decode whatever arrives and look for 212x120.
+    let mut assembler = VideoAssembler::new();
+    let mut decoder = VideoDecoder::new().expect("viewer decoder");
+    let mut sizes = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(d)) = timeout(Duration::from_millis(200), conn_b.read_datagram()).await {
+            let m = parley_proto::media::decode(&d).unwrap();
+            if m.flags & parley_proto::media::FLAG_VIDEO != 0
+                && let Ok(frag) = parley_proto::video::decode_fragment(m.payload)
+            {
+                assembler.push_fragment(frag);
+            }
+        }
+        while let Some(frame) = assembler.pop_frame() {
+            if let Ok(Some((_, dw, dh))) = decoder.decode_rgba_with_dims(&frame.data) {
+                sizes.push((dw, dh));
+            }
+        }
+        if sizes.iter().any(|&(dw, dh)| (dw, dh) == (212, 120)) {
+            break;
+        }
+    }
+    assert!(
+        sizes.iter().any(|&(dw, dh)| (dw, dh) == (212, 120)),
+        "expected a 212x120 transcoded picture, got {sizes:?}"
+    );
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");

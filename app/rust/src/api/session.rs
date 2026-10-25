@@ -162,7 +162,8 @@ pub(crate) enum Command {
     VideoReport {
         gap_rate_permille: u32,
         /// Pictures per second this viewer sustains (0 = unknown). The
-        /// sharer's rate governor paces to it; see `screen::FpsGovernor`.
+        /// sharer's pace governor steps resolution down to it; see
+        /// `screen::PaceGovernor`.
         viewer_fps: u32,
     },
     /// 7g: after the local share's supervisor reported Ended, tell the
@@ -2027,6 +2028,7 @@ mod disconnect_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         {
@@ -2097,6 +2099,7 @@ mod resume_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         {
@@ -2161,6 +2164,7 @@ mod tofu_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         {

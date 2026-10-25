@@ -13,6 +13,7 @@ use crate::db::{Db, DbHandle};
 use crate::error::Error;
 use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
+use crate::transcode::{ReportAction, TranscodeManager};
 use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
@@ -28,6 +29,7 @@ pub struct Server {
     db: Db,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
+    transcode: Arc<TranscodeManager>,
 }
 
 impl Server {
@@ -80,12 +82,22 @@ impl Server {
         quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
+        let registry = Arc::new(SessionRegistry::new());
+        let voice = Arc::new(VoiceManager::new());
+        // Built once: every session shares the same job table, so the
+        // `max_transcodes` cap is host-wide rather than per connection.
+        let transcode = Arc::new(TranscodeManager::new(
+            config.video.clone(),
+            registry.clone(),
+            voice.clone(),
+        ));
         Ok(Self {
             endpoint,
             fingerprint,
             db,
-            registry: Arc::new(SessionRegistry::new()),
-            voice: Arc::new(VoiceManager::new()),
+            registry,
+            voice,
+            transcode,
         })
     }
 
@@ -109,7 +121,8 @@ impl Server {
                     let db = db.clone();
                     let registry = self.registry.clone();
                     let voice = self.voice.clone();
-                    tokio::spawn(handle_connection(conn, db, registry, voice));
+                    let transcode = self.transcode.clone();
+                    tokio::spawn(handle_connection(conn, db, registry, voice, transcode));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
             }
@@ -123,9 +136,10 @@ async fn handle_connection(
     db: DbHandle,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
+    transcode: Arc<TranscodeManager>,
 ) {
     let peer = conn.remote_address();
-    match serve(conn.clone(), &db, &registry, &voice).await {
+    match serve(conn.clone(), &db, &registry, &voice, &transcode).await {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -137,6 +151,7 @@ async fn serve(
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
+    transcode: &Arc<TranscodeManager>,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
 
@@ -247,7 +262,7 @@ async fn serve(
             biased;
 
             dg = dg_rx.recv() => match dg {
-                Some(d) => route_datagram(&d, &info, registry, voice),
+                Some(d) => route_datagram(&d, &info, registry, voice, transcode),
                 None => break Ok(()),
             },
 
@@ -263,7 +278,7 @@ async fn serve(
             msg = msg_rx.recv() => match msg {
                 Some(m) => {
                     match handle_client_message(
-                        m, &info, session_gen, &mut tx, db, registry, voice,
+                        m, &info, session_gen, &mut tx, db, registry, voice, transcode,
                     ).await {
                         Ok(true) => {}
                         Ok(false) => break Ok(()),
@@ -318,6 +333,12 @@ async fn serve(
     {
         notify_share_stopped(info.id, channel_id, registry, voice);
     }
+    if still_current {
+        // A dead session cannot keep owning a transcode job or a seat
+        // in someone else's job.
+        transcode.remove_share(info.id);
+        transcode.remove_viewer(info.id);
+    }
     info!(user_id = info.id, "session ended");
     let _ = tx.finish();
     if result.is_err() {
@@ -327,6 +348,10 @@ async fn serve(
 }
 
 /// Handle one client control message. Ok(false) = end session gracefully.
+// The argument list is the session's whole environment (writer, db,
+// registry, voice, transcode); splitting it into a struct would only
+// move the same list one line up at the single call site.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     msg: ClientMessage,
     info: &crate::db::UserInfo,
@@ -335,6 +360,7 @@ async fn handle_client_message(
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
+    transcode: &Arc<TranscodeManager>,
 ) -> Result<bool, Error> {
     match msg.body {
         Some(ClientBody::Heartbeat(hb)) => {
@@ -440,6 +466,8 @@ async fn handle_client_message(
                     if voice.stop_sharing(info.id) {
                         notify_share_stopped(info.id, old, registry, voice);
                     }
+                    transcode.remove_share(info.id);
+                    transcode.remove_viewer(info.id);
                     registry.broadcast(ServerMessage {
                         body: Some(ServerBody::VoiceState(PbVoiceState {
                             user_id: info.id,
@@ -472,6 +500,8 @@ async fn handle_client_message(
                 if voice.stop_sharing(info.id) {
                     notify_share_stopped(info.id, old_channel, registry, voice);
                 }
+                transcode.remove_share(info.id);
+                transcode.remove_viewer(info.id);
                 registry.broadcast(ServerMessage {
                     body: Some(ServerBody::VoiceState(PbVoiceState {
                         user_id: info.id,
@@ -546,6 +576,7 @@ async fn handle_client_message(
             // An explicit stop always notifies: the client only sends
             // it after teardown, and a duplicate is a no-op downstream.
             voice.stop_sharing(info.id);
+            transcode.remove_share(info.id);
             match voice.channel_of(info.id) {
                 Some(channel_id) => notify_share_stopped(info.id, channel_id, registry, voice),
                 // 7k: the sharer already left voice (or the leave and
@@ -560,8 +591,17 @@ async fn handle_client_message(
 
         Some(ClientBody::VideoReport(rep)) => {
             // 6e: video loss feedback, routed exactly like ReceiverReport
-            // — reporter's channel members, reporter excluded.
+            // — reporter's channel members, reporter excluded. When the
+            // server is re-encoding for this viewer, the report steers
+            // the server's tier instead: forwarding it would also make
+            // the sharer lower its own stream, and the viewer would get
+            // a double-degraded picture.
             if let Some(channel_id) = voice.channel_of(info.id) {
+                if transcode.on_report(info.id, channel_id, rep.viewer_fps)
+                    == ReportAction::Suppress
+                {
+                    return Ok(true);
+                }
                 let msg = ServerMessage {
                     body: Some(ServerBody::VideoReport(VideoReport {
                         reporter_id: info.id,
@@ -618,6 +658,7 @@ fn route_datagram(
     sender: &crate::db::UserInfo,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
+    transcode: &Arc<TranscodeManager>,
 ) {
     let decoded = match parley_proto::media::decode(data) {
         Ok(d) => d,
@@ -633,8 +674,12 @@ fn route_datagram(
     // 7k: a video datagram means a share is live for this user. The
     // teardown paths consult this flag so they only announce a stop
     // for someone who had something to stop.
-    if decoded.flags & parley_proto::media::FLAG_VIDEO != 0 {
+    let is_video = decoded.flags & parley_proto::media::FLAG_VIDEO != 0;
+    if is_video {
         voice.mark_sharing(sender.id);
+        // Feed the transcode job (if one is active) and meter the
+        // sharer's own rate. Audio never takes this path.
+        transcode.note_video(sender.id, channel_id, decoded.payload);
     }
 
     let forwarded = Bytes::from(parley_proto::media::encode(
@@ -646,7 +691,7 @@ fn route_datagram(
     ));
 
     for member in voice.members_of(channel_id) {
-        if member != sender.id {
+        if member != sender.id && (!is_video || transcode.should_forward(sender.id, member)) {
             registry.send_datagram(member, forwarded.clone());
         }
     }

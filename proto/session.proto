@@ -129,10 +129,11 @@ message VideoReport {
   uint32 reporter_id = 2;
   // Decoded pictures per second, as this viewer actually sustains them
   // (worst active sender). 0 = not reported (an older client). The
-  // sender's rate governor paces at this instead of outrunning a
-  // CPU-bound viewer until the picture collapses. Additive: a server
-  // that predates it forwards 0, and a sender that predates it ignores
-  // the field.
+  // sender's pace governor steps resolution down to it rather than
+  // lowering the frame rate until the picture is a slideshow; the
+  // server may instead re-encode a lower tier for this viewer.
+  // Additive: a server that predates it forwards 0, and a sender that
+  // predates it ignores the field.
   uint32 viewer_fps = 3;
 }
 

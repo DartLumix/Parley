@@ -181,6 +181,14 @@ impl VideoLadder {
         }
     }
 
+    /// True while the loss ladder has already cut the bitrate. The pace
+    /// governor reads this to let loss settle before it also lowers the
+    /// resolution: one response at a time, so a bandwidth problem is not
+    /// mistaken for a decode problem.
+    pub fn on_robust_rung(&self) -> bool {
+        self.robust
+    }
+
     /// Feed the latest viewer report (permille). Returns Some(bps) when
     /// the ladder switched rungs — the caller applies it via
     /// set_bitrate.
