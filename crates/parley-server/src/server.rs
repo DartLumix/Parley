@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::db::{Db, DbHandle};
 use crate::error::Error;
+use crate::manage;
 use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
 use crate::transcode::{ReportAction, TranscodeManager};
@@ -209,6 +210,7 @@ async fn serve(
     let session_gen = registry.register(ClientHandle {
         user_id: info.id,
         username: info.username.clone(),
+        role: info.role,
         conn: conn.clone(),
         tx: event_tx,
         session: 0, // assigned by register()
@@ -224,8 +226,15 @@ async fn serve(
         &mut tx,
         &AuthOk {
             user_id: info.id,
-            is_admin: info.is_admin,
+            // `is_admin` stays the old binary gate (admin only); `role`
+            // is the additive three-tier value a current client reads.
+            is_admin: info.role.is_admin(),
             session_token: token,
+            role: match info.role {
+                crate::db::UserRole::Admin => parley_proto::Role::Admin as i32,
+                crate::db::UserRole::Mod => parley_proto::Role::Mod as i32,
+                crate::db::UserRole::User => parley_proto::Role::User as i32,
+            },
         },
     )
     .await?;
@@ -589,6 +598,20 @@ async fn handle_client_message(
             }
         }
 
+        Some(ClientBody::Manage(req)) => {
+            // Management is a request/response on the same control stream.
+            // Permission failures are ordinary results, not session
+            // errors: a regular client that asks still gets an answer.
+            let result = manage::handle(req, info, db, registry, voice, transcode).await;
+            session::write_message(
+                tx,
+                &ServerMessage {
+                    body: Some(ServerBody::ManageResult(result)),
+                },
+            )
+            .await?;
+        }
+
         Some(ClientBody::VideoReport(rep)) => {
             // 6e: video loss feedback, routed exactly like ReceiverReport
             // — reporter's channel members, reporter excluded. When the
@@ -635,7 +658,7 @@ async fn handle_client_message(
 /// 7k only an explicit stop *while still in the channel* notified
 /// anyone, so a sharer who closed their app (or hopped channels) left
 /// viewers with a card that never went away.
-fn notify_share_stopped(
+pub(crate) fn notify_share_stopped(
     user_id: u32,
     channel_id: u64,
     registry: &Arc<SessionRegistry>,

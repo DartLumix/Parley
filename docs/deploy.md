@@ -50,8 +50,18 @@ the users table is empty.
 
 ## 3. Accounts
 
-There is no user-management UI yet. Create each account inside the
-running container:
+Connect as `admin` and open **Server management** (the shield in the
+header) to add, edit and remove accounts, set each account's tier, and
+create, rename or delete channels. The tiers are `user` (ordinary chat,
+voice and shares), `mod` (the same management page, but no permission
+changes and no power over admins) and `admin` (everything). The last
+admin cannot be removed or demoted.
+
+**Kick** drops somebody from their voice channel immediately; it is not
+a ban — they can re-join at once.
+
+The container CLI remains for bootstrap and scripted setup (it creates
+an ordinary user):
 
 ```sh
 docker compose exec parley /parley-server adduser alice 'a long password'
@@ -60,6 +70,12 @@ docker compose exec parley /parley-server adduser bob 'another password'
 
 A `BUSY` error means the write raced the server's own connection —
 retry. Names and passwords are case-sensitive.
+
+The management page needs a role-aware server and this client. The wire
+additions (`Role` on the auth reply, `ManageRequest`/`ManageResult`) are
+additive: an older client still works against a new server, and a new
+client connected to an older server simply has no management entry
+point.
 
 ## 4. Screen-share transcode
 

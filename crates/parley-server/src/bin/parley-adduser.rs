@@ -1,4 +1,5 @@
-//! One-off account creation — no user-management RPC exists yet.
+//! One-off account creation, for bootstrap and scripts. The app's
+//! management page is the normal path for accounts and roles now.
 //!
 //! Usage: parley-adduser <data_dir> <username> <password>
 //! Use the same data_dir the server's config.toml points at. Best run

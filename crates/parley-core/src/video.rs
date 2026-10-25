@@ -819,7 +819,7 @@ mod tests {
     /// compensation has something to chew on.
     fn test_frame(w: usize, h: usize, t: usize) -> Vec<u8> {
         let mut bgra = vec![0u8; w * h * 4];
-        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = i % w;
             let y = i / w;
             let bar_x = ((t * 13) % w) as i32;

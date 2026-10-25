@@ -402,7 +402,7 @@ mod tests {
         // Pure red: Y≈81, U≈90, V≈240 (BT.601 limited).
         let (w, h) = (2, 2);
         let mut bgra = vec![0u8; 16];
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px[2] = 255; // R
             px[3] = 255;
         }

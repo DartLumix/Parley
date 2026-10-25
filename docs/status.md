@@ -50,9 +50,9 @@ were verified in 6g and have not regressed since; see the README table.
 
 Product gaps, roughly in the order a small community would notice:
 
-1. **User management** — no RPC and no UI: accounts are created with
-   `parley-server adduser` inside the container. No roles, bans, kicks
-   or per-channel permissions.
+1. **Moderation depth** — accounts, three role tiers, channel CRUD and
+   voice kicks are in the management page, but there are no bans,
+   temporary mutes, per-channel ACLs or audit trail.
 2. **Client robustness** — no automatic reconnect with backoff (a
    dropped connection waits for *Reconnect*), no device pickers
    (input/output), no deafen/push-to-talk, no notifications.
@@ -63,9 +63,8 @@ Product gaps, roughly in the order a small community would notice:
    stream is decoded and measured behind it, but not painted) before
    that. Your own stream is one of the tiles while you share, and its
    preview is live because it is your own capture.
-5. **Operations** — no metrics endpoint, log rotation, or admin UI; one
-   channel is created by default (`general`) and channels are created by
-   editing SQLite.
+5. **Operations** — no metrics endpoint or log rotation; one channel is
+   created by default (`general`), the rest are managed in the app.
 6. **Distribution** — no AppImage/Flatpak/AUR package and no
    auto-update; the tarball is the only client artifact.
 7. **Other platforms** — Windows now builds (voice with echo
@@ -76,9 +75,8 @@ Product gaps, roughly in the order a small community would notice:
 
 ## Next milestone suggestions
 
-- **8a — management surface:** user CRUD + roles over the protocol,
-  channel creation, and the admin UI that makes the container
-  self-sufficient.
+- **8a — moderation depth:** bans and temporary mutes, per-channel
+  permissions, and an audit trail on top of the management page.
 - **8b — client polish:** reconnect with backoff, remembered servers,
   device pickers, mute/deafen, and a bounded connect timeout (the CLI's
   `--check` now has one; the app still waits).

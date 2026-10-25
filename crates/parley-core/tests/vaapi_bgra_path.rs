@@ -89,7 +89,7 @@ fn a_red_frame_decodes_red() {
         return;
     }
     let mut frame = vec![0u8; W * H * 4];
-    for px in frame.chunks_exact_mut(4) {
+    for px in frame.as_chunks_mut::<4>().0 {
         px[0] = 0; // B
         px[1] = 0; // G
         px[2] = 255; // R
@@ -127,7 +127,7 @@ fn a_padded_stride_decodes_the_same_picture() {
     // Moving bar over a gradient: any row misalignment shows up as a
     // large difference, unlike a flat color which would survive a shear.
     let mut picture = vec![0u8; W * H * 4];
-    for (i, px) in picture.chunks_exact_mut(4).enumerate() {
+    for (i, px) in picture.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = i % W;
         let y = i / W;
         px[0] = (x * 255 / W) as u8;

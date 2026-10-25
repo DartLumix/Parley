@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package parley;
+
+// Three tiers. A user has the ordinary chat/voice/share abilities; a mod
+// can manage users and channels but cannot change anyone's role; an admin
+// can do everything, including roles and other admins.
+enum Role {
+  USER = 0;
+  MOD = 1;
+  ADMIN = 2;
+}

@@ -25,9 +25,23 @@ sharer's stream.
   (zero decoded pictures) with an immediate IDR. Server-only feature and
   wire-additive (no protocol bump); disable with `[video] transcode =
   false`.
+- **Server management page.** Admins and mods open a users/channels
+  dashboard from the header: add, edit and remove accounts; set the
+  `user`, `mod` or `admin` tier; create, rename and delete channels; and
+  kick somebody out of voice (an ordinary leave — they may re-join at
+  once). Mods cannot change permissions or act on admins, and the last
+  admin cannot be removed or demoted. The wire additions (`Role` on the
+  auth reply, `ManageRequest`/`ManageResult`) are additive and need no
+  protocol bump; an older server simply shows no management entry
+  point.
 
 ### Fixed
 
+- **The server image builds again.** Dependency cooking is scoped to
+  `parley-server` for the explicit musl target, so neither the Flutter
+  bridge's proc-macro crates nor `+crt-static` on host units stop the
+  build; the bundled Opus also gets the CMake 3.5 policy floor that
+  Alpine's CMake 4 requires.
 - **A decode-starved viewer no longer turns the share into a perfect
   slideshow.** The sender's governor now steps resolution down
   (1080p → 720p → 480p) before it lowers cadence, and only cuts cadence

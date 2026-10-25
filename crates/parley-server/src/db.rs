@@ -19,10 +19,70 @@ pub struct Db {
     conn: Connection,
 }
 
+/// Three permission tiers. `User` is the ordinary client; `Mod` can
+/// manage users and channels but not roles; `Admin` can do everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserRole {
+    User,
+    Mod,
+    Admin,
+}
+
+impl UserRole {
+    pub fn from_i64(value: i64) -> Self {
+        match value {
+            2 => Self::Admin,
+            1 => Self::Mod,
+            _ => Self::User,
+        }
+    }
+
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::User => 0,
+            Self::Mod => 1,
+            Self::Admin => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Mod => "mod",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// Admin or mod: access to the management page and its non-role
+    /// actions.
+    pub fn can_manage(self) -> bool {
+        !matches!(self, Self::User)
+    }
+
+    pub fn is_admin(self) -> bool {
+        matches!(self, Self::Admin)
+    }
+}
+
 pub struct UserInfo {
     pub id: u32,
     pub username: String,
-    pub is_admin: bool,
+    pub role: UserRole,
+}
+
+impl UserInfo {
+    pub fn is_admin(&self) -> bool {
+        self.role.is_admin()
+    }
+}
+
+/// One row of the management users table (the DB half; online and voice
+/// membership are live session state and are added by the server).
+#[derive(Debug, Clone)]
+pub struct ManagedUserRow {
+    pub id: u32,
+    pub username: String,
+    pub role: UserRole,
 }
 
 /// (message_id, user_id, username, text, timestamp_ms)
@@ -37,12 +97,21 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Seed the default channel only when the schema is created. The
+        // management page can delete `general`; re-running the seed on
+        // every open would resurrect it at the next restart.
+        let first_boot = {
+            let mut stmt = conn
+                .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'users'")?;
+            !stmt.exists([])?
+        };
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 is_admin INTEGER NOT NULL DEFAULT 0,
+                role INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS sessions (
@@ -61,9 +130,14 @@ impl Db {
                 text TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL
             );
-            INSERT OR IGNORE INTO channels (id, name) VALUES (1, 'general');
             ",
         )?;
+        if first_boot {
+            conn.execute(
+                "INSERT OR IGNORE INTO channels (id, name) VALUES (1, 'general')",
+                [],
+            )?;
+        }
         // 6d migration: channels.mode (0 = speech, 1 = music). CREATE
         // IF NOT EXISTS won't touch an existing table, so ALTER is the
         // path — guarded by a pragma_table_info check so re-running is
@@ -75,6 +149,19 @@ impl Db {
         };
         if !has_mode {
             conn.execute_batch("ALTER TABLE channels ADD COLUMN mode INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // Role migration: older databases only have the is_admin boolean.
+        // Admins keep their powers; everyone else starts as a user.
+        let has_role: bool = {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'role'")?;
+            stmt.exists([])?
+        };
+        if !has_role {
+            conn.execute_batch(
+                "ALTER TABLE users ADD COLUMN role INTEGER NOT NULL DEFAULT 0;
+                 UPDATE users SET role = 2 WHERE is_admin <> 0;",
+            )?;
         }
         Ok(Self { conn })
     }
@@ -118,11 +205,28 @@ impl Db {
         Ok(())
     }
 
+    /// Compatibility entry point for the CLI and bootstrap: a boolean
+    /// admin is still a valid way to create an account.
     pub fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<(), Error> {
+        let role = if is_admin {
+            UserRole::Admin
+        } else {
+            UserRole::User
+        };
+        self.create_user_with_role(username, password, role)
+    }
+
+    pub fn create_user_with_role(
+        &self,
+        username: &str,
+        password: &str,
+        role: UserRole,
+    ) -> Result<(), Error> {
         let hash = hash_password(password)?;
         self.conn.execute(
-            "INSERT INTO users (username, password_hash, is_admin) VALUES (?1, ?2, ?3)",
-            rusqlite::params![username, hash, is_admin as i32],
+            "INSERT INTO users (username, password_hash, is_admin, role) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![username, hash, role.is_admin() as i32, role.as_i64()],
         )?;
         Ok(())
     }
@@ -138,24 +242,70 @@ impl Db {
         Ok(self.conn.last_insert_rowid() as u64)
     }
 
+    pub fn update_channel(
+        &self,
+        channel_id: u64,
+        name: Option<&str>,
+        music: Option<bool>,
+    ) -> Result<(), Error> {
+        let current: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT name, mode FROM channels WHERE id = ?1",
+                rusqlite::params![channel_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_name, old_mode)) = current else {
+            return Err(Error::Internal("channel not found".into()));
+        };
+        let name = name.unwrap_or(&old_name);
+        let music = music.unwrap_or(old_mode != 0);
+        self.conn.execute(
+            "UPDATE channels SET name = ?1, mode = ?2 WHERE id = ?3",
+            rusqlite::params![name, music as i32, channel_id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a channel and its chat history. Voice membership is live
+    /// server state, not a DB row — the caller must empty the channel
+    /// first.
+    pub fn delete_channel(&self, channel_id: u64) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM channels WHERE id = ?1",
+            rusqlite::params![channel_id as i64],
+        )?;
+        if changed == 0 {
+            return Err(Error::Internal("channel not found".into()));
+        }
+        tx.execute(
+            "DELETE FROM messages WHERE channel_id = ?1",
+            rusqlite::params![channel_id as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns Some(UserInfo) on success, None on bad credentials.
     pub fn verify_user(&self, username: &str, password: &str) -> Result<Option<UserInfo>, Error> {
         let row: Option<(i64, String, String, i64)> = self
             .conn
             .query_row(
-                "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?1",
+                "SELECT id, username, password_hash, role FROM users WHERE username = ?1",
                 rusqlite::params![username],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
 
         match row {
-            Some((id, name, hash, is_admin)) => {
+            Some((id, name, hash, role)) => {
                 if verify_password(password, &hash)? {
                     Ok(Some(UserInfo {
                         id: id as u32,
                         username: name,
-                        is_admin: is_admin != 0,
+                        role: UserRole::from_i64(role),
                     }))
                 } else {
                     Ok(None)
@@ -181,20 +331,137 @@ impl Db {
         let row: Option<(i64, String, i64)> = self
             .conn
             .query_row(
-                "SELECT u.id, u.username, u.is_admin FROM sessions s
+                "SELECT u.id, u.username, u.role FROM sessions s
              JOIN users u ON u.id = s.user_id WHERE s.token = ?1",
                 rusqlite::params![token],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         match row {
-            Some((id, name, is_admin)) => Ok(Some(UserInfo {
+            Some((id, name, role)) => Ok(Some(UserInfo {
                 id: id as u32,
                 username: name,
-                is_admin: is_admin != 0,
+                role: UserRole::from_i64(role),
             })),
             None => Ok(None),
         }
+    }
+
+    /// Every account, for the management page.
+    pub fn list_users(&self) -> Result<Vec<ManagedUserRow>, Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, username, role FROM users ORDER BY username COLLATE NOCASE, id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ManagedUserRow {
+                id: row.get::<_, i64>(0)? as u32,
+                username: row.get(1)?,
+                role: UserRole::from_i64(row.get(2)?),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn get_user(&self, user_id: u32) -> Result<Option<ManagedUserRow>, Error> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, username, role FROM users WHERE id = ?1",
+                rusqlite::params![user_id as i64],
+                |row| {
+                    Ok(ManagedUserRow {
+                        id: row.get::<_, i64>(0)? as u32,
+                        username: row.get(1)?,
+                        role: UserRole::from_i64(row.get(2)?),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Apply only the fields that were provided. The role guard runs in
+    /// the same statement as the change, so two admins demoting each other
+    /// cannot both see "there is another admin" and leave the server with
+    /// none.
+    pub fn update_user(
+        &self,
+        user_id: u32,
+        username: Option<&str>,
+        password: Option<&str>,
+        role: Option<UserRole>,
+    ) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM users WHERE id = ?1",
+                rusqlite::params![user_id as i64],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(Error::Internal("user not found".into()));
+        }
+        if let Some(name) = username {
+            tx.execute(
+                "UPDATE users SET username = ?1 WHERE id = ?2",
+                rusqlite::params![name, user_id as i64],
+            )?;
+        }
+        if let Some(password) = password {
+            let hash = hash_password(password)?;
+            tx.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, user_id as i64],
+            )?;
+        }
+        if let Some(role) = role {
+            let changed = tx.execute(
+                "UPDATE users SET role = ?1, is_admin = ?2 WHERE id = ?3
+                 AND (?1 = 2 OR role <> 2
+                      OR (SELECT COUNT(*) FROM users WHERE role = 2) > 1)",
+                rusqlite::params![role.as_i64(), role.is_admin() as i32, user_id as i64],
+            )?;
+            if changed == 0 {
+                return Err(Error::Internal("cannot demote the last admin".into()));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete an account and its session tokens. The last admin cannot be
+    /// deleted (same guard shape as the role update). Chat rows stay; the
+    /// history join simply stops naming the account.
+    pub fn delete_user(&self, user_id: u32) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM users WHERE id = ?1
+             AND (role <> 2 OR (SELECT COUNT(*) FROM users WHERE role = 2) > 1)",
+            rusqlite::params![user_id as i64],
+        )?;
+        if changed == 0 {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM users WHERE id = ?1",
+                    rusqlite::params![user_id as i64],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            return Err(Error::Internal(if exists {
+                "cannot remove the last admin".into()
+            } else {
+                "user not found".into()
+            }));
+        }
+        tx.execute(
+            "DELETE FROM sessions WHERE user_id = ?1",
+            rusqlite::params![user_id as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn list_channels(&self) -> Result<Vec<ChannelRow>, Error> {
@@ -311,6 +578,51 @@ impl Db {
             } => {
                 let _ = reply.send(self.fetch_history(channel_id, limit, before_message_id));
             }
+            DbCmd::ListUsers { reply } => {
+                let _ = reply.send(self.list_users());
+            }
+            DbCmd::GetUser { user_id, reply } => {
+                let _ = reply.send(self.get_user(user_id));
+            }
+            DbCmd::CreateUser {
+                username,
+                password,
+                role,
+                reply,
+            } => {
+                let _ = reply.send(self.create_user_with_role(&username, &password, role));
+            }
+            DbCmd::UpdateUser {
+                user_id,
+                username,
+                password,
+                role,
+                reply,
+            } => {
+                let _ = reply.send(self.update_user(
+                    user_id,
+                    username.as_deref(),
+                    password.as_deref(),
+                    role,
+                ));
+            }
+            DbCmd::DeleteUser { user_id, reply } => {
+                let _ = reply.send(self.delete_user(user_id));
+            }
+            DbCmd::CreateChannel { name, music, reply } => {
+                let _ = reply.send(self.create_channel(&name, music));
+            }
+            DbCmd::UpdateChannel {
+                channel_id,
+                name,
+                music,
+                reply,
+            } => {
+                let _ = reply.send(self.update_channel(channel_id, name.as_deref(), music));
+            }
+            DbCmd::DeleteChannel { channel_id, reply } => {
+                let _ = reply.send(self.delete_channel(channel_id));
+            }
         }
     }
 }
@@ -368,6 +680,45 @@ pub enum DbCmd {
         limit: u32,
         before_message_id: u64,
         reply: oneshot::Sender<Result<Vec<HistoryRow>, Error>>,
+    },
+    ListUsers {
+        reply: oneshot::Sender<Result<Vec<ManagedUserRow>, Error>>,
+    },
+    GetUser {
+        user_id: u32,
+        reply: oneshot::Sender<Result<Option<ManagedUserRow>, Error>>,
+    },
+    CreateUser {
+        username: String,
+        password: String,
+        role: UserRole,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    UpdateUser {
+        user_id: u32,
+        username: Option<String>,
+        password: Option<String>,
+        role: Option<UserRole>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    DeleteUser {
+        user_id: u32,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    CreateChannel {
+        name: String,
+        music: bool,
+        reply: oneshot::Sender<Result<u64, Error>>,
+    },
+    UpdateChannel {
+        channel_id: u64,
+        name: Option<String>,
+        music: Option<bool>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    DeleteChannel {
+        channel_id: u64,
+        reply: oneshot::Sender<Result<(), Error>>,
     },
 }
 
@@ -483,5 +834,136 @@ impl DbHandle {
             })
             .map_err(|_| gone())?;
         rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<ManagedUserRow>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::ListUsers { reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn get_user(&self, user_id: u32) -> Result<Option<ManagedUserRow>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::GetUser { user_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn create_user_with_role(
+        &self,
+        username: &str,
+        password: &str,
+        role: UserRole,
+    ) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::CreateUser {
+                username: username.to_string(),
+                password: password.to_string(),
+                role,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn update_user(
+        &self,
+        user_id: u32,
+        username: Option<&str>,
+        password: Option<&str>,
+        role: Option<UserRole>,
+    ) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::UpdateUser {
+                user_id,
+                username: username.map(str::to_string),
+                password: password.map(str::to_string),
+                role,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn delete_user(&self, user_id: u32) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::DeleteUser { user_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn create_channel(&self, name: &str, music: bool) -> Result<u64, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::CreateChannel {
+                name: name.to_string(),
+                music,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn update_channel(
+        &self,
+        channel_id: u64,
+        name: Option<&str>,
+        music: Option<bool>,
+    ) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::UpdateChannel {
+                channel_id,
+                name: name.map(str::to_string),
+                music,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn delete_channel(&self, channel_id: u64) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::DeleteChannel { channel_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn general_is_seeded_once_not_resurrected() {
+        let dir = std::env::temp_dir().join(format!("parley-db-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("parley.db");
+
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(
+                db.list_channels().unwrap().iter().any(|c| c.0 == 1),
+                "a new database seeds general"
+            );
+            db.delete_channel(1).unwrap();
+        }
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(
+                !db.list_channels().unwrap().iter().any(|c| c.0 == 1),
+                "reopening must not resurrect a deleted channel"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

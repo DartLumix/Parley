@@ -74,6 +74,17 @@ set_target_properties(${BINARY_NAME}
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# Flutter copies plugin targets with install(FILES $<TARGET_FILE:...>), so
+# CMake never rewrites their build RPATH. The plugin links the engine from
+# the ephemeral directory, which would otherwise ship as an absolute path to
+# the build machine. Use the install RPATH in the build tree as well: the
+# engine and the plugins sit next to each other in the bundle's lib/.
+if(TARGET irondash_engine_context_plugin)
+  set_target_properties(irondash_engine_context_plugin PROPERTIES
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "$ORIGIN")
+endif()
+
 
 # === Installation ===
 # By default, "installing" just makes a relocatable bundle in the build

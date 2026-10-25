@@ -913,6 +913,8 @@ pub mod imp {
                 fps,
                 texture_id,
             }),
+            manage: None,
+            manage_error: String::new(),
         }
     }
 

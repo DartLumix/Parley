@@ -10,6 +10,9 @@ use tokio::sync::mpsc;
 pub struct ClientHandle {
     pub user_id: u32,
     pub username: String,
+    /// Permission tier as of registration. A role change disconnects the
+    /// target, so this snapshot cannot go stale while the session lives.
+    pub role: crate::db::UserRole,
     /// For media datagram forwarding.
     pub conn: quinn::Connection,
     /// Control-plane messages for this client (broadcasts).
@@ -65,6 +68,32 @@ impl SessionRegistry {
     pub fn broadcast(&self, msg: parley_proto::ServerMessage) {
         for handle in self.clients.lock().unwrap().values() {
             let _ = handle.tx.send(msg.clone());
+        }
+    }
+
+    /// Management state is for managers only. `except` is the requester,
+    /// whose copy is written on its own control stream (ordering).
+    pub fn broadcast_managers_except(&self, except: u32, msg: parley_proto::ServerMessage) {
+        for handle in self.clients.lock().unwrap().values() {
+            if handle.user_id != except && handle.role.can_manage() {
+                let _ = handle.tx.send(msg.clone());
+            }
+        }
+    }
+
+    /// Close a user's live connection (account removed, role changed).
+    /// The session loop notices the close and runs the normal cleanup.
+    /// The close happens outside the registry lock: dropping a connection
+    /// must never run under it.
+    pub fn disconnect_user(&self, user_id: u32) {
+        let conn = self
+            .clients
+            .lock()
+            .unwrap()
+            .get(&user_id)
+            .map(|h| h.conn.clone());
+        if let Some(conn) = conn {
+            conn.close(3u32.into(), b"account changed");
         }
     }
 

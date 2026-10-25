@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package parley;
 
+import "role.proto";
+
 // --- Heartbeats ---
 
 message Heartbeat {
@@ -137,6 +139,91 @@ message VideoReport {
   uint32 viewer_fps = 3;
 }
 
+// --- Server management ---
+
+message ManagedUser {
+  uint32 user_id = 1;
+  string username = 2;
+  Role role = 3;
+  bool online = 4;
+  // 0 = not in a voice channel. The management page uses it to offer a
+  // kick only to a manager when the target is actually in a channel.
+  uint64 channel_id = 5;
+}
+
+message ManagedChannel {
+  uint64 channel_id = 1;
+  string name = 2;
+  ChannelMode mode = 3;
+  uint32 members = 4;
+}
+
+message ManageState {
+  repeated ManagedUser users = 1;
+  repeated ManagedChannel channels = 2;
+}
+
+message ManageStateRequest {}
+
+message AddUser {
+  string username = 1;
+  string password = 2;
+  Role role = 3;
+}
+
+message UpdateUser {
+  uint32 user_id = 1;
+  // Empty means unchanged — the edit dialog sends the current value for
+  // fields the operator did not touch.
+  string username = 2;
+  string password = 3;
+  Role role = 4;
+}
+
+message RemoveUser {
+  uint32 user_id = 1;
+}
+
+message CreateChannel {
+  string name = 1;
+  ChannelMode mode = 2;
+}
+
+message UpdateChannel {
+  uint64 channel_id = 1;
+  // Empty means unchanged.
+  string name = 2;
+  ChannelMode mode = 3;
+}
+
+message DeleteChannel {
+  uint64 channel_id = 1;
+}
+
+message KickUser {
+  uint32 user_id = 1;
+  uint64 channel_id = 2;
+}
+
+message ManageRequest {
+  oneof action {
+    ManageStateRequest state = 1;
+    AddUser add_user = 2;
+    UpdateUser update_user = 3;
+    RemoveUser remove_user = 4;
+    CreateChannel create_channel = 5;
+    UpdateChannel update_channel = 6;
+    DeleteChannel delete_channel = 7;
+    KickUser kick_user = 8;
+  }
+}
+
+message ManageResult {
+  bool ok = 1;
+  string error = 2;
+  ManageState state = 3;
+}
+
 // --- Envelopes ---
 
 message ClientMessage {
@@ -153,6 +240,7 @@ message ClientMessage {
     StopShare stop_share = 10;
     VideoReport video_report = 11;
     SetMute set_mute = 12;
+    ManageRequest manage = 13;
   }
 }
 
@@ -168,5 +256,6 @@ message ServerMessage {
     ReceiverReport receiver_report = 8;
     ShareStopped share_stopped = 9;
     VideoReport video_report = 10;
+    ManageResult manage_result = 11;
   }
 }

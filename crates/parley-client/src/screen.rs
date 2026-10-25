@@ -441,7 +441,7 @@ impl PaceGovernor {
                         self.retry_after = Some(now + PROBE_COOLDOWN);
                         println!(
                             "share: viewer recovered ({reported} fps) → probing {}p",
-                            cap.map_or(base_h, |h| h)
+                            cap.unwrap_or(base_h)
                         );
                     }
                 } else if current < base {

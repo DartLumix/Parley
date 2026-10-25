@@ -10,6 +10,7 @@ import 'rust/api/video.dart' as video_api;
 import 'theme.dart';
 import 'widgets/fullscreen_share.dart';
 import 'widgets/login_view.dart';
+import 'widgets/manage_page.dart';
 import 'widgets/pill.dart';
 import 'widgets/screens_panel.dart';
 import 'widgets/share_dialog.dart';
@@ -973,6 +974,23 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// The management dashboard is an admin/mod destination; a regular
+  /// user never sees the entry point (the server would refuse the calls
+  /// anyway, but there is nothing useful behind the page).
+  Future<void> _openManage() async {
+    final session = _session;
+    if (session == null || session.role == 'user') return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ManagePage(
+          sessionId: session.sessionId,
+          userId: session.userId,
+          role: session.role,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openSettings() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -1392,6 +1410,15 @@ class _HomePageState extends State<HomePage> {
           appBar: AppBar(
             title: const Text('Parley'),
             actions: [
+              if (_session != null && _session!.role != 'user')
+                IconButton(
+                  tooltip: 'Server management',
+                  icon: const Icon(
+                    Icons.admin_panel_settings_outlined,
+                    size: 20,
+                  ),
+                  onPressed: _openManage,
+                ),
               IconButton(
                 tooltip: 'Settings',
                 icon: const Icon(Icons.settings_outlined, size: 20),

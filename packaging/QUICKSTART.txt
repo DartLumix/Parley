@@ -15,7 +15,8 @@ Connect to a server:
     With the release container mapped to host port 443, type
     "your-server:443".
 
-Your login is a username and password created by the server owner:
+Your login is a username and password created by the server owner —
+from Server management in their app, or with the server CLI:
 
     docker compose exec parley /parley-server adduser alice 'a password'
 

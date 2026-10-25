@@ -50,14 +50,17 @@ use parley_client::cert;
 use parley_core::session;
 #[cfg(feature = "video")]
 use parley_core::video_receive::SharedVideoReceiveHub;
+use parley_proto::pb::manage_request::Action as ManageAction;
 #[cfg(feature = "audio-device")]
 use parley_proto::ReceiverReport;
 #[cfg(feature = "video")]
 use parley_proto::VideoReport;
 use parley_proto::{
-    AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, FetchHistory,
-    Heartbeat, Hello, HelloAck, JoinVoice, LeaveVoice, ListChannels, PresenceRequest, SendChat,
-    ServerBody, ServerMessage, SetMute, VoiceStatesRequest, PROTOCOL_VERSION,
+    AddUser, AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage,
+    CreateChannel, DeleteChannel, FetchHistory, Heartbeat, Hello, HelloAck, JoinVoice, KickUser,
+    LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PresenceRequest, RemoveUser, Role,
+    SendChat, ServerBody, ServerMessage, SetMute, UpdateChannel, UpdateUser, VoiceStatesRequest,
+    PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -170,6 +173,57 @@ pub(crate) enum Command {
     /// server (never before Ended — no datagram may follow the notice).
     #[cfg(feature = "screen-capture")]
     StopShare,
+    /// Management page refresh (answer: a `manage` event).
+    ManageState,
+    ManageAddUser {
+        username: String,
+        password: String,
+        role: String,
+    },
+    ManageUpdateUser {
+        user_id: u32,
+        username: String,
+        password: String,
+        role: String,
+    },
+    ManageRemoveUser {
+        user_id: u32,
+    },
+    ManageCreateChannel {
+        name: String,
+        mode: String,
+    },
+    ManageUpdateChannel {
+        channel_id: u64,
+        name: String,
+        mode: String,
+    },
+    ManageDeleteChannel {
+        channel_id: u64,
+    },
+    ManageKick {
+        user_id: u32,
+        channel_id: u64,
+    },
+}
+
+/// The bridge carries roles/modes as the same strings the tables show;
+/// the server validates them again, so an unknown value here must never
+/// become an over-grant. Unknown role strings are USER.
+fn role_code(role: &str) -> i32 {
+    match role {
+        "admin" => Role::Admin as i32,
+        "mod" => Role::Mod as i32,
+        _ => Role::User as i32,
+    }
+}
+
+fn mode_code(mode: &str) -> i32 {
+    if mode == "music" {
+        ChannelMode::Music as i32
+    } else {
+        ChannelMode::Speech as i32
+    }
 }
 
 impl Command {
@@ -211,6 +265,65 @@ impl Command {
             }),
             #[cfg(feature = "screen-capture")]
             Command::StopShare => ClientBody::StopShare(parley_proto::StopShare {}),
+            Command::ManageState => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::State(ManageStateRequest {})),
+            }),
+            Command::ManageAddUser {
+                username,
+                password,
+                role,
+            } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::AddUser(AddUser {
+                    username,
+                    password,
+                    role: role_code(&role),
+                })),
+            }),
+            Command::ManageUpdateUser {
+                user_id,
+                username,
+                password,
+                role,
+            } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::UpdateUser(UpdateUser {
+                    user_id,
+                    username,
+                    password,
+                    role: role_code(&role),
+                })),
+            }),
+            Command::ManageRemoveUser { user_id } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::RemoveUser(RemoveUser { user_id })),
+            }),
+            Command::ManageCreateChannel { name, mode } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::CreateChannel(CreateChannel {
+                    name,
+                    mode: mode_code(&mode),
+                })),
+            }),
+            Command::ManageUpdateChannel {
+                channel_id,
+                name,
+                mode,
+            } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::UpdateChannel(UpdateChannel {
+                    channel_id,
+                    name,
+                    mode: mode_code(&mode),
+                })),
+            }),
+            Command::ManageDeleteChannel { channel_id } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::DeleteChannel(DeleteChannel { channel_id })),
+            }),
+            Command::ManageKick {
+                user_id,
+                channel_id,
+            } => ClientBody::Manage(ManageRequest {
+                action: Some(ManageAction::KickUser(KickUser {
+                    user_id,
+                    channel_id,
+                })),
+            }),
         }
     }
 }
@@ -335,6 +448,37 @@ pub struct VoiceEntry {
     pub muted: bool,
 }
 
+/// One row of the management users table.
+#[derive(Debug, Clone)]
+pub struct ManagedUserInfo {
+    pub user_id: u32,
+    pub username: String,
+    /// "user" | "mod" | "admin"
+    pub role: String,
+    pub online: bool,
+    /// 0 = not in a voice channel; otherwise the channel a kick would
+    /// remove them from.
+    pub channel_id: u64,
+}
+
+/// One row of the management channels table.
+#[derive(Debug, Clone)]
+pub struct ManagedChannelInfo {
+    pub id: u64,
+    pub name: String,
+    /// "speech" | "music"
+    pub mode: String,
+    pub members: u32,
+}
+
+/// A full management snapshot. The page replaces its tables with this on
+/// every response; there are no partial-update races.
+#[derive(Debug, Clone)]
+pub struct ManageStateInfo {
+    pub users: Vec<ManagedUserInfo>,
+    pub channels: Vec<ManagedChannelInfo>,
+}
+
 /// One sender's live output levels, for the roster's speaking glow.
 /// `voice` and `share` are peaks (0..1) of the DECODED streams — the
 /// listener's own volume does not change them.
@@ -361,7 +505,8 @@ pub struct VideoSurfaceInfo {
 
 /// Everything the server can tell the UI, as one flat event struct.
 /// `kind` is one of: "channel_list", "presence", "chat", "history",
-/// "voice_state", "voice_states", "session_closed".
+/// "voice_state", "voice_states", "video_started", "video_stats",
+/// "video_stopped", "manage", "session_closed".
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub session_id: u32,
@@ -383,6 +528,11 @@ pub struct SessionEvent {
     pub states: Vec<VoiceEntry>,
     /// 7f: video_started / video_stopped (the surface)
     pub surface: Option<VideoSurfaceInfo>,
+    /// "manage": the full users/channels snapshot. None on an error
+    /// result (see `manage_error`).
+    pub manage: Option<ManageStateInfo>,
+    /// "manage": empty on success, the server's reason otherwise.
+    pub manage_error: String,
 }
 
 /// Connected-session snapshot returned at connect time.
@@ -393,6 +543,8 @@ pub struct SessionInfo {
     pub session_token: String,
     pub server: String,
     pub fingerprint: String,
+    /// "user" | "mod" | "admin" — gates the management page.
+    pub role: String,
 }
 
 /// What a server presents on the wire, beside what this machine has
@@ -502,6 +654,8 @@ fn closed_event(session_id: u32) -> SessionEvent {
         muted: false,
         states: Vec::new(),
         surface: None,
+        manage: None,
+        manage_error: String::new(),
     }
 }
 
@@ -526,6 +680,8 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         muted: false,
         states: Vec::new(),
         surface: None,
+        manage: None,
+        manage_error: String::new(),
     };
     let Some(body) = msg.body.as_ref() else {
         return Vec::new();
@@ -785,6 +941,47 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 });
                 vec![e]
             }
+        }
+        ServerBody::ManageResult(r) => {
+            let mut e = ev("manage");
+            if !r.ok {
+                e.manage_error = r.error.clone();
+            }
+            if let Some(state) = r.state.as_ref() {
+                e.manage = Some(ManageStateInfo {
+                    users: state
+                        .users
+                        .iter()
+                        .map(|u| ManagedUserInfo {
+                            user_id: u.user_id,
+                            username: u.username.clone(),
+                            role: match u.role() {
+                                Role::Admin => "admin",
+                                Role::Mod => "mod",
+                                Role::User => "user",
+                            }
+                            .to_string(),
+                            online: u.online,
+                            channel_id: u.channel_id,
+                        })
+                        .collect(),
+                    channels: state
+                        .channels
+                        .iter()
+                        .map(|c| ManagedChannelInfo {
+                            id: c.channel_id,
+                            name: c.name.clone(),
+                            mode: match c.mode() {
+                                ChannelMode::Music => "music",
+                                ChannelMode::Speech => "speech",
+                            }
+                            .to_string(),
+                            members: c.members,
+                        })
+                        .collect(),
+                });
+            }
+            vec![e]
         }
         // HeartbeatAck: nothing to surface in the UI.
         _ => Vec::new(),
@@ -1202,12 +1399,19 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     #[cfg(feature = "video")]
     start_share_watchdog(session_id, session_hub.clone(), event_tx.clone());
 
+    let role = match ok.role() {
+        Role::Admin => "admin",
+        Role::Mod => "mod",
+        Role::User => "user",
+    }
+    .to_string();
     Ok(SessionInfo {
         session_id,
         user_id: ok.user_id,
         session_token: ok.session_token,
         server,
         fingerprint,
+        role,
     })
 }
 
@@ -1421,6 +1625,88 @@ pub fn request_presence(session_id: u32) -> Result<(), String> {
 /// happen while connected arrive as individual "voice_state" events.
 pub fn request_voice_states(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::VoiceStates)
+}
+
+// --- Server management (answer: a `manage` event with the full state) ---
+
+/// Refresh the users/channels tables. Also called when the page opens.
+pub fn manage_state(session_id: u32) -> Result<(), String> {
+    send_command(session_id, Command::ManageState)
+}
+
+pub fn manage_add_user(
+    session_id: u32,
+    username: String,
+    password: String,
+    role: String,
+) -> Result<(), String> {
+    send_command(
+        session_id,
+        Command::ManageAddUser {
+            username,
+            password,
+            role,
+        },
+    )
+}
+
+/// Empty `username`/`password` mean unchanged. `role` is the row's
+/// current value; only an admin may change it, and the server enforces
+/// that.
+pub fn manage_update_user(
+    session_id: u32,
+    user_id: u32,
+    username: String,
+    password: String,
+    role: String,
+) -> Result<(), String> {
+    send_command(
+        session_id,
+        Command::ManageUpdateUser {
+            user_id,
+            username,
+            password,
+            role,
+        },
+    )
+}
+
+pub fn manage_remove_user(session_id: u32, user_id: u32) -> Result<(), String> {
+    send_command(session_id, Command::ManageRemoveUser { user_id })
+}
+
+pub fn manage_create_channel(session_id: u32, name: String, mode: String) -> Result<(), String> {
+    send_command(session_id, Command::ManageCreateChannel { name, mode })
+}
+
+pub fn manage_update_channel(
+    session_id: u32,
+    channel_id: u64,
+    name: String,
+    mode: String,
+) -> Result<(), String> {
+    send_command(
+        session_id,
+        Command::ManageUpdateChannel {
+            channel_id,
+            name,
+            mode,
+        },
+    )
+}
+
+pub fn manage_delete_channel(session_id: u32, channel_id: u64) -> Result<(), String> {
+    send_command(session_id, Command::ManageDeleteChannel { channel_id })
+}
+
+pub fn manage_kick(session_id: u32, user_id: u32, channel_id: u64) -> Result<(), String> {
+    send_command(
+        session_id,
+        Command::ManageKick {
+            user_id,
+            channel_id,
+        },
+    )
 }
 
 /// 7k: senders whose SCREEN SHARE audio this client is playing.
@@ -1941,6 +2227,71 @@ fn start_video_reporter(
             }
         }
     });
+}
+
+/// The bridge's half of the management contract: the page's tables and
+/// its error banner are fed straight from these mappings.
+#[cfg(test)]
+mod manage_event_tests {
+    use super::*;
+    use parley_proto::{ManageResult, ManageState, ManagedChannel, ManagedUser};
+
+    #[test]
+    fn manage_result_maps_a_full_snapshot() {
+        let msg = ServerMessage {
+            body: Some(ServerBody::ManageResult(ManageResult {
+                ok: true,
+                error: String::new(),
+                state: Some(ManageState {
+                    users: vec![ManagedUser {
+                        user_id: 7,
+                        username: "alice".to_string(),
+                        role: Role::Mod as i32,
+                        online: true,
+                        channel_id: 3,
+                    }],
+                    channels: vec![ManagedChannel {
+                        channel_id: 3,
+                        name: "general".to_string(),
+                        mode: ChannelMode::Music as i32,
+                        members: 1,
+                    }],
+                }),
+            })),
+        };
+
+        let events = to_event(9, &msg);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.session_id, 9);
+        assert_eq!(event.kind, "manage");
+        assert_eq!(event.manage_error, "");
+        let state = event.manage.as_ref().expect("snapshot");
+        assert_eq!(state.users[0].username, "alice");
+        assert_eq!(state.users[0].role, "mod");
+        assert!(state.users[0].online);
+        assert_eq!(state.users[0].channel_id, 3);
+        assert_eq!(state.channels[0].name, "general");
+        assert_eq!(state.channels[0].mode, "music");
+        assert_eq!(state.channels[0].members, 1);
+    }
+
+    #[test]
+    fn manage_error_keeps_the_tables_untouched() {
+        let msg = ServerMessage {
+            body: Some(ServerBody::ManageResult(ManageResult {
+                ok: false,
+                error: "only an admin can change permissions".to_string(),
+                state: None,
+            })),
+        };
+
+        let events = to_event(9, &msg);
+        let event = &events[0];
+        assert_eq!(event.kind, "manage");
+        assert!(event.manage.is_none());
+        assert_eq!(event.manage_error, "only an admin can change permissions");
+    }
 }
 
 /// Regression: a manual disconnect must end the server-side session.

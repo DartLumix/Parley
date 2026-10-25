@@ -13,9 +13,11 @@ pub use handshake::PROTOCOL_VERSION;
 pub use pb::client_message::Body as ClientBody;
 pub use pb::server_message::Body as ServerBody;
 pub use pb::{
-    AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChannelMode, ChatMessage, ClientMessage,
-    FetchHistory, Heartbeat, HeartbeatAck, Hello, HelloAck, HistoryResult, JoinVoice, LeaveVoice,
-    ListChannels, PresenceList, PresenceRequest, PresenceUser, ReceiverReport, SendChat,
-    ServerMessage, SetMute, ShareStopped, StopShare, VideoReport, VoiceState, VoiceStateList,
-    VoiceStatesRequest,
+    AddUser, AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChannelMode, ChatMessage,
+    ClientMessage, CreateChannel, DeleteChannel, FetchHistory, Heartbeat, HeartbeatAck, Hello,
+    HelloAck, HistoryResult, JoinVoice, KickUser, LeaveVoice, ListChannels, ManageRequest,
+    ManageResult, ManageState, ManageStateRequest, ManagedChannel, ManagedUser, PresenceList,
+    PresenceRequest, PresenceUser, ReceiverReport, RemoveUser, Role, SendChat, ServerMessage,
+    SetMute, ShareStopped, StopShare, UpdateChannel, UpdateUser, VideoReport, VoiceState,
+    VoiceStateList, VoiceStatesRequest,
 };

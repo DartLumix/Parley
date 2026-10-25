@@ -716,7 +716,7 @@ mod tests {
     /// small enough to fit one fragment).
     fn noisy_bgra(w: usize, h: usize, t: usize) -> Vec<u8> {
         let mut bgra = vec![0u8; w * h * 4];
-        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let v = ((i * 7 + t * 29) % 256) as u8;
             px[0] = v;
             px[1] = v.wrapping_add(t as u8);
@@ -730,7 +730,7 @@ mod tests {
     /// are identifiable by their color.
     fn flat_bgra(w: usize, h: usize, v: u8) -> Vec<u8> {
         let mut bgra = vec![0u8; w * h * 4];
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px[0] = v;
             px[1] = v;
             px[2] = v.wrapping_mul(3);

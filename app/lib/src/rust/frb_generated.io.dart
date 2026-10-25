@@ -101,6 +101,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AppSettings dco_decode_box_autoadd_app_settings(dynamic raw);
 
   @protected
+  ManageStateInfo dco_decode_box_autoadd_manage_state_info(dynamic raw);
+
+  @protected
   SavedLogin dco_decode_box_autoadd_saved_login(dynamic raw);
 
   @protected
@@ -128,6 +131,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ChatEntry> dco_decode_list_chat_entry(dynamic raw);
 
   @protected
+  List<ManagedChannelInfo> dco_decode_list_managed_channel_info(dynamic raw);
+
+  @protected
+  List<ManagedUserInfo> dco_decode_list_managed_user_info(dynamic raw);
+
+  @protected
   List<PresenceEntry> dco_decode_list_presence_entry(dynamic raw);
 
   @protected
@@ -140,7 +149,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<VoiceLevel> dco_decode_list_voice_level(dynamic raw);
 
   @protected
+  ManageStateInfo dco_decode_manage_state_info(dynamic raw);
+
+  @protected
+  ManagedChannelInfo dco_decode_managed_channel_info(dynamic raw);
+
+  @protected
+  ManagedUserInfo dco_decode_managed_user_info(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  ManageStateInfo? dco_decode_opt_box_autoadd_manage_state_info(dynamic raw);
 
   @protected
   SavedLogin? dco_decode_opt_box_autoadd_saved_login(dynamic raw);
@@ -259,6 +280,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AppSettings sse_decode_box_autoadd_app_settings(SseDeserializer deserializer);
 
   @protected
+  ManageStateInfo sse_decode_box_autoadd_manage_state_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   SavedLogin sse_decode_box_autoadd_saved_login(SseDeserializer deserializer);
 
   @protected
@@ -288,6 +314,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ChatEntry> sse_decode_list_chat_entry(SseDeserializer deserializer);
 
   @protected
+  List<ManagedChannelInfo> sse_decode_list_managed_channel_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<ManagedUserInfo> sse_decode_list_managed_user_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<PresenceEntry> sse_decode_list_presence_entry(
     SseDeserializer deserializer,
   );
@@ -302,7 +338,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<VoiceLevel> sse_decode_list_voice_level(SseDeserializer deserializer);
 
   @protected
+  ManageStateInfo sse_decode_manage_state_info(SseDeserializer deserializer);
+
+  @protected
+  ManagedChannelInfo sse_decode_managed_channel_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  ManagedUserInfo sse_decode_managed_user_info(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  ManageStateInfo? sse_decode_opt_box_autoadd_manage_state_info(
+    SseDeserializer deserializer,
+  );
 
   @protected
   SavedLogin? sse_decode_opt_box_autoadd_saved_login(
@@ -444,6 +496,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_manage_state_info(
+    ManageStateInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_saved_login(
     SavedLogin self,
     SseSerializer serializer,
@@ -486,6 +544,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_managed_channel_info(
+    List<ManagedChannelInfo> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_managed_user_info(
+    List<ManagedUserInfo> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_presence_entry(
     List<PresenceEntry> self,
     SseSerializer serializer,
@@ -510,7 +580,31 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_manage_state_info(
+    ManageStateInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_managed_channel_info(
+    ManagedChannelInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_managed_user_info(
+    ManagedUserInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_manage_state_info(
+    ManageStateInfo? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_saved_login(

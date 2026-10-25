@@ -17,9 +17,11 @@ use parley_proto::{Hello, HelloAck, PROTOCOL_VERSION};
 
 use parley_proto::{AuthDenied, AuthOk, AuthRequest};
 
+use parley_proto::pb::manage_request::Action as ManageAction;
 use parley_proto::{
-    ClientBody, ClientMessage, Heartbeat, PresenceRequest, ReceiverReport, ServerBody,
-    ServerMessage, StopShare, VideoReport,
+    AddUser, ChannelMode, ClientBody, ClientMessage, CreateChannel, DeleteChannel, Heartbeat,
+    KickUser, ManageRequest, ManageResult, ManageStateRequest, PresenceRequest, ReceiverReport,
+    RemoveUser, Role, ServerBody, ServerMessage, StopShare, UpdateChannel, UpdateUser, VideoReport,
 };
 
 use parley_proto::{FetchHistory, ListChannels, SendChat};
@@ -253,6 +255,50 @@ fn setup_server_with_video(tag: &str, video: VideoConfig) -> (Config, Server) {
 
     let server = Server::bind(&config).unwrap();
     (config, server)
+}
+
+/// One account per permission tier: `admin` (id 1), `mod` (id 2) and
+/// `bob` (id 3). Tests rely on those ids when a request names a target.
+fn setup_server_with_roles(tag: &str) -> (Config, Server) {
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        data_dir: test_dir(tag),
+        video: VideoConfig::default(),
+    };
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
+    db.create_user_with_role("admin", "adminpass", parley_server::db::UserRole::Admin)
+        .unwrap();
+    db.create_user_with_role("mod", "modpass", parley_server::db::UserRole::Mod)
+        .unwrap();
+    db.create_user_with_role("bob", "bobpass", parley_server::db::UserRole::User)
+        .unwrap();
+    drop(db);
+
+    let server = Server::bind(&config).unwrap();
+    (config, server)
+}
+
+async fn send_manage(tx: &mut quinn::SendStream, action: ManageAction) {
+    send_client_msg(
+        tx,
+        ClientBody::Manage(ManageRequest {
+            action: Some(action),
+        }),
+    )
+    .await;
+}
+
+/// Read the next management result, skipping the channel-list broadcasts
+/// a channel write sends to every client first.
+async fn read_manage_result(rx: &mut quinn::RecvStream) -> ManageResult {
+    loop {
+        match read_server_msg(rx).await.body {
+            Some(ServerBody::ManageResult(result)) => return result,
+            Some(ServerBody::ChannelList(_)) => continue,
+            other => panic!("expected manage result, got {other:?}"),
+        }
+    }
 }
 
 /// Add a channel while the server is running (WAL allows the brief
@@ -513,6 +559,434 @@ async fn auth_failure_wrong_password() {
     assert!(!denied.reason.is_empty());
 
     conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn admin_manages_users_and_channels() {
+    init_logs();
+
+    let (config, server) = setup_server_with_roles("manage-crud");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn, mut tx, mut rx, ok) =
+        connect_and_auth_full(&endpoint, addr, "admin", "adminpass").await;
+    assert_eq!(ok.role(), Role::Admin);
+    assert!(ok.is_admin);
+
+    // The tables name every account and channel, with roles and modes.
+    send_manage(&mut tx, ManageAction::State(ManageStateRequest {})).await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "state failed: {}", result.error);
+    let state = result.state.unwrap();
+    assert_eq!(state.users.len(), 3);
+    assert_eq!(
+        state
+            .users
+            .iter()
+            .find(|u| u.username == "mod")
+            .unwrap()
+            .role(),
+        Role::Mod
+    );
+    assert_eq!(
+        state
+            .users
+            .iter()
+            .find(|u| u.username == "bob")
+            .unwrap()
+            .role(),
+        Role::User
+    );
+    assert!(state.channels.iter().any(|c| c.name == "general"));
+
+    // Add a mod.
+    send_manage(
+        &mut tx,
+        ManageAction::AddUser(AddUser {
+            username: "dave".to_string(),
+            password: "davepass".to_string(),
+            role: Role::Mod as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "add user failed: {}", result.error);
+    let state = result.state.unwrap();
+    let dave = state.users.iter().find(|u| u.username == "dave").unwrap();
+    assert_eq!(dave.role(), Role::Mod);
+    let dave_id = dave.user_id;
+
+    // Rename bob; the edit form sends the untouched role back unchanged.
+    let bob_id = state
+        .users
+        .iter()
+        .find(|u| u.username == "bob")
+        .unwrap()
+        .user_id;
+    send_manage(
+        &mut tx,
+        ManageAction::UpdateUser(UpdateUser {
+            user_id: bob_id,
+            username: "robert".to_string(),
+            password: String::new(),
+            role: Role::User as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "rename failed: {}", result.error);
+    let state = result.state.unwrap();
+    assert!(state.users.iter().any(|u| u.username == "robert"));
+    assert!(!state.users.iter().any(|u| u.username == "bob"));
+
+    // Create a music channel, then rename it to speech.
+    send_manage(
+        &mut tx,
+        ManageAction::CreateChannel(CreateChannel {
+            name: "gaming".to_string(),
+            mode: ChannelMode::Music as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "create channel failed: {}", result.error);
+    let state = result.state.unwrap();
+    let gaming = state.channels.iter().find(|c| c.name == "gaming").unwrap();
+    assert_eq!(gaming.mode(), ChannelMode::Music);
+    let gaming_id = gaming.channel_id;
+
+    send_manage(
+        &mut tx,
+        ManageAction::UpdateChannel(UpdateChannel {
+            channel_id: gaming_id,
+            name: "arcade".to_string(),
+            mode: ChannelMode::Speech as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "update channel failed: {}", result.error);
+    let state = result.state.unwrap();
+    let arcade = state.channels.iter().find(|c| c.name == "arcade").unwrap();
+    assert_eq!(arcade.mode(), ChannelMode::Speech);
+
+    // Remove the account and delete the channel.
+    send_manage(
+        &mut tx,
+        ManageAction::RemoveUser(RemoveUser { user_id: dave_id }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "remove user failed: {}", result.error);
+    assert!(
+        !result
+            .state
+            .unwrap()
+            .users
+            .iter()
+            .any(|u| u.user_id == dave_id)
+    );
+
+    send_manage(
+        &mut tx,
+        ManageAction::DeleteChannel(DeleteChannel {
+            channel_id: gaming_id,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx).await;
+    assert!(result.ok, "delete channel failed: {}", result.error);
+    assert!(
+        !result
+            .state
+            .unwrap()
+            .channels
+            .iter()
+            .any(|c| c.channel_id == gaming_id)
+    );
+
+    conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn management_permissions() {
+    init_logs();
+
+    let (config, server) = setup_server_with_roles("manage-perms");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+
+    // A plain user is refused outright.
+    let (conn_user, mut tx_user, mut rx_user, user_ok) =
+        connect_and_auth_full(&endpoint, addr, "bob", "bobpass").await;
+    assert_eq!(user_ok.role(), Role::User);
+    assert!(!user_ok.is_admin);
+    send_manage(&mut tx_user, ManageAction::State(ManageStateRequest {})).await;
+    let result = read_manage_result(&mut rx_user).await;
+    assert!(!result.ok);
+    assert_eq!(result.error, "not permitted");
+
+    // A mod may read the tables and add a regular user…
+    let (conn_mod, mut tx_mod, mut rx_mod, mod_ok) =
+        connect_and_auth_full(&endpoint, addr, "mod", "modpass").await;
+    assert_eq!(mod_ok.role(), Role::Mod);
+    assert!(!mod_ok.is_admin);
+    send_manage(&mut tx_mod, ManageAction::State(ManageStateRequest {})).await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(result.ok, "mod state failed: {}", result.error);
+    assert_eq!(result.state.unwrap().users.len(), 3);
+
+    // …but not a mod or an admin.
+    send_manage(
+        &mut tx_mod,
+        ManageAction::AddUser(AddUser {
+            username: "eve".to_string(),
+            password: "evepass".to_string(),
+            role: Role::Admin as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(!result.ok);
+    assert!(
+        result.error.contains("only an admin can add"),
+        "{}",
+        result.error
+    );
+
+    send_manage(
+        &mut tx_mod,
+        ManageAction::AddUser(AddUser {
+            username: "eve".to_string(),
+            password: "evepass".to_string(),
+            role: Role::User as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(result.ok, "mod add user failed: {}", result.error);
+
+    // No permission changes, even for another ordinary account.
+    send_manage(
+        &mut tx_mod,
+        ManageAction::UpdateUser(UpdateUser {
+            user_id: 3,
+            username: String::new(),
+            password: String::new(),
+            role: Role::Admin as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(!result.ok);
+    assert!(
+        result
+            .error
+            .contains("only an admin can change permissions"),
+        "{}",
+        result.error
+    );
+
+    // Renaming an ordinary user is allowed (the role rides along unchanged).
+    send_manage(
+        &mut tx_mod,
+        ManageAction::UpdateUser(UpdateUser {
+            user_id: 3,
+            username: "robert".to_string(),
+            password: String::new(),
+            role: Role::User as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(result.ok, "mod rename failed: {}", result.error);
+
+    // An admin is off-limits to a mod: alter, remove and kick.
+    send_manage(
+        &mut tx_mod,
+        ManageAction::UpdateUser(UpdateUser {
+            user_id: 1,
+            username: "root".to_string(),
+            password: String::new(),
+            role: Role::Admin as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(!result.ok);
+    assert!(
+        result.error.contains("only an admin can change an admin"),
+        "{}",
+        result.error
+    );
+
+    send_manage(
+        &mut tx_mod,
+        ManageAction::RemoveUser(RemoveUser { user_id: 1 }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(!result.ok);
+    assert!(result.error.contains("only an admin can remove an admin"));
+
+    send_manage(
+        &mut tx_mod,
+        ManageAction::KickUser(KickUser {
+            user_id: 1,
+            channel_id: 1,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(!result.ok);
+    assert!(result.error.contains("only an admin can kick an admin"));
+
+    // And nobody removes their own account.
+    send_manage(
+        &mut tx_mod,
+        ManageAction::RemoveUser(RemoveUser { user_id: 2 }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_mod).await;
+    assert!(!result.ok);
+    assert_eq!(result.error, "you cannot remove your own account");
+
+    // The admin cannot demote themself either (a lone admin would lock
+    // the server out of its own management).
+    let (conn_admin, mut tx_admin, mut rx_admin, admin_ok) =
+        connect_and_auth_full(&endpoint, addr, "admin", "adminpass").await;
+    assert_eq!(admin_ok.role(), Role::Admin);
+    send_manage(
+        &mut tx_admin,
+        ManageAction::UpdateUser(UpdateUser {
+            user_id: 1,
+            username: String::new(),
+            password: String::new(),
+            role: Role::User as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_admin).await;
+    assert!(!result.ok);
+    assert_eq!(result.error, "you cannot change your own role");
+
+    // An admin can promote a mod, and the state reflects it.
+    send_manage(
+        &mut tx_admin,
+        ManageAction::UpdateUser(UpdateUser {
+            user_id: 2,
+            username: String::new(),
+            password: String::new(),
+            role: Role::Admin as i32,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_admin).await;
+    assert!(result.ok, "promote failed: {}", result.error);
+    let state = result.state.unwrap();
+    assert_eq!(
+        state.users.iter().find(|u| u.user_id == 2).unwrap().role(),
+        Role::Admin
+    );
+
+    conn_user.close(0u32.into(), b"done");
+    conn_mod.close(0u32.into(), b"done");
+    conn_admin.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[tokio::test]
+async fn kick_removes_from_channel_and_allows_rejoin() {
+    init_logs();
+
+    let (config, server) = setup_server_with_roles("manage-kick");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_admin, mut tx_admin, mut rx_admin, _) =
+        connect_and_auth_full(&endpoint, addr, "admin", "adminpass").await;
+    let (conn_bob, mut tx_bob, mut rx_bob, bob_ok) =
+        connect_and_auth_full(&endpoint, addr, "bob", "bobpass").await;
+    let bob_id = bob_ok.user_id;
+
+    // Bob joins voice; both sides see the ordinary membership change.
+    send_client_msg(
+        &mut tx_bob,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_admin, bob_id, 1, true).await;
+    expect_voice_state(&mut rx_bob, bob_id, 1, true).await;
+
+    // A kick from the wrong channel changes nothing.
+    send_manage(
+        &mut tx_admin,
+        ManageAction::KickUser(KickUser {
+            user_id: bob_id,
+            channel_id: 2,
+        }),
+    )
+    .await;
+    let result = read_manage_result(&mut rx_admin).await;
+    assert!(!result.ok);
+    assert_eq!(result.error, "that user is not in the channel"); // The real kick is an ordinary leave, not a ban: one VoiceState
+    // broadcast, and no channel-list change. The requester's own result
+    // is written by the session loop while the broadcast goes through
+    // the writer task, so the two may arrive in either order.
+    send_manage(
+        &mut tx_admin,
+        ManageAction::KickUser(KickUser {
+            user_id: bob_id,
+            channel_id: 1,
+        }),
+    )
+    .await;
+    let mut saw_leave = false;
+    let mut kick_result = None;
+    while kick_result.is_none() || !saw_leave {
+        match read_server_msg(&mut rx_admin).await.body {
+            Some(ServerBody::VoiceState(v)) if v.user_id == bob_id && !v.joined => {
+                saw_leave = true;
+            }
+            Some(ServerBody::ManageResult(result)) => kick_result = Some(result),
+            other => panic!("unexpected kick outcome: {other:?}"),
+        }
+    }
+    let result = kick_result.unwrap();
+    assert!(result.ok, "kick failed: {}", result.error);
+    let state = result.state.unwrap();
+    assert_eq!(
+        state
+            .users
+            .iter()
+            .find(|u| u.user_id == bob_id)
+            .unwrap()
+            .channel_id,
+        0
+    );
+    expect_voice_state(&mut rx_bob, bob_id, 0, false).await;
+
+    // Bob may re-join immediately.
+    send_client_msg(
+        &mut tx_bob,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_admin, bob_id, 1, true).await;
+    expect_voice_state(&mut rx_bob, bob_id, 1, true).await;
+
+    conn_admin.close(0u32.into(), b"done");
+    conn_bob.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 

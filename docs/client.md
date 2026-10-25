@@ -40,8 +40,9 @@ and the remembered login live in `%APPDATA%\parley`.
               "your-server" is enough. The deploy kit publishes 4443
               by default; "your-server:443" only if you changed
               PARLEY_PORT.
-    Username: created by the server owner (`docker compose exec parley
-              /parley-server adduser alice 'password'`)
+    Username: created by the server owner — from Server management in
+              their app, or `docker compose exec parley /parley-server
+              adduser alice 'password'` for scripted setup
     Password: as created.
 
 The first connection pins the server's certificate — the same TOFU

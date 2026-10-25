@@ -7,9 +7,9 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `now_ms`, `own_user_id`, `probe`, `read_frame`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `mode_code`, `now_ms`, `own_user_id`, `probe`, `read_frame`, `role_code`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Auth`, `Command`, `LiveSession`, `Probe`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// The certificate a server presents right now, beside the pin we hold.
 /// Read-only: nothing is trusted or written here.
@@ -169,6 +169,85 @@ Future<void> requestVoiceStates({required int sessionId}) => RustLib
     .instance
     .api
     .crateApiSessionRequestVoiceStates(sessionId: sessionId);
+
+/// Refresh the users/channels tables. Also called when the page opens.
+Future<void> manageState({required int sessionId}) =>
+    RustLib.instance.api.crateApiSessionManageState(sessionId: sessionId);
+
+Future<void> manageAddUser({
+  required int sessionId,
+  required String username,
+  required String password,
+  required String role,
+}) => RustLib.instance.api.crateApiSessionManageAddUser(
+  sessionId: sessionId,
+  username: username,
+  password: password,
+  role: role,
+);
+
+/// Empty `username`/`password` mean unchanged. `role` is the row's
+/// current value; only an admin may change it, and the server enforces
+/// that.
+Future<void> manageUpdateUser({
+  required int sessionId,
+  required int userId,
+  required String username,
+  required String password,
+  required String role,
+}) => RustLib.instance.api.crateApiSessionManageUpdateUser(
+  sessionId: sessionId,
+  userId: userId,
+  username: username,
+  password: password,
+  role: role,
+);
+
+Future<void> manageRemoveUser({required int sessionId, required int userId}) =>
+    RustLib.instance.api.crateApiSessionManageRemoveUser(
+      sessionId: sessionId,
+      userId: userId,
+    );
+
+Future<void> manageCreateChannel({
+  required int sessionId,
+  required String name,
+  required String mode,
+}) => RustLib.instance.api.crateApiSessionManageCreateChannel(
+  sessionId: sessionId,
+  name: name,
+  mode: mode,
+);
+
+Future<void> manageUpdateChannel({
+  required int sessionId,
+  required BigInt channelId,
+  required String name,
+  required String mode,
+}) => RustLib.instance.api.crateApiSessionManageUpdateChannel(
+  sessionId: sessionId,
+  channelId: channelId,
+  name: name,
+  mode: mode,
+);
+
+Future<void> manageDeleteChannel({
+  required int sessionId,
+  required BigInt channelId,
+}) => RustLib.instance.api.crateApiSessionManageDeleteChannel(
+  sessionId: sessionId,
+  channelId: channelId,
+);
+
+Future<void> manageKick({
+  required int sessionId,
+  required int userId,
+  required BigInt channelId,
+}) => RustLib.instance.api.crateApiSessionManageKick(
+  sessionId: sessionId,
+  userId: userId,
+  channelId: channelId,
+);
 
 /// Play (or stop playing) one sharer's screen audio. The UI calls this
 /// with the share it is watching — the pane, the fullscreen viewer, or
@@ -332,6 +411,98 @@ class ChatEntry {
           timestampMs == other.timestampMs;
 }
 
+/// A full management snapshot. The page replaces its tables with this on
+/// every response; there are no partial-update races.
+class ManageStateInfo {
+  final List<ManagedUserInfo> users;
+  final List<ManagedChannelInfo> channels;
+
+  const ManageStateInfo({required this.users, required this.channels});
+
+  @override
+  int get hashCode => users.hashCode ^ channels.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ManageStateInfo &&
+          runtimeType == other.runtimeType &&
+          users == other.users &&
+          channels == other.channels;
+}
+
+/// One row of the management channels table.
+class ManagedChannelInfo {
+  final BigInt id;
+  final String name;
+
+  /// "speech" | "music"
+  final String mode;
+  final int members;
+
+  const ManagedChannelInfo({
+    required this.id,
+    required this.name,
+    required this.mode,
+    required this.members,
+  });
+
+  @override
+  int get hashCode =>
+      id.hashCode ^ name.hashCode ^ mode.hashCode ^ members.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ManagedChannelInfo &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          name == other.name &&
+          mode == other.mode &&
+          members == other.members;
+}
+
+/// One row of the management users table.
+class ManagedUserInfo {
+  final int userId;
+  final String username;
+
+  /// "user" | "mod" | "admin"
+  final String role;
+  final bool online;
+
+  /// 0 = not in a voice channel; otherwise the channel a kick would
+  /// remove them from.
+  final BigInt channelId;
+
+  const ManagedUserInfo({
+    required this.userId,
+    required this.username,
+    required this.role,
+    required this.online,
+    required this.channelId,
+  });
+
+  @override
+  int get hashCode =>
+      userId.hashCode ^
+      username.hashCode ^
+      role.hashCode ^
+      online.hashCode ^
+      channelId.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ManagedUserInfo &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          username == other.username &&
+          role == other.role &&
+          online == other.online &&
+          channelId == other.channelId;
+}
+
 /// One row of a presence listing.
 class PresenceEntry {
   final int userId;
@@ -390,7 +561,8 @@ class ServerCertificate {
 
 /// Everything the server can tell the UI, as one flat event struct.
 /// `kind` is one of: "channel_list", "presence", "chat", "history",
-/// "voice_state", "voice_states", "session_closed".
+/// "voice_state", "voice_states", "video_started", "video_stats",
+/// "video_stopped", "manage", "session_closed".
 class SessionEvent {
   final int sessionId;
   final String kind;
@@ -419,6 +591,13 @@ class SessionEvent {
   /// 7f: video_started / video_stopped (the surface)
   final VideoSurfaceInfo? surface;
 
+  /// "manage": the full users/channels snapshot. None on an error
+  /// result (see `manage_error`).
+  final ManageStateInfo? manage;
+
+  /// "manage": empty on success, the server's reason otherwise.
+  final String manageError;
+
   const SessionEvent({
     required this.sessionId,
     required this.kind,
@@ -432,6 +611,8 @@ class SessionEvent {
     required this.muted,
     required this.states,
     this.surface,
+    this.manage,
+    required this.manageError,
   });
 
   @override
@@ -447,7 +628,9 @@ class SessionEvent {
       joined.hashCode ^
       muted.hashCode ^
       states.hashCode ^
-      surface.hashCode;
+      surface.hashCode ^
+      manage.hashCode ^
+      manageError.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -465,7 +648,9 @@ class SessionEvent {
           joined == other.joined &&
           muted == other.muted &&
           states == other.states &&
-          surface == other.surface;
+          surface == other.surface &&
+          manage == other.manage &&
+          manageError == other.manageError;
 }
 
 /// Connected-session snapshot returned at connect time.
@@ -476,12 +661,16 @@ class SessionInfo {
   final String server;
   final String fingerprint;
 
+  /// "user" | "mod" | "admin" — gates the management page.
+  final String role;
+
   const SessionInfo({
     required this.sessionId,
     required this.userId,
     required this.sessionToken,
     required this.server,
     required this.fingerprint,
+    required this.role,
   });
 
   @override
@@ -490,7 +679,8 @@ class SessionInfo {
       userId.hashCode ^
       sessionToken.hashCode ^
       server.hashCode ^
-      fingerprint.hashCode;
+      fingerprint.hashCode ^
+      role.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -501,7 +691,8 @@ class SessionInfo {
           userId == other.userId &&
           sessionToken == other.sessionToken &&
           server == other.server &&
-          fingerprint == other.fingerprint;
+          fingerprint == other.fingerprint &&
+          role == other.role;
 }
 
 /// 7f: one remote share's display surface. `texture_id` feeds a plain

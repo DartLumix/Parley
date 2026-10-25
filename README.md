@@ -258,10 +258,13 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       default, and the offer's format/modifier list has to match the producer
       (LINEAR alone fails against a portal that only speaks `MOD_INVALID`;
       the transcript is in docs/hd-encode-runs.md)
+- [x] 8a Management — admin/mod page for account CRUD, `user`/`mod`/`admin`
+      tiers, channel creation and deletion, and voice kicks (the server
+      enforces every rule; a kick is a plain leave, not a ban)
 - [x] Windows client — voice with echo cancellation (`aec-rust`, the Rust AEC3 port), chat,
       share viewing (capture pending)
 - [ ] Android / iOS bring-up
-- [ ] File transfer (QUIC streams), roles, rich text, search, DMs, push, auto-update
+- [ ] File transfer (QUIC streams), rich text, search, DMs, push, auto-update
 
 **Parked indefinitely** : camera video — returns after the client has adecent foundation (it needs UI preview; the pipeline exists).
 

@@ -38,7 +38,7 @@ use parley_core::video::{
 /// of 1–3 px "text" runs and jitters them horizontally per frame.
 fn frame(width: usize, height: usize, t: usize) -> Vec<u8> {
     let mut bgra = vec![0u8; width * height * 4];
-    for px in bgra.chunks_exact_mut(4) {
+    for px in bgra.as_chunks_mut::<4>().0 {
         px[0] = 24; // B
         px[1] = 26; // G
         px[2] = 30; // R

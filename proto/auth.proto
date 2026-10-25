@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package parley;
 
+import "role.proto";
+
 message AuthRequest {
   string username = 1;
   string password = 2;
@@ -10,8 +12,13 @@ message AuthRequest {
 
 message AuthOk {
   uint32 user_id = 1;
+  // True only for the full ADMIN role. Kept for older clients, whose
+  // admin gate predates the role tiers.
   bool is_admin = 2;
   string session_token = 3;
+  // Additive: an older server leaves this USER, which is the safe
+  // default (no management page). An older client ignores it.
+  Role role = 4;
 }
 
 message AuthDenied {

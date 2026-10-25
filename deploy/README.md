@@ -10,8 +10,10 @@ docker compose up -d
 ```
 
 The first boot creates the `admin` account from
-`PARLEY_ADMIN_PASSWORD`. Add everyone else (the password is the last
-argument, quote it):
+`PARLEY_ADMIN_PASSWORD`. From there, connect as `admin` and use **Server
+management** in the app to create accounts, set tiers and manage
+channels. For scripted setup the CLI still works (the password is the
+last argument, quote it):
 
 ```sh
 docker compose exec parley /parley-server adduser alice 'a long password'
