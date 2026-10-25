@@ -82,6 +82,14 @@ The image is never a separate asset — installing the kit without it
 would only mean downloading the image from somewhere else and loading
 it by hand.
 
+## AUR
+
+`parley-bin` is prepared in [../packaging/aur/README.md](../packaging/aur/README.md).
+It will be published separately from this workflow once the AUR account
+and public mirror exist; it repackages the Arch-built client tarball,
+because AUR cannot fetch from the private repository. Build, checksum
+and push steps are in that README.
+
 ## Verifying a published release
 
 ```sh

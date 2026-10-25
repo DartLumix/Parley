@@ -1,0 +1,20 @@
+pkgbase = parley-bin
+	pkgdesc = Self-hosted voice, chat and screen share
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://github.com/DartLumix/parley-releases
+	arch = x86_64
+	license = MIT
+	depends = gtk3
+	depends = alsa-lib
+	depends = pipewire
+	depends = opus
+	optdepends = xdg-desktop-portal: screen sharing on Wayland
+	provides = parley
+	conflicts = parley
+	options = !strip
+	options = !debug
+	source = https://github.com/DartLumix/parley-releases/releases/download/v0.4.0/parley-0.4.0-linux-x86_64.tar.gz
+	sha256sums = f0dc243ab2be56f634ec4fc9b8ac0be19c9c37ce776d7c453413f91e71bece6d
+
+pkgname = parley-bin

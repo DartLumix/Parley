@@ -1,0 +1,58 @@
+# Maintainer: DartLumix <matteo.pati.dev@gmail.com>
+
+pkgname=parley-bin
+pkgver=0.4.0
+pkgrel=1
+pkgdesc='Self-hosted voice, chat and screen share'
+arch=('x86_64')
+url='https://github.com/DartLumix/parley-releases'
+license=('MIT')
+depends=('gtk3' 'alsa-lib' 'pipewire' 'opus')
+optdepends=('xdg-desktop-portal: screen sharing on Wayland')
+provides=('parley')
+conflicts=('parley')
+options=('!strip' '!debug')
+
+# The app's source repository is private, so the release tarball lives on a
+# public mirror. Change this line if the mirror moves.
+_mirror='https://github.com/DartLumix/parley-releases/releases/download'
+
+source=("$_mirror/v$pkgver/parley-$pkgver-linux-x86_64.tar.gz")
+sha256sums=('f0dc243ab2be56f634ec4fc9b8ac0be19c9c37ce776d7c453413f91e71bece6d')
+
+package() {
+    local bundle="parley-$pkgver-linux-x86_64"
+
+    install -d "$pkgdir/opt/parley" \
+        "$pkgdir/usr/bin" \
+        "$pkgdir/usr/share/applications" \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps" \
+        "$pkgdir/usr/share/licenses/$pkgname"
+
+    cp -a "$srcdir/$bundle/." "$pkgdir/opt/parley/"
+    # pacman owns the installation; the tarball's per-user installer and
+    # its quickstart would only describe a second copy under ~/.local.
+    rm -f "$pkgdir/opt/parley/install.sh" "$pkgdir/opt/parley/QUICKSTART.txt"
+    chmod +x "$pkgdir/opt/parley/parley"
+
+    ln -s /opt/parley/parley "$pkgdir/usr/bin/parley"
+    install -Dm644 "$srcdir/$bundle/parley.svg" \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/parley.svg"
+    install -Dm644 "$srcdir/$bundle/LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    cat > "$pkgdir/usr/share/applications/io.github.dartlumix.Parley.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Parley
+GenericName=Team voice
+Comment=Self-hosted voice, chat and screen share
+Exec=/opt/parley/parley
+Icon=parley
+Terminal=false
+Categories=Network;Chat;
+Keywords=voice;chat;screen share;teamspeak;parley;
+StartupNotify=true
+StartupWMClass=io.github.dartlumix.Parley
+EOF
+}
