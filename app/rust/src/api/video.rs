@@ -905,6 +905,7 @@ pub mod imp {
             channel_id: 0,
             joined: false,
             muted: false,
+            status: String::new(),
             states: Vec::new(),
             surface: Some(VideoSurfaceInfo {
                 user_id: sender,

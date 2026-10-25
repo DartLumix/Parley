@@ -89,6 +89,10 @@ message VoiceState {
   // per user, so the roster can show a muted badge without listening to
   // their packets.
   bool muted = 4;
+  // Away status ("coming back later..."), announced by SetStatus. Empty
+  // means none. Server-held per user like `muted`, so the roster shows it
+  // without extra requests.
+  string status = 5;
 }
 
 // Client -> server: my microphone is (un)muted. Answered by a VoiceState
@@ -96,6 +100,12 @@ message VoiceState {
 // not channel-scoped in the UI).
 message SetMute {
   bool muted = 1;
+}
+
+// Client -> server: set my away status. Empty text clears it. Answered by
+// a VoiceState broadcast carrying the text (whole session, like mute).
+message SetStatus {
+  string text = 1;
 }
 
 message VoiceStatesRequest {}
@@ -241,6 +251,7 @@ message ClientMessage {
     VideoReport video_report = 11;
     SetMute set_mute = 12;
     ManageRequest manage = 13;
+    SetStatus set_status = 14;
   }
 }
 

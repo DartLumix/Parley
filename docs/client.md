@@ -80,6 +80,16 @@ same trust decision.
   voice). A muted mic sends no audio at all, and the mute survives
   switching channels. Everyone else's roster shows a muted-mic badge as
   soon as you press it: the state is announced, not guessed from silence.
+- **Mute all (headset)** — the slashed-headset button next to it silences
+  both directions in one click: your mic goes muted (announced, like the
+  mic button) and everything you hear — voices, share audio and the
+  join/leave cues — goes silent at the mixer. Unmuting restores the exact
+  per-user volumes you had; nothing is replayed from the backlog.
+- **AFK** — once your mic is muted, an amber *AFK* button appears beside
+  it. It asks for a note ("Coming back later…" is prefilled) that shows
+  next to your name in the channel roster, then takes the mic button's
+  place. Pressing it again — *Back* — unmutes, makes the output audible
+  again and clears the note. Leaving the channel leaves AFK behind.
 - **Speaking** — a name lights up in its channel while that person's audio
   is non-silent (measured from the decoded stream, ~10 Hz), and the mic
   button lights with your own capture level. Quiet people stay dark; a
@@ -92,10 +102,12 @@ same trust decision.
 - **Screen share** — *Share screen* in the floating bar asks for a
   resolution and frame-rate cap first (defaults from Settings, *Source*
   means the capture's own size and rate — caps never upscale), then the
-  desktop's portal asks which monitor or window. The share's audio is
-  the default output; this client's own playback — the voice channel and
-  any other share you are watching — is subtracted from it first, so a
-  viewer never hears themselves back. The software encoder
+  desktop's portal asks which monitor or window. The same dialog has a
+  *Share audio* switch and the list of applications playing right now:
+  tick one or more and each is captured from its own PipeWire node, so
+  Parley's playback (the voice channel, other shares) is never in the
+  stream and a viewer cannot hear themselves back. No guard, no
+  subtraction — the echo is excluded by construction. The software encoder
   (openh264) is capped at 1080p whatever *Source* says: measured at
   1440p it needs ~35 ms per frame against a 33 ms slot, so half the
   frames would be dropped. With *Hardware encoding* on, the cap is
@@ -160,7 +172,7 @@ same trust decision.
 | share starts but looks blocky after picking a cap | the cap scales the capture down on the CPU; pick *Source* or a larger height on a slow machine |
 | *Source* on a 1440p/4K display streams 1080p | the software encoder's ceiling (see *Screen share*); enable *Hardware encoding* to send the full size |
 | a share stutters while the sender's CPU is busy | software 1080p30 is near the limit on eight cores (~19 ms per frame, p95 ~35 ms). Lower the share height/frame rate, or use hardware encoding |
-| a viewer hears their own voice in the shared stream | the sharer's default-output monitor is capturing the sharer's playback of that voice. The guard subtracts this client's own playback (80 dB on centred voice); if it persists, a **second** Parley instance is playing to the same sink — route it to another output device |
+| a viewer hears their own voice in the shared stream | the sharer is on the whole-output path (`--share-audio` on the CLI), whose monitor includes our playback; the guard subtracts this client's own playback, but a **second** Parley instance playing to the same sink defeats it. In the app, open *Share screen* → *Share audio* and tick the apps to send: each is captured from its own PipeWire node, and Parley's playback is never offered |
 | a share stutters while the **viewer's** CPU is busy | the viewer reports its decode rate every 5 s. A current server re-encodes a 720p/480p tier for that viewer alone; otherwise (or at the server's cap) the sharer steps its resolution down one rung at a time and only lowers the frame rate at the 480p floor. The `video: viewer sustaining … fps` line in the viewer's log names the number. If it stays low at a small share, the machine has no decode headroom left |
 | own preview stays black | frames are only produced once capture delivers its first buffer — check the `share: encoder ready` line |
 | a share's tile says "connecting…" | the first decoded frame has not reached the display yet; if it stays there, check the receiver's `video:` lines |

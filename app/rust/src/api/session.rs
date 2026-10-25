@@ -59,8 +59,8 @@ use parley_proto::{
     AddUser, AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage,
     CreateChannel, DeleteChannel, FetchHistory, Heartbeat, Hello, HelloAck, JoinVoice, KickUser,
     LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PresenceRequest, RemoveUser, Role,
-    SendChat, ServerBody, ServerMessage, SetMute, UpdateChannel, UpdateUser, VoiceStatesRequest,
-    PROTOCOL_VERSION,
+    SendChat, ServerBody, ServerMessage, SetMute, SetStatus, UpdateChannel, UpdateUser,
+    VoiceStatesRequest, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -141,6 +141,11 @@ pub(crate) enum Command {
     /// the state visible to the other clients.
     SetMute {
         muted: bool,
+    },
+    /// My away text (AFK). Empty clears it; the server broadcasts the
+    /// row to every session, exactly like mute.
+    SetStatus {
+        text: String,
     },
     /// Voice-membership snapshot ("voice_states" event). VoiceState
     /// broadcasts cover every join/leave that happens while we are
@@ -246,6 +251,7 @@ impl Command {
             }),
             Command::Presence => ClientBody::PresenceRequest(PresenceRequest {}),
             Command::SetMute { muted } => ClientBody::SetMute(SetMute { muted }),
+            Command::SetStatus { text } => ClientBody::SetStatus(SetStatus { text }),
             Command::VoiceStates => ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
             #[cfg(feature = "audio-device")]
             Command::ReceiverReport { gap_rate_permille } => {
@@ -446,6 +452,8 @@ pub struct VoiceEntry {
     pub joined: bool,
     /// Their microphone is muted (announced, not inferred).
     pub muted: bool,
+    /// Their away text (SetStatus); empty when none.
+    pub status: String,
 }
 
 /// One row of the management users table.
@@ -524,6 +532,8 @@ pub struct SessionEvent {
     pub joined: bool,
     /// voice_state: their microphone is muted (see SetMute).
     pub muted: bool,
+    /// voice_state: their away text (see SetStatus); empty when none.
+    pub status: String,
     /// voice_states (the full snapshot)
     pub states: Vec<VoiceEntry>,
     /// 7f: video_started / video_stopped (the surface)
@@ -652,6 +662,7 @@ fn closed_event(session_id: u32) -> SessionEvent {
         channel_id: 0,
         joined: false,
         muted: false,
+        status: String::new(),
         states: Vec::new(),
         surface: None,
         manage: None,
@@ -678,6 +689,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         channel_id: 0,
         joined: false,
         muted: false,
+        status: String::new(),
         states: Vec::new(),
         surface: None,
         manage: None,
@@ -820,6 +832,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             e.channel_id = v.channel_id;
             e.joined = v.joined;
             e.muted = v.muted;
+            e.status = v.status.clone();
             extra.push(e);
             extra
         }
@@ -891,6 +904,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                     channel_id: v.channel_id,
                     joined: v.joined,
                     muted: v.muted,
+                    status: v.status.clone(),
                 })
                 .collect();
             vec![e]
@@ -1500,6 +1514,28 @@ pub fn set_mic_muted(session_id: u32, muted: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Set (or clear, with "") this client's away text. Roster news like
+/// mute: the server keeps it and broadcasts the row to everyone. The
+/// mic flag stays the caller's business — the AFK button mutes locally.
+pub fn set_status(session_id: u32, text: String) -> Result<(), String> {
+    send_command(session_id, Command::SetStatus { text })
+}
+
+/// Mute everything this client plays: voices, share audio and the
+/// local join/leave cues. Local only (the server never needs to know),
+/// applied at the mixer so per-user sliders survive the round trip.
+pub fn set_output_muted(session_id: u32, muted: bool) -> Result<(), String> {
+    let mixer = {
+        let sessions = SESSIONS.lock().unwrap();
+        let s = sessions
+            .get(&session_id)
+            .ok_or(format!("no session {session_id}"))?;
+        s.mixer.clone()
+    };
+    mixer.lock().unwrap().set_output_muted(muted);
+    Ok(())
+}
+
 /// Clamp a UI slider value to something the mixer can use: 0 = silent,
 /// 1 = the sender's own level, 2 = twice as loud (before the mix clamp).
 fn volume_or_err(gain: f64) -> f32 {
@@ -1867,7 +1903,13 @@ pub fn screen_share_supported() -> bool {
 /// path). Acceptance: share_started event, then the peer's Screens
 /// panel shows this machine.
 #[cfg(not(feature = "screen-capture"))]
-pub fn start_screen_share(_session_id: u32, _max_height: u32, _max_fps: u32) -> Result<(), String> {
+pub fn start_screen_share(
+    _session_id: u32,
+    _max_height: u32,
+    _max_fps: u32,
+    _share_audio: bool,
+    _audio_players: Vec<u32>,
+) -> Result<(), String> {
     Err("screen-capture feature off".into())
 }
 
@@ -1875,8 +1917,19 @@ pub fn start_screen_share(_session_id: u32, _max_height: u32, _max_fps: u32) -> 
 /// pre-share dialog's caps; 0 means "the capture's own" (never
 /// upscaled, never sped up). A cap the running encoder cannot honour
 /// is not an error: the share still starts, just larger or faster.
+///
+/// Audio: `share_audio` off ⇒ no audio tap at all. On with
+/// `audio_players` empty ⇒ the whole default output (echo guard runs).
+/// On with node ids ⇒ exactly those applications, captured from their
+/// own PipeWire nodes — this app's voice cannot appear in it.
 #[cfg(feature = "screen-capture")]
-pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Result<(), String> {
+pub fn start_screen_share(
+    session_id: u32,
+    max_height: u32,
+    max_fps: u32,
+    share_audio: bool,
+    audio_players: Vec<u32>,
+) -> Result<(), String> {
     // The own-share card reads the NEW share's shape, not the last one's
     // while the portal picker is still open.
     crate::api::video::clear_share_stats();
@@ -1915,22 +1968,47 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
             // stream — mic tee routes to it via SHARE_MIC_ROUTE while
             // the mux lives.
             #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
-            let (sys_tx, sys_rx) = {
-                // 7k: the PipeWire monitor mix enters RAW and leaves the
-                // echo filter with our own playback subtracted, then
-                // reaches the mux. Two bounded channels: the capture
-                // thread never blocks, and a canceller-init failure
-                // degrades to a pass-through instead of silence.
+            let (audio, sys_rx) = if !share_audio {
+                (None, None)
+            } else if audio_players.is_empty() {
+                // Whole-output tap: the PipeWire monitor mix enters RAW
+                // and leaves the echo filter with our own playback
+                // subtracted, then reaches the mux. Two bounded channels:
+                // the capture thread never blocks, and a canceller-init
+                // failure degrades to a pass-through instead of silence.
                 let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
                 let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
                 parley_client::share_echo::spawn_filter(raw_rx, tx.clone());
-                (Some(raw_tx), Some(rx))
+                (
+                    Some(parley_client::screen::ShareAudioTap {
+                        source: parley_client::screen::ShareAudio::Output,
+                        tx: raw_tx,
+                    }),
+                    Some(rx),
+                )
+            } else {
+                // Per-application tap: no guard. The capture never holds
+                // our playback, so subtracting would only risk eating
+                // audio that belongs to the selected app.
+                println!(
+                    "share-audio: capturing {} selected app(s): {:?}",
+                    audio_players.len(),
+                    audio_players
+                );
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+                (
+                    Some(parley_client::screen::ShareAudioTap {
+                        source: parley_client::screen::ShareAudio::Players(audio_players),
+                        tx,
+                    }),
+                    Some(rx),
+                )
             };
             // No share audio in this build: the mux below is cfg'd out
             // with the same predicate, so the receiver is never read.
             #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
-            let (sys_tx, _sys_rx): (
-                Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+            let (audio, _sys_rx): (
+                Option<parley_client::screen::ShareAudioTap>,
                 Option<std::sync::mpsc::Receiver<Vec<f32>>>,
             ) = (None, None);
             // The app keeps the mapped-copy capture path: DMA-BUF capture
@@ -1949,7 +2027,7 @@ pub fn start_screen_share(session_id: u32, max_height: u32, max_fps: u32) -> Res
                 share_loss,
                 share_viewer_fps,
                 share_event_tx,
-                sys_tx,
+                audio,
                 false,
                 options,
                 preview,

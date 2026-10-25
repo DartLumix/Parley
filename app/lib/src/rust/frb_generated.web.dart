@@ -7,6 +7,7 @@
 // ignore_for_file: argument_type_not_assignable
 
 import 'api/login.dart';
+import 'api/players.dart';
 import 'api/session.dart';
 import 'api/settings.dart';
 import 'api/video.dart';
@@ -142,7 +143,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<PresenceEntry> dco_decode_list_presence_entry(dynamic raw);
 
   @protected
+  List<int> dco_decode_list_prim_u_32_loose(dynamic raw);
+
+  @protected
+  Uint32List dco_decode_list_prim_u_32_strict(dynamic raw);
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<ShareAudioPlayer> dco_decode_list_share_audio_player(dynamic raw);
 
   @protected
   List<VoiceEntry> dco_decode_list_voice_entry(dynamic raw);
@@ -188,6 +198,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SessionInfo dco_decode_session_info(dynamic raw);
+
+  @protected
+  ShareAudioPlayer dco_decode_share_audio_player(dynamic raw);
 
   @protected
   SharePreview dco_decode_share_preview(dynamic raw);
@@ -331,7 +344,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<int> sse_decode_list_prim_u_32_loose(SseDeserializer deserializer);
+
+  @protected
+  Uint32List sse_decode_list_prim_u_32_strict(SseDeserializer deserializer);
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  List<ShareAudioPlayer> sse_decode_list_share_audio_player(
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<VoiceEntry> sse_decode_list_voice_entry(SseDeserializer deserializer);
@@ -387,6 +411,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SessionInfo sse_decode_session_info(SseDeserializer deserializer);
+
+  @protected
+  ShareAudioPlayer sse_decode_share_audio_player(SseDeserializer deserializer);
 
   @protected
   SharePreview sse_decode_share_preview(SseDeserializer deserializer);
@@ -564,8 +591,26 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_prim_u_32_loose(
+    List<int> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_prim_u_32_strict(
+    Uint32List self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_share_audio_player(
+    List<ShareAudioPlayer> self,
     SseSerializer serializer,
   );
 
@@ -643,6 +688,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_session_info(SessionInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_share_audio_player(
+    ShareAudioPlayer self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_share_preview(SharePreview self, SseSerializer serializer);

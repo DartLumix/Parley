@@ -23,7 +23,7 @@ use crate::voice::VoiceManager;
 use parley_proto::pb::manage_request::Action;
 use parley_proto::{
     ChannelList, ChannelMode, ManageRequest, ManageResult, ManageState, ManagedChannel,
-    ManagedUser, ServerBody, ServerMessage, VoiceState,
+    ManagedUser, ServerBody, ServerMessage,
 };
 
 pub async fn handle(
@@ -329,14 +329,7 @@ fn force_leave(
     }
     transcode.remove_share(user_id);
     transcode.remove_viewer(user_id);
-    registry.broadcast(ServerMessage {
-        body: Some(ServerBody::VoiceState(VoiceState {
-            user_id,
-            channel_id: 0,
-            joined: false,
-            muted: voice.is_muted(user_id),
-        })),
-    });
+    registry.broadcast(crate::server::voice_state_message(voice, user_id, 0, false));
 }
 
 fn pb_role(role: UserRole) -> i32 {

@@ -140,6 +140,11 @@ pub struct Mixer {
     /// `mix()` — the UI's speaking indicator polls it. Peaks are of the
     /// decoded signal, so turning someone down never hides their glow.
     levels: HashMap<u32, (f32, f32)>,
+    /// Headphone mute: the whole output device goes silent. Applied at
+    /// the END of `mix`, so the pipelines keep decoding and draining
+    /// (unmuting resumes at the live edge, not a backlog) and the levels
+    /// stay live for the roster.
+    output_muted: bool,
 }
 
 /// Shared mixer handle.
@@ -151,6 +156,7 @@ pub fn new() -> SharedMixer {
         gains: HashMap::new(),
         share_gains: HashMap::new(),
         levels: HashMap::new(),
+        output_muted: false,
     }))
 }
 
@@ -159,6 +165,18 @@ impl Mixer {
     /// leaving/rejoining.
     pub fn set_gain(&mut self, user_id: u32, gain: f32) {
         self.gains.insert(user_id, gain);
+    }
+
+    /// Mute/unmute the whole output (the headphones button). Independent
+    /// of the per-user sliders: unmuting restores exactly their levels.
+    pub fn set_output_muted(&mut self, muted: bool) {
+        self.output_muted = muted;
+    }
+
+    /// True while the headphones button is engaged. The render callback
+    /// uses it to skip the local join/leave cues as well.
+    pub fn output_muted(&self) -> bool {
+        self.output_muted
     }
 
     /// Set the extra trim on a user's screen-share audio only. The
@@ -273,6 +291,12 @@ impl Mixer {
             if let Some(s) = v.share.as_mut() {
                 s.drain(n);
             }
+        }
+        if self.output_muted {
+            // Silent device, live pipelines: the meters above and the
+            // drains just done keep timing honest.
+            mix.fill(0.0);
+            return mix;
         }
         for s in &mut mix {
             *s = s.clamp(-1.0, 1.0);
@@ -600,6 +624,41 @@ mod tests {
             voice > 0.01,
             "speaking must still register while turned down: {voice}"
         );
+    }
+
+    /// The headphones button silences the DEVICE, not the pipelines:
+    /// decoders keep draining (no replay burst on unmute) and the
+    /// speaking meters keep working while the user hears nothing.
+    #[test]
+    fn headphone_mute_silences_output_but_keeps_pipelines() {
+        let mixer = new();
+        {
+            let mut m = mixer.lock().unwrap();
+            warm_up(&mut m, 21, &speech_packets(4), false);
+            let before = m.mix(SAMPLES_PER_FRAME);
+            assert!(before.iter().any(|s| s.abs() > 0.001), "audio is flowing");
+
+            m.set_output_muted(true);
+            let muted = m.mix(SAMPLES_PER_FRAME);
+            assert!(
+                muted.iter().all(|&s| s == 0.0),
+                "muted output must be exact silence"
+            );
+            let (_, voice, _) = m
+                .levels()
+                .iter()
+                .find(|(id, ..)| *id == 21)
+                .copied()
+                .expect("the sender still has a level entry");
+            assert!(
+                voice > 0.0,
+                "speaking stays visible while the output is muted"
+            );
+
+            m.set_output_muted(false);
+            let after = m.mix(SAMPLES_PER_FRAME);
+            assert_eq!(after.len(), SAMPLES_PER_FRAME * 2);
+        }
     }
 
     #[test]

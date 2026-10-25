@@ -1178,9 +1178,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let share_audio = cmd_share_audio;
                                     let mux_spawn = mux_spawn_tx.clone();
                                     tokio::spawn(async move {
-                                        let (sys_tx, sys_rx) = if share_audio {
-                                            // Our own playback is in the monitor too;
-                                            // the guard subtracts it before the mux.
+                                        let (audio, sys_rx) = if share_audio {
+                                            // The CLI keeps the whole-output monitor; our
+                                            // own playback is in it, so the guard
+                                            // subtracts it before the mux. (The app
+                                            // captures specific apps instead — there is
+                                            // no echo to cancel.)
                                             let (raw_tx, raw_rx) =
                                                 std::sync::mpsc::sync_channel::<Vec<f32>>(8);
                                             let (tx, rx) =
@@ -1189,7 +1192,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 raw_rx,
                                                 tx.clone(),
                                             );
-                                            (Some(raw_tx), Some(rx))
+                                            (
+                                                Some(screen::ShareAudioTap {
+                                                    source: screen::ShareAudio::Output,
+                                                    tx: raw_tx,
+                                                }),
+                                                Some(rx),
+                                            )
                                         } else {
                                             (None, None)
                                         };
@@ -1202,7 +1211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             // pipe declares a fixed rate).
                                             Arc::new(std::sync::atomic::AtomicU32::new(0)),
                                             events.clone(),
-                                            sys_tx,
+                                            audio,
                                             args.dmabuf,
                                             screen::ShareOptions::default(),
                                             None,

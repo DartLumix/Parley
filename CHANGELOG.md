@@ -3,7 +3,40 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
-## [Unreleased]
+## [0.4.2] — 2026-10-25
+
+The screen share carries the audio you pick, not your whole output, and
+the client gains a mute-everything switch and AFK.
+
+### Added
+
+- **Mute all (headset).** One button silences both directions: the mic
+  goes muted (announced, like the mic button) and the output device goes
+  silent at the mixer — voices, share audio and the local join/leave
+  cues. Per-user volume sliders are preserved, and unmuting resumes at
+  the live edge rather than replaying a backlog; the speaking meters keep
+  working while muted.
+- **AFK.** With the mic muted, an amber *AFK* button appears beside it.
+  It asks for an optional note ("Coming back later…" prefilled),
+  publishes it, and replaces the mic button; pressing it again (*Back*)
+  unmutes, restores the output and clears the note. The note shows next
+  to the name in the channel roster. Wire addition (`VoiceState.status`,
+  `SetStatus`), server-held per user exactly like `muted`.
+
+### Changed
+
+- **Share audio is per-application (Linux app).** The pre-share dialog
+  now has a *Share audio* switch and a picker listing what is playing
+  right now; the share captures exactly those PipeWire playback nodes.
+  Because Parley's own playback is a different node — and is filtered
+  out of the picker by name and process id — a viewer can no longer
+  hear their own voice in a share; the previous digital guard was a
+  subtraction and could not guarantee that. Several apps mix into one
+  stereo stream at a fixed 10 ms cadence, so their quanta need not
+  match. The CLI's `--share-audio` keeps the whole-output monitor and
+  the guard. Bridge API change: `start_screen_share` takes `share_audio`
+  and `audio_players` (node ids), and `list_share_audio_players` feeds
+  the picker.
 
 ## [0.4.1] — 2026-10-25
 

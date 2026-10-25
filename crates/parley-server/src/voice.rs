@@ -3,6 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// Away texts are roster decoration, not a message: cap them so one
+/// client cannot push unbounded data to every session with every
+/// keystroke.
+pub const MAX_STATUS_CHARS: usize = 120;
+
 #[derive(Default)]
 pub struct VoiceManager {
     /// user_id -> channel they're currently in
@@ -18,6 +23,9 @@ pub struct VoiceManager {
     /// muted when switching channels) and only ever describes a client
     /// that told us — silence is never inferred from an empty mixer.
     muted: Mutex<HashSet<u32>>,
+    /// Away texts (SetStatus), same lifetime rules as `muted`: kept per
+    /// user across channel switches, dropped when the session ends.
+    statuses: Mutex<HashMap<u32, String>>,
 }
 
 impl VoiceManager {
@@ -84,14 +92,54 @@ impl VoiceManager {
         self.muted.lock().unwrap().remove(&user_id);
     }
 
-    /// Full state for snapshots: (user_id, channel_id, muted).
-    pub fn snapshot(&self) -> Vec<(u32, u64, bool)> {
+    /// Record an away status. Returns true when the text actually
+    /// changed — the caller only broadcasts real news. Text is trimmed
+    /// and capped; empty clears the status.
+    pub fn set_status(&self, user_id: u32, text: &str) -> bool {
+        let text = text.trim();
+        let mut statuses = self.statuses.lock().unwrap();
+        if text.is_empty() {
+            return statuses.remove(&user_id).is_some();
+        }
+        let capped: String = text.chars().take(MAX_STATUS_CHARS).collect();
+        if statuses.get(&user_id) == Some(&capped) {
+            return false;
+        }
+        statuses.insert(user_id, capped);
+        true
+    }
+
+    /// The user's away text, or empty when there is none.
+    pub fn status_of(&self, user_id: u32) -> String {
+        self.statuses
+            .lock()
+            .unwrap()
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Session end: a new login starts with no status.
+    pub fn clear_status(&self, user_id: u32) {
+        self.statuses.lock().unwrap().remove(&user_id);
+    }
+
+    /// Full state for snapshots: (user_id, channel_id, muted, status).
+    pub fn snapshot(&self) -> Vec<(u32, u64, bool, String)> {
         let muted = self.muted.lock().unwrap();
+        let statuses = self.statuses.lock().unwrap();
         self.members
             .lock()
             .unwrap()
             .iter()
-            .map(|(&id, &ch)| (id, ch, muted.contains(&id)))
+            .map(|(&id, &ch)| {
+                (
+                    id,
+                    ch,
+                    muted.contains(&id),
+                    statuses.get(&id).cloned().unwrap_or_default(),
+                )
+            })
             .collect()
     }
 }

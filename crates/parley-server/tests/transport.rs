@@ -2599,3 +2599,96 @@ async fn mute_state_is_broadcast_and_survives_rejoin() {
     conn_b.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
+
+/// Away text is roster news exactly like mute: broadcast to the whole
+/// session (the sender included), carried in the snapshot so a late
+/// joiner sees it, not re-broadcast when unchanged, and clearable with
+/// the empty string.
+#[tokio::test]
+async fn away_status_is_broadcast_and_in_the_snapshot() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("away");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::SetStatus(parley_proto::SetStatus {
+            text: "coming back later...".to_string(),
+        }),
+    )
+    .await;
+    for rx in [&mut rx_a, &mut rx_b] {
+        match read_server_msg(rx).await.body {
+            Some(ServerBody::VoiceState(v)) => assert_eq!(
+                (v.user_id, v.status.as_str()),
+                (1, "coming back later..."),
+                "away text must broadcast"
+            ),
+            other => panic!("expected away broadcast, got {other:?}"),
+        }
+    }
+
+    // Unchanged text is not news.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::SetStatus(parley_proto::SetStatus {
+            text: "coming back later...".to_string(),
+        }),
+    )
+    .await;
+    expect_silence(&mut rx_b, Duration::from_millis(150)).await;
+
+    // Snapshot carries it for a client that connected mid-away.
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+    )
+    .await;
+    match read_server_msg(&mut rx_b).await.body {
+        Some(ServerBody::VoiceStateList(list)) => {
+            let a = list
+                .states
+                .iter()
+                .find(|s| s.user_id == 1)
+                .expect("testuser in the snapshot");
+            assert_eq!(a.status, "coming back later...");
+        }
+        other => panic!("expected voice state list, got {other:?}"),
+    }
+
+    // Empty clears it, and the row says so.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::SetStatus(parley_proto::SetStatus {
+            text: String::new(),
+        }),
+    )
+    .await;
+    match read_server_msg(&mut rx_b).await.body {
+        Some(ServerBody::VoiceState(v)) => {
+            assert!(v.status.is_empty(), "clear must broadcast an empty text")
+        }
+        other => panic!("expected clear broadcast, got {other:?}"),
+    }
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}

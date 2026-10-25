@@ -863,12 +863,15 @@ fn build_streams(
                 // The join/leave cue rides on top of the mix, LOCAL only:
                 // it is added after the AEC/share-echo reference, so it is
                 // never subtracted from the mic and never sent to peers.
+                // "Mute everything" mutes the cues too — the request is
+                // still consumed, so it cannot fire later on unmute.
+                let output_muted = mixer.lock().unwrap().output_muted();
                 match CHIME_REQUEST.swap(0, Ordering::Relaxed) {
-                    1 => {
+                    1 if !output_muted => {
                         cue = Some(cues()[0].as_slice());
                         cue_pos = 0;
                     }
-                    2 => {
+                    2 if !output_muted => {
                         cue = Some(cues()[1].as_slice());
                         cue_pos = 0;
                     }

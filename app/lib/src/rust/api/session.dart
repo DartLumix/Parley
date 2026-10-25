@@ -82,6 +82,24 @@ Future<void> setMicMuted({required int sessionId, required bool muted}) =>
       muted: muted,
     );
 
+/// Set (or clear, with "") this client's away text. Roster news like
+/// mute: the server keeps it and broadcasts the row to everyone. The
+/// mic flag stays the caller's business — the AFK button mutes locally.
+Future<void> setStatus({required int sessionId, required String text}) =>
+    RustLib.instance.api.crateApiSessionSetStatus(
+      sessionId: sessionId,
+      text: text,
+    );
+
+/// Mute everything this client plays: voices, share audio and the
+/// local join/leave cues. Local only (the server never needs to know),
+/// applied at the mixer so per-user sliders survive the round trip.
+Future<void> setOutputMuted({required int sessionId, required bool muted}) =>
+    RustLib.instance.api.crateApiSessionSetOutputMuted(
+      sessionId: sessionId,
+      muted: muted,
+    );
+
 /// Set one user's output volume (their voice and their share). Session-
 /// scoped: a new login starts everyone at 1.0.
 Future<void> setUserVolume({
@@ -329,14 +347,23 @@ Future<bool> screenShareSupported() =>
 /// pre-share dialog's caps; 0 means "the capture's own" (never
 /// upscaled, never sped up). A cap the running encoder cannot honour
 /// is not an error: the share still starts, just larger or faster.
+///
+/// Audio: `share_audio` off ⇒ no audio tap at all. On with
+/// `audio_players` empty ⇒ the whole default output (echo guard runs).
+/// On with node ids ⇒ exactly those applications, captured from their
+/// own PipeWire nodes — this app's voice cannot appear in it.
 Future<void> startScreenShare({
   required int sessionId,
   required int maxHeight,
   required int maxFps,
+  required bool shareAudio,
+  required List<int> audioPlayers,
 }) => RustLib.instance.api.crateApiSessionStartScreenShare(
   sessionId: sessionId,
   maxHeight: maxHeight,
   maxFps: maxFps,
+  shareAudio: shareAudio,
+  audioPlayers: audioPlayers,
 );
 
 /// Real impl — see the stub above.
@@ -585,6 +612,9 @@ class SessionEvent {
   /// voice_state: their microphone is muted (see SetMute).
   final bool muted;
 
+  /// voice_state: their away text (see SetStatus); empty when none.
+  final String status;
+
   /// voice_states (the full snapshot)
   final List<VoiceEntry> states;
 
@@ -609,6 +639,7 @@ class SessionEvent {
     required this.channelId,
     required this.joined,
     required this.muted,
+    required this.status,
     required this.states,
     this.surface,
     this.manage,
@@ -627,6 +658,7 @@ class SessionEvent {
       channelId.hashCode ^
       joined.hashCode ^
       muted.hashCode ^
+      status.hashCode ^
       states.hashCode ^
       surface.hashCode ^
       manage.hashCode ^
@@ -647,6 +679,7 @@ class SessionEvent {
           channelId == other.channelId &&
           joined == other.joined &&
           muted == other.muted &&
+          status == other.status &&
           states == other.states &&
           surface == other.surface &&
           manage == other.manage &&
@@ -744,16 +777,24 @@ class VoiceEntry {
   /// Their microphone is muted (announced, not inferred).
   final bool muted;
 
+  /// Their away text (SetStatus); empty when none.
+  final String status;
+
   const VoiceEntry({
     required this.userId,
     required this.channelId,
     required this.joined,
     required this.muted,
+    required this.status,
   });
 
   @override
   int get hashCode =>
-      userId.hashCode ^ channelId.hashCode ^ joined.hashCode ^ muted.hashCode;
+      userId.hashCode ^
+      channelId.hashCode ^
+      joined.hashCode ^
+      muted.hashCode ^
+      status.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -763,7 +804,8 @@ class VoiceEntry {
           userId == other.userId &&
           channelId == other.channelId &&
           joined == other.joined &&
-          muted == other.muted;
+          muted == other.muted &&
+          status == other.status;
 }
 
 /// One sender's live output levels, for the roster's speaking glow.

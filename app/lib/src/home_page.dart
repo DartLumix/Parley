@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'rust/api/login.dart' as login_api;
+import 'rust/api/players.dart';
 import 'rust/api/session.dart';
 import 'rust/api/settings.dart' as settings_api;
 import 'rust/api/video.dart' as video_api;
@@ -54,7 +55,10 @@ bool isVoiceMembershipCue({
   // The floor follows the window down: a 900 px window gives the column
   // a third of itself, not half, so the screens area never becomes the
   // sliver on the small windows where it matters most.
-  final lower = math.min(math.max(160.0, available * 0.38), math.min(420.0, upper));
+  final lower = math.min(
+    math.max(160.0, available * 0.38),
+    math.min(420.0, upper),
+  );
   return (lower, upper);
 }
 
@@ -106,6 +110,19 @@ class _HomePageState extends State<HomePage> {
   /// Users whose microphone the server says is muted (SetMute), from the
   /// snapshot and every broadcast since.
   final Set<int> _mutedUsers = {};
+
+  /// Away texts by user id (SetStatus), same sources. Absence means
+  /// "no status" — the empty string never enters the map.
+  final Map<int, String> _statuses = {};
+
+  /// Headphone mute: our mic AND everything we play are off. The
+  /// playback half lives in the Rust mixer; this mirrors it for the
+  /// button (and is cleared when the session ends).
+  bool _outputMuted = false;
+
+  /// My own away text while AFK, null when not away. Entered from the
+  /// muted state; leaving AFK unmutes and clears this.
+  String? _afkStatus;
 
   // Session state assembled from events:
   final List<ChannelInfo> _channels = [];
@@ -460,6 +477,9 @@ class _HomePageState extends State<HomePage> {
       _levels.clear();
       _selfLevel = 0;
       _mutedUsers.clear();
+      _statuses.clear();
+      _afkStatus = null;
+      _outputMuted = false;
       _shareStats = null;
     });
     setWindowFullscreen(false);
@@ -692,6 +712,9 @@ class _HomePageState extends State<HomePage> {
       _levels.clear();
       _selfLevel = 0;
       _mutedUsers.clear();
+      _statuses.clear();
+      _afkStatus = null;
+      _outputMuted = false;
       _volume.clear();
       _shareVolume.clear();
       _shareStats = null;
@@ -828,7 +851,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-
   /// Sharers whose share audio the Rust side is currently playing —
   /// muted again on disconnect so a later session starts silent.
   final Set<int> _audibleShares = {};
@@ -856,15 +878,21 @@ class _HomePageState extends State<HomePage> {
     for (final id in _rustWatched.difference(want).toList()) {
       _rustWatched.remove(id);
       unawaited(
-        setScreenWatched(sessionId: sessionId, userId: id, watched: false)
-            .catchError((_) {}),
+        setScreenWatched(
+          sessionId: sessionId,
+          userId: id,
+          watched: false,
+        ).catchError((_) {}),
       );
     }
     for (final id in want.difference(_rustWatched)) {
       _rustWatched.add(id);
       unawaited(
-        setScreenWatched(sessionId: sessionId, userId: id, watched: true)
-            .catchError((_) {}),
+        setScreenWatched(
+          sessionId: sessionId,
+          userId: id,
+          watched: true,
+        ).catchError((_) {}),
       );
     }
   }
@@ -1050,12 +1078,21 @@ class _HomePageState extends State<HomePage> {
   Future<void> _startShare() async {
     final session = _session;
     if (session == null) return;
+    // A snapshot of what is playing right now: the share captures these
+    // applications' own PipeWire nodes, so Parley's voice can never end
+    // up in the stream. Empty (no audio device, no players, other OS) is
+    // not an error — the dialog then simply offers no audio.
+    final players = await listShareAudioPlayers();
+    if (!mounted || _session?.sessionId != session.sessionId) return;
     final options = await showShareOptionsDialog(
       context,
       height: _settings.shareHeight,
       fps: _settings.shareFps,
+      players: players,
     );
-    if (options == null || !mounted || _session?.sessionId != session.sessionId) {
+    if (options == null ||
+        !mounted ||
+        _session?.sessionId != session.sessionId) {
       return;
     }
     // The dialog is the same cap Settings → Video edits, so remember what
@@ -1080,6 +1117,8 @@ class _HomePageState extends State<HomePage> {
         sessionId: session.sessionId,
         maxHeight: options.height,
         maxFps: options.fps,
+        shareAudio: options.audio,
+        audioPlayers: options.audioPlayers,
       );
       // share_started arrives as an event; the button flips there.
     } catch (e) {
@@ -1139,6 +1178,7 @@ class _HomePageState extends State<HomePage> {
           if (ev.users.isNotEmpty) {
             final online = {for (final u in ev.users) u.userId};
             _mutedUsers.removeWhere((id) => !online.contains(id));
+            _statuses.removeWhere((id, _) => !online.contains(id));
           }
           _pruneShares();
         });
@@ -1179,7 +1219,15 @@ class _HomePageState extends State<HomePage> {
           } else {
             _mutedUsers.remove(ev.userId);
           }
+          // Away text (SetStatus). Only rows in a channel render it, so
+          // a status kept across a leave/join stays harmless.
+          if (ev.status.isEmpty) {
+            _statuses.remove(ev.userId);
+          } else {
+            _statuses[ev.userId] = ev.status;
+          }
           if (ev.userId == _session?.userId) {
+            _afkStatus = ev.status.isEmpty ? null : ev.status;
             // 7e: the own join/leave IS the voice lifecycle — the Rust
             // side already opened/closed the devices on this event.
             _joinedChannelId = ev.joined ? ev.channelId : null;
@@ -1196,14 +1244,17 @@ class _HomePageState extends State<HomePage> {
         setState(() {
           _voiceChannel.clear();
           _mutedUsers.clear();
+          _statuses.clear();
           for (final st in ev.states) {
             if (st.joined) _voiceChannel[st.userId] = st.channelId;
             if (st.muted) _mutedUsers.add(st.userId);
+            if (st.status.isNotEmpty) _statuses[st.userId] = st.status;
           }
           for (final st in ev.states) {
             if (st.userId == _session?.userId) {
               _joinedChannelId = st.joined ? st.channelId : null;
               _voiceUp = st.joined;
+              _afkStatus = st.status.isEmpty ? null : st.status;
             }
           }
           _pruneShares();
@@ -1335,6 +1386,9 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _leaveChannel() async {
     if (_session == null || _joinedChannelId == null) return;
+    // Away is a voice-time state: leave it behind rather than lingering
+    // on the roster with a note for a channel that is gone.
+    if (_afkStatus != null) await _exitAfk();
     await leaveVoice(sessionId: _session!.sessionId);
     setState(() => _chat.clear());
   }
@@ -1794,6 +1848,9 @@ class _HomePageState extends State<HomePage> {
     final muted = _mutedUsers.contains(userId);
     final volume = _volume[userId] ?? 1.0;
     final name = self ? '${_nameOf(userId)} (you)' : _nameOf(userId);
+    // Away text is channel-time news (SetStatus): the presence-only idle
+    // rows never have one to show.
+    final away = idle ? null : _statuses[userId];
     final hot = speaking
         ? accentSoft
         : (self ? accentSoft : Colors.greenAccent);
@@ -1851,11 +1908,27 @@ class _HomePageState extends State<HomePage> {
                 ),
               const SizedBox(width: 9),
               Expanded(
-                child: Text(
-                  name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 13),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                    if (away != null)
+                      Text(
+                        away,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontStyle: FontStyle.italic,
+                          color: Color(0xFFFFB74D),
+                        ),
+                      ),
+                  ],
                 ),
               ),
               if (volume != 1.0)
@@ -2053,7 +2126,146 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  // --- floating bottom bar: mute + share + hardware encode.
+  /// AFK's amber, shared with the roster's away line.
+  static const Color _afkAmber = Color(0xFFFFB300);
+
+  /// Mute BOTH directions at once: the announced mic flag and the local
+  /// playback device (voices, share audio, chimes). Turning it off makes
+  /// everything live again — including leaving AFK, since AFK's contract
+  /// is "muted until I come back".
+  Future<void> _toggleHeadphones() async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    final me = _session?.userId;
+    final next = !_outputMuted;
+    try {
+      await setOutputMuted(sessionId: sessionId, muted: next);
+      await setMicMuted(sessionId: sessionId, muted: next);
+      if (!next && _afkStatus != null) {
+        await setStatus(sessionId: sessionId, text: '');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = 'mute-all failed: $e');
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _outputMuted = next;
+      _micMuted = next;
+      _selfLevel = 0;
+      if (me != null) {
+        if (next) {
+          _mutedUsers.add(me);
+        } else {
+          _mutedUsers.remove(me);
+        }
+      }
+      if (!next) _afkStatus = null;
+      _status = next ? 'mic and sound muted' : 'mic and sound live';
+    });
+  }
+
+  /// Ask for the away note (the suggestion is prefilled and editable).
+  /// Always returns a non-empty text: AFK without a note would be
+  /// invisible to everyone else, which is not what the button means.
+  Future<String?> _askAwayText() async {
+    // Local to the dialog: not disposed here — the route keeps the field
+    // alive through its exit animation, and an explicit dispose would
+    // race that (the object is garbage once the dialog is gone).
+    final controller = TextEditingController(text: 'Coming back later\u2026');
+    final answer = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Go away'),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Your mic stays muted and this note shows next to your '
+                'name. Press the AFK button again to come back.',
+                style: TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                maxLength: 120,
+                decoration: const InputDecoration(
+                  labelText: 'Status message',
+                  hintText: 'Coming back later\u2026',
+                ),
+                onSubmitted: (v) => Navigator.pop(context, v),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('Go AFK'),
+          ),
+        ],
+      ),
+    );
+    if (answer == null) return null;
+    final trimmed = answer.trim();
+    return trimmed.isEmpty ? 'Away' : trimmed;
+  }
+
+  /// Enter AFK: muted already (that is how the button appears), publish
+  /// the note, and swap the mic button for the AFK one.
+  Future<void> _enterAfk() async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    final text = await _askAwayText();
+    if (text == null || !mounted) return;
+    try {
+      await setStatus(sessionId: sessionId, text: text);
+    } catch (e) {
+      if (mounted) setState(() => _status = 'away failed: $e');
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _afkStatus = text;
+      _status = 'away';
+    });
+  }
+
+  /// Leave AFK: normal again — live mic, audible output, no note.
+  Future<void> _exitAfk() async {
+    final sessionId = _session?.sessionId;
+    final me = _session?.userId;
+    if (sessionId == null) return;
+    try {
+      await setStatus(sessionId: sessionId, text: '');
+      await setMicMuted(sessionId: sessionId, muted: false);
+      if (_outputMuted) {
+        await setOutputMuted(sessionId: sessionId, muted: false);
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = 'wake failed: $e');
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _afkStatus = null;
+      _micMuted = false;
+      _outputMuted = false;
+      _selfLevel = 0;
+      if (me != null) _mutedUsers.remove(me);
+      _status = 'back';
+    });
+  }
+
+  // --- floating bottom bar: mute + AFK + headphone mute + share.
 
   Widget _actionBar(ThemeData theme) {
     final inVoice = _joinedChannelId != null && !_connecting;
@@ -2066,10 +2278,45 @@ class _HomePageState extends State<HomePage> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextButton.icon(
-              onPressed: inVoice ? _toggleMic : null,
-              icon: Icon(_micMuted ? Icons.mic_off : Icons.mic, size: 20),
-              label: Text(_micMuted ? 'Unmute' : 'Mute'),
+            // While away the AFK button REPLACES the mic button: one
+            // control for the state you are in, not two ways out of it.
+            if (_afkStatus != null)
+              TextButton.icon(
+                onPressed: inVoice ? _exitAfk : null,
+                style: TextButton.styleFrom(foregroundColor: _afkAmber),
+                icon: const Icon(Icons.bedtime, size: 20, color: _afkAmber),
+                label: const Text('Back'),
+              )
+            else
+              TextButton.icon(
+                onPressed: inVoice ? _toggleMic : null,
+                icon: Icon(_micMuted ? Icons.mic_off : Icons.mic, size: 20),
+                label: Text(_micMuted ? 'Unmute' : 'Mute'),
+              ),
+            // Away is one click from a muted mic, next to it — the
+            // muted state is what makes AFK meaningful.
+            if (_afkStatus == null && _micMuted)
+              TextButton.icon(
+                onPressed: inVoice ? _enterAfk : null,
+                style: TextButton.styleFrom(foregroundColor: _afkAmber),
+                icon: const Icon(
+                  Icons.bedtime_outlined,
+                  size: 20,
+                  color: _afkAmber,
+                ),
+                label: const Text('AFK'),
+              ),
+            // Icon-only: its own symbol (slashed headset) is the point,
+            // and the bar must stay narrow on small windows.
+            Tooltip(
+              message: _outputMuted
+                  ? 'Unmute your mic and sound'
+                  : 'Mute your mic and everything you hear',
+              child: IconButton(
+                onPressed: inVoice ? _toggleHeadphones : null,
+                iconSize: 20,
+                icon: Icon(_outputMuted ? Icons.headset_off : Icons.headset),
+              ),
             ),
             if (_screenShareSupported) ...[
               Container(
@@ -2078,8 +2325,9 @@ class _HomePageState extends State<HomePage> {
                 color: Colors.white.withValues(alpha: 0.12),
               ),
               TextButton.icon(
-                onPressed:
-                    inVoice ? (_sharing ? _stopShare : _startShare) : null,
+                onPressed: inVoice
+                    ? (_sharing ? _stopShare : _startShare)
+                    : null,
                 icon: Icon(
                   _sharing ? Icons.stop_screen_share : Icons.screen_share,
                   size: 20,

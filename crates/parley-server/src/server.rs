@@ -322,16 +322,11 @@ async fn serve(
         // forgetting it here keeps the server's roster in step with a
         // client that signs back in unmuted.
         voice.clear_muted(info.id);
+        // Same for the away status: it described that client's session.
+        voice.clear_status(info.id);
     }
     if still_current && voice.leave(info.id).is_some() {
-        registry.broadcast(ServerMessage {
-            body: Some(ServerBody::VoiceState(PbVoiceState {
-                user_id: info.id,
-                channel_id: 0,
-                joined: false,
-                muted: voice.is_muted(info.id),
-            })),
-        });
+        registry.broadcast(voice_state_message(voice, info.id, 0, false));
     }
     // 7k: the session (and with it any share) is over — the channel it
     // was routed to must hear that, or a crash/disconnect strands a
@@ -477,23 +472,9 @@ async fn handle_client_message(
                     }
                     transcode.remove_share(info.id);
                     transcode.remove_viewer(info.id);
-                    registry.broadcast(ServerMessage {
-                        body: Some(ServerBody::VoiceState(PbVoiceState {
-                            user_id: info.id,
-                            channel_id: old,
-                            joined: false,
-                            muted: voice.is_muted(info.id),
-                        })),
-                    });
+                    registry.broadcast(voice_state_message(voice, info.id, old, false));
                 }
-                registry.broadcast(ServerMessage {
-                    body: Some(ServerBody::VoiceState(PbVoiceState {
-                        user_id: info.id,
-                        channel_id: j.channel_id,
-                        joined: true,
-                        muted: voice.is_muted(info.id),
-                    })),
-                });
+                registry.broadcast(voice_state_message(voice, info.id, j.channel_id, true));
             }
             // joining a nonexistent channel is ignored
         }
@@ -511,14 +492,7 @@ async fn handle_client_message(
                 }
                 transcode.remove_share(info.id);
                 transcode.remove_viewer(info.id);
-                registry.broadcast(ServerMessage {
-                    body: Some(ServerBody::VoiceState(PbVoiceState {
-                        user_id: info.id,
-                        channel_id: 0,
-                        joined: false,
-                        muted: voice.is_muted(info.id),
-                    })),
-                });
+                registry.broadcast(voice_state_message(voice, info.id, 0, false));
             }
         }
 
@@ -528,14 +502,26 @@ async fn handle_client_message(
             // a state poll can never disagree with the last SetMute.
             if voice.set_muted(info.id, m.muted) {
                 let channel = voice.channel_of(info.id);
-                registry.broadcast(ServerMessage {
-                    body: Some(ServerBody::VoiceState(PbVoiceState {
-                        user_id: info.id,
-                        channel_id: channel.unwrap_or(0),
-                        joined: channel.is_some(),
-                        muted: m.muted,
-                    })),
-                });
+                registry.broadcast(voice_state_message(
+                    voice,
+                    info.id,
+                    channel.unwrap_or(0),
+                    channel.is_some(),
+                ));
+            }
+        }
+
+        Some(ClientBody::SetStatus(s)) => {
+            // Away text is roster news exactly like mute: whole session,
+            // unchanged text is not re-broadcast.
+            if voice.set_status(info.id, &s.text) {
+                let channel = voice.channel_of(info.id);
+                registry.broadcast(voice_state_message(
+                    voice,
+                    info.id,
+                    channel.unwrap_or(0),
+                    channel.is_some(),
+                ));
             }
         }
 
@@ -547,11 +533,12 @@ async fn handle_client_message(
                     body: Some(ServerBody::VoiceStateList(VoiceStateList {
                         states: states
                             .into_iter()
-                            .map(|(user_id, channel_id, muted)| PbVoiceState {
+                            .map(|(user_id, channel_id, muted, status)| PbVoiceState {
                                 user_id,
                                 channel_id,
                                 joined: true,
                                 muted,
+                                status,
                             })
                             .collect(),
                     })),
@@ -724,6 +711,26 @@ fn route_datagram(
 /// broadcast on every session start/end so connected clients never
 /// hold a stale user list. Presence was pull-only until the Flutter
 /// app became the first consumer and found the gap.
+/// One user's roster row, stamped with the server-held mute and away
+/// text. Every VoiceState the server emits goes through here, so a new
+/// per-user field cannot be forgotten at one of the construction sites.
+pub(crate) fn voice_state_message(
+    voice: &VoiceManager,
+    user_id: u32,
+    channel_id: u64,
+    joined: bool,
+) -> ServerMessage {
+    ServerMessage {
+        body: Some(ServerBody::VoiceState(PbVoiceState {
+            user_id,
+            channel_id,
+            joined,
+            muted: voice.is_muted(user_id),
+            status: voice.status_of(user_id),
+        })),
+    }
+}
+
 fn presence_message(registry: &SessionRegistry) -> ServerMessage {
     let users = registry.online_users();
     ServerMessage {

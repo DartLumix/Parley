@@ -18,6 +18,6 @@ pub use pb::{
     HelloAck, HistoryResult, JoinVoice, KickUser, LeaveVoice, ListChannels, ManageRequest,
     ManageResult, ManageState, ManageStateRequest, ManagedChannel, ManagedUser, PresenceList,
     PresenceRequest, PresenceUser, ReceiverReport, RemoveUser, Role, SendChat, ServerMessage,
-    SetMute, ShareStopped, StopShare, UpdateChannel, UpdateUser, VideoReport, VoiceState,
-    VoiceStateList, VoiceStatesRequest,
+    SetMute, SetStatus, ShareStopped, StopShare, UpdateChannel, UpdateUser, VideoReport,
+    VoiceState, VoiceStateList, VoiceStatesRequest,
 };

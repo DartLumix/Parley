@@ -143,6 +143,44 @@ pub struct ShareOptions {
     pub max_fps: Option<f64>,
 }
 
+/// One application's playback, as PipeWire exposes it: a
+/// `Stream/Output/Audio` node. Capturing one of these taps THAT app's
+/// audio and nothing else — which is why the echo cannot come back:
+/// Parley's own playback is a different node, is never a target, and is
+/// filtered out of the picker (see [`list_audio_players`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioPlayer {
+    /// PipeWire global id — the capture target. Unique even when two
+    /// clients share a `node.name` (two `pw-play`s do), which is why the
+    /// target is an id and not a name.
+    pub id: u32,
+    /// `node.name`, for logs (not unique: see `id`).
+    pub name: String,
+    /// `application.name` (falls back to the process binary, then the
+    /// node name): what the picker shows.
+    pub app: String,
+    /// `node.description` when the app sets one, else `app`. Made unique
+    /// across the list so two same-named players stay distinguishable.
+    pub description: String,
+}
+
+/// Where a share's audio comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareAudio {
+    /// The default output's monitor: everything this machine plays,
+    /// Parley included — the caller must run the echo guard.
+    Output,
+    /// Exactly these application nodes (`AudioPlayer::id`), mixed.
+    Players(Vec<u32>),
+}
+
+/// A share's audio tap: the source, and the channel the mux drains.
+/// Dropping the sender is what tells the mux the share's audio ended.
+pub struct ShareAudioTap {
+    pub source: ShareAudio,
+    pub tx: SyncSender<Vec<f32>>,
+}
+
 /// One preview frame for the sharer's own view: RGBA, tightly packed,
 /// in the stream's own shape (see [`preview_target`]). Borrowed from the
 /// preview thread's reusable canvas — valid for the duration of the
@@ -1937,20 +1975,27 @@ struct AudioState {
     drops: u64,
 }
 
-/// Start capture of the DEFAULT OUTPUT (PipeWire `stream.capture.sink`)
-/// on its own thread/loop. Bounded channel + try_send: never block the
-/// pw thread (the 6f discipline); a slow consumer drops stale audio —
-/// correct for live content. Failures surface on stderr; the video
-/// share proceeds regardless.
-fn start_audio_capture(stop: Arc<AtomicBool>, sys_tx: SyncSender<Vec<f32>>) {
+/// Start the share's audio capture on its own thread/loop. Bounded
+/// channel + try_send: never block the pw thread (the 6f discipline); a
+/// slow consumer drops stale audio — correct for live content. Failures
+/// surface on stderr; the video share proceeds regardless.
+fn start_audio_capture(stop: Arc<AtomicBool>, tap: ShareAudioTap) {
     std::thread::spawn(move || {
-        if let Err(e) = audio_capture_thread(stop, sys_tx) {
+        let ShareAudioTap { source, tx } = tap;
+        let result = match source {
+            ShareAudio::Output => output_capture_thread(stop, tx),
+            ShareAudio::Players(targets) => players_capture_thread(stop, tx, targets),
+        };
+        if let Err(e) = result {
             eprintln!("share-audio: {e}");
         }
     });
 }
 
-fn audio_capture_thread(
+/// The whole-output tap: capture the DEFAULT OUTPUT (PipeWire
+/// `stream.capture.sink`). Everything the machine plays is in there,
+/// this app included — the caller pairs it with the echo guard.
+fn output_capture_thread(
     stop: Arc<AtomicBool>,
     sys_tx: SyncSender<Vec<f32>>,
 ) -> Result<(), pw::Error> {
@@ -1980,6 +2025,10 @@ fn audio_capture_thread(
             // registry, no node targeting — PipeWire routes it. Scope:
             // this output's audio (documented product behavior).
             *pw::keys::STREAM_CAPTURE_SINK => "true",
+            // Keep producing silence through quiet stretches instead of
+            // suspending: a paused tap starves the mux, and the peer's
+            // decoder then conceals the gap (audible warble).
+            *pw::keys::NODE_PAUSE_ON_IDLE => "false",
         },
     )?;
 
@@ -2082,11 +2131,351 @@ fn audio_capture_thread(
         })
         .register()?;
 
-    // EnumFormat: exactly F32LE / 48 kHz / 2ch. The pod property!
-    // macro CANNOT express Int-valued choices (its $type_ must be a
-    // utils:: struct; ints are plain i32 — no path). The Id properties
-    // and the two Int ranges are built with Property::new — the
-    // crate's own AudioInfoRaw idiom (raw.rs From<...> impl).
+    // EnumFormat: exactly F32LE / 48 kHz / 2ch — the same request the
+    // per-app taps make, from one place.
+    let values = f32_stereo_format_pod();
+    let mut params = [spa::pod::Pod::from_bytes(&values).expect("serialized pod is valid")];
+
+    stream.connect(
+        spa::utils::Direction::Input,
+        None, // STREAM_CAPTURE_SINK decides the target
+        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        &mut params,
+    )?;
+    println!("share-audio: capturing the default output (native PipeWire, stream.capture.sink)");
+
+    // Same iterate-loop discipline as the video pw thread.
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
+    }
+    let _ = stream.disconnect();
+    println!("share-audio: capture stopped");
+    Ok(())
+}
+
+/// Enumerate the applications currently playing into the graph.
+///
+/// A fresh registry round-trip on its own connection: the caller gets a
+/// snapshot and nothing lingers. Blocking for up to ~600 ms by design;
+/// call it off the audio thread.
+///
+/// Parley's own playback nodes are excluded HERE, at the source: a picker
+/// that offered them would re-create exactly the echo this path exists
+/// to remove.
+pub fn list_audio_players() -> Result<Vec<AudioPlayer>, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mainloop = pw::main_loop::MainLoopBox::new(None).map_err(|e| e.to_string())?;
+    let context =
+        pw::context::ContextBox::new(mainloop.loop_(), None).map_err(|e| e.to_string())?;
+    let core = context.connect(None).map_err(|e| e.to_string())?;
+    let registry = core.get_registry().map_err(|e| e.to_string())?;
+
+    let players: Rc<RefCell<Vec<AudioPlayer>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = players.clone();
+    // Our own playback must never be a target. Name matching alone is not
+    // enough: through the pulse/alsa compatibility layers cpal's stream is
+    // named "cpal-pulseaudio-<pid>" with no app name at all, so exclude by
+    // process id as well.
+    let own_pid = std::process::id().to_string();
+    let _listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.type_ != pw::types::ObjectType::Node {
+                return;
+            }
+            let Some(props) = global.props else { return };
+            if props.get(&pw::keys::MEDIA_CLASS) != Some("Stream/Output/Audio") {
+                return;
+            }
+            let Some(name) = props.get(&pw::keys::NODE_NAME).filter(|v| !v.is_empty()) else {
+                return;
+            };
+            if props.get("application.process.id") == Some(own_pid.as_str()) {
+                return; // this very client's playback
+            }
+            let app = props
+                .get("application.name")
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    props
+                        .get("application.process.binary")
+                        .filter(|v| !v.is_empty())
+                })
+                .unwrap_or(name);
+            if is_parley(app) || is_parley(name) {
+                return; // our own voice or share — never a source
+            }
+            let description = props
+                .get(&pw::keys::NODE_DESCRIPTION)
+                .filter(|v| !v.is_empty())
+                .unwrap_or(app);
+            let mut list = sink.borrow_mut();
+            if list.iter().any(|p| p.id == global.id) {
+                return;
+            }
+            // Two streams of the same app (two `pw-play`s, two browser
+            // profiles) can share a name; the picker still has to tell
+            // them apart.
+            let base = description.to_string();
+            let mut description = base.clone();
+            let mut n = 2;
+            while list.iter().any(|p| p.description == description) {
+                description = format!("{base} ({n})");
+                n += 1;
+            }
+            list.push(AudioPlayer {
+                id: global.id,
+                name: name.to_string(),
+                app: app.to_string(),
+                description,
+            });
+        })
+        .register();
+
+    // The initial burst arrives as fast as the server sends it; a quiet
+    // window marks its end. (core.sync() would need a core listener for
+    // one bool — not worth it for a snapshot.)
+    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+    let mut stable_since = std::time::Instant::now();
+    let mut last = usize::MAX;
+    while std::time::Instant::now() < deadline {
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(40)));
+        let len = players.borrow().len();
+        if len != last {
+            last = len;
+            stable_since = std::time::Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(120) {
+            break;
+        }
+    }
+
+    let mut out = players.borrow().clone();
+    out.sort_by(|a, b| {
+        a.app
+            .to_lowercase()
+            .cmp(&b.app.to_lowercase())
+            .then_with(|| a.description.cmp(&b.description))
+    });
+    Ok(out)
+}
+
+fn is_parley(value: &str) -> bool {
+    value.to_lowercase().contains("parley")
+}
+
+/// Backlog for one selected application. Written by its capture callback,
+/// drained by the collector — both on the capture thread, so a plain
+/// `VecDeque` needs no lock.
+struct PlayerSource {
+    /// Interleaved stereo f32 at 48 kHz, oldest first.
+    buf: std::collections::VecDeque<f32>,
+    /// True once the backlog reaches the playout target: a source still
+    /// filling contributes silence rather than a late, bursty start.
+    primed: bool,
+}
+
+const STEREO_SAMPLES_PER_MS: usize = 48 * 2;
+/// Playout backlog before a source is mixed in (30 ms absorbs quantum
+/// jitter without adding audible delay).
+const PLAYER_PREBUFFER_SAMPLES: usize = 30 * STEREO_SAMPLES_PER_MS;
+/// Hard cap per source (240 ms): a sustained surplus means the clocks
+/// disagree — drop OLDEST, never grow latency.
+const PLAYER_CAP_SAMPLES: usize = 240 * STEREO_SAMPLES_PER_MS;
+/// One collector step: 10 ms of stereo.
+const MIX_STEP_SAMPLES: usize = 10 * STEREO_SAMPLES_PER_MS;
+
+/// Capture specific application nodes — the echo-free path.
+///
+/// Every target is its own stream bound with `target.object`, all on this
+/// thread's mainloop. Their quanta are independent and need not match, so
+/// each accumulates into its own ring and a 10 ms collector sums whatever
+/// is ready: the mux always receives the same steady stereo shape. Parley's
+/// own playback is not among the sources — structural, not a subtraction.
+fn players_capture_thread(
+    stop: Arc<AtomicBool>,
+    tx: SyncSender<Vec<f32>>,
+    targets: Vec<u32>,
+) -> Result<(), pw::Error> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mainloop = pw::main_loop::MainLoopBox::new(None)?;
+    let context = pw::context::ContextBox::new(mainloop.loop_(), None)?;
+    let core = context.connect(None)?;
+
+    let sources: Rc<RefCell<Vec<PlayerSource>>> = Rc::new(RefCell::new(
+        targets
+            .iter()
+            .map(|_| PlayerSource {
+                buf: std::collections::VecDeque::new(),
+                primed: false,
+            })
+            .collect(),
+    ));
+
+    let values = f32_stereo_format_pod();
+    let mut streams = Vec::with_capacity(targets.len());
+    let mut listeners = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter().enumerate() {
+        let stream = pw::stream::StreamBox::new(
+            &core,
+            "parley-share-audio",
+            properties! {
+                *pw::keys::MEDIA_TYPE => "Audio",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Music",
+                // Capturing playback, not a microphone...
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
+                // Keep the tap running while the app is silent, so the
+                // mux never stalls on a paused game or a muted tab.
+                *pw::keys::NODE_PAUSE_ON_IDLE => "false",
+            },
+        )?;
+        let acc = sources.clone();
+        let listener = stream
+            .add_local_listener_with_user_data(index)
+            .state_changed(|_, _, _old, new| {
+                // A vanished node (app quit) surfaces here; never fatal —
+                // the remaining sources keep playing.
+                if let pw::stream::StreamState::Error(e) = new {
+                    eprintln!("share-audio: player stream error: {e}");
+                }
+            })
+            .process(move |stream, index| {
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    return;
+                };
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+                let data = &mut datas[0];
+                let chunk = data.chunk();
+                let size = chunk.size() as usize;
+                if size == 0 {
+                    return;
+                }
+                let offset = chunk.offset() as usize;
+                let Some(mapped) = data.data() else { return };
+                let Some(bytes) = mapped.get(offset..offset + size) else {
+                    return; // truncated buffer: skip
+                };
+                let mut acc = acc.borrow_mut();
+                let Some(source) = acc.get_mut(*index) else {
+                    return;
+                };
+                for b in bytes.as_chunks::<4>().0 {
+                    source.buf.push_back(f32::from_le_bytes(*b));
+                }
+                // Whole frames only: a dangling half-sample would shift
+                // every later L/R pair.
+                if source.buf.len() % 2 == 1 {
+                    source.buf.pop_back();
+                }
+                while source.buf.len() > PLAYER_CAP_SAMPLES {
+                    source.buf.pop_front();
+                }
+            })
+            .register()?;
+        let mut params = [spa::pod::Pod::from_bytes(&values).expect("serialized pod is valid")];
+        // THE fix for the echo: an explicit target id — one app's
+        // playback node, never the default sink's monitor. (Same
+        // mechanism the portal video stream uses for its node.)
+        stream.connect(
+            spa::utils::Direction::Input,
+            Some(*target),
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )?;
+        println!("share-audio: capturing app node {target} ({index})");
+        streams.push(stream);
+        listeners.push(listener);
+    }
+
+    // Collector: a fixed 10 ms clock, independent of every source's
+    // quantum. `iterate` only pumps events; the deadline below decides
+    // when a step is due, so a busy graph cannot speed it up.
+    let mut next_tick = std::time::Instant::now() + Duration::from_millis(10);
+    let mut drops: u64 = 0;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(5)));
+        let now = std::time::Instant::now();
+        if now < next_tick {
+            continue;
+        }
+        // A stall (suspend, scheduling) must not be paid back as a burst:
+        // resync instead of emitting a backlog of 10 ms steps.
+        next_tick = if now.saturating_duration_since(next_tick) > Duration::from_millis(60) {
+            now + Duration::from_millis(10)
+        } else {
+            next_tick + Duration::from_millis(10)
+        };
+        let chunk = collect_mix(&sources, MIX_STEP_SAMPLES);
+        if tx.try_send(chunk).is_err() {
+            drops += 1;
+            if drops.is_multiple_of(128) {
+                eprintln!("share-audio: mux behind — {drops} buffers dropped");
+            }
+        }
+    }
+    for stream in &streams {
+        let _ = stream.disconnect();
+    }
+    drop(listeners);
+    println!("share-audio: player capture stopped");
+    Ok(())
+}
+
+/// Sum one step across every selected app. Each primed source contributes
+/// the next `step` samples of its backlog; a source short of data
+/// contributes silence for the missing tail — the mux's clock must never
+/// depend on one app.
+fn collect_mix(
+    sources: &std::rc::Rc<std::cell::RefCell<Vec<PlayerSource>>>,
+    step: usize,
+) -> Vec<f32> {
+    let mut mix = vec![0.0f32; step];
+    let mut acc = sources.borrow_mut();
+    for source in acc.iter_mut() {
+        if !source.primed {
+            if source.buf.len() >= PLAYER_PREBUFFER_SAMPLES {
+                source.primed = true;
+            } else {
+                continue; // still filling
+            }
+        }
+        let take = source.buf.len().min(step);
+        for slot in mix.iter_mut().take(take) {
+            *slot += source.buf.pop_front().unwrap_or(0.0);
+        }
+    }
+    for sample in &mut mix {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+    mix
+}
+
+/// The one format every share-audio tap asks for: F32LE, 48 kHz, stereo.
+/// Share audio rides the music profile, so nothing downstream converts or
+/// resamples.
+fn f32_stereo_format_pod() -> Vec<u8> {
     use spa::pod::{ChoiceValue, Object, Property, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
     let obj = Object {
@@ -2129,35 +2518,13 @@ fn audio_capture_thread(
             ),
         ],
     };
-    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
+    spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &Value::Object(obj),
     )
     .expect("static pod serialization cannot fail")
     .0
-    .into_inner();
-    let mut params = [spa::pod::Pod::from_bytes(&values).expect("serialized pod is valid")];
-
-    stream.connect(
-        spa::utils::Direction::Input,
-        None, // STREAM_CAPTURE_SINK decides the target
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-        &mut params,
-    )?;
-    println!("share-audio: capturing the default output (native PipeWire, stream.capture.sink)");
-
-    // Same iterate-loop discipline as the video pw thread.
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        mainloop
-            .loop_()
-            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
-    }
-    let _ = stream.disconnect();
-    println!("share-audio: capture stopped");
-    Ok(())
+    .into_inner()
 }
 
 /// The share-audio mux: [default-output stereo + mic mono→center] →
@@ -2329,8 +2696,9 @@ pub fn spawn_share_audio_mux(
 
 /// Entry point: portal dance → threads → supervisor.
 ///
-/// `sys_tx` = Some ⇒ share WITH audio (the default-output capture
-/// starts alongside video, same stop flag). `options` is the pre-share
+/// `audio` = Some ⇒ share WITH audio (that tap starts alongside video,
+/// same stop flag) — the source is either the default output's monitor
+/// or a set of specific application nodes. `options` is the pre-share
 /// dialog's caps (see [`ShareOptions`]) and `preview` the sharer's own
 /// view of the capture (see [`PreviewSink`]); neither changes the
 /// pixels' route, so both are best-effort. Returns the keyframe
@@ -2348,7 +2716,7 @@ pub async fn start(
     video_loss: Arc<AtomicU32>,
     viewer_fps: Arc<AtomicU32>,
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
-    sys_tx: Option<SyncSender<Vec<f32>>>,
+    audio: Option<ShareAudioTap>,
     dmabuf: bool,
     options: ShareOptions,
     preview: Option<PreviewSink>,
@@ -2498,8 +2866,8 @@ pub async fn start(
     // early return must never strand an audio thread. Same stop flag:
     // teardown kills both; the capture's channel-sender dropping is
     // what tells the mux the share ended.
-    if let Some(sys_tx) = sys_tx {
-        start_audio_capture(stop_flag.clone(), sys_tx);
+    if let Some(tap) = audio {
+        start_audio_capture(stop_flag.clone(), tap);
     }
 
     // Supervisor: the single owner of the portal session. One select,
@@ -2910,5 +3278,94 @@ mod tests {
             g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
             (0.0, None)
         );
+    }
+}
+
+/// The per-app collector: pure sample bookkeeping, no PipeWire, so it
+/// runs in CI (the capture path itself needs a live graph).
+#[cfg(test)]
+mod share_audio_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn source(samples: &[f32]) -> PlayerSource {
+        PlayerSource {
+            buf: samples.iter().copied().collect(),
+            primed: false,
+        }
+    }
+
+    /// Touches the live graph, so it is opt-in like the audio-device
+    /// tests: `PARLEY_AUDIO=1 cargo test -p parley-client \
+    ///   --features screen-capture lists_players -- --nocapture`.
+    #[test]
+    fn lists_players_when_hardware_enabled() {
+        if std::env::var("PARLEY_AUDIO")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+        {
+            eprintln!("skipping (set PARLEY_AUDIO=1 to enable)");
+            return;
+        }
+        let players = list_audio_players().expect("PipeWire reachable");
+        eprintln!("players: {players:?}");
+        assert!(
+            players
+                .iter()
+                .all(|p| !is_parley(&p.name) && !is_parley(&p.app)),
+            "this client's own playback must never be offered"
+        );
+    }
+
+    #[test]
+    fn unprimed_source_contributes_silence_and_keeps_its_backlog() {
+        let sources = Rc::new(RefCell::new(vec![source(&[0.5; 8])]));
+        let mix = collect_mix(&sources, 16);
+        assert_eq!(mix, vec![0.0; 16]);
+        assert_eq!(sources.borrow()[0].buf.len(), 8);
+    }
+
+    #[test]
+    fn primed_source_passes_through_and_two_sum_to_a_clamp() {
+        let mut one = source(&[0.75; PLAYER_PREBUFFER_SAMPLES * 2]);
+        one.primed = true;
+        let sources = Rc::new(RefCell::new(vec![one]));
+        assert_eq!(collect_mix(&sources, 8), vec![0.75; 8]);
+        assert_eq!(
+            sources.borrow()[0].buf.len(),
+            PLAYER_PREBUFFER_SAMPLES * 2 - 8
+        );
+
+        let mut a = source(&[0.75; PLAYER_PREBUFFER_SAMPLES]);
+        a.primed = true;
+        let mut b = source(&[0.75; PLAYER_PREBUFFER_SAMPLES]);
+        b.primed = true;
+        let mixed = Rc::new(RefCell::new(vec![a, b]));
+        assert_eq!(collect_mix(&mixed, 4), vec![1.0; 4]);
+    }
+
+    #[test]
+    fn underrun_fills_the_tail_with_silence() {
+        let mut short = source(&[1.0, 1.0]);
+        short.primed = true;
+        let sources = Rc::new(RefCell::new(vec![short]));
+        assert_eq!(collect_mix(&sources, 4), vec![1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_source_primes_once_it_reaches_the_prebuffer() {
+        let sources = Rc::new(RefCell::new(vec![source(
+            &[0.25; PLAYER_PREBUFFER_SAMPLES - 4],
+        )]));
+        // Below the prebuffer: still filling, silence, backlog intact.
+        assert_eq!(collect_mix(&sources, 4), vec![0.0; 4]);
+        assert!(!sources.borrow()[0].primed);
+        assert_eq!(sources.borrow()[0].buf.len(), PLAYER_PREBUFFER_SAMPLES - 4);
+        // The next callback crosses the threshold; from then on it is a
+        // normal source.
+        sources.borrow_mut()[0].buf.extend([0.25; 8]);
+        assert_eq!(collect_mix(&sources, 4), vec![0.25; 4]);
+        assert!(sources.borrow()[0].primed);
     }
 }
