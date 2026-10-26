@@ -2457,6 +2457,7 @@ mod disconnect_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            presence_listen: "127.0.0.1:0".to_string(),
             video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -2528,6 +2529,7 @@ mod resume_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            presence_listen: "127.0.0.1:0".to_string(),
             video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -2593,6 +2595,7 @@ mod tofu_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            presence_listen: "127.0.0.1:0".to_string(),
             video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();

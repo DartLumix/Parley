@@ -14,10 +14,20 @@ services:
     image: ${PARLEY_IMAGE:-parley:latest}
     ports:
       - "${PARLEY_PORT:-4443}:4443/udp"
+      # Read-only JSON snapshot for a dashboard on this host
+      # (GET /api/presence). Published to loopback on purpose: it is not
+      # a public API. Set PARLEY_PRESENCE_BIND only if the caller cannot
+      # reach host loopback, and set a token when you do.
+      - "${PARLEY_PRESENCE_BIND:-127.0.0.1}:${PARLEY_PRESENCE_PORT:-4444}:4444/tcp"
     volumes:
       - parley-data:/data
     environment:
       PARLEY_ADMIN_PASSWORD: ${PARLEY_ADMIN_PASSWORD:-}
+      # The container's own interface, so the published port reaches it.
+      PARLEY_PRESENCE_LISTEN: 0.0.0.0:4444
+      # Optional bearer gate for /api/presence. Empty means localhost-only
+      # protection (the published bind above), which is the default.
+      PARLEY_PRESENCE_TOKEN: ${PARLEY_PRESENCE_TOKEN:-}
     restart: unless-stopped
 
 volumes:

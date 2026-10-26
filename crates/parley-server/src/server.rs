@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::db::{Db, DbHandle};
 use crate::error::Error;
 use crate::manage;
+use crate::presence::PresenceServer;
 use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
 use crate::transcode::{ReportAction, TranscodeManager};
@@ -31,6 +32,8 @@ pub struct Server {
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
     transcode: Arc<TranscodeManager>,
+    /// Read-only HTTP snapshot for a dashboard; `None` when disabled.
+    presence: Option<PresenceServer>,
 }
 
 impl Server {
@@ -92,6 +95,17 @@ impl Server {
             registry.clone(),
             voice.clone(),
         ));
+        // Bound here, not in `run`, so a taken port is a startup error
+        // rather than a listener that silently died in a task.
+        let presence = if config.presence_listen.trim().is_empty() {
+            None
+        } else {
+            let token = std::env::var("PARLEY_PRESENCE_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty());
+            Some(PresenceServer::bind(&config.presence_listen, token)?)
+        };
         Ok(Self {
             endpoint,
             fingerprint,
@@ -99,6 +113,7 @@ impl Server {
             registry,
             voice,
             transcode,
+            presence,
         })
     }
 
@@ -110,12 +125,34 @@ impl Server {
         &self.fingerprint
     }
 
-    pub async fn run(self) -> Result<(), Error> {
+    /// The presence endpoint's bound address, if it is enabled. Tests use
+    /// it with `presence_listen = "127.0.0.1:0"`.
+    pub fn presence_addr(&self) -> Option<SocketAddr> {
+        self.presence
+            .as_ref()
+            .and_then(|presence| presence.local_addr().ok())
+    }
+
+    pub async fn run(mut self) -> Result<(), Error> {
         info!(addr = %self.local_addr(), fingerprint = %self.fingerprint, "parley listening");
+        let presence = self.presence.take();
         // 6c: the db actor owns the Connection on a dedicated thread —
         // no Mutex, no lock poisoning, and blocking work (Argon2
         // verifies, WAL checkpoints) never touches a tokio worker.
         let db = DbHandle::spawn(self.db);
+        if let Some(presence) = presence {
+            if let Ok(addr) = presence.local_addr() {
+                info!(%addr, "presence endpoint listening");
+            }
+            let registry = self.registry.clone();
+            let voice = self.voice.clone();
+            let presence_db = db.clone();
+            tokio::spawn(async move {
+                if let Err(e) = presence.serve(presence_db, registry, voice).await {
+                    warn!(error = %e, "presence endpoint stopped");
+                }
+            });
+        }
         while let Some(incoming) = self.endpoint.accept().await {
             match incoming.await {
                 Ok(conn) => {

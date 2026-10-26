@@ -13,6 +13,11 @@ pub struct Config {
     pub listen: String,
     /// Directory for persistent state (cert, key, database).
     pub data_dir: PathBuf,
+    /// Read-only HTTP presence endpoint (`GET /api/presence`) for a
+    /// dashboard on the same host. Loopback by default; an empty string
+    /// disables it. The container sets 0.0.0.0 and compose publishes the
+    /// port to 127.0.0.1 on the host only.
+    pub presence_listen: String,
     /// Screen-share transcode policy. Off means the server stays a pure
     /// datagram relay.
     pub video: VideoConfig,
@@ -23,6 +28,7 @@ impl Default for Config {
         Self {
             listen: "0.0.0.0:4443".to_string(),
             data_dir: "data".into(),
+            presence_listen: "127.0.0.1:4444".to_string(),
             video: VideoConfig::default(),
         }
     }

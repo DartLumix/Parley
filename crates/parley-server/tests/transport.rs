@@ -244,6 +244,9 @@ fn setup_server_with_video(tag: &str, video: VideoConfig) -> (Config, Server) {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir(tag),
+        // Every test in this file binds its own presence port; `:0`
+        // keeps parallel servers from fighting over the default.
+        presence_listen: "127.0.0.1:0".to_string(),
         video,
     };
     std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -263,6 +266,7 @@ fn setup_server_with_roles(tag: &str) -> (Config, Server) {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir(tag),
+        presence_listen: "127.0.0.1:0".to_string(),
         video: VideoConfig::default(),
     };
     std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -409,6 +413,7 @@ async fn presence_shows_connected_users() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir("presence"),
+        presence_listen: "127.0.0.1:0".to_string(),
         video: Default::default(),
     };
     std::fs::create_dir_all(&config.data_dir).unwrap();
@@ -995,6 +1000,7 @@ async fn fingerprint_survives_restart() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         data_dir: test_dir("restart"),
+        presence_listen: "127.0.0.1:0".to_string(),
         video: Default::default(),
     };
 

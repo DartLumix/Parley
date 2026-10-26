@@ -6,6 +6,9 @@ services:
     build: .
     ports:
       - "${PARLEY_PORT:-4443}:4443/udp"  # host UDP port → container 4443
+      # Read-only presence API for a dashboard on this machine. Loopback
+      # on the host only; the container binds its own interface.
+      - "127.0.0.1:${PARLEY_PRESENCE_PORT:-4444}:4444/tcp"
     volumes:
       # The container runs as uid 65534. First time only:
       #   mkdir -p data && sudo chown 65534:65534 data
@@ -14,6 +17,7 @@ services:
       # First boot only: creates the admin account when the users table is
       # empty. Afterwards the variable is ignored — remove it from .env.
       - PARLEY_ADMIN_PASSWORD=${PARLEY_ADMIN_PASSWORD:-}
+      - PARLEY_PRESENCE_LISTEN=0.0.0.0:4444
     restart: unless-stopped
 
 # Accounts (no user-management RPC yet). While the container runs:

@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod manage;
+pub mod presence;
 pub mod server;
 pub mod session;
 pub mod tls;

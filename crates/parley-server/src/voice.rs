@@ -55,6 +55,12 @@ impl VoiceManager {
         self.sharing.lock().unwrap().remove(&user_id)
     }
 
+    /// Copy of the live-share set, for read-only observers such as the
+    /// HTTP presence snapshot. Callers must not hold this across awaits.
+    pub fn sharing_snapshot(&self) -> HashSet<u32> {
+        self.sharing.lock().unwrap().clone()
+    }
+
     pub fn channel_of(&self, user_id: u32) -> Option<u64> {
         self.members.lock().unwrap().get(&user_id).copied()
     }

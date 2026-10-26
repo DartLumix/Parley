@@ -14,7 +14,14 @@ use parley_server::{Config, Error, Server};
 
 fn config() -> Result<Config, Error> {
     let path = std::env::var("PARLEY_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
-    Config::load_or_default(std::path::Path::new(&path))
+    let mut config = Config::load_or_default(std::path::Path::new(&path))?;
+    // The container's `/config.toml` is baked. This lets compose bind the
+    // presence endpoint on the container interface without mounting a
+    // config file over the image's own.
+    if let Ok(listen) = std::env::var("PARLEY_PRESENCE_LISTEN") {
+        config.presence_listen = listen;
+    }
+    Ok(config)
 }
 
 fn add_user(args: &[String]) -> Result<(), Error> {

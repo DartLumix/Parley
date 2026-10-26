@@ -24,6 +24,13 @@ pub struct ClientHandle {
     pub session: u64,
 }
 
+/// One connected user's session facts, without its connection handles.
+pub struct OnlineUser {
+    pub id: u32,
+    pub username: String,
+    pub role: crate::db::UserRole,
+}
+
 #[derive(Default)]
 pub struct SessionRegistry {
     clients: Mutex<HashMap<u32, ClientHandle>>,
@@ -122,6 +129,22 @@ impl SessionRegistry {
             .unwrap()
             .iter()
             .map(|(id, h)| (*id, h.username.clone()))
+            .collect()
+    }
+
+    /// Connected users with their permission tier, for read-only
+    /// observers (the HTTP presence endpoint). A point-in-time copy:
+    /// sessions may change while the caller renders it.
+    pub fn roster(&self) -> Vec<OnlineUser> {
+        self.clients
+            .lock()
+            .unwrap()
+            .values()
+            .map(|h| OnlineUser {
+                id: h.user_id,
+                username: h.username.clone(),
+                role: h.role,
+            })
             .collect()
     }
 }

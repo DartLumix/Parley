@@ -3,6 +3,21 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.3] — 2026-10-26
+
+A read-only HTTP snapshot of the live server, for dashboards that run
+next to it.
+
+### Added
+
+- **Presence API for dashboards.** `GET /api/presence` on a separate
+  HTTP listener (default `127.0.0.1:4444`; the container publishes it to
+  host loopback only) returns every connected user with their voice
+  channel, mic mute, AFK text, share state and role, plus the flat
+  channel list. It is read-only and safe to poll every 5 s. An optional
+  `PARLEY_PRESENCE_TOKEN` adds a bearer gate. The QUIC port, the wire
+  protocol and both clients are unchanged.
+
 ## [0.4.2] — 2026-10-25
 
 The screen share carries the audio you pick, not your whole output, and

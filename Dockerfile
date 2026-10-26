@@ -39,7 +39,7 @@ RUN cargo chef cook -p parley-server --release --recipe-path recipe.json \
 COPY . .
 RUN cargo build --release -p parley-server --bin parley-server --bin parley-adduser \
     --target x86_64-unknown-linux-musl
-RUN printf 'listen = "0.0.0.0:4443"\ndata_dir = "/data"\n' > /config.toml \
+RUN printf 'listen = "0.0.0.0:4443"\ndata_dir = "/data"\npresence_listen = "0.0.0.0:4444"\n' > /config.toml \
     && mkdir -p /data && touch /data/.keep
 
 # ---- Stage 4: the image that actually ships ----
@@ -57,4 +57,6 @@ COPY --from=builder --chown=65534:65534 /data /data
 USER 65534:65534
 ENV PARLEY_CONFIG=/config.toml
 EXPOSE 4443/udp
+# Read-only presence API for a dashboard; compose publishes it to loopback.
+EXPOSE 4444/tcp
 ENTRYPOINT ["/parley-server"]

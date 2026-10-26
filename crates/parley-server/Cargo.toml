@@ -16,6 +16,7 @@ tracing-subscriber.workspace = true
 sha2.workspace = true
 hex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 parley-core = { workspace = true, features = ["video"] }
 rusqlite.workspace = true

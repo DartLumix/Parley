@@ -112,7 +112,123 @@ change these values:
       - ./config.toml:/config.toml:ro
 ```
 
-## 5. Verify from outside
+A mounted config overrides the image's baked one; `PARLEY_PRESENCE_LISTEN`
+in the environment still wins, so the presence endpoint keeps working
+(see below).
+
+## 5. Read-only presence API (dashboards)
+
+Port 4443 is **QUIC over UDP**, not HTTP — `curl` and browsers cannot
+speak to it, and container logs are not an interface. For a dashboard on
+the same host the server also runs a deliberately small HTTP listener:
+
+- `GET /api/presence` (query strings are ignored; other methods get
+  `405`, other paths `404`).
+- Default bind `127.0.0.1:4444` (`presence_listen` in `config.toml`; an
+  empty value disables it).
+- In the container it binds `0.0.0.0:4444` and compose publishes it to
+  `127.0.0.1:4444` on the host, so it is not internet-reachable.
+- Optional auth: when `PARLEY_PRESENCE_TOKEN` is set, the request must
+  carry `Authorization: Bearer <token>` (`401` otherwise). Without the
+  variable, loopback access is the only gate.
+
+It is read-only by construction (no handler path writes anything) and
+cheap to poll every 5 s: one indexed SQLite `SELECT` for the channel
+list plus short in-memory reads of the session and voice tables. The
+response is `Cache-Control: no-store` and carries no CORS headers — a
+browser page on another origin must call it through its own backend.
+
+```sh
+curl -s http://127.0.0.1:4444/api/presence | jq .
+# with a token:
+curl -s -H "Authorization: Bearer $PARLEY_PRESENCE_TOKEN" \
+     http://127.0.0.1:4444/api/presence
+```
+
+### Snapshot contract
+
+One object with three keys. Channel and user ids are the stable SQLite
+primary keys, prefixed (`ch-1`, `u-7`); they survive reconnects and
+restarts.
+
+| field | type | notes |
+|:--|:--|:--|
+| `server.name` | string | always `"Parley"` |
+| `server.user_count` | number | connected accounts, not connections |
+| `channels[].id` | string | `ch-<id>` |
+| `channels[].name` | string | |
+| `channels[].parent_id` | null | always null: Parley has no channel tree |
+| `channels[].position` | number | 0-based; the array is already in order |
+| `channels[].type` | string | always `"voice"`: every channel is voice + chat |
+| `channels[].user_limit` | number | always `0` (no limit) |
+| `channels[].mode` | string | `"speech"` or `"music"` (Parley extension) |
+| `users[].id` | string | `u-<id>` |
+| `users[].display_name` | string | same as `username`; there is no separate display name |
+| `users[].username` | string | |
+| `users[].avatar_url` | null | Parley has no avatars |
+| `users[].channel_id` | string \| null | voice channel; `null` = online, not in a channel |
+| `users[].muted` | bool | self-muted microphone, announced by the client |
+| `users[].deafened` | bool | always `false` (see below) |
+| `users[].afk` | bool | same as `afk_message != null` |
+| `users[].afk_message` | string \| null | away text, trimmed, at most 120 chars |
+| `users[].screen_sharing` | bool | live share in their current channel |
+| `users[].is_bot` | bool | always `false`; Parley has no bots |
+| `users[].role` | string | `user`, `mod` or `admin` (Parley extension) |
+
+Semantics to encode in the UI:
+
+- **Only connected users appear**, ordered by user id; a disconnect
+  removes the row. `channel_id: null` means authenticated but not in a
+  voice channel — there is no separate `online` flag and no offline rows.
+- **Channels are flat.** No categories, so `parent_id` is always null and
+  everything renders at depth 0. There are no text-only channels: every
+  channel carries chat and voice, hence `type` is always `"voice"`.
+- **Muted is self-mute.** The server never mutes anyone. **Deafen is not
+  observable**: the app's mute-all switch acts on the local mixer only
+  and is never sent, so `deafened` is a contract placeholder that never
+  becomes true. Do not light a deafen badge from it.
+- **AFK is a status, not a channel.** Any connected user can set the away
+  text; it survives channel switches and is cleared on sign-out. It is
+  free text, nullable.
+- **Screen sharing is per user**, not per channel — true for a user with a
+  live share, cleared on stop, leave or disconnect. There is no stream
+  title or viewer count.
+- **One voice channel per user.** A second login for the same account
+  replaces the first session, so an account appears at most once.
+- **No hidden or locked channels/users**: everything listed is visible to
+  every authenticated client.
+
+```json
+{
+  "server": { "name": "Parley", "user_count": 3 },
+  "channels": [
+    { "id": "ch-1", "name": "Lobby", "parent_id": null, "position": 0,
+      "type": "voice", "user_limit": 0, "mode": "speech" },
+    { "id": "ch-2", "name": "Music", "parent_id": null, "position": 1,
+      "type": "voice", "user_limit": 0, "mode": "music" }
+  ],
+  "users": [
+    { "id": "u-1", "display_name": "alice", "username": "alice",
+      "avatar_url": null, "channel_id": null, "muted": false,
+      "deafened": false, "afk": true, "afk_message": "Coming back later…",
+      "screen_sharing": false, "is_bot": false, "role": "admin" },
+    { "id": "u-2", "display_name": "bob", "username": "bob",
+      "avatar_url": null, "channel_id": "ch-1", "muted": true,
+      "deafened": false, "afk": false, "afk_message": null,
+      "screen_sharing": false, "is_bot": false, "role": "user" },
+    { "id": "u-3", "display_name": "carol", "username": "carol",
+      "avatar_url": null, "channel_id": "ch-2", "muted": false,
+      "deafened": false, "afk": true, "afk_message": "Back in 10",
+      "screen_sharing": true, "is_bot": false, "role": "mod" }
+  ]
+}
+```
+
+This is a server-only feature: no client or protocol change. It ships in
+the server image; `docker compose up -d` after loading the new image (or
+`cargo run -p parley-server` from a checkout).
+
+## 6. Verify from outside
 
 Download `parley-cli-<version>-linux-x86_64.tar.gz` on any machine, or
 use a checkout (`tools/vps-check.sh`):
@@ -127,7 +243,7 @@ tar xf parley-cli-<version>-linux-x86_64.tar.gz
 `--check` does QUIC + TLS + TOFU + password auth + channel list and
 exits 0. It opens no audio or video devices, so it works on any machine.
 
-## 6. Hand the client to the team
+## 7. Hand the client to the team
 
 Download `parley-<version>-linux-x86_64.tar.gz` on each machine:
 
