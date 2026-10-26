@@ -16,8 +16,8 @@ pub use pb::{
     AddUser, AuthDenied, AuthOk, AuthRequest, Channel, ChannelList, ChannelMode, ChatMessage,
     ClientMessage, CreateChannel, DeleteChannel, FetchHistory, Heartbeat, HeartbeatAck, Hello,
     HelloAck, HistoryResult, JoinVoice, KickUser, LeaveVoice, ListChannels, ManageRequest,
-    ManageResult, ManageState, ManageStateRequest, ManagedChannel, ManagedUser, PresenceList,
-    PresenceRequest, PresenceUser, ReceiverReport, RemoveUser, Role, SendChat, ServerMessage,
-    SetMute, SetStatus, ShareStopped, StopShare, UpdateChannel, UpdateUser, VideoReport,
-    VoiceState, VoiceStateList, VoiceStatesRequest,
+    ManageResult, ManageState, ManageStateRequest, ManagedChannel, ManagedUser, PinMessage,
+    PresenceList, PresenceRequest, PresenceUser, ReceiverReport, RemoveUser, Role, SendChat,
+    ServerMessage, SetMute, SetStatus, ShareStopped, StopShare, UpdateChannel, UpdateUser,
+    VideoReport, VoiceState, VoiceStateList, VoiceStatesRequest,
 };

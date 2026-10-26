@@ -43,6 +43,14 @@ impl Server {
         let db = Db::open(&config.data_dir.join("parley.db"))?;
         db.bootstrap_admin()?;
         db.purge_stale_sessions()?;
+        // Expired ephemeral chat is also filtered on read; sweeping at
+        // boot keeps the file from carrying yesterday's rows until the
+        // first periodic pass.
+        if let Ok(removed) = db.purge_expired_messages()
+            && removed > 0
+        {
+            info!(removed, "purged expired chat messages");
+        }
 
         let (identity, _new) = tls::load_or_generate(&config.data_dir)?;
         let fingerprint = tls::fingerprint(&identity.cert);
@@ -140,6 +148,23 @@ impl Server {
         // no Mutex, no lock poisoning, and blocking work (Argon2
         // verifies, WAL checkpoints) never touches a tokio worker.
         let db = DbHandle::spawn(self.db);
+        // Ephemeral chat: one sweep every ten minutes. Read-time
+        // filtering makes the exact cadence invisible to clients.
+        {
+            let purge_db = db.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+                tick.tick().await; // the first tick fires immediately
+                loop {
+                    tick.tick().await;
+                    match purge_db.purge_expired_messages().await {
+                        Ok(0) => {}
+                        Ok(n) => info!(removed = n, "purged expired chat messages"),
+                        Err(e) => warn!(error = %e, "chat purge failed"),
+                    }
+                }
+            });
+        }
         if let Some(presence) = presence {
             if let Ok(addr) = presence.local_addr() {
                 info!(%addr, "presence endpoint listening");
@@ -429,7 +454,7 @@ async fn handle_client_message(
                     body: Some(ServerBody::ChannelList(ChannelList {
                         channels: channels
                             .into_iter()
-                            .map(|(id, name, music)| PbChannel {
+                            .map(|(id, name, music, ephemeral)| PbChannel {
                                 id,
                                 name,
                                 mode: if music {
@@ -437,6 +462,7 @@ async fn handle_client_message(
                                 } else {
                                     ChannelMode::Speech as i32
                                 },
+                                ephemeral,
                             })
                             .collect(),
                     })),
@@ -459,6 +485,7 @@ async fn handle_client_message(
                     username: info.username.clone(),
                     text,
                     timestamp_ms: ts,
+                    pinned: false,
                 })),
             });
         }
@@ -474,21 +501,40 @@ async fn handle_client_message(
                     body: Some(ServerBody::HistoryResult(parley_proto::HistoryResult {
                         messages: rows
                             .into_iter()
-                            .map(
-                                |(id, user_id, username, text, ts)| parley_proto::ChatMessage {
-                                    message_id: id,
-                                    channel_id: fetch.channel_id,
-                                    user_id,
-                                    username,
-                                    text,
-                                    timestamp_ms: ts,
-                                },
-                            )
+                            .map(|m| parley_proto::ChatMessage {
+                                message_id: m.id,
+                                channel_id: m.channel_id,
+                                user_id: m.user_id,
+                                username: m.username,
+                                text: m.text,
+                                timestamp_ms: m.timestamp_ms,
+                                pinned: m.pinned,
+                            })
                             .collect(),
                     })),
                 },
             )
             .await?;
+        }
+
+        Some(ClientBody::PinMessage(pin)) => {
+            // A pin is a chat update, not a new message: the row keeps
+            // its id and text so every open client can replace it in
+            // place. Any authenticated user may pin; the server has no
+            // per-message ownership to enforce (the author may be gone).
+            if let Some(m) = db.set_message_pinned(pin.message_id, pin.pinned).await? {
+                registry.broadcast(ServerMessage {
+                    body: Some(ServerBody::ChatMessage(parley_proto::ChatMessage {
+                        message_id: m.id,
+                        channel_id: m.channel_id,
+                        user_id: m.user_id,
+                        username: m.username,
+                        text: m.text,
+                        timestamp_ms: m.timestamp_ms,
+                        pinned: m.pinned,
+                    })),
+                });
+            }
         }
 
         Some(ClientBody::JoinVoice(j)) => {

@@ -142,7 +142,7 @@ async fn chat_broadcast_and_history() {
     // Two sessions: sender and listener
     let (conn_a, mut tx_a, mut rx_a) =
         connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
-    let (conn_b, _tx_b, mut rx_b) =
+    let (conn_b, mut tx_b, mut rx_b) =
         connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
 
     // Both get the broadcast; skip any non-chat messages (none expected yet)
@@ -157,14 +157,16 @@ async fn chat_broadcast_and_history() {
 
     // alice reads broadcast
     let msg = read_server_msg(&mut rx_a).await;
-    match msg.body {
+    let chat_id = match msg.body {
         Some(parley_proto::ServerBody::ChatMessage(m)) => {
             assert_eq!(m.text, "hello world");
             assert_eq!(m.channel_id, 1);
             assert!(m.message_id > 0);
+            assert!(!m.pinned);
+            m.message_id
         }
         _ => panic!("expected chat message"),
-    }
+    };
     // bob reads broadcast
     let msg = read_server_msg(&mut rx_b).await;
     match msg.body {
@@ -190,6 +192,47 @@ async fn chat_broadcast_and_history() {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.messages[0].text, "hello world");
             assert_eq!(h.messages[0].username, "testuser");
+            assert!(!h.messages[0].pinned);
+        }
+        _ => panic!("expected history result"),
+    }
+
+    // Bob pins alice's message: the row is broadcast (not appended) with
+    // the same id and the new flag, to every session.
+    send_client_msg(
+        &mut tx_b,
+        parley_proto::ClientBody::PinMessage(parley_proto::PinMessage {
+            message_id: chat_id,
+            pinned: true,
+        }),
+    )
+    .await;
+    for rx in [&mut rx_a, &mut rx_b] {
+        let msg = read_server_msg(rx).await;
+        match msg.body {
+            Some(parley_proto::ServerBody::ChatMessage(m)) => {
+                assert_eq!(m.message_id, chat_id);
+                assert_eq!(m.text, "hello world");
+                assert!(m.pinned);
+            }
+            _ => panic!("expected the pin broadcast"),
+        }
+    }
+
+    send_client_msg(
+        &mut tx_a,
+        parley_proto::ClientBody::FetchHistory(FetchHistory {
+            channel_id: 1,
+            limit: 50,
+            before_message_id: 0,
+        }),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_a).await;
+    match msg.body {
+        Some(parley_proto::ServerBody::HistoryResult(h)) => {
+            assert_eq!(h.messages.len(), 1);
+            assert!(h.messages[0].pinned);
         }
         _ => panic!("expected history result"),
     }
@@ -309,7 +352,7 @@ async fn read_manage_result(rx: &mut quinn::RecvStream) -> ManageResult {
 /// concurrent writer). Returns its id.
 fn add_channel(config: &Config, name: &str, music: bool) -> u64 {
     let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
-    let id = db.create_channel(name, music).unwrap();
+    let id = db.create_channel(name, music, true).unwrap();
     drop(db);
     id
 }
@@ -654,6 +697,7 @@ async fn admin_manages_users_and_channels() {
         ManageAction::CreateChannel(CreateChannel {
             name: "gaming".to_string(),
             mode: ChannelMode::Music as i32,
+            ephemeral: Some(true),
         }),
     )
     .await;
@@ -670,6 +714,7 @@ async fn admin_manages_users_and_channels() {
             channel_id: gaming_id,
             name: "arcade".to_string(),
             mode: ChannelMode::Speech as i32,
+            ephemeral: None,
         }),
     )
     .await;
@@ -2268,7 +2313,7 @@ async fn restart_persistence_end_to_end() {
     // A music channel must survive the restart with its mode.
     {
         let db = parley_server::db::Db::open(&config.data_dir.join("parley.db")).unwrap();
-        let _music_id = db.create_channel("stage", true).unwrap();
+        let _music_id = db.create_channel("stage", true, true).unwrap();
         drop(db);
     }
     let addr = server.local_addr();

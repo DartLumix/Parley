@@ -10,6 +10,16 @@ next to it.
 
 ### Added
 
+- **Disappearing chat.** Every channel is ephemeral by default: an
+  unpinned message is gone 24 hours after it was sent, both on read and
+  in the periodic sweep. **Server management → Channels** has a
+  *Disappearing chat* switch (mods and admins) to keep a channel's
+  history forever. A pushpin on any chat row pins it past the expiry;
+  the pin is a `ChatMessage` update with the same id (`PinMessage` on
+  the wire), so every open client replaces the row in place.
+- **Chat timestamps and copy.** Each row shows the local date and time
+  (the year only when it is not the current one), and the conversation
+  is selectable and copyable.
 - **Presence API for dashboards.** `GET /api/presence` on a separate
   HTTP listener (default `127.0.0.1:4444`; the container publishes it to
   host loopback only) returns every connected user with their voice

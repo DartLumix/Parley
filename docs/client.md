@@ -67,7 +67,11 @@ same trust decision.
   column, 420 px at the default window size), screens and chat sit on the
   right. A screen share opens above the chat and pushes it down.
 - **Chat** — the chat panel belongs to the joined channel; history
-  loads on join.
+  loads on join. Each row carries the local date and time it was sent
+  and the text is selectable/copyable. Channels are ephemeral by
+  default: unpinned messages vanish after 24 hours. The pushpin on a row
+  pins it (and unpins it) so it survives; mods and admins can turn
+  disappearing chat off per channel in **Server management → Channels**.
 - **Stays signed in** — closing the window is not signing out: the app
   keeps the server-issued session token in
   `~/.config/parley/session.toml` (owner-only, never the password) and

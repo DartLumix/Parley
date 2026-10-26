@@ -42,6 +42,22 @@ bool isVoiceMembershipCue({
   return isMine != wasMine;
 }
 
+/// The chat row's stamp: local date and time, `dd/mm HH:MM`. The year is
+/// added only for a message from another year, so today's chat stays
+/// compact while an old pinned message is still unambiguous.
+String chatStamp(DateTime when, {DateTime? now}) {
+  final local = when.toLocal();
+  final today = (now ?? DateTime.now()).toLocal();
+  final day = local.day.toString().padLeft(2, '0');
+  final month = local.month.toString().padLeft(2, '0');
+  final hour = local.hour.toString().padLeft(2, '0');
+  final minute = local.minute.toString().padLeft(2, '0');
+  final date = '$day/$month';
+  return local.year == today.year
+      ? '$date $hour:$minute'
+      : '${local.year}-$date $hour:$minute';
+}
+
 /// The clamp bounds for the left column (channels + rosters).
 ///
 /// The column is measured to fit its longest name, but a name fits in a
@@ -1148,12 +1164,41 @@ class _HomePageState extends State<HomePage> {
     final clean = rows.where((m) => !_isHarnessNoise(m.text)).toList();
     if (clean.isEmpty) return;
     setState(() {
+      // A pin flip arrives as a ChatMessage with an existing id: replace
+      // that row in place instead of appending a duplicate.
+      final indexById = {
+        for (var i = 0; i < _chat.length; i++) _chat[i].messageId: i,
+      };
+      final fresh = <ChatEntry>[];
+      final seen = <BigInt>{};
+      for (final m in clean) {
+        final at = indexById[m.messageId];
+        if (at != null) {
+          _chat[at] = m;
+        } else if (seen.add(m.messageId)) {
+          fresh.add(m);
+        }
+      }
+      if (fresh.isEmpty) return;
       if (prepend) {
-        _chat.insertAll(0, clean);
+        _chat.insertAll(0, fresh);
       } else {
-        _chat.addAll(clean);
+        _chat.addAll(fresh);
       }
     });
+  }
+
+  Future<void> _togglePin(ChatEntry message) async {
+    if (_session == null) return;
+    try {
+      pinMessage(
+        sessionId: _session!.sessionId,
+        messageId: message.messageId,
+        pinned: !message.pinned,
+      );
+    } catch (e) {
+      setState(() => _status = 'pin failed: $e');
+    }
   }
 
   void _onEvent(SessionEvent ev) {
@@ -1980,35 +2025,87 @@ class _HomePageState extends State<HomePage> {
                       style: TextStyle(color: Colors.white38),
                     ),
                   )
-                : ListView.builder(
-                    controller: _chatScroll,
-                    padding: const EdgeInsets.all(10),
-                    itemCount: _chat.length,
-                    itemBuilder: (_, i) {
-                      final m = _chat[i];
-                      final own = m.userId == _session!.userId;
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 2),
-                        child: Text.rich(
-                          TextSpan(
-                            style: const TextStyle(fontSize: 13),
+                : SelectionArea(
+                    child: ListView.builder(
+                      controller: _chatScroll,
+                      padding: const EdgeInsets.all(10),
+                      itemCount: _chat.length,
+                      itemBuilder: (_, i) {
+                        final m = _chat[i];
+                        final own = m.userId == _session!.userId;
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              TextSpan(
-                                text: '${m.username}: ',
-                                style: TextStyle(
-                                  color: own ? accentSoft : Colors.white70,
-                                  fontWeight: FontWeight.bold,
+                              if (m.pinned)
+                                const Padding(
+                                  padding: EdgeInsets.only(top: 3, right: 4),
+                                  child: Tooltip(
+                                    message: 'Pinned — kept after 24 h',
+                                    child: Icon(
+                                      Icons.push_pin,
+                                      size: 13,
+                                      color: accentSoft,
+                                    ),
+                                  ),
+                                ),
+                              Expanded(
+                                child: Text.rich(
+                                  TextSpan(
+                                    style: const TextStyle(fontSize: 13),
+                                    children: [
+                                      TextSpan(
+                                        text: '${m.username} ',
+                                        style: TextStyle(
+                                          color: own
+                                              ? accentSoft
+                                              : Colors.white70,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      TextSpan(
+                                        text:
+                                            '${chatStamp(DateTime.fromMillisecondsSinceEpoch(m.timestampMs.toInt()))}  ',
+                                        style: const TextStyle(
+                                          color: Colors.white38,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                      TextSpan(
+                                        text: m.text,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
-                              TextSpan(
-                                text: m.text,
-                                style: const TextStyle(color: Colors.white),
+                              IconButton(
+                                onPressed: () => _togglePin(m),
+                                tooltip: m.pinned
+                                    ? 'Unpin (it will expire again)'
+                                    : 'Pin — keep after 24 h',
+                                visualDensity: VisualDensity.compact,
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(
+                                  minWidth: 26,
+                                  minHeight: 26,
+                                ),
+                                icon: Icon(
+                                  m.pinned
+                                      ? Icons.push_pin
+                                      : Icons.push_pin_outlined,
+                                  size: 14,
+                                  color: Colors.white38,
+                                ),
                               ),
                             ],
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
+                    ),
                   ),
           ),
           if (_joinedChannelId != null) ...[

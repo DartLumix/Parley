@@ -335,7 +335,7 @@ pub(crate) struct RosterEntry {
 /// Render the contract. Users are ordered by id so repeated polls of an
 /// unchanged server produce identical bytes (dashboards may diff them).
 fn render(
-    channels: &[(u64, String, bool)],
+    channels: &[(u64, String, bool, bool)],
     mut roster: Vec<RosterEntry>,
 ) -> Result<String, serde_json::Error> {
     roster.sort_by_key(|user| user.id);
@@ -347,7 +347,7 @@ fn render(
         channels: channels
             .iter()
             .enumerate()
-            .map(|(position, (id, name, music))| ChannelEntry {
+            .map(|(position, (id, name, music, _ephemeral))| ChannelEntry {
                 id: channel_key(*id),
                 name: name.clone(),
                 // Parley has no channel tree: one flat list, no categories.
@@ -440,8 +440,8 @@ mod tests {
     #[test]
     fn render_matches_the_dashboard_contract() {
         let channels = vec![
-            (1, "Lobby".to_string(), false),
-            (2, "Music".to_string(), true),
+            (1, "Lobby".to_string(), false, true),
+            (2, "Music".to_string(), true, false),
         ];
         let roster = vec![
             RosterEntry {

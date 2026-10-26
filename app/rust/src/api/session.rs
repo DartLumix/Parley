@@ -58,9 +58,9 @@ use parley_proto::VideoReport;
 use parley_proto::{
     AddUser, AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage,
     CreateChannel, DeleteChannel, FetchHistory, Heartbeat, Hello, HelloAck, JoinVoice, KickUser,
-    LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PresenceRequest, RemoveUser, Role,
-    SendChat, ServerBody, ServerMessage, SetMute, SetStatus, UpdateChannel, UpdateUser,
-    VoiceStatesRequest, PROTOCOL_VERSION,
+    LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PinMessage, PresenceRequest,
+    RemoveUser, Role, SendChat, ServerBody, ServerMessage, SetMute, SetStatus, UpdateChannel,
+    UpdateUser, VoiceStatesRequest, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -197,11 +197,19 @@ pub(crate) enum Command {
     ManageCreateChannel {
         name: String,
         mode: String,
+        ephemeral: bool,
     },
     ManageUpdateChannel {
         channel_id: u64,
         name: String,
         mode: String,
+        ephemeral: bool,
+    },
+    /// Pin or unpin one message (answer: a `chat` event carrying the same
+    /// id and the new flag).
+    PinMessage {
+        message_id: u64,
+        pinned: bool,
     },
     ManageDeleteChannel {
         channel_id: u64,
@@ -301,23 +309,33 @@ impl Command {
             Command::ManageRemoveUser { user_id } => ClientBody::Manage(ManageRequest {
                 action: Some(ManageAction::RemoveUser(RemoveUser { user_id })),
             }),
-            Command::ManageCreateChannel { name, mode } => ClientBody::Manage(ManageRequest {
+            Command::ManageCreateChannel {
+                name,
+                mode,
+                ephemeral,
+            } => ClientBody::Manage(ManageRequest {
                 action: Some(ManageAction::CreateChannel(CreateChannel {
                     name,
                     mode: mode_code(&mode),
+                    ephemeral: Some(ephemeral),
                 })),
             }),
             Command::ManageUpdateChannel {
                 channel_id,
                 name,
                 mode,
+                ephemeral,
             } => ClientBody::Manage(ManageRequest {
                 action: Some(ManageAction::UpdateChannel(UpdateChannel {
                     channel_id,
                     name,
                     mode: mode_code(&mode),
+                    ephemeral: Some(ephemeral),
                 })),
             }),
+            Command::PinMessage { message_id, pinned } => {
+                ClientBody::PinMessage(PinMessage { message_id, pinned })
+            }
             Command::ManageDeleteChannel { channel_id } => ClientBody::Manage(ManageRequest {
                 action: Some(ManageAction::DeleteChannel(DeleteChannel { channel_id })),
             }),
@@ -424,6 +442,8 @@ pub struct ChannelInfo {
     /// "speech" | "music" (ChannelMode mapped to a string: plain types
     /// only across the bridge).
     pub mode: String,
+    /// Chat in this channel drops after 24 h unless pinned.
+    pub ephemeral: bool,
 }
 
 /// One row of a presence listing.
@@ -442,6 +462,8 @@ pub struct ChatEntry {
     pub username: String,
     pub text: String,
     pub timestamp_ms: u64,
+    /// Pinned rows survive the 24-hour ephemeral expiry.
+    pub pinned: bool,
 }
 
 /// One voice-state snapshot row.
@@ -477,6 +499,8 @@ pub struct ManagedChannelInfo {
     /// "speech" | "music"
     pub mode: String,
     pub members: u32,
+    /// Disappearing chat is on (the default).
+    pub ephemeral: bool,
 }
 
 /// A full management snapshot. The page replaces its tables with this on
@@ -729,6 +753,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                         ChannelMode::Speech => "speech",
                     }
                     .to_string(),
+                    ephemeral: c.ephemeral,
                 })
                 .collect();
             vec![e]
@@ -757,6 +782,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 username: m.username.clone(),
                 text: m.text.clone(),
                 timestamp_ms: m.timestamp_ms,
+                pinned: m.pinned,
             });
             vec![e]
         }
@@ -773,6 +799,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                     username: m.username.clone(),
                     text: m.text.clone(),
                     timestamp_ms: m.timestamp_ms,
+                    pinned: m.pinned,
                 })
                 .collect();
             vec![e]
@@ -991,6 +1018,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                             }
                             .to_string(),
                             members: c.members,
+                            ephemeral: c.ephemeral,
                         })
                         .collect(),
                 });
@@ -1633,6 +1661,11 @@ pub fn send_chat(session_id: u32, channel_id: u64, text: String) -> Result<(), S
     send_command(session_id, Command::SendChat { channel_id, text })
 }
 
+/// Pin or unpin a message (response: a "chat" event with the same id).
+pub fn pin_message(session_id: u32, message_id: u64, pinned: bool) -> Result<(), String> {
+    send_command(session_id, Command::PinMessage { message_id, pinned })
+}
+
 /// Fetch chat history (response: "history" event, newest-last).
 pub fn fetch_history(
     session_id: u32,
@@ -1711,8 +1744,20 @@ pub fn manage_remove_user(session_id: u32, user_id: u32) -> Result<(), String> {
     send_command(session_id, Command::ManageRemoveUser { user_id })
 }
 
-pub fn manage_create_channel(session_id: u32, name: String, mode: String) -> Result<(), String> {
-    send_command(session_id, Command::ManageCreateChannel { name, mode })
+pub fn manage_create_channel(
+    session_id: u32,
+    name: String,
+    mode: String,
+    ephemeral: bool,
+) -> Result<(), String> {
+    send_command(
+        session_id,
+        Command::ManageCreateChannel {
+            name,
+            mode,
+            ephemeral,
+        },
+    )
 }
 
 pub fn manage_update_channel(
@@ -1720,6 +1765,7 @@ pub fn manage_update_channel(
     channel_id: u64,
     name: String,
     mode: String,
+    ephemeral: bool,
 ) -> Result<(), String> {
     send_command(
         session_id,
@@ -1727,6 +1773,7 @@ pub fn manage_update_channel(
             channel_id,
             name,
             mode,
+            ephemeral,
         },
     )
 }
@@ -2333,6 +2380,7 @@ mod manage_event_tests {
                         name: "general".to_string(),
                         mode: ChannelMode::Music as i32,
                         members: 1,
+                        ephemeral: true,
                     }],
                 }),
             })),

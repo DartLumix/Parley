@@ -57,12 +57,14 @@ void main() {
         name: 'general',
         mode: 'speech',
         members: 2,
+        ephemeral: true,
       ),
       ManagedChannelInfo(
         id: BigInt.from(6),
         name: 'jam',
         mode: 'music',
         members: 0,
+        ephemeral: false,
       ),
     ],
   );

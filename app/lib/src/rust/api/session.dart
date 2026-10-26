@@ -162,6 +162,17 @@ Future<void> sendChat({
   text: text,
 );
 
+/// Pin or unpin a message (response: a "chat" event with the same id).
+Future<void> pinMessage({
+  required int sessionId,
+  required BigInt messageId,
+  required bool pinned,
+}) => RustLib.instance.api.crateApiSessionPinMessage(
+  sessionId: sessionId,
+  messageId: messageId,
+  pinned: pinned,
+);
+
 /// Fetch chat history (response: "history" event, newest-last).
 Future<void> fetchHistory({
   required int sessionId,
@@ -231,10 +242,12 @@ Future<void> manageCreateChannel({
   required int sessionId,
   required String name,
   required String mode,
+  required bool ephemeral,
 }) => RustLib.instance.api.crateApiSessionManageCreateChannel(
   sessionId: sessionId,
   name: name,
   mode: mode,
+  ephemeral: ephemeral,
 );
 
 Future<void> manageUpdateChannel({
@@ -242,11 +255,13 @@ Future<void> manageUpdateChannel({
   required BigInt channelId,
   required String name,
   required String mode,
+  required bool ephemeral,
 }) => RustLib.instance.api.crateApiSessionManageUpdateChannel(
   sessionId: sessionId,
   channelId: channelId,
   name: name,
   mode: mode,
+  ephemeral: ephemeral,
 );
 
 Future<void> manageDeleteChannel({
@@ -383,10 +398,19 @@ class ChannelInfo {
   /// only across the bridge).
   final String mode;
 
-  const ChannelInfo({required this.id, required this.name, required this.mode});
+  /// Chat in this channel drops after 24 h unless pinned.
+  final bool ephemeral;
+
+  const ChannelInfo({
+    required this.id,
+    required this.name,
+    required this.mode,
+    required this.ephemeral,
+  });
 
   @override
-  int get hashCode => id.hashCode ^ name.hashCode ^ mode.hashCode;
+  int get hashCode =>
+      id.hashCode ^ name.hashCode ^ mode.hashCode ^ ephemeral.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -395,7 +419,8 @@ class ChannelInfo {
           runtimeType == other.runtimeType &&
           id == other.id &&
           name == other.name &&
-          mode == other.mode;
+          mode == other.mode &&
+          ephemeral == other.ephemeral;
 }
 
 /// One chat row (live or history).
@@ -407,6 +432,9 @@ class ChatEntry {
   final String text;
   final BigInt timestampMs;
 
+  /// Pinned rows survive the 24-hour ephemeral expiry.
+  final bool pinned;
+
   const ChatEntry({
     required this.messageId,
     required this.channelId,
@@ -414,6 +442,7 @@ class ChatEntry {
     required this.username,
     required this.text,
     required this.timestampMs,
+    required this.pinned,
   });
 
   @override
@@ -423,7 +452,8 @@ class ChatEntry {
       userId.hashCode ^
       username.hashCode ^
       text.hashCode ^
-      timestampMs.hashCode;
+      timestampMs.hashCode ^
+      pinned.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -435,7 +465,8 @@ class ChatEntry {
           userId == other.userId &&
           username == other.username &&
           text == other.text &&
-          timestampMs == other.timestampMs;
+          timestampMs == other.timestampMs &&
+          pinned == other.pinned;
 }
 
 /// A full management snapshot. The page replaces its tables with this on
@@ -467,16 +498,24 @@ class ManagedChannelInfo {
   final String mode;
   final int members;
 
+  /// Disappearing chat is on (the default).
+  final bool ephemeral;
+
   const ManagedChannelInfo({
     required this.id,
     required this.name,
     required this.mode,
     required this.members,
+    required this.ephemeral,
   });
 
   @override
   int get hashCode =>
-      id.hashCode ^ name.hashCode ^ mode.hashCode ^ members.hashCode;
+      id.hashCode ^
+      name.hashCode ^
+      mode.hashCode ^
+      members.hashCode ^
+      ephemeral.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -486,7 +525,8 @@ class ManagedChannelInfo {
           id == other.id &&
           name == other.name &&
           mode == other.mode &&
-          members == other.members;
+          members == other.members &&
+          ephemeral == other.ephemeral;
 }
 
 /// One row of the management users table.

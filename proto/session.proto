@@ -41,6 +41,9 @@ message Channel {
   uint64 id = 1;
   string name = 2;
   ChannelMode mode = 3;
+  // Chat in this channel drops after 24 hours unless a message is pinned.
+  // On by default; mods and admins can turn it off per channel.
+  bool ephemeral = 4;
 }
 
 message ListChannels {}
@@ -61,6 +64,17 @@ message ChatMessage {
   string username = 4;
   string text = 5;
   uint64 timestamp_ms = 6;
+  // Pinned messages survive the 24-hour expiry. A pin flip is broadcast
+  // as a ChatMessage with the same id and the new flag; clients update
+  // the row in place.
+  bool pinned = 7;
+}
+
+// Client -> server: pin or unpin one message (answer: a ChatMessage
+// broadcast carrying the new flag).
+message PinMessage {
+  uint64 message_id = 1;
+  bool pinned = 2;
 }
 
 message FetchHistory {
@@ -166,6 +180,7 @@ message ManagedChannel {
   string name = 2;
   ChannelMode mode = 3;
   uint32 members = 4;
+  bool ephemeral = 5;
 }
 
 message ManageState {
@@ -197,6 +212,8 @@ message RemoveUser {
 message CreateChannel {
   string name = 1;
   ChannelMode mode = 2;
+  // Unset means the default: ephemeral on.
+  optional bool ephemeral = 3;
 }
 
 message UpdateChannel {
@@ -204,6 +221,9 @@ message UpdateChannel {
   // Empty means unchanged.
   string name = 2;
   ChannelMode mode = 3;
+  // Unset means unchanged, so an older manager cannot clear it by
+  // omitting the field.
+  optional bool ephemeral = 4;
 }
 
 message DeleteChannel {
@@ -252,6 +272,7 @@ message ClientMessage {
     SetMute set_mute = 12;
     ManageRequest manage = 13;
     SetStatus set_status = 14;
+    PinMessage pin_message = 15;
   }
 }
 

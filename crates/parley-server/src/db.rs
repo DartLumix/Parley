@@ -85,10 +85,30 @@ pub struct ManagedUserRow {
     pub role: UserRole,
 }
 
-/// (message_id, user_id, username, text, timestamp_ms)
-pub type HistoryRow = (u64, u32, String, String, u64);
-/// (id, name, music) per channel (6d).
-pub type ChannelRow = (u64, String, bool);
+/// One chat row. `pinned` survives the 24-hour ephemeral expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRow {
+    pub id: u64,
+    pub channel_id: u64,
+    pub user_id: u32,
+    pub username: String,
+    pub text: String,
+    pub timestamp_ms: u64,
+    pub pinned: bool,
+}
+
+/// (id, name, music, ephemeral) per channel (6d, 0.4.3).
+pub type ChannelRow = (u64, String, bool, bool);
+
+/// How long an unpinned message lives in an ephemeral channel.
+pub const EPHEMERAL_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self, Error> {
@@ -121,14 +141,16 @@ impl Db {
             );
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
+                name TEXT NOT NULL UNIQUE,
+                ephemeral INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 text TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL
+                timestamp_ms INTEGER NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0
             );
             ",
         )?;
@@ -149,6 +171,28 @@ impl Db {
         };
         if !has_mode {
             conn.execute_batch("ALTER TABLE channels ADD COLUMN mode INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // 0.4.3: disappearing chat. Existing channels start ephemeral,
+        // which is the new default.
+        let has_ephemeral: bool = {
+            let mut stmt = conn
+                .prepare("SELECT 1 FROM pragma_table_info('channels') WHERE name = 'ephemeral'")?;
+            stmt.exists([])?
+        };
+        if !has_ephemeral {
+            conn.execute_batch(
+                "ALTER TABLE channels ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+        let has_pinned: bool = {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'pinned'")?;
+            stmt.exists([])?
+        };
+        if !has_pinned {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         // Role migration: older databases only have the is_admin boolean.
         // Admins keep their powers; everyone else starts as a user.
@@ -234,10 +278,10 @@ impl Db {
     /// Create a channel, returning its id (6b/6d). `music` selects the
     /// stereo/256 kbps profile. No control-plane caller yet — tests
     /// and future tooling use this.
-    pub fn create_channel(&self, name: &str, music: bool) -> Result<u64, Error> {
+    pub fn create_channel(&self, name: &str, music: bool, ephemeral: bool) -> Result<u64, Error> {
         self.conn.execute(
-            "INSERT INTO channels (name, mode) VALUES (?1, ?2)",
-            rusqlite::params![name, music as i32],
+            "INSERT INTO channels (name, mode, ephemeral) VALUES (?1, ?2, ?3)",
+            rusqlite::params![name, music as i32, ephemeral as i32],
         )?;
         Ok(self.conn.last_insert_rowid() as u64)
     }
@@ -247,23 +291,25 @@ impl Db {
         channel_id: u64,
         name: Option<&str>,
         music: Option<bool>,
+        ephemeral: Option<bool>,
     ) -> Result<(), Error> {
-        let current: Option<(String, i64)> = self
+        let current: Option<(String, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT name, mode FROM channels WHERE id = ?1",
+                "SELECT name, mode, ephemeral FROM channels WHERE id = ?1",
                 rusqlite::params![channel_id as i64],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((old_name, old_mode)) = current else {
+        let Some((old_name, old_mode, old_ephemeral)) = current else {
             return Err(Error::Internal("channel not found".into()));
         };
         let name = name.unwrap_or(&old_name);
         let music = music.unwrap_or(old_mode != 0);
+        let ephemeral = ephemeral.unwrap_or(old_ephemeral != 0);
         self.conn.execute(
-            "UPDATE channels SET name = ?1, mode = ?2 WHERE id = ?3",
-            rusqlite::params![name, music as i32, channel_id as i64],
+            "UPDATE channels SET name = ?1, mode = ?2, ephemeral = ?3 WHERE id = ?4",
+            rusqlite::params![name, music as i32, ephemeral as i32, channel_id as i64],
         )?;
         Ok(())
     }
@@ -467,12 +513,13 @@ impl Db {
     pub fn list_channels(&self) -> Result<Vec<ChannelRow>, Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, mode FROM channels ORDER BY id")?;
+            .prepare("SELECT id, name, mode, ephemeral FROM channels ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)? as u64,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? != 0,
             ))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -484,10 +531,7 @@ impl Db {
         user_id: u32,
         text: &str,
     ) -> Result<(u64, u64, String), Error> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let ts = now_ms() as i64;
         self.conn.execute(
             "INSERT INTO messages (channel_id, user_id, text, timestamp_ms) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![channel_id as i64, user_id, text, ts],
@@ -503,28 +547,85 @@ impl Db {
         channel_id: u64,
         limit: u32,
         before_message_id: u64,
-    ) -> Result<Vec<HistoryRow>, Error> {
+    ) -> Result<Vec<MessageRow>, Error> {
+        let cutoff = now_ms().saturating_sub(EPHEMERAL_TTL_MS) as i64;
+        // The expiry filter is applied on read as well as by the purge
+        // task, so a message can never reappear between two sweeps.
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.user_id, u.username, m.text, m.timestamp_ms
+            "SELECT m.id, m.channel_id, m.user_id, u.username, m.text, m.timestamp_ms, m.pinned
              FROM messages m JOIN users u ON u.id = m.user_id
+             JOIN channels c ON c.id = m.channel_id
              WHERE m.channel_id = ?1 AND (?2 = 0 OR m.id < ?2)
+               AND (m.pinned <> 0 OR c.ephemeral = 0 OR m.timestamp_ms >= ?4)
              ORDER BY m.id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            rusqlite::params![channel_id as i64, before_message_id as i64, limit],
+            rusqlite::params![channel_id as i64, before_message_id as i64, limit, cutoff],
             |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i32>(1)? as u32,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)? as u64,
-                ))
+                Ok(MessageRow {
+                    id: row.get::<_, i64>(0)? as u64,
+                    channel_id: row.get::<_, i64>(1)? as u64,
+                    user_id: row.get::<_, i32>(2)? as u32,
+                    username: row.get(3)?,
+                    text: row.get(4)?,
+                    timestamp_ms: row.get::<_, i64>(5)? as u64,
+                    pinned: row.get::<_, i64>(6)? != 0,
+                })
             },
         )?;
         let mut out: Vec<_> = rows.filter_map(|r| r.ok()).collect();
         out.reverse(); // oldest first
         Ok(out)
+    }
+
+    /// Pin or unpin one message. Returns the updated row (for the
+    /// broadcast) or None when the id is unknown.
+    pub fn set_message_pinned(
+        &self,
+        message_id: u64,
+        pinned: bool,
+    ) -> Result<Option<MessageRow>, Error> {
+        let changed = self.conn.execute(
+            "UPDATE messages SET pinned = ?2 WHERE id = ?1",
+            rusqlite::params![message_id as i64, pinned as i32],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                "SELECT m.id, m.channel_id, m.user_id, u.username, m.text, m.timestamp_ms, m.pinned
+                 FROM messages m JOIN users u ON u.id = m.user_id
+                 WHERE m.id = ?1",
+                rusqlite::params![message_id as i64],
+                |row| {
+                    Ok(MessageRow {
+                        id: row.get::<_, i64>(0)? as u64,
+                        channel_id: row.get::<_, i64>(1)? as u64,
+                        user_id: row.get::<_, i32>(2)? as u32,
+                        username: row.get(3)?,
+                        text: row.get(4)?,
+                        timestamp_ms: row.get::<_, i64>(5)? as u64,
+                        pinned: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Drop unpinned messages older than the ephemeral TTL in channels
+    /// that still have disappearing chat on. Returns how many rows went.
+    pub fn purge_expired_messages(&self) -> Result<u64, Error> {
+        let cutoff = now_ms().saturating_sub(EPHEMERAL_TTL_MS) as i64;
+        let removed = self.conn.execute(
+            "DELETE FROM messages
+             WHERE pinned = 0 AND timestamp_ms < ?1
+               AND channel_id IN (SELECT id FROM channels WHERE ephemeral <> 0)",
+            rusqlite::params![cutoff],
+        )?;
+        Ok(removed as u64)
     }
 
     pub fn channel_exists(&self, channel_id: u64) -> Result<bool, Error> {
@@ -609,16 +710,33 @@ impl Db {
             DbCmd::DeleteUser { user_id, reply } => {
                 let _ = reply.send(self.delete_user(user_id));
             }
-            DbCmd::CreateChannel { name, music, reply } => {
-                let _ = reply.send(self.create_channel(&name, music));
+            DbCmd::SetMessagePinned {
+                message_id,
+                pinned,
+                reply,
+            } => {
+                let _ = reply.send(self.set_message_pinned(message_id, pinned));
+            }
+            DbCmd::PurgeExpiredMessages { reply } => {
+                let _ = reply.send(self.purge_expired_messages());
+            }
+            DbCmd::CreateChannel {
+                name,
+                music,
+                ephemeral,
+                reply,
+            } => {
+                let _ = reply.send(self.create_channel(&name, music, ephemeral));
             }
             DbCmd::UpdateChannel {
                 channel_id,
                 name,
                 music,
+                ephemeral,
                 reply,
             } => {
-                let _ = reply.send(self.update_channel(channel_id, name.as_deref(), music));
+                let _ =
+                    reply.send(self.update_channel(channel_id, name.as_deref(), music, ephemeral));
             }
             DbCmd::DeleteChannel { channel_id, reply } => {
                 let _ = reply.send(self.delete_channel(channel_id));
@@ -679,7 +797,15 @@ pub enum DbCmd {
         channel_id: u64,
         limit: u32,
         before_message_id: u64,
-        reply: oneshot::Sender<Result<Vec<HistoryRow>, Error>>,
+        reply: oneshot::Sender<Result<Vec<MessageRow>, Error>>,
+    },
+    SetMessagePinned {
+        message_id: u64,
+        pinned: bool,
+        reply: oneshot::Sender<Result<Option<MessageRow>, Error>>,
+    },
+    PurgeExpiredMessages {
+        reply: oneshot::Sender<Result<u64, Error>>,
     },
     ListUsers {
         reply: oneshot::Sender<Result<Vec<ManagedUserRow>, Error>>,
@@ -708,12 +834,14 @@ pub enum DbCmd {
     CreateChannel {
         name: String,
         music: bool,
+        ephemeral: bool,
         reply: oneshot::Sender<Result<u64, Error>>,
     },
     UpdateChannel {
         channel_id: u64,
         name: Option<String>,
         music: Option<bool>,
+        ephemeral: Option<bool>,
         reply: oneshot::Sender<Result<(), Error>>,
     },
     DeleteChannel {
@@ -823,7 +951,7 @@ impl DbHandle {
         channel_id: u64,
         limit: u32,
         before_message_id: u64,
-    ) -> Result<Vec<HistoryRow>, Error> {
+    ) -> Result<Vec<MessageRow>, Error> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCmd::FetchHistory {
@@ -898,12 +1026,18 @@ impl DbHandle {
         rx.await.map_err(|_| gone())?
     }
 
-    pub async fn create_channel(&self, name: &str, music: bool) -> Result<u64, Error> {
+    pub async fn create_channel(
+        &self,
+        name: &str,
+        music: bool,
+        ephemeral: bool,
+    ) -> Result<u64, Error> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCmd::CreateChannel {
                 name: name.to_string(),
                 music,
+                ephemeral,
                 reply,
             })
             .map_err(|_| gone())?;
@@ -915,6 +1049,7 @@ impl DbHandle {
         channel_id: u64,
         name: Option<&str>,
         music: Option<bool>,
+        ephemeral: Option<bool>,
     ) -> Result<(), Error> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -922,8 +1057,33 @@ impl DbHandle {
                 channel_id,
                 name: name.map(str::to_string),
                 music,
+                ephemeral,
                 reply,
             })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn set_message_pinned(
+        &self,
+        message_id: u64,
+        pinned: bool,
+    ) -> Result<Option<MessageRow>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::SetMessagePinned {
+                message_id,
+                pinned,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn purge_expired_messages(&self) -> Result<u64, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::PurgeExpiredMessages { reply })
             .map_err(|_| gone())?;
         rx.await.map_err(|_| gone())?
     }
@@ -963,6 +1123,56 @@ mod tests {
                 "reopening must not resurrect a deleted channel"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn age_message(db: &Db, message_id: u64, age_ms: u64) {
+        db.conn
+            .execute(
+                "UPDATE messages SET timestamp_ms = ?1 WHERE id = ?2",
+                rusqlite::params![(now_ms().saturating_sub(age_ms)) as i64, message_id as i64],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn ephemeral_chat_expires_but_pins_and_opt_outs_survive() {
+        let dir = std::env::temp_dir().join(format!("parley-db-ephemeral-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("parley.db")).unwrap();
+        db.create_user_with_role("alice", "password", UserRole::User)
+            .unwrap();
+
+        let temp = db.create_channel("temp", false, true).unwrap();
+        let keep_alive = db.create_channel("forever", false, false).unwrap();
+        let (old, ..) = db.insert_message(temp, 1, "gone tomorrow").unwrap();
+        let (pinned, ..) = db.insert_message(temp, 1, "keep me").unwrap();
+        let (forever, ..) = db.insert_message(keep_alive, 1, "not ephemeral").unwrap();
+        age_message(&db, old, EPHEMERAL_TTL_MS + 60_000);
+        age_message(&db, pinned, EPHEMERAL_TTL_MS + 60_000);
+        age_message(&db, forever, EPHEMERAL_TTL_MS + 60_000);
+        assert!(db.set_message_pinned(pinned, true).unwrap().is_some());
+
+        // Read-time filtering hides the expired row immediately, before
+        // any sweep runs.
+        let visible = db.fetch_history(temp, 100, 0).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, pinned);
+        assert!(visible[0].pinned);
+
+        assert_eq!(db.purge_expired_messages().unwrap(), 1);
+        assert_eq!(db.fetch_history(temp, 100, 0).unwrap().len(), 1);
+        assert_eq!(
+            db.fetch_history(keep_alive, 100, 0).unwrap().len(),
+            1,
+            "an ephemeral opt-out keeps its history"
+        );
+
+        let channels = db.list_channels().unwrap();
+        assert!(channels.iter().find(|c| c.0 == temp).unwrap().3);
+        assert!(!channels.iter().find(|c| c.0 == keep_alive).unwrap().3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

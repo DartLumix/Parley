@@ -325,7 +325,8 @@ class _ManagePageState extends State<ManagePage> {
     final name = TextEditingController(text: target?.name ?? '');
     final formKey = GlobalKey<FormState>();
     var mode = target?.mode ?? 'speech';
-    final result = await showDialog<(String, String)>(
+    var ephemeral = target?.ephemeral ?? true;
+    final result = await showDialog<(String, String, bool)>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
         builder: (dialogContext, setDialogState) => AlertDialog(
@@ -379,6 +380,19 @@ class _ManagePageState extends State<ManagePage> {
                       style: TextStyle(color: Colors.white38, fontSize: 11),
                     ),
                   ),
+                  const Divider(height: 24),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    value: ephemeral,
+                    onChanged: (value) =>
+                        setDialogState(() => ephemeral = value),
+                    title: const Text('Disappearing chat'),
+                    subtitle: const Text(
+                      'Messages vanish after 24 hours unless pinned.',
+                      style: TextStyle(color: Colors.white38, fontSize: 11),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -391,7 +405,7 @@ class _ManagePageState extends State<ManagePage> {
             FilledButton(
               onPressed: () {
                 if (!(formKey.currentState?.validate() ?? false)) return;
-                Navigator.of(dialogContext).pop((name.text.trim(), mode));
+                Navigator.of(dialogContext).pop((name.text.trim(), mode, ephemeral));
               },
               child: Text(editing ? 'Save' : 'Add'),
             ),
@@ -401,7 +415,7 @@ class _ManagePageState extends State<ManagePage> {
     );
     name.dispose();
     if (result == null || !mounted) return;
-    final (nextName, nextMode) = result;
+    final (nextName, nextMode, nextEphemeral) = result;
     if (editing) {
       await _send(
         () => manageUpdateChannel(
@@ -409,6 +423,7 @@ class _ManagePageState extends State<ManagePage> {
           channelId: target.id,
           name: nextName,
           mode: nextMode,
+          ephemeral: nextEphemeral,
         ),
       );
     } else {
@@ -417,6 +432,7 @@ class _ManagePageState extends State<ManagePage> {
           sessionId: widget.sessionId,
           name: nextName,
           mode: nextMode,
+          ephemeral: nextEphemeral,
         ),
       );
     }
@@ -780,6 +796,8 @@ class ManageView extends StatelessWidget {
               text: channel.mode,
               color: channel.mode == 'music' ? accentSoft : Colors.white54,
             ),
+            if (channel.ephemeral)
+              const Pill(text: '24h chat', color: Colors.white54),
             Text(
               '${channel.members} in voice',
               style: const TextStyle(color: Colors.white54, fontSize: 11),

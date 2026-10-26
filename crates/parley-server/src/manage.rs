@@ -142,7 +142,10 @@ pub async fn handle(
             let Some(music) = parse_mode(c.mode) else {
                 return fail("invalid channel mode");
             };
-            if let Err(e) = db.create_channel(&name, music).await {
+            // Disappearing chat is the default; a manager must opt out
+            // explicitly (older clients omit the field and get it on).
+            let ephemeral = c.ephemeral.unwrap_or(true);
+            if let Err(e) = db.create_channel(&name, music, ephemeral).await {
                 return fail(db_error(e));
             }
             broadcast_channel_list(db, registry).await;
@@ -161,7 +164,7 @@ pub async fn handle(
                 return fail("invalid channel mode");
             };
             if let Err(e) = db
-                .update_channel(u.channel_id, name.as_deref(), Some(music))
+                .update_channel(u.channel_id, name.as_deref(), Some(music), u.ephemeral)
                 .await
             {
                 return fail(db_error(e));
@@ -249,7 +252,7 @@ async fn state(
             .collect(),
         channels: Vec::new(),
     };
-    for (id, name, music) in db.list_channels().await.map_err(db_error)? {
+    for (id, name, music, ephemeral) in db.list_channels().await.map_err(db_error)? {
         state.channels.push(ManagedChannel {
             channel_id: id,
             name,
@@ -259,6 +262,7 @@ async fn state(
                 ChannelMode::Speech as i32
             },
             members: voice.members_of(id).len() as u32,
+            ephemeral,
         });
     }
     Ok(state)
@@ -297,7 +301,7 @@ async fn broadcast_channel_list(db: &DbHandle, registry: &Arc<SessionRegistry>) 
             body: Some(ServerBody::ChannelList(ChannelList {
                 channels: channels
                     .into_iter()
-                    .map(|(id, name, music)| parley_proto::Channel {
+                    .map(|(id, name, music, ephemeral)| parley_proto::Channel {
                         id,
                         name,
                         mode: if music {
@@ -305,6 +309,7 @@ async fn broadcast_channel_list(db: &DbHandle, registry: &Arc<SessionRegistry>) 
                         } else {
                             ChannelMode::Speech as i32
                         },
+                        ephemeral,
                     })
                     .collect(),
             })),
