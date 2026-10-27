@@ -18,6 +18,7 @@ deploy kit.
 | Share audio (system output), share lifecycle notices | shipping | receiver e2e + latency measurement |
 | Flutter client: session, channels, chat, voice, share watch/send, fullscreen | shipping | widget tests, release bundle, live two-machine runs |
 | Container + release automation | shipping | `tools/e2e-container.sh`; release workflow builds and tests before publishing |
+| In-app updates, bundled release notes | shipping | unit/widget tests for the release decision, checksums, note popup and the swap scripts' quoting; the swap itself is manual (see below) |
 
 Performance budgets (server RSS, 10 talkers, login time, binary size)
 were verified in 6g and have not regressed since; see the README table.
@@ -45,6 +46,16 @@ were verified in 6g and have not regressed since; see the README table.
 - A local packaging build on a machine with system abseil >= 20240722
   links that abseil (the release CI does not; its tarball is
   self-contained).
+- **The update swap is not covered by CI.** The release decision, the
+  checksum check, the notes popup and the generated scripts are tested; the
+  part that waits for the app to exit and moves directories runs on a real
+  desktop. It is verified by hand on Linux and on Windows, and every step
+  is logged to `update.log` beside the download.
+- **The updater reads published releases only.** It installs the asset for
+  its platform from `releases/latest` and verifies it against that release's
+  `SHA256SUMS`; an `-rc` tag is never offered, and a release that lacks the
+  asset or the checksum file is reported in the settings card instead of
+  being half-installed.
 
 ## Missing features
 
@@ -65,8 +76,10 @@ Product gaps, roughly in the order a small community would notice:
    preview is live because it is your own capture.
 5. **Operations** — no metrics endpoint or log rotation; one channel is
    created by default (`general`), the rest are managed in the app.
-6. **Distribution** — no AppImage/Flatpak/AUR package and no
-   auto-update; the tarball is the only client artifact.
+6. **Distribution** — no AppImage or Flatpak package, and the AUR
+   package is prepared but not published; the tarball and the Windows zip
+   (with in-app updates straight from the release page) are the client
+   artifacts.
 7. **Other platforms** — Windows now builds (voice with echo
    cancellation, chat, viewing; see the limits above); what it lacks is
    capture (WGC/DXGI + WASAPI loopback), which is why the Share button is
@@ -80,8 +93,9 @@ Product gaps, roughly in the order a small community would notice:
 - **8b — client polish:** reconnect with backoff, remembered servers,
   device pickers, mute/deafen, and a bounded connect timeout (the CLI's
   `--check` now has one; the app still waits).
-- **8c — packaging:** AppImage or Flatpak build + auto-update, so a new
-  device needs one download and no terminal.
+- **8c — packaging:** AppImage or Flatpak build and the first AUR push,
+  so a new device needs one download and no terminal (in-app updates are
+  in).
 - **8d — Android bring-up** (the second client, reusing `parley-core`).
 - **8e — verification depth:** property/fuzz tests on the wire
   decoders, a two-client CI test that exchanges media datagrams, and a

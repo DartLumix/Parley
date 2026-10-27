@@ -32,7 +32,9 @@ anywhere and run `parley.exe` — nothing to install. Voice with echo
 cancellation, chat and watching other people's shares work; starting a
 share of your own does not yet (the Share button is absent, not broken),
 and the zip is unsigned, so SmartScreen warns on the first run. Settings
-and the remembered login live in `%APPDATA%\parley`.
+and the remembered login live in `%APPDATA%\parley`; the in-app updater
+works here too (extract the zip somewhere your user can write, and the
+log of a swap is `%LOCALAPPDATA%\parley\update.log`).
 
 ## Connect
 
@@ -140,10 +142,22 @@ same trust decision.
   actually sent, so a 60 fps request on a machine that encodes 47 says 47.
 - **Settings** — the gear in the app bar: video (hardware encoding,
   default share resolution and frame rate), audio (echo cancellation,
-  which applies to the next channel you join), and account (the connected
-  server and account, plus *Sign out*). Every control saves immediately
-  to `~/.config/parley/settings.toml`; a preference that only takes effect
-  at encoder/AEC creation says so on the page.
+  which applies to the next channel you join), account (the connected
+  server and account, plus *Sign out*) and updates. Every control saves
+  immediately to `~/.config/parley/settings.toml`; a preference that only
+  takes effect at encoder/AEC creation says so on the page.
+- **Updates** — Settings → *Updates*: **Check for updates** asks the
+  release channel (`github.com/DartLumix/Parley`), and when a
+  newer version is published, *Install … and restart* downloads it, checks
+  it against the release's `SHA256SUMS`, swaps the install directory and
+  restarts Parley on the new build — the old copy is only removed after a
+  successful unpack, so a failed update leaves a working app behind.
+  *What's new* shows the release notes bundled with the build you are
+  running, the same dialog that opens by itself on the first launch of a
+  version. A copy installed by a package manager (the AUR package lives in
+  `/opt/parley`) cannot be replaced by the app and says so: update it with
+  `pacman`/`yay` instead. `install.sh` installs under `~/.local`, which the
+  app owns and can update itself.
 - **Fullscreen** — the expand button on an open share, your own
   included (yours draws the capture preview, and turning the preview
   switch back on first if it was off). It is real window fullscreen: the
@@ -180,6 +194,9 @@ same trust decision.
 | a share stutters while the **viewer's** CPU is busy | the viewer reports its decode rate every 5 s. A current server re-encodes a 720p/480p tier for that viewer alone; otherwise (or at the server's cap) the sharer steps its resolution down one rung at a time and only lowers the frame rate at the 480p floor. The `video: viewer sustaining … fps` line in the viewer's log names the number. If it stays low at a small share, the machine has no decode headroom left |
 | own preview stays black | frames are only produced once capture delivers its first buffer — check the `share: encoder ready` line |
 | a share's tile says "connecting…" | the first decoded frame has not reached the display yet; if it stays there, check the receiver's `video:` lines |
+| *Check for updates* reports "no releases at …" | no `v*` release is published yet, or the GitHub API is rate-limiting. The check reads `releases/latest`, which needs no token and no account |
+| the update card says this copy is not writable | it is a package-manager install (`/opt/parley`); update with `pacman`/`yay`. Only a `install.sh` copy under `~/.local` is the app's to replace |
+| Parley does not come back after installing an update | the reason is in `~/.cache/parley/update.log` (`%LOCALAPPDATA%\parley\update.log` on Windows); the previous build is still on disk and starts normally |
 
 Logs: run `~/.local/opt/parley/parley` from a terminal to see
 `video:`/`voice:`/`window:` lines; the login page shows the build

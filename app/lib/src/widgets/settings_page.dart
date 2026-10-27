@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../rust/api/settings.dart' as settings_api;
 import '../theme.dart';
+import 'update_section.dart';
 
 /// Audio, video and account preferences.
 ///
@@ -187,6 +188,9 @@ class _SettingsPageState extends State<SettingsPage> {
             'Closing the window does not — it reconnects on the next launch.',
             style: TextStyle(color: Colors.white38, fontSize: 11),
           ),
+          const SizedBox(height: 20),
+          _section(theme, 'Updates'),
+          const UpdateSection(),
         ],
       ),
     );

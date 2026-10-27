@@ -9,6 +9,7 @@ import 'rust/api/session.dart';
 import 'rust/api/settings.dart' as settings_api;
 import 'rust/api/video.dart' as video_api;
 import 'theme.dart';
+import 'update/notes.dart' as notes;
 import 'widgets/fullscreen_share.dart';
 import 'widgets/login_view.dart';
 import 'widgets/manage_page.dart';
@@ -226,6 +227,12 @@ class _HomePageState extends State<HomePage> {
     // Persisted preferences. Best-effort: a featureless build reports no
     // hardware encoder, and the preview is simply unavailable.
     _loadSettings();
+    // What changed in this version, once per version: the marker file is what
+    // tells an ordinary launch from the first one after an update. Released
+    // builds only — a source build has nothing to announce.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) notes.maybeShowPatchNotes(context);
+    });
   }
 
   /// Re-enter the last session. The token comes from the Rust side, so no

@@ -3,6 +3,28 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.4] — 2026-10-28
+
+Updates arrive from inside the app, and every release says what it
+changed before you use it.
+
+### Added
+
+- **In-app updates.** Settings → *Updates* asks `releases/latest` of this
+  repository (no token, no account), downloads the build for this platform,
+  verifies it against the release's `SHA256SUMS` and restarts into it. The
+  running install is only replaced after a successful unpack, a failed
+  swap restores the previous build, and the log of the handover is
+  `update.log` beside the download. A copy the user cannot write to —
+  `/opt/parley` for a pacman install — is refused with a pointer to the
+  package manager. An `-rc` tag, a release without the platform's asset and
+  a release without checksums are all reported in the card rather than
+  silently doing nothing.
+- **Bundled release notes.** `app/assets/patch_notes.md` travels inside the
+  build and is shown by itself on the first launch of a version — and any
+  time behind *What's new* next to the update check. It is the hand-written
+  note for the release, not the GitHub release body.
+
 ## [0.4.3] — 2026-10-26
 
 A read-only HTTP snapshot of the live server, for dashboards that run

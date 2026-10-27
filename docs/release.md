@@ -82,6 +82,31 @@ The image is never a separate asset — installing the kit without it
 would only mean downloading the image from somewhere else and loading
 it by hand.
 
+## In-app updates
+
+Settings → *Updates* in the desktop client reads `releases/latest` from this
+repository and installs the asset named `parley-<v>-linux-x86_64.tar.gz`
+(Linux) or `parley-<v>-windows-x86_64.zip` (Windows), after checking it
+against the release's `SHA256SUMS`. All three come out of the publish job, so
+**a tagged release needs no extra step** for the updater to see it. Override
+the channel for a fork or a test build with
+`--dart-define=PARLEY_UPDATE_REPO=owner/repo`.
+
+What the updater depends on, and what to check after publishing:
+
+- **Both assets and `SHA256SUMS`** must be attached, and the checksums must
+  cover the exact uploaded bytes. The app verifies the download against them
+  and installs nothing when they disagree.
+- `/releases/latest` **skips prereleases and drafts**: an `-rc` tag is never
+  offered, and the last stable release stays the one clients see.
+- A release with **no asset for the platform** is reported in the Settings
+  card ("release X has no …") rather than failing silently.
+- The updater ships **inside the client**, so the first release carrying it
+  has to be installed by hand; from then on the app can move forward on its
+  own. It never installs an older build.
+- A copy the app cannot write to — `/opt/parley` for a pacman install — is
+  refused with a pointer to the package manager instead of being modified.
+
 ## AUR
 
 `parley-bin` is prepared in [../packaging/aur/README.md](../packaging/aur/README.md).

@@ -1,12 +1,13 @@
 name: parley
 description: "Parley — self-hosted voice, chat and screen share (Linux desktop client)."
 publish_to: 'none'
-version: 0.4.3+15
+version: 0.4.4+16
 
 environment:
   sdk: ^3.13.5
 
 dependencies:
+  crypto: ^3.0.8
   flutter:
     sdk: flutter
   flutter_rust_bridge: ^2.0.0
@@ -21,3 +22,7 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # Written by hand before a release: the app shows it on the first launch
+    # of a version and behind Settings → What's new.
+    - assets/patch_notes.md
