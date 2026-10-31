@@ -349,12 +349,13 @@ Future<bool> hwEncodeEnabled() =>
 Future<bool> hwEncodeSupported() =>
     RustLib.instance.api.crateApiSessionHwEncodeSupported();
 
-/// Whether this build can share a screen at all (the `screen-capture`
-/// feature pulls the portal + PipeWire capture path, which is Linux
-/// only). The Dart side hides the share entry points when this is false:
-/// on such a build the call could only ever return "screen-capture
-/// feature off". Viewing other people's shares is `video`, a different
-/// feature — a client without this one still watches.
+/// Whether this build can share a screen at all. The `screen-capture`
+/// feature pulls the platform backend: the portal + PipeWire path on
+/// Linux, Windows Graphics Capture + WASAPI on Windows. The Dart side
+/// hides the share entry points when this is false — on such a build the
+/// call could only ever return "screen-capture feature off". Viewing
+/// other people's shares is `video`, a different feature — a client
+/// without this one still watches.
 Future<bool> screenShareSupported() =>
     RustLib.instance.api.crateApiSessionScreenShareSupported();
 
@@ -365,8 +366,10 @@ Future<bool> screenShareSupported() =>
 ///
 /// Audio: `share_audio` off ⇒ no audio tap at all. On with
 /// `audio_players` empty ⇒ the whole default output (echo guard runs).
-/// On with node ids ⇒ exactly those applications, captured from their
-/// own PipeWire nodes — this app's voice cannot appear in it.
+/// On with ids ⇒ exactly those applications: PipeWire node ids on
+/// Linux, process ids on Windows (both come from
+/// `list_share_audio_players`). This app's own voice can never appear
+/// in that capture.
 Future<void> startScreenShare({
   required int sessionId,
   required int maxHeight,

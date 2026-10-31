@@ -53,10 +53,11 @@ git push origin v0.2.0
    the bundle's shared libraries on a clean Ubuntu 24.04 (and that the
    system WebRTC dependency is gone).
 5. **windows** — builds the bridge and the Flutter bundle on
-   `windows-latest` with `audio-device,aec-rust,video` (echo cancellation
-   through the pure-Rust AEC3 port; no capture), and zips the bundle. The archive layout is checked by extracting it: a
-   `parley.exe` without `parley_flutter.dll` next to it would start and
-   then fail on the first bridge call.
+   `windows-latest` with `audio-device,aec-rust,video,screen-capture`
+   (echo cancellation through the pure-Rust AEC3 port; WGC capture and
+   WASAPI loopback), and zips the bundle. The archive layout is checked by
+   extracting it: a `parley.exe` without `parley_flutter.dll` next to it
+   would start and then fail on the first bridge call.
 6. **smoke** — extracts the kit, loads its image, boots it, adds a user through
    `/parley-server adduser`, logs in as two accounts and proves a wrong
    password is refused (`tools/e2e-container.sh`).

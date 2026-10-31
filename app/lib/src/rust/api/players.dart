@@ -12,17 +12,21 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 /// Snapshot of the applications playing right now.
 ///
 /// Empty — never an error — when this build has no screen-capture
-/// feature or PipeWire cannot be reached: the dialog then offers no
-/// per-app audio instead of failing the share. The list is a snapshot,
-/// so a player that starts after the dialog opened is simply not in it.
+/// feature or the platform audio graph cannot be reached: the dialog
+/// then offers no per-app audio instead of failing the share. The list
+/// is a snapshot, so a player that starts after the dialog opened is
+/// simply not in it. Parley's own playback is never listed: capturing
+/// it is the echo this feature exists to avoid.
 Future<List<ShareAudioPlayer>> listShareAudioPlayers() =>
     RustLib.instance.api.crateApiPlayersListShareAudioPlayers();
 
 /// One selectable application, as the share dialog shows it.
 class ShareAudioPlayer {
-  /// PipeWire global id — handed back to `start_screen_share` as the
-  /// capture target. Unique per stream, so two same-named apps stay
-  /// distinguishable.
+  /// Capture target, handed back to `start_screen_share` unchanged.
+  /// Linux: the PipeWire global id of the app's playback node
+  /// (unique per stream). Windows: the process id of the audio
+  /// session's owner (unique per process, which is the unit WASAPI
+  /// process loopback captures).
   final int id;
 
   /// Application name (the picker's first line).

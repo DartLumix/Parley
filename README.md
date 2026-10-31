@@ -49,7 +49,8 @@ Voice is the product; everything else grows later.
 | 7k | Share teardown notices, ghost-card race, real fullscreen, app chrome | ✅ |
 | 0.2 | First downloadable release — client tarball, container kit, release CI | ✅ |
 | 0.3 | Settings page, screens grid with own-stream preview, share size/rate dialog | ✅ |
-| 7+ | Windows capture, Android / iOS bring-up, file transfer | ⏳ |
+| 7+ | Windows capture + share audio (WGC + WASAPI) | ✅ |
+| Next | Android / iOS bring-up, file transfer | ⏳ |
 
 ---
 
@@ -82,7 +83,7 @@ Connect to `your-server` (port 4443, the client default). The full runbooks are
 
 - 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera video
 - 👀 Every share is a live 16:9 tile — including yours while you send — with *Watch*, several open at once, and per-share audio · pick a resolution/rate cap before the portal opens · settings for video, audio and your account
-- 🐧 Native clients: **Linux → Windows → Android → iOS** — no Electron, no webviews, ever. The Windows client (voice with echo cancellation, chat, watching shares; capture still to come) builds from the same code
+- 🐧 Native clients: **Linux → Windows → Android → iOS** — no Electron, no webviews, ever. The Windows client (voice with echo cancellation, chat, sharing and watching — WGC capture + WASAPI per-app audio) builds from the same code
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
 - 🐳 Deploy with `docker compose up` · one TOML config · one UDP port
 
@@ -262,7 +263,8 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       tiers, channel creation and deletion, and voice kicks (the server
       enforces every rule; a kick is a plain leave, not a ban)
 - [x] Windows client — voice with echo cancellation (`aec-rust`, the Rust AEC3 port), chat,
-      share viewing (capture pending)
+      screen sharing (Windows Graphics Capture) with whole-output or per-app audio,
+      and share viewing
 - [ ] Android / iOS bring-up
 - [ ] File transfer (QUIC streams), rich text, search, DMs, push, auto-update
 

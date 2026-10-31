@@ -1,6 +1,6 @@
 [package]
 name = "parley_flutter"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 
 [lib]
@@ -33,8 +33,10 @@ aec-rust = ["audio-device", "parley-client/aec-rust"]
 # and the musl server build never touch openh264 or the texture glue.
 # The app builds with --features audio-device,video.
 video = ["dep:irondash_texture", "dep:irondash_engine_context", "parley-core/video"]
-# 7g: in-app screen SHARE (portal capture + encode via parley-client's
-# screen module). Builds ashpd/pipewire into the bridge .so.
+# 7g: in-app screen SHARE (capture + encode via parley-client's screen
+# module). Linux builds ashpd/pipewire into the bridge; Windows builds
+# windows-capture/wasapi (WGC + WASAPI loopback). Same feature name, the
+# platform module is chosen by target.
 screen-capture = ["parley-client/screen-capture", "video"]
 # 7g: hardware (VAAPI) encode support — build the moq-vaapi backend in
 # and let the app's hardware-encoding setting (Settings → Video) do

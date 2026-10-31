@@ -98,7 +98,7 @@ link device libraries):
 | `aec` | WebRTC AEC/NS/HPF on the mic path — Unix-only build deps |
 | `aec-rust` | the same DSP from the pure-Rust AEC3 port — what Windows builds |
 | `video` | openh264 encode/decode + the video receive hub |
-| `screen-capture` | portal capture (ashpd + PipeWire) — Linux only |
+| `screen-capture` | capture + share audio: portal/PipeWire (Linux), WGC/WASAPI (Windows) |
 | `vaapi` | hardware encode via the vendored crate (`--hw-encode`) — Linux only |
 
 ## Flutter client
@@ -148,19 +148,24 @@ The second desktop target builds `audio-device` (WASAPI), `video` and
 
   Enabling `aec` and `aec-rust` together is a compile error, so a build
   cannot compile one and silently run the other.
-- **`screen-capture`** — portal + PipeWire capture and the
-  `stream.capture.sink` share-audio tap. A Windows capture backend
-  (WGC/DXGI + WASAPI loopback) is not written yet, so the app hides the
-  Share button there (`screen_share_supported()`). Watching shares is
-  `video`, which does build.
+- **`screen-capture`** — one feature, two backends, chosen by target.
+  Linux is the portal + PipeWire path and the `stream.capture.sink`
+  share-audio tap. Windows is Windows Graphics Capture (system picker,
+  BGRA frames, 1 Hz keepalive for a still desktop) with WASAPI
+  loopback for share audio (default render device, or one process
+  loopback client per selected app — Windows 10 2004+).
+  `screen_share_supported()` is therefore true on both desktop targets;
+  the flag still exists for builds that leave the feature out. Watching
+  shares is `video`, a separate feature.
 
-Hardware encode is VAAPI, so it is off too; software H.264 handles
-1080p30. The custom title bar is Linux-only by design: the Windows
-runner keeps its native frame, and the fullscreen button falls back to
-filling the window.
+Hardware encode is VAAPI, so it is still Linux-only: Windows uses the
+software H.264 encoder (1080p30 ceiling). The custom title bar is
+Linux-only: the Windows runner keeps its native frame. The window
+channel (`parley/window`) is implemented on both, so the fullscreen
+viewer takes the real window fullscreen on Windows too.
 
 ```sh
-cargo build --release -p parley_flutter --features audio-device,aec-rust,video
+cargo build --release -p parley_flutter --features audio-device,aec-rust,video,screen-capture
 cd app
 flutter config --enable-windows-desktop
 flutter pub get

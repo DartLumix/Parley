@@ -13,7 +13,8 @@ deploy kit.
 | Text chat, history, per-channel broadcast | shipping | server tests; app UI |
 | Voice: Opus 48 kHz, jitter buffer + PLC, FEC, loss ladder | shipping | core/app tests; digital latency 49.8 ms median (budget 150 ms) |
 | AEC/NS (WebRTC APM), per-user volume, music channels | shipping | synthetic-echo test (>10 dB), by-ear A/B |
-| Screen share: portal capture, H.264, fragmentation, drop-until-IDR | shipping | core video tests; glass-to-glass ~250 ms LAN |
+| Screen share: portal capture (Linux), WGC (Windows), H.264, fragmentation, drop-until-IDR | shipping | core video tests; glass-to-glass ~250 ms LAN; cross-target Windows build |
+| Share audio: default output or exactly the picked apps | shipping | PipeWire nodes on Linux, WASAPI process loopback on Windows; receiver e2e on Linux |
 | Hardware encode (VAAPI), HD profiles, DMA-BUF capture | shipping, opt-in | keyframe-shape tests; measured 98/47.8/29.1 fps at 720p/1080p/1440p |
 | Share audio (system output), share lifecycle notices | shipping | receiver e2e + latency measurement |
 | Flutter client: session, channels, chat, voice, share watch/send, fullscreen | shipping | widget tests, release bundle, live two-machine runs |
@@ -27,11 +28,16 @@ were verified in 6g and have not regressed since; see the README table.
 
 - **Linux is the reference client.** Windows ships voice with echo
   cancellation (the pure-Rust `aec-rust` backend; the C++ APM does not
-  build there), chat and share *viewing*; starting a share needs a
-  capture backend that does not exist yet. Android and iOS are parked;
-  macOS has never been built.
-- **Hardware encode is VAAPI only**, and one known driver window (the
-  polaris box) must not pass `--hw-encode` — the probe enforces that.
+  build there), chat, share viewing and now share *starting*: Windows
+  Graphics Capture plus WASAPI share audio (whole output, or per-app
+  process loopback). The Windows capture path is verified by the
+  cross-target build and its unit tests, not by a live Windows desktop
+  in this repository's CI. Android and iOS are parked; macOS has never
+  been built.
+- **Hardware encode is VAAPI only** (Linux), and one known driver window
+  (the polaris box) must not pass `--hw-encode` — the probe enforces that.
+  Windows encodes in software, capped at 1080p30 like a Linux software
+  build.
 - **Fullscreen state readback** was proven on one compositor
   (Hyprland). Other desktops are unverified.
 - **The window toolbar's visual result** is verified by widget tests and
@@ -80,11 +86,12 @@ Product gaps, roughly in the order a small community would notice:
    package is prepared but not published; the tarball and the Windows zip
    (with in-app updates straight from the release page) are the client
    artifacts.
-7. **Other platforms** — Windows now builds (voice with echo
-   cancellation, chat, viewing; see the limits above); what it lacks is
-   capture (WGC/DXGI + WASAPI loopback), which is why the Share button is
-   absent there. Android and iOS are after that; camera video is parked
-   until a client can preview it.
+7. **Other platforms** — Windows now builds with the full desktop
+   feature set (voice with echo cancellation, chat, share viewing and
+   share sending with per-app audio). What it still lacks is hardware
+   encoding (Media Foundation/QuickSync/NVENC) and the custom title bar,
+   both deliberate for now. Android and iOS are after that; camera video
+   is parked until a client can preview it.
 
 ## Next milestone suggestions
 

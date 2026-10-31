@@ -24,14 +24,16 @@ is built on Ubuntu 24.04, so it needs **glibc 2.39** — Ubuntu 24.04+,
 Debian 13+, Fedora 40+ — and a PipeWire new enough to carry
 `spa_video_info_raw.flags` (0.3.65+, which 24.04 and everything newer
 ships; Ubuntu 22.04's 0.3.48 cannot run this build).
-Screen sharing additionally needs a ScreenCast portal backend matching
-the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`, `-gnome`).
+Screen sharing on Linux additionally needs a ScreenCast portal backend
+matching the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`,
+`-gnome`).
 
 **Windows.** Download `parley-<version>-windows-x86_64.zip`, extract it
 anywhere and run `parley.exe` — nothing to install. Voice with echo
-cancellation, chat and watching other people's shares work; starting a
-share of your own does not yet (the Share button is absent, not broken),
-and the zip is unsigned, so SmartScreen warns on the first run. Settings
+cancellation, chat, sharing (Windows Graphics Capture, with whole-output
+or per-app WASAPI audio) and watching work; the zip is unsigned, so
+SmartScreen warns on the first run. Capturing needs Windows 10 1903 or
+newer; per-app audio uses process loopback, which needs 2004. Settings
 and the remembered login live in `%APPDATA%\parley`; the in-app updater
 works here too (extract the zip somewhere your user can write, and the
 log of a swap is `%LOCALAPPDATA%\parley\update.log`).
@@ -108,17 +110,21 @@ same trust decision.
 - **Screen share** — *Share screen* in the floating bar asks for a
   resolution and frame-rate cap first (defaults from Settings, *Source*
   means the capture's own size and rate — caps never upscale), then the
-  desktop's portal asks which monitor or window. The same dialog has a
+  platform asks which monitor or window (the desktop portal on Linux,
+  the Windows Graphics Capture picker on Windows). The same dialog has a
   *Share audio* switch and the list of applications playing right now:
-  tick one or more and each is captured from its own PipeWire node, so
-  Parley's playback (the voice channel, other shares) is never in the
-  stream and a viewer cannot hear themselves back. No guard, no
-  subtraction — the echo is excluded by construction. The software encoder
-  (openh264) is capped at 1080p whatever *Source* says: measured at
-  1440p it needs ~35 ms per frame against a 33 ms slot, so half the
-  frames would be dropped. With *Hardware encoding* on, the cap is
-  gone and source 1440p60/1080p60 is reachable. The tile's resolution
-  line is the stream viewers get, not the capture.
+  tick one or more and each is captured on its own (PipeWire nodes on
+  Linux, WASAPI process loopback on Windows), so Parley's playback (the
+  voice channel, other shares) is never in the stream and a viewer
+  cannot hear themselves back. No guard, no subtraction — the echo is
+  excluded by construction. The software encoder (openh264) is capped
+  at 1080p whatever *Source* says: measured at 1440p it needs ~35 ms per
+  frame against a 33 ms slot, so half the frames would be dropped. With
+  *Hardware encoding* on (Linux/VAAPI only) the cap is gone and source
+  1440p60/1080p60 is reachable. The tile's resolution line is the stream
+  viewers get, not the capture. A still desktop still streams: the
+  Windows backend repeats the newest frame about once a second while
+  nothing changes.
 - **Screens** — everyone sharing in your channel (you included) is a 16:9
   tile in the section above the chat: name, resolution, measured frame
   rate, and a *Watch* button. A remote share is a poster until *Watch* is
@@ -165,12 +171,13 @@ same trust decision.
   interrupts the stream — it is the same open share, drawn on the
   fullscreen page — and only *Stop watching* closes somebody else's.
   Nothing is drawn over the picture except two fading controls.
-- **Window bar** — the window has no title bar. Move the pointer to the
-  very top edge and a thin toolbar slides down with minimise, maximise
-  and close; it hides again after a moment. On tiling compositors a
-  drag can be done with the compositor's own binding (e.g. Mod+drag on
-  Hyprland) — the toolbar's drag area works where the protocol allows
-  it.
+- **Window bar** — on Linux the window has no title bar. Move the
+  pointer to the very top edge and a thin toolbar slides down with
+  minimise, maximise and close; it hides again after a moment. On tiling
+  compositors a drag can be done with the compositor's own binding (e.g.
+  Mod+drag on Hyprland) — the toolbar's drag area works where the
+  protocol allows it. Windows keeps its native frame; the fullscreen
+  viewer takes the real window fullscreen on both platforms.
 - **Hardware encoding** — the switch in Settings → Video, shown only in
   builds with the `hw-encode` feature and usable only where VAAPI works.
   It applies the next time an encoder is created (the next share); a

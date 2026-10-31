@@ -5,9 +5,10 @@ import '../rust/api/players.dart';
 /// What the pre-share dialog returns: caps for one share plus its audio
 /// choice. 0 means "the capture's own" for both caps.
 ///
-/// `audio` off ⇒ no audio at all. On ⇒ `audioPlayers` holds the PipeWire
-/// node ids to capture (one or more); those are captured directly, so
-/// this app's own voice is never part of the share.
+/// `audio` off ⇒ no audio at all. On ⇒ `audioPlayers` holds the platform
+/// capture ids (PipeWire node ids on Linux, process ids on Windows; see
+/// `listShareAudioPlayers`). Those are captured directly, so this app's
+/// own voice is never part of the share.
 typedef ShareOptions = ({
   int height,
   int fps,
@@ -15,7 +16,7 @@ typedef ShareOptions = ({
   List<int> audioPlayers,
 });
 
-/// Ask for resolution, frame rate and audio before the portal opens.
+/// Ask for resolution, frame rate and audio before the source picker opens.
 ///
 /// Its own file so the choice can be tested without a session: the
 /// dialog has no state beyond the selections, and the caller decides
@@ -25,6 +26,9 @@ typedef ShareOptions = ({
 /// `players` is a snapshot taken just before opening (see
 /// `listShareAudioPlayers`): the per-app tracking is what removes the
 /// echo, so "entire system audio" is deliberately not an option here.
+/// The screen source itself is chosen in the platform dialog that opens
+/// afterwards — the XDG portal on Linux, the Windows Graphics Capture
+/// picker on Windows.
 Future<ShareOptions?> showShareOptionsDialog(
   BuildContext context, {
   required int height,
@@ -52,7 +56,7 @@ Future<ShareOptions?> showShareOptionsDialog(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'Pick the source in the desktop dialog that opens next. '
+                  'Pick the source in the system dialog that opens next. '
                   'These are caps, not upscales — the stream runs at the '
                   'fastest rate the encoder can hold up to the frame rate '
                   'chosen here, and the screen tile shows the rate actually '

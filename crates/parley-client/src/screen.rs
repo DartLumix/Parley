@@ -1,5 +1,15 @@
-//! Phase 5d/6a/6.9: real screen capture through the XDG ScreenCast
-//! portal, with a full stop/restart lifecycle — plus share audio.
+//! Phase 5d/6a/6.9: real screen capture, with a full stop/restart
+//! lifecycle — plus share audio.
+//!
+//! Two backends, one pipeline. Linux goes through the XDG ScreenCast
+//! portal (ashpd + PipeWire). Windows (`screen/win.rs`) goes through
+//! Windows Graphics Capture — the system picker, BGRA frames with a row
+//! stride, and a 1 Hz keepalive for a still desktop — and WASAPI
+//! loopback for share audio (the default render device, or one process
+//! loopback client per picked app). Both produce the same messages to
+//! the encoder thread and the same interleaved stereo to the mux, so
+//! pacing, fragmentation, the pace governor and the echo guard are
+//! shared and behave identically.
 //!
 //! ashpd drives the portal (user picks a monitor or window in the
 //! compositor's picker) and hands back a PipeWire node id + fd. A
@@ -78,36 +88,54 @@
 //! fidelity-class content. The mux ([system + mic] → one stream) lives
 //! here too; main.rs routes the mic to it via a tee while sharing.
 
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::Duration;
 
 use crate::video::VideoLadder;
+#[cfg(not(windows))]
 use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
+#[cfg(not(windows))]
 use futures_util::StreamExt;
 use parley_core::audio::pipeline::SendPipeline;
 use parley_core::video::{VideoEncoder, bitrate_for, create_encoder_auto, target_fps};
 use parley_proto::video::fragment_frame_with_max;
+#[cfg(not(windows))]
 use pipewire as pw;
+#[cfg(not(windows))]
 use pw::properties::properties;
+#[cfg(not(windows))]
 use pw::spa;
+#[cfg(not(windows))]
+use std::os::fd::OwnedFd;
 
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+pub use win::{list_audio_players, start};
+
+#[cfg(not(windows))]
 use crate::ShareEvent;
 
-/// Messages from the pipewire thread to the encoder thread. One
-/// channel keeps them ordered — format always arrives before frames.
+/// Messages from the capture thread to the encoder thread. One channel
+/// keeps them ordered — format always arrives before frames.
 enum ToEncoder {
     /// Negotiated stream format.
     Negotiated { width: u32, height: u32, fps: f64 },
     /// 7g: one BGRx/BGRA frame AS MAPPED — row stride kept (bytes),
     /// padding bytes included. The encoder converts in place from the
     /// buffer via the strided SIMD path; no tight repack here.
-    Frame { data: Vec<u8>, stride: usize },
+    ///
+    /// `Arc` because two sources feed this channel on Windows: the
+    /// capture callback (on every change) and a 1 Hz keepalive that
+    /// repeats the newest frame while the desktop is static. A repeated
+    /// frame then costs an atomic increment, not a second copy of a
+    /// 1440p buffer.
+    Frame { data: Arc<Vec<u8>>, stride: usize },
 }
 
 /// Handle for poking the capture pipeline from the control reader
@@ -143,32 +171,34 @@ pub struct ShareOptions {
     pub max_fps: Option<f64>,
 }
 
-/// One application's playback, as PipeWire exposes it: a
-/// `Stream/Output/Audio` node. Capturing one of these taps THAT app's
-/// audio and nothing else — which is why the echo cannot come back:
-/// Parley's own playback is a different node, is never a target, and is
-/// filtered out of the picker (see [`list_audio_players`]).
+/// One application's playback, as the platform's audio graph exposes
+/// it. Capturing one of these taps THAT app's audio and nothing else —
+/// which is why the echo cannot come back: Parley's own playback is a
+/// different node/process, is never a target, and is filtered out of the
+/// picker (see [`list_audio_players`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioPlayer {
-    /// PipeWire global id — the capture target. Unique even when two
-    /// clients share a `node.name` (two `pw-play`s do), which is why the
-    /// target is an id and not a name.
+    /// Capture target: a PipeWire global id on Linux, a process id on
+    /// Windows (WASAPI process loopback). Unique even when two clients
+    /// share a name, which is why the target is an id and not a name.
     pub id: u32,
-    /// `node.name`, for logs (not unique: see `id`).
+    /// Platform node/process name, for logs (not unique: see `id`).
     pub name: String,
-    /// `application.name` (falls back to the process binary, then the
-    /// node name): what the picker shows.
+    /// What the picker shows: `application.name` on Linux (falling back
+    /// to the process binary, then the node name), the executable on
+    /// Windows.
     pub app: String,
-    /// `node.description` when the app sets one, else `app`. Made unique
-    /// across the list so two same-named players stay distinguishable.
+    /// A second line that keeps two same-named players apart — the
+    /// node description on Linux, the owning PID on Windows.
     pub description: String,
 }
 
 /// Where a share's audio comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShareAudio {
-    /// The default output's monitor: everything this machine plays,
-    /// Parley included — the caller must run the echo guard.
+    /// The default output: everything this machine plays (the PipeWire
+    /// monitor on Linux, WASAPI render loopback on Windows), Parley
+    /// included — the caller must run the echo guard.
     Output,
     /// Exactly these application nodes (`AudioPlayer::id`), mixed.
     Players(Vec<u32>),
@@ -279,6 +309,7 @@ impl ShareController {
 }
 
 /// Listener user data, owned by the pw loop thread.
+#[cfg(not(windows))]
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
@@ -336,6 +367,18 @@ struct PaceGovernor {
     last_sample: std::time::Instant,
     low: u32,
     good: u32,
+    /// Frames per second the encoder actually delivered over its last
+    /// measurement second (0 = not measured yet).
+    ///
+    /// A viewer cannot decode more pictures than were sent. Comparing
+    /// its report against this as well as against the configured
+    /// ceiling is what stops a genuinely static source from reading as
+    /// a starved viewer: WGC sends nothing while the desktop does not
+    /// change (the Windows capture adds a 1 Hz keepalive), so a report
+    /// of "1 fps" after a minute of a still screen is the SOURCE's
+    /// rate, not a decode deficit — and folding the stream down to 480p
+    /// for it would be the old 5 fps bug with a new cause.
+    sent_fps: f64,
     /// The last cadence/resolution change was a probe upward. A low
     /// report after it backs off for longer than a normal step down.
     probing: bool,
@@ -365,6 +408,7 @@ impl PaceGovernor {
             last_sample: std::time::Instant::now(),
             low: 0,
             good: 0,
+            sent_fps: 0.0,
             probing: false,
             retry_after: None,
         }
@@ -430,7 +474,10 @@ impl PaceGovernor {
         }
         let current = self.current_fps(base);
         let r = f64::from(reported);
-        if r < current * 0.8 {
+        // Only a viewer that missed frames the sender actually SENDS is
+        // behind. Unmeasured (0) keeps the old behaviour.
+        let viewer_behind = self.sent_fps <= 0.0 || r < self.sent_fps * 0.8;
+        if r < current * 0.8 && viewer_behind {
             self.low += 1;
             self.good = 0;
             if self.low < 2 {
@@ -607,6 +654,10 @@ struct ShareEncoder {
     stream: (u32, u32),
     /// The rate the sharer's own card currently shows.
     shown_fps: f64,
+    /// Frames this encoder actually sent over the last measurement
+    /// second. The pace governor compares viewer reports to this, so a
+    /// still source is not mistaken for a struggling viewer.
+    sent_fps: f64,
     /// Frames sent, and when the current measurement second began: the
     /// card reports what this machine ACTUALLY delivers, not the profile
     /// it hoped for (a hardware share paced at 60 that encodes 47 must
@@ -723,6 +774,7 @@ struct ShareSenderArgs {
 /// set, then disconnects and returns (scope exit drops stream, core,
 /// context, mainloop — in reverse declaration order, which is the
 /// required C teardown order).
+#[cfg(not(windows))]
 fn pw_thread(
     node_id: u32,
     fd: OwnedFd,
@@ -992,7 +1044,10 @@ fn pw_thread(
             }
             if user_data
                 .tx
-                .try_send(ToEncoder::Frame { data, stride })
+                .try_send(ToEncoder::Frame {
+                    data: Arc::new(data),
+                    stride,
+                })
                 .is_err()
             {
                 user_data.drops += 1;
@@ -1227,7 +1282,7 @@ fn pw_thread(
 /// Built by hand because the `object!`/`property!` macros have no arm for a
 /// numeric choice in this version of libspa (`Choice, Enum, Long, ..` looks
 /// for a type named `utils::Long`, which is a pod type tag, not a type).
-#[cfg(feature = "vaapi")]
+#[cfg(all(feature = "vaapi", not(windows)))]
 fn modifier_property() -> spa::pod::Property {
     use spa::pod::{ChoiceValue, PropertyFlags, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
@@ -1252,7 +1307,7 @@ fn modifier_property() -> spa::pod::Property {
 ///
 /// `SPA_PARAM_BUFFERS_dataType` has no typed constant in libspa, so the raw
 /// key comes from the generated bindings.
-#[cfg(feature = "vaapi")]
+#[cfg(all(feature = "vaapi", not(windows)))]
 fn buffers_data_type_property() -> spa::pod::Property {
     use spa::pod::{ChoiceValue, PropertyFlags, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
@@ -1471,6 +1526,7 @@ impl ShareEncoder {
             last_preview: None,
             stream: (0, 0),
             shown_fps: 0.0,
+            sent_fps: 0.0,
             report_start: std::time::Instant::now(),
             report_frames: 0,
             started: std::time::Instant::now(),
@@ -1613,6 +1669,7 @@ impl ShareEncoder {
         let base = self.base_fps();
         let reported = self.viewer_fps.load(Ordering::Relaxed);
         let loss = self.video_loss.load(Ordering::Relaxed);
+        self.governor.sent_fps = self.sent_fps;
         let (fps_cap, height_cap) = self.governor.step(
             base,
             reported,
@@ -1836,6 +1893,7 @@ impl ShareEncoder {
         let report = self.report_start.elapsed();
         if report >= Duration::from_secs(1) {
             let raw = f64::from(self.report_frames) / report.as_secs_f64();
+            self.sent_fps = raw;
             // Nearest 5 fps: one burst must not print "43 fps".
             let measured = ((raw / 5.0).round() * 5.0).max(1.0);
             self.report_start = std::time::Instant::now();
@@ -1950,9 +2008,10 @@ fn encoder_thread(
                 if let Some((width, height, f)) = renegotiate {
                     share.negotiate(width, height, f);
                 }
-                // One allocation-free wrap: the preview thread shares
-                // these pixels with the encoder instead of copying them.
-                if !share.encode_bgra(&Arc::new(bgra), stride) {
+                // The Arc came in with the frame: the preview thread
+                // shares these pixels with the encoder instead of
+                // copying them.
+                if !share.encode_bgra(&bgra, stride) {
                     // The connection itself is gone: nothing left to do.
                     let _ = share.die.send(());
                     return;
@@ -1964,8 +2023,13 @@ fn encoder_thread(
 }
 
 // ---- 6.9: share audio (default-output capture + mux) ----
+//
+// This half is the Linux capture side (PipeWire). The mux below is
+// shared: it only sees interleaved stereo, so Windows feeds it from
+// WASAPI with the same contract.
 
 /// Listener user data for the audio capture stream.
+#[cfg(not(windows))]
 struct AudioState {
     stop: Arc<AtomicBool>,
     accepted: bool,
@@ -1979,6 +2043,7 @@ struct AudioState {
 /// channel + try_send: never block the pw thread (the 6f discipline); a
 /// slow consumer drops stale audio — correct for live content. Failures
 /// surface on stderr; the video share proceeds regardless.
+#[cfg(not(windows))]
 fn start_audio_capture(stop: Arc<AtomicBool>, tap: ShareAudioTap) {
     std::thread::spawn(move || {
         let ShareAudioTap { source, tx } = tap;
@@ -1995,6 +2060,7 @@ fn start_audio_capture(stop: Arc<AtomicBool>, tap: ShareAudioTap) {
 /// The whole-output tap: capture the DEFAULT OUTPUT (PipeWire
 /// `stream.capture.sink`). Everything the machine plays is in there,
 /// this app included — the caller pairs it with the echo guard.
+#[cfg(not(windows))]
 fn output_capture_thread(
     stop: Arc<AtomicBool>,
     sys_tx: SyncSender<Vec<f32>>,
@@ -2167,6 +2233,7 @@ fn output_capture_thread(
 /// Parley's own playback nodes are excluded HERE, at the source: a picker
 /// that offered them would re-create exactly the echo this path exists
 /// to remove.
+#[cfg(not(windows))]
 pub fn list_audio_players() -> Result<Vec<AudioPlayer>, String> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2268,6 +2335,7 @@ pub fn list_audio_players() -> Result<Vec<AudioPlayer>, String> {
     Ok(out)
 }
 
+#[cfg(not(windows))]
 fn is_parley(value: &str) -> bool {
     value.to_lowercase().contains("parley")
 }
@@ -2275,6 +2343,7 @@ fn is_parley(value: &str) -> bool {
 /// Backlog for one selected application. Written by its capture callback,
 /// drained by the collector — both on the capture thread, so a plain
 /// `VecDeque` needs no lock.
+#[cfg(not(windows))]
 struct PlayerSource {
     /// Interleaved stereo f32 at 48 kHz, oldest first.
     buf: std::collections::VecDeque<f32>,
@@ -2283,14 +2352,18 @@ struct PlayerSource {
     primed: bool,
 }
 
+#[cfg(not(windows))]
 const STEREO_SAMPLES_PER_MS: usize = 48 * 2;
 /// Playout backlog before a source is mixed in (30 ms absorbs quantum
 /// jitter without adding audible delay).
+#[cfg(not(windows))]
 const PLAYER_PREBUFFER_SAMPLES: usize = 30 * STEREO_SAMPLES_PER_MS;
 /// Hard cap per source (240 ms): a sustained surplus means the clocks
 /// disagree — drop OLDEST, never grow latency.
+#[cfg(not(windows))]
 const PLAYER_CAP_SAMPLES: usize = 240 * STEREO_SAMPLES_PER_MS;
 /// One collector step: 10 ms of stereo.
+#[cfg(not(windows))]
 const MIX_STEP_SAMPLES: usize = 10 * STEREO_SAMPLES_PER_MS;
 
 /// Capture specific application nodes — the echo-free path.
@@ -2300,6 +2373,7 @@ const MIX_STEP_SAMPLES: usize = 10 * STEREO_SAMPLES_PER_MS;
 /// each accumulates into its own ring and a 10 ms collector sums whatever
 /// is ready: the mux always receives the same steady stereo shape. Parley's
 /// own playback is not among the sources — structural, not a subtraction.
+#[cfg(not(windows))]
 fn players_capture_thread(
     stop: Arc<AtomicBool>,
     tx: SyncSender<Vec<f32>>,
@@ -2447,6 +2521,7 @@ fn players_capture_thread(
 /// the next `step` samples of its backlog; a source short of data
 /// contributes silence for the missing tail — the mux's clock must never
 /// depend on one app.
+#[cfg(not(windows))]
 fn collect_mix(
     sources: &std::rc::Rc<std::cell::RefCell<Vec<PlayerSource>>>,
     step: usize,
@@ -2475,6 +2550,7 @@ fn collect_mix(
 /// The one format every share-audio tap asks for: F32LE, 48 kHz, stereo.
 /// Share audio rides the music profile, so nothing downstream converts or
 /// resamples.
+#[cfg(not(windows))]
 fn f32_stereo_format_pod() -> Vec<u8> {
     use spa::pod::{ChoiceValue, Object, Property, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
@@ -2710,6 +2786,7 @@ pub fn spawn_share_audio_mux(
 // share audio, the DMA-BUF switch, the dialog's caps, and the preview
 // tap. They are deliberately separate — folding them into a struct at
 // the one call site that has all of them (the bridge) buys nothing.
+#[cfg(not(windows))]
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
     conn: quinn::Connection,
@@ -2932,7 +3009,7 @@ pub async fn start(
     Ok((handle, ShareController { stop_tx }))
 }
 
-#[cfg(all(test, feature = "vaapi"))]
+#[cfg(all(test, feature = "vaapi", not(windows)))]
 mod dmabuf_negotiation_tests {
     use super::{buffers_data_type_property, modifier_property};
     use pipewire::spa::pod::{ChoiceValue, PropertyFlags, Value};
@@ -3197,6 +3274,32 @@ mod tests {
         g
     }
 
+    /// A still source (a WGC capture of a desktop that does not change)
+    /// sends about one frame a second. A viewer decoding all of them is
+    /// NOT starved, so the governor must leave the stream alone: the
+    /// configured 60 fps ceiling is not the sender's real rate.
+    #[test]
+    fn a_static_source_does_not_look_like_a_starved_viewer() {
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        g.sent_fps = 1.0;
+        for i in 1..=3 {
+            assert_eq!(
+                g.step_at(t0 + i * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false),
+                (0.0, None),
+                "a 1 fps stream decoded at 1 fps keeps its resolution"
+            );
+        }
+        // The same viewer on a stream that IS sending 30 fps is behind.
+        g.sent_fps = 30.0;
+        g.step_at(t0 + 4 * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false);
+        assert_eq!(
+            g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false),
+            (0.0, Some(720)),
+            "two reports short of the real send rate lower resolution"
+        );
+    }
+
     /// No report is not "zero fps": an older viewer (or none in the
     /// channel yet) must leave the profile's own pace alone.
     #[test]
@@ -3283,7 +3386,7 @@ mod tests {
 
 /// The per-app collector: pure sample bookkeeping, no PipeWire, so it
 /// runs in CI (the capture path itself needs a live graph).
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod share_audio_tests {
     use super::*;
     use std::cell::RefCell;

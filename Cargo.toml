@@ -13,7 +13,7 @@ exclude = ["vendor/moq-vaapi"]
 
 
 [workspace.package]
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 
 [workspace.dependencies]
@@ -54,6 +54,17 @@ sonora = "0.2"
 openh264 = "0.9"
 ashpd = "0.13"
 pipewire = "0.10"
+# Windows capture backend: WGC for pixels (it owns the D3D11 interop we
+# would otherwise have to write) and WASAPI for sound. Both sit behind
+# `screen-capture` on cfg(windows) only, so Linux builds never see them.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-capture = "2.0"
+wasapi = "0.26"
 # 7f: Flutter external textures from Rust (app display bridge for video
 # receive). irondash_texture 0.5.0 is the latest stable (the 0.6 line
 # is pre-release dev); irondash_engine_context provides the engine

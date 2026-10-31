@@ -1890,11 +1890,12 @@ pub fn play_voice_chime(join: bool) {
 
 // ===== 7g: in-app screen share =====
 //
-// The Dart side calls start_screen_share after joining a channel; the
-// portal dialog opens (Hyprland's picker). Lifecycle events arrive as
+// The Dart side calls start_screen_share after joining a channel and the
+// platform source picker opens (the XDG portal on Linux, the Windows
+// Graphics Capture picker on Windows). Lifecycle events arrive as
 // session events (share_started / share_ended). Stop is stop_screen_
-// share OR the desktop's sharing indicator — both converge on Ended →
-// StopShare AFTER teardown.
+// share OR the desktop's own sharing indicator — both converge on Ended
+// → StopShare AFTER teardown.
 
 /// Toggle hardware (VAAPI) encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
@@ -1934,21 +1935,22 @@ pub fn hw_encode_supported() -> bool {
     cfg!(feature = "hw-encode")
 }
 
-/// Whether this build can share a screen at all (the `screen-capture`
-/// feature pulls the portal + PipeWire capture path, which is Linux
-/// only). The Dart side hides the share entry points when this is false:
-/// on such a build the call could only ever return "screen-capture
-/// feature off". Viewing other people's shares is `video`, a different
-/// feature — a client without this one still watches.
+/// Whether this build can share a screen at all. The `screen-capture`
+/// feature pulls the platform backend: the portal + PipeWire path on
+/// Linux, Windows Graphics Capture + WASAPI on Windows. The Dart side
+/// hides the share entry points when this is false — on such a build the
+/// call could only ever return "screen-capture feature off". Viewing
+/// other people's shares is `video`, a different feature — a client
+/// without this one still watches.
 pub fn screen_share_supported() -> bool {
     cfg!(feature = "screen-capture")
 }
 
-/// Start sharing this machine's screen (portal dialog opens). The
-/// share runs regardless of channel membership — viewers see it when
-/// they're in the same voice channel (FLAG_VIDEO rides the media
-/// path). Acceptance: share_started event, then the peer's Screens
-/// panel shows this machine.
+/// Start sharing this machine's screen (the platform source picker
+/// opens). The share runs regardless of channel membership — viewers see
+/// it when they're in the same voice channel (FLAG_VIDEO rides the media
+/// path). Acceptance: share_started event, then the peer's Screens panel
+/// shows this machine.
 #[cfg(not(feature = "screen-capture"))]
 pub fn start_screen_share(
     _session_id: u32,
@@ -1967,8 +1969,10 @@ pub fn start_screen_share(
 ///
 /// Audio: `share_audio` off ⇒ no audio tap at all. On with
 /// `audio_players` empty ⇒ the whole default output (echo guard runs).
-/// On with node ids ⇒ exactly those applications, captured from their
-/// own PipeWire nodes — this app's voice cannot appear in it.
+/// On with ids ⇒ exactly those applications: PipeWire node ids on
+/// Linux, process ids on Windows (both come from
+/// `list_share_audio_players`). This app's own voice can never appear
+/// in that capture.
 #[cfg(feature = "screen-capture")]
 pub fn start_screen_share(
     session_id: u32,
@@ -1978,7 +1982,7 @@ pub fn start_screen_share(
     audio_players: Vec<u32>,
 ) -> Result<(), String> {
     // The own-share card reads the NEW share's shape, not the last one's
-    // while the portal picker is still open.
+    // while the source picker is still open.
     crate::api::video::clear_share_stats();
     let (event_tx, share_loss, share_viewer_fps, conn, poke_slot, ctrl_slot) = {
         let sessions = SESSIONS.lock().unwrap();
@@ -1997,9 +2001,9 @@ pub fn start_screen_share(
             s.share_ctrl.clone(),
         )
     };
-    // Spawned (not awaited): the portal dialog blocks for seconds and
-    // FRB calls must return fast. The owner task forwards lifecycle
-    // events into the session's stream and clears the slots on Ended.
+    // Spawned (not awaited): the source picker blocks for seconds and FRB
+    // calls must return fast. The owner task forwards lifecycle events
+    // into the session's stream and clears the slots on Ended.
     let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
     let ended_event_tx = event_tx.clone();
     rt().spawn(async move {
@@ -2018,9 +2022,9 @@ pub fn start_screen_share(
             let (audio, sys_rx) = if !share_audio {
                 (None, None)
             } else if audio_players.is_empty() {
-                // Whole-output tap: the PipeWire monitor mix enters RAW
-                // and leaves the echo filter with our own playback
-                // subtracted, then reaches the mux. Two bounded channels:
+                // Whole-output tap: the system mix enters RAW and leaves
+                // the echo filter with our own playback subtracted, then
+                // reaches the mux. Two bounded channels:
                 // the capture thread never blocks, and a canceller-init
                 // failure degrades to a pass-through instead of silence.
                 let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);

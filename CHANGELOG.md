@@ -3,6 +3,35 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.5] — 2026-10-31
+
+Windows reaches feature parity for sharing: it can start a screen share and
+carry the sound you choose, not just watch.
+
+### Added
+
+- **Screen sharing on Windows.** *Share screen* opens the Windows Graphics
+  Capture picker (a monitor or a window), encodes through the same H.264
+  path and shows the sharer's own live preview. A still desktop is still a
+  live stream: the newest frame is repeated about once a second, so the
+  viewer's stall detector does not hide a share that simply has nothing to
+  update.
+- **Share audio on Windows.** WASAPI loopback carries either the default
+  output (with the same echo guard as Linux) or exactly the applications
+  picked in the dialog, one process-loopback client per app. Parley's own
+  process is never listed or captured.
+
+### Changed
+
+- **Fullscreen is real on Windows.** The `parley/window` channel now exists
+  in the Windows runner: the viewer takes a borderless monitor-sized window
+  and restores the previous placement on exit, instead of only covering the
+  app's own window.
+- **A still source no longer looks like a struggling viewer.** The pace
+  governor compares a viewer's decoded rate with what the sender actually
+  delivered as well as with the configured ceiling, so a capture that has
+  nothing new to send cannot fold the stream down to 480p.
+
 ## [0.4.4] — 2026-10-28
 
 Updates arrive from inside the app, and every release says what it

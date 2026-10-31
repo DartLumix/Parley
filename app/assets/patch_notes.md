@@ -10,10 +10,17 @@
      headings and bullets, everything else as a paragraph.
 -->
 
-- Parley now updates itself: **Settings → Updates → Check for updates**
-  finds a new release, installs it after checking the download against
-  the release checksums, and comes back on the new build. A call or a
-  share in progress ends with the restart, and an install owned by a
-  package manager is left alone and says so.
-- What changed shows up by itself, here, the first time you launch a new
-  version — and any time from **What's new**, next to the update button.
+- **Screen sharing now works on Windows.** *Share screen* opens the
+  Windows picker for a monitor or a window, sends through the same H.264
+  path as Linux, and shows your own live preview. Sharing the desktop
+  normally costs nothing extra; a still screen keeps streaming too.
+- **Share audio on Windows.** Pick the applications whose sound should
+  travel with the stream (or share the whole default output). Parley's
+  own voices are never captured, so nobody hears themselves back.
+- **Fullscreen is real on Windows.** The fullscreen viewer takes the
+  whole monitor, not just the app's window, and restores the window
+  where it was when you leave it.
+- **A still screen no longer looks like a slow viewer.** The sender now
+  compares what a viewer decodes with what it actually sends, so a
+  desktop with nothing changing keeps its resolution instead of being
+  folded down to 480p.

@@ -1094,15 +1094,16 @@ class _HomePageState extends State<HomePage> {
     if (on && _preview == null && _sharing) await _loadPreview();
   }
 
-  // 7g: share lifecycle. Start: options dialog → portal dialog
-  // (compositor's picker); share_started/share_ended events flip the
+  // 7g: share lifecycle. Start: options dialog → platform source picker
+  // (compositor's on Linux, WGC's on Windows); share_started/share_ended
+  // events flip the
   // button. FRB exposes the start as async (even though the Rust side
-  // returns instantly) — the portal dialog blocks for seconds.
+  // returns instantly) — the source picker blocks for seconds.
   Future<void> _startShare() async {
     final session = _session;
     if (session == null) return;
     // A snapshot of what is playing right now: the share captures these
-    // applications' own PipeWire nodes, so Parley's voice can never end
+    // applications' own capture nodes, so Parley's voice can never end
     // up in the stream. Empty (no audio device, no players, other OS) is
     // not an error — the dialog then simply offers no audio.
     final players = await listShareAudioPlayers();

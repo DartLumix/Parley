@@ -6,13 +6,16 @@ import 'package:flutter/services.dart';
 
 import 'theme.dart';
 
-/// The GTK side's window channel (linux/runner/my_application.cc).
+/// The native window channel: `linux/runner/my_application.cc` and
+/// `windows/runner/flutter_window.cpp`.
 ///
-/// The window is undecorated: the app owns the title bar. Fullscreen is
-/// still the WINDOW's, not the page's — the same call every native
-/// player makes (`gtk_window_fullscreen` → xdg_toplevel /
-/// `_NET_WM_STATE_FULLSCREEN`). That is what makes the system recognise
-/// it, instead of a widget merely covering our own window.
+/// Fullscreen is the WINDOW's, not the page's — the same call every
+/// native player makes (GTK's `gtk_window_fullscreen` on Linux, a
+/// borderless monitor-sized window on Windows). That is what makes the
+/// system recognise it, instead of a widget merely covering our own
+/// window. Minimize/maximize/close exist for the Linux custom title bar;
+/// Windows keeps its native frame and still uses the same methods for
+/// its own buttons if asked.
 const MethodChannel windowChannel = MethodChannel('parley/window');
 
 /// Ask the window manager for real fullscreen. Answers with the state
@@ -79,11 +82,13 @@ Future<bool> startWindowDrag() async {
 /// A thin window toolbar that slides down when the pointer reaches the
 /// very top of the window and hides again afterwards.
 ///
-/// The window is undecorated (the GTK header bar is gone — on a tiling
-/// desktop it was a white strip above the page). That leaves no native
-/// close/minimise control, so this is the replacement: 6 px of dead
-/// space at the top reveals it, the strip itself holds the app name, a
-/// drag region, and minimise / maximise / close.
+/// The Linux window is undecorated (the GTK header bar is gone — on a
+/// tiling desktop it was a white strip above the page). That leaves no
+/// native close/minimise control, so this is the replacement: 6 px of
+/// dead space at the top reveals it, the strip itself holds the app
+/// name, a drag region, and minimise / maximise / close. Windows keeps
+/// its native frame (the platform's convention), so the toolbar stays
+/// hidden there rather than drawing a second title bar.
 class WindowToolbar extends StatefulWidget {
   const WindowToolbar({super.key, this.enabled = true});
 

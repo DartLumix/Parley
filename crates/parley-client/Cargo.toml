@@ -23,7 +23,19 @@ video = ["parley-core/video"]
 # 7g: opt-in hardware encode (--hw-encode). NOT part of any default
 # build — the server/CI configs must never link libva. §8 containment.
 vaapi = ["parley-core/vaapi", "video"]
-screen-capture = ["dep:ashpd", "dep:pipewire", "dep:futures-util", "video"]
+# Screen capture + share audio, one feature for both desktop targets:
+# Linux is the portal + PipeWire path, Windows is WGC + WASAPI loopback.
+# The platform deps are target-scoped so enabling this on either OS only
+# pulls that OS's backend.
+screen-capture = [
+    "dep:ashpd",
+    "dep:pipewire",
+    "dep:futures-util",
+    "dep:windows",
+    "dep:windows-capture",
+    "dep:wasapi",
+    "video",
+]
 
 [dependencies]
 parley-core = { workspace = true }
@@ -38,6 +50,13 @@ cpal = { workspace = true, optional = true }
 webrtc-audio-processing = { workspace = true, optional = true }
 sonora = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
 ashpd = { workspace = true, optional = true, features = ["screencast"] }
 pipewire = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, optional = true }
+windows-capture = { workspace = true, optional = true }
+wasapi = { workspace = true, optional = true }
