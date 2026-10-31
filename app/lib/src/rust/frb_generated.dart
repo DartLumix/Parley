@@ -299,6 +299,7 @@ abstract class RustLibApi extends BaseApi {
     required bool shareAudio,
     required List<int> audioPlayers,
     required bool camera,
+    required bool cameraOverlay,
   });
 
   Future<void> crateApiSessionStopScreenShare({required int sessionId});
@@ -2025,6 +2026,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required bool shareAudio,
     required List<int> audioPlayers,
     required bool camera,
+    required bool cameraOverlay,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -2036,6 +2038,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_bool(shareAudio, serializer);
           sse_encode_list_prim_u_32_loose(audioPlayers, serializer);
           sse_encode_bool(camera, serializer);
+          sse_encode_bool(cameraOverlay, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -2055,6 +2058,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           shareAudio,
           audioPlayers,
           camera,
+          cameraOverlay,
         ],
         apiImpl: this,
       ),
@@ -2071,6 +2075,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           "shareAudio",
           "audioPlayers",
           "camera",
+          "cameraOverlay",
         ],
       );
 

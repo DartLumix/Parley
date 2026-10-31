@@ -15,6 +15,7 @@ typedef ShareOptions = ({
   bool audio,
   List<int> audioPlayers,
   bool camera,
+  bool cameraOverlay,
 });
 
 /// Ask for resolution, frame rate and audio before the source picker opens.
@@ -40,6 +41,9 @@ Future<ShareOptions?> showShareOptionsDialog(
   var chosenHeight = height;
   var chosenFps = fps;
   var camera = false;
+  // Off by default: the camera is a deliberate choice, never something a
+  // screen share turns on for someone who did not ask.
+  var cameraOverlay = false;
   // Everything playing is checked by default: the old whole-output
   // behaviour, minus this app itself.
   var audioOn = players.isNotEmpty;
@@ -63,8 +67,26 @@ Future<ShareOptions?> showShareOptionsDialog(
                     label: 'Source',
                     value: camera,
                     items: const [(false, 'Screen'), (true, 'Camera')],
-                    onChanged: (v) => setDialog(() => camera = v),
+                    onChanged: (v) => setDialog(() {
+                      camera = v;
+                      if (v) cameraOverlay = false;
+                    }),
                   ),
+                  if (!camera)
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Include camera',
+                            style: TextStyle(fontSize: 13),
+                          ),
+                        ),
+                        Switch(
+                          value: cameraOverlay,
+                          onChanged: (v) => setDialog(() => cameraOverlay = v),
+                        ),
+                      ],
+                    ),
                   const SizedBox(height: 8),
                 ],
                 Text(
@@ -72,6 +94,10 @@ Future<ShareOptions?> showShareOptionsDialog(
                       ? 'The camera stream uses the same video path as a '
                             'screen share: resolution and frame rate are '
                             'caps, and viewers can watch it like any share.'
+                      : cameraOverlay
+                      ? 'The camera is composited into the bottom-right corner '
+                            'of the screen stream. If it cannot open, the '
+                            'screen share still runs.'
                       : 'Pick the source in the system dialog that opens next. '
                             'These are caps, not upscales — the stream runs at '
                             'the fastest rate the encoder can hold up to the '
@@ -190,11 +216,9 @@ Future<ShareOptions?> showShareOptionsDialog(
                   ? selected.toList(growable: false)
                   : const <int>[],
               camera: camera,
+              cameraOverlay: !camera && cameraOverlay,
             )),
-            icon: Icon(
-              camera ? Icons.videocam : Icons.screen_share,
-              size: 18,
-            ),
+            icon: Icon(camera ? Icons.videocam : Icons.screen_share, size: 18),
             label: Text(camera ? 'Start camera' : 'Start sharing'),
           ),
         ],

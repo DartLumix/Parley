@@ -390,6 +390,7 @@ Future<void> startScreenShare({
   required bool shareAudio,
   required List<int> audioPlayers,
   required bool camera,
+  required bool cameraOverlay,
 }) => RustLib.instance.api.crateApiSessionStartScreenShare(
   sessionId: sessionId,
   maxHeight: maxHeight,
@@ -397,6 +398,7 @@ Future<void> startScreenShare({
   shareAudio: shareAudio,
   audioPlayers: audioPlayers,
   camera: camera,
+  cameraOverlay: cameraOverlay,
 );
 
 /// Real impl — see the stub above.

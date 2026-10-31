@@ -35,8 +35,9 @@
 //!   themselves back.
 
 use std::collections::VecDeque;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,7 +46,18 @@ use wasapi::{
     initialize_mta,
 };
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Media::MediaFoundation::{
+    IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample, IMFSourceReader,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READERF_STREAMTICK,
+    MF_VERSION, MFCreateAttributes, MFCreateDeviceSource, MFCreateMediaType,
+    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFMediaType_Video, MFSTARTUP_LITE,
+    MFShutdown, MFStartup, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
+};
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Threading::{
     GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
@@ -62,8 +74,8 @@ use windows_capture::settings::{
 };
 
 use super::{
-    PreviewSink, ShareAudio, ShareAudioTap, ShareController, ShareHandle, ShareOptions, ToEncoder,
-    encoder_thread,
+    CameraOverlay, PreviewSink, ShareAudio, ShareAudioTap, ShareController, ShareHandle,
+    ShareOptions, ToEncoder, encoder_thread,
 };
 use crate::ShareEvent;
 
@@ -274,19 +286,331 @@ impl GraphicsCaptureApiHandler for Capture {
     }
 }
 
-/// Camera shares are a Linux feature for now: Windows would need a
-/// Media Foundation source reader, and offering a button that always
-/// fails is worse than hiding it. The bridge checks
-/// `camera_share_supported()` before showing the choice.
+/// A camera opened through Media Foundation, already negotiated to
+/// RGB32 (the BGRA order WGC and the encoder both produce). The buffer
+/// is top-down or bottom-up depending on the driver's stride sign, so
+/// the reader normalises it before handing a frame on.
+struct MfCamera {
+    reader: IMFSourceReader,
+    width: usize,
+    height: usize,
+    /// Negative when the driver hands over bottom-up RGB32.
+    stride: isize,
+}
+
+/// Open the first video capture device. Beta path: the first device is
+/// chosen deliberately (there is no camera picker yet), and every
+/// failure is a plain `Err` the bridge turns into a message — never a
+/// panic and never a share that starts without video.
+fn open_mf_camera() -> Result<MfCamera, String> {
+    unsafe {
+        // MTA because this thread only ever owns the source reader; a
+        // failure here (RPC_E_CHANGED_MODE on an already-STA thread) is
+        // harmless for Media Foundation's lite startup.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_LITE).map_err(|e| format!("Media Foundation: {e}"))?;
+
+        let mut attrs: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut attrs, 1).map_err(|e| format!("camera attributes: {e}"))?;
+        let attrs = attrs.ok_or("camera attributes were not created")?;
+        attrs
+            .SetGUID(
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+            )
+            .map_err(|e| format!("camera enumeration: {e}"))?;
+
+        let mut devices: *mut Option<IMFActivate> = ptr::null_mut();
+        let mut count = 0u32;
+        MFEnumDeviceSources(&attrs, &mut devices, &mut count)
+            .map_err(|e| format!("camera enumeration: {e}"))?;
+        let activate = if count == 0 || devices.is_null() {
+            None
+        } else {
+            let list = std::slice::from_raw_parts(devices, count as usize);
+            list[0].clone()
+        };
+        CoTaskMemFree(Some(devices as *const _));
+        let activate =
+            activate.ok_or("no camera found (Media Foundation listed no video device)")?;
+
+        let source: IMFMediaSource =
+            MFCreateDeviceSource(&activate).map_err(|e| format!("camera open: {e}"))?;
+
+        let mut reader_attrs: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut reader_attrs, 1)
+            .map_err(|e| format!("camera reader attributes: {e}"))?;
+        reader_attrs
+            .as_ref()
+            .ok_or("camera reader attributes were not created")?
+            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+            .map_err(|e| format!("camera reader attributes: {e}"))?;
+        let reader: IMFSourceReader =
+            MFCreateSourceReaderFromMediaSource(&source, reader_attrs.as_ref())
+                .map_err(|e| format!("camera reader: {e}"))?;
+
+        let media_type: IMFMediaType =
+            MFCreateMediaType().map_err(|e| format!("camera media type: {e}"))?;
+        media_type
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(|e| format!("camera media type: {e}"))?;
+        media_type
+            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
+            .map_err(|e| format!("camera media type: {e}"))?;
+        media_type
+            .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+            .map_err(|e| format!("camera media type: {e}"))?;
+        reader
+            .SetCurrentMediaType(
+                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                None,
+                &media_type,
+            )
+            .map_err(|e| format!("camera format: {e}"))?;
+
+        let actual = reader
+            .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            .map_err(|e| format!("camera format: {e}"))?;
+        let size = actual
+            .GetUINT64(&MF_MT_FRAME_SIZE)
+            .map_err(|e| format!("camera frame size: {e}"))?;
+        let width = (size >> 32) as usize;
+        let height = (size & 0xffff_ffff) as usize;
+        if width == 0 || height == 0 {
+            return Err("the camera reported an empty frame size".to_string());
+        }
+        let stride = actual
+            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+            .map(|v| v as i32 as isize)
+            .unwrap_or((width * 4) as isize);
+        Ok(MfCamera {
+            reader,
+            width,
+            height,
+            stride,
+        })
+    }
+}
+
+/// Pull frames until stop or end-of-stream. Each frame is copied into a
+/// tightly packed top-down BGRA buffer (the encoder's stride path still
+/// works, but a camera frame is small enough that the normalisation is
+/// free and removes the bottom-up driver quirk).
+fn mf_read(
+    cam: &MfCamera,
+    stop: &AtomicBool,
+    mut sink: impl FnMut(Arc<Vec<u8>>),
+) -> Result<(), String> {
+    let row_bytes = cam.width * 4;
+    let pitch = cam.stride.unsigned_abs();
+    if pitch < row_bytes {
+        return Err(format!(
+            "camera stride {pitch} is shorter than a {} px row",
+            cam.width
+        ));
+    }
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        unsafe {
+            let mut flags = 0u32;
+            let mut sample: Option<IMFSample> = None;
+            cam.reader
+                .ReadSample(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                    0,
+                    None,
+                    Some(&mut flags),
+                    None,
+                    Some(&mut sample),
+                )
+                .map_err(|e| format!("camera read: {e}"))?;
+            if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
+                return Err("camera read failed (device removed?)".to_string());
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+            if flags & MF_SOURCE_READERF_STREAMTICK.0 as u32 != 0 {
+                continue;
+            }
+            let Some(sample) = sample else {
+                continue;
+            };
+            let buffer = sample
+                .ConvertToContiguousBuffer()
+                .map_err(|e| format!("camera buffer: {e}"))?;
+            let mut data: *mut u8 = ptr::null_mut();
+            let mut len = 0u32;
+            buffer
+                .Lock(&mut data, None, Some(&mut len))
+                .map_err(|e| format!("camera buffer lock: {e}"))?;
+            let bytes = std::slice::from_raw_parts(data, len as usize);
+            let result = if bytes.len() < pitch * cam.height {
+                Err(format!(
+                    "camera frame is {} bytes, expected {}",
+                    bytes.len(),
+                    pitch * cam.height
+                ))
+            } else {
+                let mut out = vec![0u8; row_bytes * cam.height];
+                for y in 0..cam.height {
+                    let src_y = if cam.stride < 0 {
+                        cam.height - 1 - y
+                    } else {
+                        y
+                    };
+                    out[y * row_bytes..(y + 1) * row_bytes]
+                        .copy_from_slice(&bytes[src_y * pitch..src_y * pitch + row_bytes]);
+                }
+                Ok(out)
+            };
+            let _ = buffer.Unlock();
+            match result {
+                Ok(out) => sink(Arc::new(out)),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Camera share. The encoder path is the screen path: one stream,
+/// frame pacing, the ladder and the preview all behave identically.
+/// The camera is opened on the capture thread so its COM apartment is
+/// the one that reads it, and a failed open is reported before this
+/// function returns.
 pub async fn start_camera(
-    _conn: quinn::Connection,
-    _video_loss: Arc<AtomicU32>,
-    _viewer_fps: Arc<AtomicU32>,
-    _events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
-    _options: ShareOptions,
-    _preview: Option<PreviewSink>,
+    conn: quinn::Connection,
+    video_loss: Arc<AtomicU32>,
+    viewer_fps: Arc<AtomicU32>,
+    events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
+    options: ShareOptions,
+    preview: Option<PreviewSink>,
 ) -> Result<(ShareHandle, ShareController), String> {
-    Err("camera capture is not available on Windows yet".to_string())
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ToEncoder>(4);
+    let force_idr = Arc::new(AtomicBool::new(false));
+    let handle = ShareHandle {
+        flag: force_idr.clone(),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    let enc_handle = std::thread::Builder::new()
+        .name("parley-camera-encode".into())
+        .spawn(move || {
+            encoder_thread(
+                frame_rx, conn, force_idr, video_loss, viewer_fps, die_tx, options, None, preview,
+            )
+        })
+        .map_err(|e| format!("camera encoder thread: {e}"))?;
+
+    let (ready_tx, ready_rx) = sync_channel::<Result<(u32, u32), String>>(1);
+    let stop_for_capture = stop.clone();
+    let capture_handle = std::thread::Builder::new()
+        .name("parley-camera".into())
+        .spawn(move || {
+            let cam = match open_mf_camera() {
+                Ok(cam) => cam,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            let width = cam.width as u32;
+            let height = cam.height as u32;
+            println!(
+                "camera: Media Foundation {width}x{height} RGB32 stride {} @ 30 fps",
+                cam.stride
+            );
+            let _ = ready_tx.send(Ok((width, height)));
+            let _ = frame_tx.send(ToEncoder::Negotiated {
+                width,
+                height,
+                fps: 30.0,
+            });
+            let row = cam.width * 4;
+            if let Err(e) = mf_read(&cam, &stop_for_capture, |data| {
+                let _ = frame_tx.try_send(ToEncoder::Frame { data, stride: row });
+            }) {
+                eprintln!("camera: capture ended: {e}");
+            }
+            unsafe {
+                let _ = MFShutdown();
+            }
+            let _ = done_tx.send(());
+        })
+        .map_err(|e| format!("camera capture thread: {e}"))?;
+
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = capture_handle.join();
+            let _ = enc_handle.join();
+            return Err(e);
+        }
+        Err(_) => {
+            return Err("camera did not open within 5 s".to_string());
+        }
+    }
+
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let stop_for_task = stop.clone();
+    let events_for_task = events.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = stop_rx.recv() => {}
+            _ = die_rx.recv() => {}
+            _ = done_rx.recv() => {}
+        }
+        stop_for_task.store(true, Ordering::Relaxed);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = capture_handle.join();
+            let _ = enc_handle.join();
+        })
+        .await;
+        let _ = events_for_task.send(ShareEvent::Ended { external: false });
+    });
+
+    Ok((handle, ShareController { stop_tx }))
+}
+
+/// Camera overlay for a Windows screen share. The Media Foundation
+/// source is a beta path; failing to open one is not a share failure,
+/// and the screen keeps streaming. The thread clears the slot on exit,
+/// so a frozen last picture cannot outlive the camera.
+pub fn start_overlay(
+    stop: Arc<AtomicBool>,
+    overlay: CameraOverlay,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    std::thread::Builder::new()
+        .name("parley-camera-overlay".into())
+        .spawn(move || match open_mf_camera() {
+            Ok(cam) => {
+                println!(
+                    "camera overlay: Media Foundation {}x{} RGB32 stride {}",
+                    cam.width, cam.height, cam.stride
+                );
+                let width = cam.width;
+                let height = cam.height;
+                let slot = overlay.clone();
+                if let Err(e) = mf_read(&cam, &stop, |data| slot.publish(data, width, height)) {
+                    eprintln!("camera overlay: capture ended: {e}");
+                }
+                unsafe {
+                    let _ = MFShutdown();
+                }
+                overlay.clear();
+            }
+            Err(e) => {
+                eprintln!("camera overlay: {e}; continuing screen-only");
+                overlay.clear();
+            }
+        })
+        .map_err(|e| format!("camera overlay thread: {e}"))
 }
 
 /// Entry point, matching the Linux one: pick a source, start capture,
@@ -311,6 +635,12 @@ pub async fn start(
     let handle = ShareHandle {
         flag: force_idr.clone(),
     };
+    // The overlay is opt-in. If the camera fails to open, the thread
+    // logs it and the screen keeps going; nothing downstream depends on
+    // it having produced a frame.
+    let overlay = options.camera_overlay.then(CameraOverlay::new);
+    let overlay_for_encoder = overlay.clone();
+    let overlay_for_capture = overlay.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicBool::new(false));
     let tid = Arc::new(AtomicU32::new(0));
@@ -409,10 +739,28 @@ pub async fn start(
         .name("parley-share-encoder".into())
         .spawn(move || {
             encoder_thread(
-                frame_rx, conn, force_idr, video_loss, viewer_fps, die_tx, options, preview,
+                frame_rx,
+                conn,
+                force_idr,
+                video_loss,
+                viewer_fps,
+                die_tx,
+                options,
+                overlay_for_encoder,
+                preview,
             )
         })
         .map_err(|e| format!("encoder thread: {e}"))?;
+
+    let overlay_thread = overlay_for_capture.as_ref().and_then(|overlay| {
+        match start_overlay(stop_flag.clone(), overlay.clone()) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("camera overlay: {e}; continuing screen-only");
+                None
+            }
+        }
+    });
 
     // Audio starts only once every fallible step is behind us: an early
     // return must never strand a capture thread holding a stop flag that
@@ -420,13 +768,13 @@ pub async fn start(
     if let Some(tap) = audio {
         start_audio_capture(stop_flag.clone(), tap);
     }
-
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tokio::spawn(async move {
         tokio::select! {
             biased;
             _ = stop_rx.recv() => {}
             _ = die_rx.recv() => {}
+
         }
         stop_flag.store(true, Ordering::Relaxed);
         // WM_QUIT ends WGC's GetMessage loop. Post only after `new`
@@ -457,6 +805,18 @@ pub async fn start(
             Ok(Ok(_)) => {}
             Ok(Err(_)) => eprintln!("share: encoder thread join failed"),
             Err(_) => eprintln!("share: encoder thread did not stop within 5 s — leaked"),
+        }
+        if let Some(overlay) = overlay_thread {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || overlay.join()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => eprintln!("camera overlay: join failed"),
+                Err(_) => eprintln!("camera overlay: did not stop within 2 s — leaked"),
+            }
         }
         let _ = events.send(ShareEvent::Ended {
             external: closed.load(Ordering::Relaxed),

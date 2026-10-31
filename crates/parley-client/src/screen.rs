@@ -88,9 +88,9 @@
 //! fidelity-class content. The mux ([system + mic] → one stream) lives
 //! here too; main.rs routes the mic to it via a tee while sharing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::video::VideoLadder;
@@ -116,17 +116,71 @@ use std::os::fd::OwnedFd;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::{list_audio_players, start, start_camera};
+pub use win::{list_audio_players, start, start_camera, start_overlay};
 #[cfg(not(windows))]
 mod camera;
 #[cfg(not(windows))]
-pub use camera::start_camera;
+pub use camera::{start_camera, start_overlay};
 
 /// Whether this build has a camera source. Linux captures V4L2 directly;
-/// Windows has no Media Foundation source yet, so the option is hidden
-/// rather than offered and then refused.
+/// Windows uses Media Foundation (beta: it can fail on a device whose
+/// driver exposes no RGB32 mode, in which case the share continues with
+/// the screen only).
 pub fn camera_share_supported() -> bool {
-    cfg!(not(windows))
+    true
+}
+
+/// The newest camera frame for a screen share's overlay. The screen
+/// encoder copies it into the bottom-right of every frame it sends; the
+/// camera keeps running at its own rate, so a slow screen frame never
+/// blocks the camera and a stalled camera simply stops updating the
+/// overlay after one second.
+#[derive(Clone)]
+pub struct CameraOverlay {
+    frame: Arc<Mutex<Option<OverlayFrame>>>,
+}
+
+struct OverlayFrame {
+    data: Arc<Vec<u8>>,
+    width: usize,
+    height: usize,
+    at: std::time::Instant,
+}
+
+impl CameraOverlay {
+    pub fn new() -> Self {
+        Self {
+            frame: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn publish(&self, data: Arc<Vec<u8>>, width: usize, height: usize) {
+        *self.frame.lock().unwrap() = Some(OverlayFrame {
+            data,
+            width,
+            height,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    fn clear(&self) {
+        *self.frame.lock().unwrap() = None;
+    }
+
+    /// A frame younger than one second, or None. A camera that was
+    /// unplugged must not leave its last picture frozen on the stream.
+    fn latest(&self) -> Option<(Arc<Vec<u8>>, usize, usize)> {
+        let slot = self.frame.lock().unwrap();
+        let frame = slot.as_ref()?;
+        (frame.at.elapsed() < Duration::from_secs(1))
+            .then(|| (frame.data.clone(), frame.width, frame.height))
+    }
+}
+
+impl Default for CameraOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(not(windows))]
@@ -180,6 +234,10 @@ pub struct ShareOptions {
     pub max_height: Option<u32>,
     /// Frame rate cap for the encode/pacing loop.
     pub max_fps: Option<f64>,
+    /// Put the camera in the bottom-right corner of a SCREEN share. A
+    /// standalone camera share ignores this. The camera runs on its own
+    /// thread; if it cannot open, the screen share still starts.
+    pub camera_overlay: bool,
 }
 
 /// One application's playback, as the platform's audio graph exposes
@@ -345,9 +403,7 @@ struct UserData {
 /// Frame-rate rungs the sender will pace at when a viewer says it cannot
 /// decode what it is being sent. The top is the encoder's own ceiling;
 /// the bottom is still recognisably live.
-const FPS_RUNGS: [f64; 11] = [
-    60.0, 50.0, 40.0, 30.0, 24.0, 20.0, 15.0, 12.0, 10.0, 8.0, 5.0,
-];
+const FPS_RUNGS: [f64; 7] = [60.0, 50.0, 40.0, 30.0, 24.0, 20.0, 15.0];
 
 /// The viewer-feedback rate governor.
 ///
@@ -614,6 +670,61 @@ fn raise_fps(current: f64, base: f64) -> Option<f64> {
     (next > current + 0.5).then_some(if (next - base).abs() < 0.5 { 0.0 } else { next })
 }
 
+/// Sends fragments at the stream's own bitrate instead of in a frame-sized
+/// burst.
+///
+/// This is the fix for the recurring "high motion → 5 fps" failure. The
+/// old send loop spread a frame over half a frame interval, which sounds
+/// like pacing but is not: a 200 KB 1080p keyframe became ~175 datagrams
+/// in 16 ms, i.e. ~87 Mbps on a link the encoder was asked to fill at 15.
+/// Quinn's congestion controller queues what it can and drops the rest;
+/// one missing fragment makes the frame undecodable, and the receiver
+/// then waits for the next IDR — which is also sent as a burst. The
+/// stream looks fine while the screen is still and collapses exactly
+/// when frames get large.
+///
+/// A byte budget makes the burst impossible: every fragment waits for its
+/// own share of the target rate before the next one leaves. A keyframe
+/// takes as long as its bits need (a few hundred milliseconds at worst)
+/// and arrives whole; the capture thread's skip-to-newest rule drops the
+/// frames that arrived during that window, so latency does not grow.
+struct SendPacer {
+    /// When the next fragment may leave. Reset to `now` whenever the
+    /// sender has been idle, so a still screen does not accumulate a
+    /// burst credit it can spend all at once.
+    next: std::time::Instant,
+    bps: u32,
+}
+
+impl SendPacer {
+    fn new(bps: u32) -> Self {
+        Self {
+            next: std::time::Instant::now(),
+            bps: bps.max(1),
+        }
+    }
+
+    fn set_bps(&mut self, bps: u32) {
+        self.bps = bps.max(1);
+    }
+
+    /// Block until `bytes` may be sent at the current target rate.
+    fn wait(&mut self, bytes: usize) {
+        let now = std::time::Instant::now();
+        if self.next > now {
+            std::thread::sleep(self.next - now);
+        }
+        let start = std::time::Instant::now();
+        self.next = start + Duration::from_micros(pace_micros(bytes, self.bps));
+    }
+}
+
+/// How long one datagram occupies the link at `bps`. At least 1 µs, so a
+/// zero-bit frame cannot make the pacer spin.
+fn pace_micros(bytes: usize, bps: u32) -> u64 {
+    ((bytes as u64).saturating_mul(8_000_000) / u64::from(bps.max(1))).max(1)
+}
+
 /// Everything the sender half needs, shared by both capture paths.
 ///
 /// The memfd path owns one on `encoder_thread`; the DMA-BUF path owns one
@@ -624,6 +735,8 @@ struct ShareEncoder {
     conn: quinn::Connection,
     encoder: Option<Box<dyn VideoEncoder>>,
     ladder: VideoLadder,
+    /// Byte-level fragment pacing at the ladder's current target.
+    pacer: SendPacer,
     fps: f64,
     /// Viewer-reported sustainable rate and the cap it produced.
     viewer_fps: Arc<AtomicU32>,
@@ -647,6 +760,12 @@ struct ShareEncoder {
     video_loss: Arc<AtomicU32>,
     /// The pre-share dialog's caps (see [`ShareOptions`]).
     options: ShareOptions,
+    /// The camera composited into the bottom-right corner, when this is
+    /// a screen share with the overlay switched on.
+    overlay: Option<CameraOverlay>,
+    /// Reused canvas for the overlay composite: one copy of the capture
+    /// per frame only while the overlay is on.
+    overlay_buf: Vec<u8>,
     /// The sharer's own tap, when the app asked for one. Frames are
     /// handed to [`PreviewJob`], never scaled here.
     tap: Option<PreviewSink>,
@@ -769,6 +888,9 @@ struct ShareSenderArgs {
     /// before it needs fewer pictures.
     viewer_fps: Arc<AtomicU32>,
     options: ShareOptions,
+    /// The camera overlay's latest-frame slot, when the dialog asked for
+    /// one and the camera opened. `None` on a camera-only share.
+    overlay: Option<CameraOverlay>,
     /// Metadata + preview tap. Only the non-DMA-BUF path spawns the
     /// preview thread; the capture thread keeps the tap for `negotiate`.
     tap: Option<PreviewSink>,
@@ -1512,6 +1634,7 @@ impl ShareEncoder {
         Self {
             conn: sender.conn,
             encoder: None,
+            pacer: SendPacer::new(VideoLadder::new().current_bps()),
             ladder: VideoLadder::new(),
             fps: 30.0,
             viewer_fps: sender.viewer_fps,
@@ -1530,6 +1653,8 @@ impl ShareEncoder {
             force_idr: sender.force_idr,
             video_loss: sender.video_loss,
             options: sender.options,
+            overlay: sender.overlay,
+            overlay_buf: Vec::new(),
             tap: sender.tap,
             preview_tx: sender.preview_tx,
             source: (0, 0),
@@ -1645,12 +1770,16 @@ impl ShareEncoder {
                      → paced {eff:.0} fps, clean rung {base} bps); hardware={}",
                     parley_core::video::hardware_encoder_active()
                 );
-                if applied != base {
-                    // The ladder was already on the robust rung: keep the
-                    // encoder there rather than pretending the rebuild
-                    // restored the clean target.
-                    e.set_bitrate(applied);
-                    println!("share: bitrate → {applied} bps (robust rung, scaled to profile)");
+                // Apply the target even when it equals the ladder's base:
+                // the encoder was created with a PROFILE default (60 fps
+                // for hardware, 30 for software), which can be twice the
+                // rate this particular share was asked for. Leaving that
+                // untouched was a second source of over-budget bursts on
+                // a 30 fps hardware share.
+                e.set_bitrate(applied);
+                self.pacer.set_bps(applied);
+                if applied != base || self.ladder.on_robust_rung() {
+                    println!("share: bitrate → {applied} bps (scaled to profile)");
                 }
                 self.encoder = Some(e);
                 self.stream = (enc_w as u32, enc_h as u32);
@@ -1714,6 +1843,7 @@ impl ShareEncoder {
         let enc = self.encoder.as_mut()?;
         if let Some(bps) = self.ladder.step(self.video_loss.load(Ordering::Relaxed)) {
             enc.set_bitrate(bps);
+            self.pacer.set_bps(bps);
             println!("share: bitrate → {bps} bps (video loss ladder)");
         }
         if self.ladder.should_force_keyframe() {
@@ -1740,6 +1870,31 @@ impl ShareEncoder {
         // preview thread is all the encode loop does for it.
         self.preview_tick(data, stride);
         let (sw, sh) = self.source;
+        // The camera is composited at the ENCODER's size, so the overlay
+        // is the same physical fraction of the picture at every rung.
+        // The copy is only paid while a camera frame is actually live: a
+        // camera that failed to open leaves the screen path untouched.
+        if let Some((cam, cw, ch)) = self.overlay.as_ref().and_then(CameraOverlay::latest) {
+            let need = w * h * 4;
+            let mut canvas = std::mem::take(&mut self.overlay_buf);
+            canvas.resize(need, 0);
+            let copied = if (sw, sh) == (w, h) && stride == w * 4 {
+                data.get(..need).is_some_and(|src| {
+                    canvas.copy_from_slice(src);
+                    true
+                })
+            } else {
+                scale_bgra(data, sw, sh, stride, w, h, &mut canvas)
+            };
+            let alive = if copied {
+                Self::draw_camera_overlay(&mut canvas, w, h, &cam, cw, ch);
+                self.frame_encode(|enc, out| enc.encode_bgra_strided(&canvas, w, h, w * 4, out))
+            } else {
+                true // truncated capture: skip this frame, keep the share up
+            };
+            self.overlay_buf = canvas;
+            return alive;
+        }
         if (sw, sh) == (w, h) || w == 0 || h == 0 {
             return self.frame_encode(|enc, out| enc.encode_bgra_strided(data, w, h, stride, out));
         }
@@ -1756,6 +1911,54 @@ impl ShareEncoder {
         };
         self.scaled = scaled;
         alive
+    }
+
+    /// Draw a camera frame in the bottom-right corner of a tightly packed
+    /// BGRA canvas, with a two-pixel dark border so it reads as an inset on
+    /// any content. Nearest-neighbour is deliberate: the camera is small, the
+    /// encode is real time, and a box filter here would cost more than it
+    /// gains on a 160–480 px overlay.
+    fn draw_camera_overlay(
+        dst: &mut [u8],
+        width: usize,
+        height: usize,
+        cam: &[u8],
+        cam_w: usize,
+        cam_h: usize,
+    ) {
+        if width == 0 || height == 0 || cam_w == 0 || cam_h == 0 {
+            return;
+        }
+        if cam.len() < cam_w.saturating_mul(cam_h).saturating_mul(4) {
+            return;
+        }
+        if dst.len() < width.saturating_mul(height).saturating_mul(4) {
+            return;
+        }
+        let max_ow = (width / 2).max(1);
+        let min_ow = 160.min(width).min(max_ow);
+        let ow = (width / 4).clamp(min_ow, max_ow).max(1);
+        let oh = (ow * cam_h / cam_w).min(height / 2).max(1);
+        let margin = (width / 64).max(8);
+        let x0 = width.saturating_sub(ow + margin);
+        let y0 = height.saturating_sub(oh + margin);
+        // Border first, then the picture inset by two pixels.
+        let border = 2usize;
+        for y in y0.saturating_sub(border)..(y0 + oh + border).min(height) {
+            for x in x0.saturating_sub(border)..(x0 + ow + border).min(width) {
+                let i = (y * width + x) * 4;
+                dst[i..i + 4].copy_from_slice(&[24, 24, 24, 255]);
+            }
+        }
+        for oy in 0..oh {
+            let sy = oy * cam_h / oh;
+            for ox in 0..ow {
+                let sx = ox * cam_w / ow;
+                let si = (sy * cam_w + sx) * 4;
+                let di = ((y0 + oy) * width + x0 + ox) * 4;
+                dst[di..di + 4].copy_from_slice(&cam[si..si + 4]);
+            }
+        }
     }
 
     /// Hand the shared capture buffer to the preview thread, at most
@@ -1867,15 +2070,10 @@ impl ShareEncoder {
             eff_fps > 45.0,
         );
         self.frame_id = self.frame_id.wrapping_add(1);
-        let min_interval = self.interval();
-        let total = dgs.len();
-        let per_frag = if total > 1 {
-            let half_interval_us = (min_interval.as_micros() as usize / 2).max(200);
-            (half_interval_us / (total - 1)).min(500) as u64
-        } else {
-            0
-        };
-        for (i, dg) in dgs.into_iter().enumerate() {
+        for dg in dgs {
+            // Byte pacing, not frame-interval pacing: a fragment may only
+            // leave when the link has budget for it. See `SendPacer`.
+            self.pacer.wait(dg.len());
             if let Err(e) = self.conn.send_datagram(dg.into()) {
                 // Real reason, not a guess: TooLarge (the estimate moved
                 // under us) and ConnectionLost are very different
@@ -1890,9 +2088,6 @@ impl ShareEncoder {
                 );
                 self.max_payload = fragment_budget_for(&self.conn);
                 return self.conn.close_reason().is_none();
-            }
-            if i + 1 < total && per_frag > 0 {
-                std::thread::sleep(Duration::from_micros(per_frag));
             }
         }
         self.encoded += 1;
@@ -1922,11 +2117,17 @@ impl ShareEncoder {
         }
         let el = self.window.elapsed();
         if el.as_secs() >= 10 {
+            let stats = self.conn.stats();
             println!(
-                "share: encoded {} frames ({:.1} fps), {} stale skipped",
+                "share: encoded {} frames ({:.1} fps), {} stale skipped; target {} bps, \
+                 rtt {:?}, cwnd {} KiB, lost {} packets",
                 self.encoded,
                 self.encoded as f64 / el.as_secs_f64(),
-                self.stale_skipped
+                self.stale_skipped,
+                self.pacer.bps,
+                stats.path.rtt,
+                stats.path.cwnd / 1024,
+                stats.path.lost_packets
             );
             self.encoded = 0;
             self.stale_skipped = 0;
@@ -1961,6 +2162,7 @@ fn encoder_thread(
     viewer_fps: Arc<AtomicU32>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     options: ShareOptions,
+    overlay: Option<CameraOverlay>,
     tap: Option<PreviewSink>,
 ) {
     // The preview gets its own thread for the life of this share; it
@@ -1973,6 +2175,7 @@ fn encoder_thread(
         video_loss,
         viewer_fps,
         options,
+        overlay,
         tap,
         preview_tx,
     });
@@ -2886,6 +3089,10 @@ pub async fn start(
     // connection must not leave a portal session and pw loop running
     // (found in the 6e netem run: endless "encoder behind").
     let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Created empty before the encoder starts, filled only after the
+    // portal/PipeWire setup has succeeded. A camera that cannot open is
+    // therefore a normal, screen-only share — no half-started thread.
+    let overlay = options.camera_overlay.then(CameraOverlay::new);
     let sender = ShareSenderArgs {
         conn: conn.clone(),
         die: die_tx.clone(),
@@ -2893,10 +3100,12 @@ pub async fn start(
         video_loss: video_loss.clone(),
         viewer_fps: viewer_fps.clone(),
         options,
+        overlay: overlay.clone(),
         tap: preview.clone(),
         preview_tx: None,
     };
 
+    let overlay_for_encoder = overlay.clone();
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
     let stop_for_thread = stop_flag.clone();
     let pw_handle = std::thread::spawn(move || {
@@ -2926,6 +3135,7 @@ pub async fn start(
                 viewer_fps.clone(),
                 die_tx,
                 options,
+                overlay_for_encoder,
                 preview,
             )
         }))
@@ -2957,6 +3167,20 @@ pub async fn start(
     if let Some(tap) = audio {
         start_audio_capture(stop_flag.clone(), tap);
     }
+
+    // The camera overlay starts only after the screen's setup succeeded.
+    // A missing camera is logged and leaves `overlay` empty; the screen
+    // stream is unaffected.
+    let overlay_handle = match (&overlay, options.camera_overlay) {
+        (Some(slot), true) => match camera::start_overlay(stop_flag.clone(), slot.clone()) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("share: camera overlay unavailable ({e}); sharing the screen only");
+                None
+            }
+        },
+        _ => None,
+    };
 
     // Supervisor: the single owner of the portal session. One select,
     // no loop — the first of (user stop, desktop Closed) wins, teardown
@@ -3010,6 +3234,20 @@ pub async fn start(
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => eprintln!("share: encoder thread join failed"),
                 Err(_) => eprintln!("share: encoder thread did not stop within 5 s — leaked"),
+            }
+        }
+        if let Some(overlay_handle) = overlay_handle {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || overlay_handle.join()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => eprintln!("share: camera overlay thread join failed"),
+                Err(_) => {
+                    eprintln!("share: camera overlay thread did not stop within 2 s — leaked")
+                }
             }
         }
         // Already-closed (external stop) is fine — errors ignored.
@@ -3276,6 +3514,30 @@ mod tests {
         assert_eq!(&canvas[0..4], &[3, 2, 1, 255]);
     }
 
+    /// The camera inset is opaque, in the bottom-right corner, and does
+    /// not touch the rest of the frame.
+    #[test]
+    fn camera_overlay_lands_in_the_corner() {
+        let (w, h) = (320usize, 180usize);
+        let mut dst = vec![0u8; w * h * 4];
+        let cam = vec![255u8; 4 * 4 * 4];
+        ShareEncoder::draw_camera_overlay(&mut dst, w, h, &cam, 4, 4);
+        // 25% wide, square for a square camera, 8 px margin.
+        let x = w - w / 4 - 8 + 5;
+        let y = h - w / 4 - 8 + 5;
+        assert_eq!(&dst[(y * w + x) * 4..][..4], &[255, 255, 255, 255]);
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0], "the screen outside stays put");
+    }
+
+    /// 1.25 KB at 10 Mbps occupies 1 ms of link time. The old per-frame
+    /// burst sent the same fragment in microseconds.
+    #[test]
+    fn pacer_budget_is_bytes_over_bitrate() {
+        assert_eq!(pace_micros(1250, 10_000_000), 1000);
+        assert_eq!(pace_micros(0, 10_000_000), 1, "never spin");
+        assert_eq!(pace_micros(1, 0), 8_000_000, "a zero rate is clamped");
+    }
+
     /// A governor whose first `step_at` is exactly one sample after `t0`
     /// (the constructor stamps `last_sample` with the real clock, which
     /// is a hair after a test's `t0` and would swallow the first call).
@@ -3370,6 +3632,31 @@ mod tests {
                 (0.0, None)
             );
         }
+    }
+
+    /// The cadence ladder stops at 15 fps. Five fps is not a stream; it
+    /// is the symptom of the old controller treating a transport burst
+    /// as a decode deficit.
+    #[test]
+    fn cadence_never_falls_below_live() {
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        let mut step = (0.0, Some(480));
+        // Walk the fps rungs from 60 down: every two reports step one
+        // rung, exactly as a sustained decode deficit would.
+        for i in 0..40 {
+            step = g.step_at(
+                t0 + (i as u32 + 1) * SAMPLE_EVERY,
+                60.0,
+                1,
+                480,
+                480,
+                0,
+                false,
+            );
+        }
+        assert_eq!(step.0, 15.0, "the floor is 15 fps, not 5");
+        assert_eq!(step.1, None, "already at the 480p floor");
     }
 
     /// A viewer that recovers is probed back up one rung at a time, and

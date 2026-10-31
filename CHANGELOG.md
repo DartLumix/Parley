@@ -3,6 +3,28 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.7] — 2026-10-31
+
+Streams that hold their shape under motion, and a camera on both desktops.
+
+### Added
+
+- **Camera on Windows (beta).** Camera-only shares now open the first
+  Media Foundation device, negotiate RGB32 and feed the same encoder,
+  preview and wire path as Linux. A driver that refuses the format
+  returns a plain error and leaves the rest of the app untouched.
+- **Camera overlay.** A screen share can carry the webcam in its
+  bottom-right corner on either desktop: one stream, one tile, both
+  views. If the camera cannot open, the screen share still starts.
+
+### Fixed
+
+- **High-motion stream collapse.** The sender now paces every fragment
+  at the stream's target bitrate instead of bursting a whole frame onto
+  the link; the bitrate ladder has six gentler rungs and the view-rate
+  floor is 15 fps. The server only starts a transcode for a genuinely
+  stalled viewer and gets two threads when it does.
+
 ## [0.4.6] — 2026-10-31
 
 Three small things and a cleaner build: pokes between people, a camera

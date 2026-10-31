@@ -62,10 +62,14 @@ impl Default for VideoConfig {
         Self {
             transcode: true,
             max_transcodes: 1,
-            min_viewer_fps: 24,
+            // A 60 fps share decoded at 30 is not a failure; starting a
+            // second encode for it used to turn a healthy viewer into a
+            // 720p30 one. Only a genuinely stalled decoder is a
+            // candidate, and the server gets two threads to keep up.
+            min_viewer_fps: 15,
             first_height: 720,
             second_height: 480,
-            threads: 1,
+            threads: 2,
         }
     }
 }

@@ -695,7 +695,21 @@ fn run_worker(
                         }
                     }
                 }
+                // The worker used to hand every fragment of a tier to
+                // quinn in one tight loop. A 720p keyframe is ~40 KB, i.e.
+                // ~35 datagrams back-to-back — the same burst that made
+                // the direct path lose frames, only now on the server's
+                // uplink. Pace by the tier's own bitrate instead.
+                let mut next = Instant::now();
                 for dg in &dgs {
+                    let now = Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    }
+                    let micros = ((dg.len() as u64).saturating_mul(8_000_000)
+                        / u64::from(encoded.bps.max(1)))
+                    .max(1);
+                    next = Instant::now() + Duration::from_micros(micros);
                     for (viewer_id, v) in &viewers {
                         // Re-check membership, not just the job's viewer
                         // set: a viewer who switched channels must not
@@ -742,6 +756,8 @@ struct TierFrame {
     keyframe: bool,
     data: Vec<u8>,
     timestamp: u32,
+    /// The tier's own byte budget, used to pace its fragments.
+    bps: u32,
 }
 
 impl Pipeline {
@@ -847,6 +863,7 @@ impl Pipeline {
             keyframe,
             data,
             timestamp,
+            bps: bitrate_for(tw, th, TIER_FPS),
         }))
     }
 }

@@ -2017,6 +2017,7 @@ pub fn start_screen_share(
     _share_audio: bool,
     _audio_players: Vec<u32>,
     _camera: bool,
+    _camera_overlay: bool,
 ) -> Result<(), String> {
     Err("screen-capture feature off".into())
 }
@@ -2040,6 +2041,7 @@ pub fn start_screen_share(
     share_audio: bool,
     audio_players: Vec<u32>,
     camera: bool,
+    camera_overlay: bool,
 ) -> Result<(), String> {
     // The own-share card reads the NEW share's shape, not the last one's
     // while the source picker is still open.
@@ -2128,6 +2130,8 @@ pub fn start_screen_share(
             let options = parley_client::screen::ShareOptions {
                 max_height: (max_height > 0).then_some(max_height),
                 max_fps: (max_fps > 0).then(|| f64::from(max_fps)),
+                // A standalone camera share has no screen to overlay on.
+                camera_overlay: camera_overlay && !camera,
             };
             // The sharer's own preview: the tap is always installed and
             // checks the settings switch per frame, so toggling it mid-

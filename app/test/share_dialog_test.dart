@@ -58,6 +58,22 @@ void main() {
     // No app is playing: the audio switch is off and cannot be armed.
     expect(value.audio, isFalse);
     expect(value.audioPlayers, isEmpty);
+    expect(value.camera, isFalse);
+    expect(value.cameraOverlay, isFalse, reason: 'the camera is opt-in');
+  });
+
+  testWidgets('screen share can include the camera', (tester) async {
+    final result = await open(tester);
+
+    // The first switch is the camera overlay; the audio switch is the
+    // disabled one below it when nothing is playing.
+    await tester.tap(find.byType(Switch).first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Start sharing'));
+    await tester.pumpAndSettle();
+    final value = result()!;
+    expect(value.camera, isFalse);
+    expect(value.cameraOverlay, isTrue);
   });
 
   testWidgets('changing both choices returns the new caps', (tester) async {
@@ -133,6 +149,11 @@ void main() {
     await tester.pumpAndSettle();
     final value = result()!;
     expect(value.camera, isTrue);
+    expect(
+      value.cameraOverlay,
+      isFalse,
+      reason: 'a camera share has no screen',
+    );
     expect(value.audio, isFalse);
     expect(value.audioPlayers, isEmpty);
   });

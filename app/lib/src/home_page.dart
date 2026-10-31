@@ -1183,6 +1183,7 @@ class _HomePageState extends State<HomePage> {
         shareAudio: options.audio,
         audioPlayers: options.audioPlayers,
         camera: options.camera,
+        cameraOverlay: options.cameraOverlay,
       );
       // share_started arrives as an event; the button flips there.
     } catch (e) {

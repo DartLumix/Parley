@@ -1933,6 +1933,7 @@ fn wire__crate__api__session__start_screen_share_impl(
             let api_share_audio = <bool>::sse_decode(&mut deserializer);
             let api_audio_players = <Vec<u32>>::sse_decode(&mut deserializer);
             let api_camera = <bool>::sse_decode(&mut deserializer);
+            let api_camera_overlay = <bool>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
@@ -1943,6 +1944,7 @@ fn wire__crate__api__session__start_screen_share_impl(
                         api_share_audio,
                         api_audio_players,
                         api_camera,
+                        api_camera_overlay,
                     )?;
                     std::result::Result::Ok(output_ok)
                 })())

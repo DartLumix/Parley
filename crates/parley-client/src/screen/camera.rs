@@ -32,7 +32,10 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::{Device, MmapStream};
 use v4l::video::Capture;
 
-use super::{PreviewSink, ShareController, ShareHandle, ShareOptions, ToEncoder, encoder_thread};
+use super::{
+    CameraOverlay, PreviewSink, ShareController, ShareHandle, ShareOptions, ToEncoder,
+    encoder_thread,
+};
 use crate::ShareEvent;
 
 /// The camera runs at a fixed 30 fps; the encoder's own profile and the
@@ -208,6 +211,75 @@ fn capture_loop(
     let _ = done.send(());
 }
 
+/// The overlay's capture loop: the same V4L2 read as a camera share,
+/// but it publishes the newest frame into the screen encoder's slot and
+/// never touches the wire. A dead camera clears the slot, so a frozen
+/// last picture cannot outlive the device by more than a second.
+fn overlay_loop(
+    dev: Device,
+    width: usize,
+    height: usize,
+    stride: usize,
+    stop: Arc<AtomicBool>,
+    overlay: CameraOverlay,
+) {
+    let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("camera overlay: stream setup failed: {e}");
+            overlay.clear();
+            return;
+        }
+    };
+    stream.set_timeout(Duration::from_millis(500));
+    let frame_bytes = width * height * 4;
+    let mut bgra = vec![0u8; frame_bytes];
+    while !stop.load(Ordering::Relaxed) {
+        match stream.next() {
+            Ok((buf, meta)) => {
+                let used = (meta.bytesused as usize).min(buf.len());
+                if !yuyv_to_bgra(&buf[..used], width, height, stride, &mut bgra) {
+                    continue;
+                }
+                overlay.publish(Arc::new(std::mem::take(&mut bgra)), width, height);
+                bgra = vec![0u8; frame_bytes];
+            }
+            Err(e) if e.kind() == ErrorKind::TimedOut => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                eprintln!("camera overlay: no frame for 500 ms — removing the overlay");
+                break;
+            }
+            Err(e) => {
+                eprintln!("camera overlay: capture failed: {e}");
+                break;
+            }
+        }
+    }
+    overlay.clear();
+}
+
+/// Start the overlay's camera capture. The returned handle is joined by
+/// the share supervisor; a failure to open a camera is returned to the
+/// caller, which logs it and keeps the screen-only share.
+pub fn start_overlay(
+    stop: Arc<AtomicBool>,
+    overlay: CameraOverlay,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    let (dev, format, card) = open_camera()?;
+    let width = format.width as usize;
+    let height = format.height as usize;
+    let stride = (format.stride as usize).max(width * 2);
+    println!(
+        "camera overlay: {card} {width}x{height} YUYV @ {CAMERA_FPS:.0} fps (stride {stride})"
+    );
+    std::thread::Builder::new()
+        .name("parley-camera-overlay".into())
+        .spawn(move || overlay_loop(dev, width, height, stride, stop, overlay))
+        .map_err(|e| format!("camera overlay thread: {e}"))
+}
+
 /// Start a camera share. Returns the same handles as the screen path:
 /// a keyframe poke and a stop controller. Completion is reported as
 /// `ShareEvent::Ended` only after both threads have joined.
@@ -238,7 +310,7 @@ pub async fn start_camera(
         .name("parley-camera-encode".into())
         .spawn(move || {
             encoder_thread(
-                frame_rx, conn, force_idr, video_loss, viewer_fps, die_tx, options, preview,
+                frame_rx, conn, force_idr, video_loss, viewer_fps, die_tx, options, None, preview,
             )
         })
         .map_err(|e| format!("camera encoder thread: {e}"))?;

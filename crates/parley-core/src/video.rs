@@ -72,28 +72,34 @@ pub fn keyframe_interval_frames(fps: f32) -> u32 {
 
 /// The interval at the software profile's rate (2 s at 30 fps).
 pub const KEYFRAME_INTERVAL_FRAMES: u32 = 60;
-/// Screen content at 720p30 holds up well around 2.5 Mbps.
+/// The historical 720p30 baseline. Kept as the anchor for the scaled
+/// profile, but no longer the budget a real share is held to.
 pub const VIDEO_BITRATE_BPS: u32 = 2_500_000;
-/// Ceiling for the scaled profile below. 12 Mbps is comfortable on the
-/// LAN/local-network deployment this is built for and still far under
-/// what a 1080p60/1440p60 stream can spend.
-pub const MAX_VIDEO_BITRATE_BPS: u32 = 12_000_000;
+/// Ceiling for the scaled profile below. This is deliberately generous:
+/// a motion-heavy 1440p60 stream is ~27 Mbps at the profile's own
+/// bits-per-pixel, and the whole point of the ladder is that the path —
+/// not an arbitrary constant — decides when to spend less. A sender on a
+/// slow link still gets there through the loss ladder, and a LAN or a
+/// good VPS link can actually carry the picture.
+pub const MAX_VIDEO_BITRATE_BPS: u32 = 30_000_000;
 /// Floor, so a tiny window on a busy path still gets a usable picture.
 pub const MIN_VIDEO_BITRATE_BPS: u32 = 800_000;
 
-/// Bits per pixel per frame — the quality budget the 720p30 baseline
-/// encodes (2.5 Mbps / (1280·720·30)). Held constant as resolution and
-/// frame rate grow, which is what makes HD *look* like HD: the old
-/// fixed 2.5 Mbps target is what a 720p30 stream spends, and handing it
-/// to 1080p60 buys four times less detail per pixel.
-pub const BITS_PER_PIXEL_PER_FRAME: f64 = VIDEO_BITRATE_BPS as f64 / (1280.0 * 720.0 * 30.0);
+/// Bits per pixel per frame. The 720p30 baseline was 0.090; motion-heavy
+/// game content needs roughly 0.10–0.15 to stay sharp, and screen text
+/// is the easy case at the low end. 0.12 is the compromise the profile
+/// uses: 720p30 ≈ 3.3 Mbps, 1080p60 ≈ 15 Mbps, 1440p60 ≈ 27 Mbps. The
+/// previous 0.090 profile is what made a fast-moving 1080p60 share look
+/// soft just as the content got hard to encode — the encoder ran out of
+/// bits, not pixels.
+pub const BITS_PER_PIXEL_PER_FRAME: f64 = 0.12;
 
 /// Bitrate target for a resolution and frame rate.
 ///
-/// Exactly [`VIDEO_BITRATE_BPS`] at the 720p30 baseline (so nothing about
-/// the shipped software profile moves), scaled with pixels and rate
-/// above it, capped at [`MAX_VIDEO_BITRATE_BPS`]:
-/// 1080p30 ≈ 5.6 Mbps · 1080p60 ≈ 11.3 Mbps · 1440p60 ≈ 12 Mbps (cap).
+/// Scaled with pixels and rate, floored at [`MIN_VIDEO_BITRATE_BPS`] and
+/// capped at [`MAX_VIDEO_BITRATE_BPS`]:
+/// 720p30 ≈ 3.3 Mbps · 1080p30 ≈ 7.5 Mbps · 1080p60 ≈ 15 Mbps ·
+/// 1440p60 ≈ 27 Mbps · 4K60 ≈ 30 Mbps (cap).
 pub fn bitrate_for(width: usize, height: usize, fps: f32) -> u32 {
     let pixels = width.max(2) as f64 * height.max(2) as f64;
     let target = pixels * f64::from(fps.max(1.0)) * BITS_PER_PIXEL_PER_FRAME;

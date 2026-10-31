@@ -11,21 +11,18 @@
      backticks are stripped, so use plain words instead of emphasis.
 -->
 
-# Three small things, one cleaner build.
+# Looks sharp.
 
-## 01 · Poke
+## 01 · Streams hold the line
 
-Click anyone online and send a nudge. They get a sound, a notification,
-and a button to poke back.
+Frames leave at the stream's bitrate instead of in a burst. Fast motion no longer collapses the picture to 5 fps, and the bitrate ladder steps down gently instead of dropping off a cliff.
 
-## 02 · Camera, on Linux
+## 02 · Camera, everywhere
 
-Share a webcam exactly like a screen — same player, same quality. Camera
-and screen are alternatives for now; one video at a time.
+Share a webcam on Windows too (beta), or switch on Include camera and stay in the bottom-right corner of any screen share. One stream, one tile, both views.
 
-## 03 · Scroll to tune
+## 03 · If it fails, keep going
 
-Hover a member and scroll. Their volume moves in 5% steps, and the roster
-stays put.
+A camera that cannot open never takes a screen share down. Windows shows the error; the stream keeps running.
 
-Under the hood: the 0.4.5 build failure on newer CMake is fixed.
+Under the hood: six bitrate rungs, two transcode threads, and a sender that paces every fragment.

@@ -112,14 +112,20 @@ pub const VIDEO_ROBUST_BITRATE_BPS: u32 = 1_000_000;
 /// constant matches 4d's. The set_bitrate it triggers recreates the
 /// encoder: the next frame is a standalone IDR, which receivers'
 /// drop-until-IDR absorbs by design.
+/// The ladder's rungs as a fraction of the clean target. Six steps, not
+/// two: 40% of a 15 Mbps 1080p60 stream is still 6 Mbps, which is over a
+/// slow VPS uplink; the extra rungs let a 3 Mbps path settle at 20%
+/// instead of oscillating between "over budget" and "keyframe storms".
+const LADDER_SCALES: [f64; 6] = [1.0, 0.75, 0.55, 0.40, 0.30, 0.20];
+
 pub struct VideoLadder {
     ema_permille: f32,
-    robust: bool,
-    /// 7h HD: the two rungs in bits per second. Derived from the live
-    /// profile (resolution × rate) rather than fixed at 720p30's
-    /// numbers — see [`Self::set_base`].
+    /// 0 = clean, 1..=5 = progressively smaller rungs.
+    rung: u8,
+    /// The live profile's clean target (resolution × rate); every rung
+    /// is a fraction of this, so a resolution change rescales the whole
+    /// ladder in one place.
     clean_bps: u32,
-    robust_bps: u32,
     last_switch: std::time::Instant,
     low_since: Option<std::time::Instant>,
     last_step: std::time::Instant,
@@ -139,9 +145,8 @@ impl VideoLadder {
     pub fn with_base(clean_bps: u32) -> Self {
         Self {
             ema_permille: 0.0,
-            robust: false,
+            rung: 0,
             clean_bps,
-            robust_bps: robust_rung(clean_bps),
             last_switch: std::time::Instant::now(),
             low_since: None,
             last_step: std::time::Instant::now(),
@@ -156,29 +161,21 @@ impl VideoLadder {
     /// promote a loss epoch back to full rate).
     pub fn set_base(&mut self, clean_bps: u32) -> u32 {
         self.clean_bps = clean_bps;
-        self.robust_bps = robust_rung(clean_bps);
-        if self.robust {
-            self.robust_bps
-        } else {
-            self.clean_bps
-        }
+        self.current_bps()
     }
 
-    /// Test hook: put the ladder in its loss state without waiting out
-    /// the 1 s step / 5 s switch gates (the transitions themselves are
-    /// time-based — the netem runs exercise those).
+    /// Test hook: put the ladder in its historical 40% loss state without
+    /// waiting out the 1 s step / 5 s switch gates (the transitions
+    /// themselves are time-based — the netem runs exercise those).
     #[cfg(test)]
     pub(crate) fn select_robust_for_test(&mut self) {
-        self.robust = true;
+        self.rung = 3;
     }
 
     /// The rung the ladder is on.
     pub fn current_bps(&self) -> u32 {
-        if self.robust {
-            self.robust_bps
-        } else {
-            self.clean_bps
-        }
+        let scale = LADDER_SCALES[usize::from(self.rung)];
+        ((f64::from(self.clean_bps) * scale) as u32).max(300_000)
     }
 
     /// True while the loss ladder has already cut the bitrate. The pace
@@ -186,7 +183,7 @@ impl VideoLadder {
     /// resolution: one response at a time, so a bandwidth problem is not
     /// mistaken for a decode problem.
     pub fn on_robust_rung(&self) -> bool {
-        self.robust
+        self.rung > 0
     }
 
     /// Feed the latest viewer report (permille). Returns Some(bps) when
@@ -199,22 +196,23 @@ impl VideoLadder {
         }
         self.last_step = now;
         self.ema_permille = 0.7 * self.ema_permille + 0.3 * observed_permille as f32;
-        if !self.robust {
-            if self.ema_permille > 30.0 && now.duration_since(self.last_switch).as_secs() >= 5 {
-                self.robust = true;
+        if self.ema_permille > 30.0 && now.duration_since(self.last_switch).as_secs() >= 5 {
+            self.low_since = None;
+            if usize::from(self.rung) + 1 < LADDER_SCALES.len() {
+                self.rung += 1;
                 self.last_switch = now;
-                self.low_since = None;
-                return Some(self.robust_bps);
+                return Some(self.current_bps());
             }
         } else if self.ema_permille < 10.0 {
             let since = *self.low_since.get_or_insert(now);
-            if now.duration_since(since).as_secs() >= 20
+            if self.rung > 0
+                && now.duration_since(since).as_secs() >= 20
                 && now.duration_since(self.last_switch).as_secs() >= 5
             {
-                self.robust = false;
+                self.rung -= 1;
                 self.last_switch = now;
                 self.low_since = None;
-                return Some(self.clean_bps);
+                return Some(self.current_bps());
             }
         } else {
             self.low_since = None;
@@ -229,7 +227,7 @@ impl VideoLadder {
     /// at sustained 10% loss, seconds at 5%, immediate once loss clears.
     pub fn should_force_keyframe(&mut self) -> bool {
         let now = std::time::Instant::now();
-        if !self.robust || self.ema_permille <= 30.0 {
+        if self.rung == 0 || self.ema_permille <= 30.0 {
             return false;
         }
         if now.duration_since(self.last_kf_poke) >= Duration::from_secs(2) {
@@ -245,14 +243,6 @@ impl Default for VideoLadder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The robust rung for a clean target: 40% of it, floored so a small
-/// stream still gets a usable picture and capped by the ladder's own
-/// clean value (a 800 kbps clean target cannot have a higher robust
-/// rung).
-fn robust_rung(clean_bps: u32) -> u32 {
-    ((clean_bps as f64 * 0.4) as u32).clamp(300_000, clean_bps)
 }
 
 // ---- send side (synthetic; real capture lives in screen.rs) ----
@@ -622,38 +612,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn robust_rung_keeps_the_720p30_ratio_and_a_floor() {
-        // 7h HD: the rungs scale with the profile now, but the RATIO is
-        // the one 6e measured (1 Mbps robust : 2.5 Mbps clean — the
-        // frame-survival arithmetic), and a small stream still gets a
-        // usable rung.
-        assert_eq!(robust_rung(VIDEO_BITRATE_BPS), VIDEO_ROBUST_BITRATE_BPS);
-        assert_eq!(robust_rung(11_250_000), 4_500_000); // 1080p60 clean
-        assert_eq!(robust_rung(500_000), 300_000, "floor, not 200 kbps");
-    }
-
-    #[test]
-    fn ladder_rungs_follow_the_profile() {
+    fn ladder_rungs_scale_with_the_profile_and_keep_their_step() {
         let mut ladder = VideoLadder::new();
         assert_eq!(ladder.current_bps(), VIDEO_BITRATE_BPS);
 
-        // A hardware HD profile moves both rungs.
-        assert_eq!(
-            ladder.set_base(11_250_000),
-            11_250_000,
-            "clean state → clean rung"
-        );
-        assert_eq!(ladder.current_bps(), 11_250_000);
-
-        // In a loss epoch the rebuild must NOT promote back to full rate:
-        // set_base returns the scaled robust rung.
+        // A hardware HD profile moves the clean target and every rung
+        // below it.
+        assert_eq!(ladder.set_base(11_250_000), 11_250_000);
         ladder.select_robust_for_test();
-        assert_eq!(ladder.set_base(5_631_000), robust_rung(5_631_000));
-        assert_eq!(ladder.current_bps(), robust_rung(5_631_000));
+        assert_eq!(ladder.set_base(11_250_000), 4_500_000);
 
-        // And a negotiation that lowers the profile still respects the
-        // loss state.
-        assert_eq!(ladder.set_base(2_500_000), robust_rung(2_500_000));
-        assert_eq!(ladder.current_bps(), VIDEO_ROBUST_BITRATE_BPS);
+        // A negotiation that lowers the profile keeps the same rung
+        // (40%), and the floor still holds.
+        assert_eq!(ladder.set_base(5_631_000), 2_252_400);
+        assert_eq!(ladder.set_base(500_000), 300_000);
+        assert_eq!(ladder.current_bps(), 300_000);
     }
 }
