@@ -83,27 +83,36 @@ A viewer that cannot decode the sharer's original stream (a low
 `viewer_fps` in its five-second report) can be given a server-encoded
 tier instead. The sharer's stream is untouched: capable viewers keep
 1080p/60, the struggling viewer gets 720p or 480p at 30 fps. The
-server pays one worker thread per active share, and only while a
-viewer is below the threshold.
+server pays one worker thread per active share (plus its encoder
+threads), and only while a viewer is below the threshold.
 
-It is on by default. The defaults are one concurrent transcode,
-720p then 480p, and one encoder thread:
+It is **off by default**, because a small VPS cannot decode a 1440p60
+share and re-encode a tier in real time. A tier that manages only a few
+pictures per second looks exactly like a slow viewer, so the app hides
+the real stream behind a blurry slideshow. Enable it only on a host with
+spare CPU. The tunables are one concurrent transcode, 720p then 480p,
+two encoder threads and a 15 fps threshold:
 
 ```toml
 [video]
-transcode = true
+transcode = false
 max_transcodes = 1
-min_viewer_fps = 24
+min_viewer_fps = 15
 first_height = 720
 second_height = 480
-threads = 1
+threads = 2
 ```
+
+When enabled, the worker watches its own output: if it cannot hold 10
+fps for three seconds it stops the job and hands the viewer back to the
+original stream, so a host that is too small cannot become the
+bottleneck it was meant to bypass.
 
 `max_transcodes` is host-wide, not per channel and is the CPU/memory
 ceiling: one job holds the decoded frame plus one encoder per active
 tier (roughly 30–60 MB at 1080p). A second share that needs help falls
-back to the sharer's own resolution ladder. To stay a pure relay (no
-openh264 work at all), set `transcode = false`. The
+back to the sharer's own resolution ladder. Leaving `transcode = false`
+keeps the server a pure relay with no openh264 work. The
 container's `/config.toml` is baked; mount your own file over it to
 change these values:
 

@@ -80,17 +80,17 @@ impl Server {
                 .expect("10 s is a valid IdleTimeout"),
         ));
 
-        // 6e: outgoing datagram headroom — quinn's default send buffer
-        // is small relative to 2.5 Mbps video; a full buffer runs the
+        // 6e/7m: outgoing datagram headroom — quinn's default send
+        // buffer is small relative to HD video; a full buffer runs the
         // drop-oldest path, whose accounting has a known panic under
-        // saturation on 0.11.17 (see §8). 2 MiB ≈ 6 s at Clean, ~16 s
-        // at Robust — the drop path becomes unreachable short of a
-        // pathological stall.
-        transport.datagram_send_buffer_size(2 * 1024 * 1024);
+        // saturation on 0.11.17 (see §8). 8 MiB covers a 1440p60
+        // keyframe plus the frames queued behind it at the 30 Mbps
+        // profile ceiling.
+        transport.datagram_send_buffer_size(8 * 1024 * 1024);
         // 6.9: receive side of the 6e buffer fix — the server receives
         // the sharer's firehose and forwards it; default overflows
         // under load.
-        transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+        transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
         quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;

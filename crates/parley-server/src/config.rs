@@ -38,6 +38,11 @@ impl Default for Config {
 /// original stream. The sender still encodes once; a job decodes that
 /// stream and re-encodes only the tiers a weak viewer needs, so strong
 /// viewers keep the untouched original.
+///
+/// Off by default: a small VPS cannot decode a 1440p60 share and encode
+/// a 720p tier in real time, and the resulting 5 fps tier is worse than
+/// handing the viewer back to the sender's own ladder. Enable it only on
+/// a host with spare CPU, and watch the `transcode:` log lines.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct VideoConfig {
@@ -60,7 +65,7 @@ pub struct VideoConfig {
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
-            transcode: true,
+            transcode: false,
             max_transcodes: 1,
             // A 60 fps share decoded at 30 is not a failure; starting a
             // second encode for it used to turn a healthy viewer into a
@@ -95,5 +100,28 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)?;
         toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcode_is_opt_in_and_tiers_stay_ordered() {
+        let video = VideoConfig::default();
+        assert!(!video.transcode, "a small VPS must stay a pure relay");
+        let normalized = VideoConfig {
+            transcode: true,
+            first_height: 481,
+            second_height: 900,
+            ..VideoConfig::default()
+        }
+        .normalized();
+        assert_eq!(normalized.first_height, 480);
+        assert_eq!(
+            normalized.second_height, 480,
+            "second tier never exceeds first"
+        );
     }
 }

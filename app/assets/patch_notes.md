@@ -25,4 +25,4 @@ Share a webcam on Windows too (beta), or switch on Include camera and stay in th
 
 A camera that cannot open never takes a screen share down. Windows shows the error; the stream keeps running.
 
-Under the hood: six bitrate rungs, two transcode threads, and a sender that paces every fragment.
+Under the hood: six bitrate rungs, byte-level pacing, and a server that stays a pure relay unless you opt into transcoding.

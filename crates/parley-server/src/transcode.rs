@@ -11,10 +11,12 @@
 //! on its way to the sharer, so the sharer's own resolution ladder does
 //! not fight the server's tier.
 //!
-//! The worker is deliberately single-threaded (the encoder's slice
-//! parallelism is configurable, default one thread): a share that needs
-//! help must not cost the host several cores. The cap and tiers live in
-//! [`crate::config::VideoConfig`].
+//! The worker is deliberately small (the encoder's slice parallelism is
+//! configurable, default two threads): a share that needs help must not
+//! cost the host several cores. The cap and tiers live in
+//! [`crate::config::VideoConfig`]. Transcoding is off by default; a
+//! worker that cannot sustain its own tier stops itself rather than
+//! serving a slideshow.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,12 +64,18 @@ const MIN_TIER_DWELL: Duration = Duration::from_secs(60);
 /// Fragments buffered for the worker. At ~1 KB each, 512 is a few hundred
 /// milliseconds of a busy stream; a full queue drops the newest fragment,
 /// and the assembler rebases on the next keyframe.
-const CHANNEL_CAPACITY: usize = 512;
+const CHANNEL_CAPACITY: usize = 2048;
 /// A share with no video datagrams for this long ends its job.
 const WORKER_IDLE: Duration = Duration::from_secs(10);
 /// Below this incoming frame rate the bottleneck is upstream, not the
 /// viewer's decoder: transcoding the same slow stream cannot help.
 const MIN_SOURCE_FPS: f64 = 12.0;
+/// A tier that cannot emit faster than this is a server bottleneck, not
+/// a viewer bottleneck. Hand the viewer back to the original instead of
+/// serving a blurry slideshow from a host that cannot keep up.
+const MIN_TIER_FPS: f64 = 10.0;
+/// How long a tier may sit below [`MIN_TIER_FPS`] before the job stops.
+const SLOW_TIER_GRACE: Duration = Duration::from_secs(3);
 
 /// What the server does with a viewer's `VideoReport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,9 +621,14 @@ fn run_worker(
     let mut last_input = Instant::now();
     let mut last_output = Instant::now();
     let mut last_keyframe = Instant::now();
+    // Per tier: (window start, frames sent). A host that can only manage
+    // a few pictures per second is not helping the viewer; stop before
+    // the tier becomes the stream, return the viewer to the original and
+    // let the sharer's ladder get the reports again.
+    let mut output_rate: HashMap<u32, (Instant, u32)> = HashMap::new();
     let mut errors: u64 = 0;
 
-    while !job.stop.load(Ordering::Relaxed) {
+    'worker: while !job.stop.load(Ordering::Relaxed) {
         // A worker that stopped producing pictures must hand the viewer
         // back to the original stream immediately; otherwise `live`
         // suppresses the original and the viewer freezes on the last
@@ -720,6 +733,21 @@ fn run_worker(
                     }
                 }
                 last_output = Instant::now();
+                let rate = output_rate.entry(tier).or_insert((Instant::now(), 0));
+                rate.1 += 1;
+                if rate.0.elapsed() >= SLOW_TIER_GRACE {
+                    let fps = f64::from(rate.1) / rate.0.elapsed().as_secs_f64();
+                    if fps < MIN_TIER_FPS {
+                        warn!(
+                            sender_id = job.sender_id,
+                            tier,
+                            fps,
+                            "transcode: server cannot sustain the tier; handing viewers back"
+                        );
+                        break 'worker;
+                    }
+                    *rate = (Instant::now(), 0);
+                }
             }
         }
     }

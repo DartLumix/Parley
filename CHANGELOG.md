@@ -3,6 +3,22 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.8] — 2026-10-31
+
+### Fixed
+
+- **Server transcode no longer defaults on.** A small VPS cannot decode
+  a 1440p share and re-encode a 720p tier in real time; the resulting
+  5 fps tier was worse than the sender's own ladder and looked exactly
+  like a slow viewer. Transcoding is now opt-in. When enabled, a tier
+  that cannot hold 10 fps for three seconds stops itself and hands the
+  viewer back to the original.
+- **More datagram headroom.** Both endpoints moved from 2 MiB to 8 MiB
+  send/receive datagram buffers, enough for a 1440p60 keyframe plus the
+  frames queued behind it at the 30 Mbps profile ceiling.
+- **Windows camera failsafe.** A camera that cannot open no longer
+  leaves the share half-started; the screen continues without it.
+
 ## [0.4.7] — 2026-10-31
 
 Streams that hold their shape under motion, and a camera on both desktops.

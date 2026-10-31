@@ -467,10 +467,7 @@ fn mf_read(
                 Ok(out)
             };
             let _ = buffer.Unlock();
-            match result {
-                Ok(out) => sink(Arc::new(out)),
-                Err(e) => return Err(e),
-            }
+            sink(Arc::new(result?));
         }
     }
     Ok(())
@@ -526,12 +523,19 @@ pub async fn start_camera(
                 "camera: Media Foundation {width}x{height} RGB32 stride {} @ 30 fps",
                 cam.stride
             );
-            let _ = ready_tx.send(Ok((width, height)));
-            let _ = frame_tx.send(ToEncoder::Negotiated {
-                width,
-                height,
-                fps: 30.0,
-            });
+            if ready_tx.send(Ok((width, height))).is_err() {
+                return; // the caller gave up before the camera opened
+            }
+            if frame_tx
+                .send(ToEncoder::Negotiated {
+                    width,
+                    height,
+                    fps: 30.0,
+                })
+                .is_err()
+            {
+                return; // encoder thread already gone
+            }
             let row = cam.width * 4;
             if let Err(e) = mf_read(&cam, &stop_for_capture, |data| {
                 let _ = frame_tx.try_send(ToEncoder::Frame { data, stride: row });
@@ -553,6 +557,7 @@ pub async fn start_camera(
             return Err(e);
         }
         Err(_) => {
+            stop.store(true, Ordering::Relaxed);
             return Err("camera did not open within 5 s".to_string());
         }
     }

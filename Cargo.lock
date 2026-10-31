@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "parley-client"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "ashpd",
  "cpal",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "parley-core"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "audiopus",
  "cpal",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "parley-proto"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "prost",
  "prost-build",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "parley-server"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "argon2",
  "bytes",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "parley_flutter"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "cpal",
  "flutter_rust_bridge",

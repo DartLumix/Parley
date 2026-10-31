@@ -36,11 +36,12 @@ Clients connect with `your-server` (the client default is 4443), or
 
 ## Screen-share transcode
 
-The server re-encodes a share at a lower tier for a viewer that cannot
-keep up; capable viewers keep the original stream. It is on by
-default, one share at a time and one encoder thread. The values live in
-`[video]` in the config file (see [docs/deploy.md](../docs/deploy.md));
-`transcode = false` keeps the server a pure relay.
+The server can re-encode a share at a lower tier for a viewer that
+cannot keep up; capable viewers keep the original stream. It is **off
+by default**: on a small VPS the decode plus re-encode cannot hold 30
+fps, and a slow tier is worse than the sender's own ladder. Enable it
+only on a host with spare CPU. The values live in `[video]` in the
+config file (see [docs/deploy.md](../docs/deploy.md)).
 
 ## Identity
 
