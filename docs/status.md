@@ -17,6 +17,8 @@ deploy kit.
 | Share audio: default output or exactly the picked apps | shipping | PipeWire nodes on Linux, WASAPI process loopback on Windows; receiver e2e on Linux |
 | Hardware encode (VAAPI), HD profiles, DMA-BUF capture | shipping, opt-in | keyframe-shape tests; measured 98/47.8/29.1 fps at 720p/1080p/1440p |
 | Share audio (system output), share lifecycle notices | shipping | receiver e2e + latency measurement |
+| Camera share (Linux V4L2 → the screen-share encoder) | shipping, Linux-only | YUYV→BGRA unit tests; a real camera is still needed for a live run |
+| Poke notifications, wheel volume on roster rows | shipping | server routing test; widget tests for the dialog and camera source |
 | Flutter client: session, channels, chat, voice, share watch/send, fullscreen | shipping | widget tests, release bundle, live two-machine runs |
 | Container + release automation | shipping | `tools/e2e-container.sh`; release workflow builds and tests before publishing |
 | In-app updates, bundled release notes | shipping | unit/widget tests for the release decision, checksums, note popup and the swap scripts' quoting; the swap itself is manual (see below) |
@@ -90,8 +92,10 @@ Product gaps, roughly in the order a small community would notice:
    feature set (voice with echo cancellation, chat, share viewing and
    share sending with per-app audio). What it still lacks is hardware
    encoding (Media Foundation/QuickSync/NVENC) and the custom title bar,
-   both deliberate for now. Android and iOS are after that; camera video
-   is parked until a client can preview it.
+   both deliberate for now. Camera sharing is Linux-only: the V4L2 source
+   and preview work through the existing share path, but Windows has no
+   Media Foundation source reader yet and hides the choice. Android and
+   iOS are after that.
 
 ## Next milestone suggestions
 

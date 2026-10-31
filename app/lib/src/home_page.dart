@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import 'rust/api/login.dart' as login_api;
@@ -170,10 +171,14 @@ class _HomePageState extends State<HomePage> {
   int? _fullscreen;
   // 7g: our own share state (start/stop button).
   bool _sharing = false;
+  // What the running share is showing, so the status line and the end
+  // handler do not have to guess from the stream.
+  bool _shareIsCamera = false;
   bool _hwEncodeSupported = false;
-  // False in builds without the capture backend (Windows): viewing
-  // shares still works, starting one cannot, so the button is absent
-  // rather than failing with "screen-capture feature off".
+  bool _cameraShareSupported = false;
+  // False in builds without the capture backend: viewing shares still
+  // works, starting one cannot, so the button is absent rather than
+  // failing with "screen-capture feature off".
   bool _screenShareSupported = false;
   // Persisted preferences (Rust: ~/.config/parley/settings.toml). The
   // share dialog's defaults and the preview switch read from here; the
@@ -402,10 +407,10 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Per-user volume (their voice, their share) and — for someone who is
-  /// sharing — the trim on that share's system audio. Two sliders because
-  /// they are two independent streams in the mixer.
-  Future<void> _showVolumeDialog(int userId) async {
+  /// One row's actions: volume (their voice, their share, and — while
+  /// sharing — the trim on that share's system audio) plus a poke for
+  /// anyone online. An idle row has no mixer stream, so it only pokes.
+  Future<void> _showUserDialog(int userId, {bool idle = false}) async {
     var master = _volume[userId] ?? 1.0;
     var share = _shareVolume[userId] ?? 1.0;
     final self = userId == _session?.userId;
@@ -416,27 +421,42 @@ class _HomePageState extends State<HomePage> {
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: Text(_nameOf(userId)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _volumeSlider('Voice', master, (v) {
-                setDialogState(() => master = v);
-                _applyVolume(userId, v);
-              }),
-              if (sharing && !self)
-                _volumeSlider('Screen share audio', share, (v) {
-                  setDialogState(() => share = v);
-                  _applyShareVolume(userId, v);
-                }),
-              const Text(
-                'The screen-share bar trims only that share\u2019s system '
-                'audio; their voice keeps its own level.',
-                style: TextStyle(color: Colors.white54, fontSize: 11),
-              ),
-            ],
-          ),
+          content: idle
+              ? Text(
+                  '${_nameOf(userId)} is online but not in a voice '
+                  'channel. You can still poke them.',
+                )
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _volumeSlider('Voice', master, (v) {
+                      setDialogState(() => master = v);
+                      _applyVolume(userId, v);
+                    }),
+                    if (sharing && !self)
+                      _volumeSlider('Screen share audio', share, (v) {
+                        setDialogState(() => share = v);
+                        _applyShareVolume(userId, v);
+                      }),
+                    const Text(
+                      'Scroll over a member in the roster to trim their '
+                      'voice. The screen-share bar trims only that share\u2019s '
+                      'system audio; their voice keeps its own level.',
+                      style: TextStyle(color: Colors.white54, fontSize: 11),
+                    ),
+                  ],
+                ),
           actions: [
+            if (!self)
+              TextButton.icon(
+                onPressed: () {
+                  Navigator.pop(context);
+                  unawaited(_poke(userId));
+                },
+                icon: const Icon(Icons.touch_app, size: 18),
+                label: const Text('Poke'),
+              ),
             TextButton(
               onPressed: () => Navigator.pop(context),
               child: const Text('Done'),
@@ -445,6 +465,19 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+
+  /// Send a poke. The server relays it to that user alone; their client
+  /// shows a notification and plays the cue.
+  Future<void> _poke(int userId) async {
+    final sessionId = _session?.sessionId;
+    if (sessionId == null) return;
+    try {
+      await pokeUser(sessionId: sessionId, userId: userId);
+      if (mounted) setState(() => _status = 'poked ${_nameOf(userId)}');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'poke failed: $e');
+    }
   }
 
   Widget _volumeSlider(
@@ -496,6 +529,7 @@ class _HomePageState extends State<HomePage> {
       _watched.clear();
       _fullscreen = null;
       _sharing = false;
+      _shareIsCamera = false;
       _micMuted = false;
       _levels.clear();
       _selfLevel = 0;
@@ -731,6 +765,7 @@ class _HomePageState extends State<HomePage> {
       _watched.clear();
       _fullscreen = null;
       _sharing = false;
+      _shareIsCamera = false;
       _micMuted = false;
       _levels.clear();
       _selfLevel = 0;
@@ -997,11 +1032,13 @@ class _HomePageState extends State<HomePage> {
       final loaded = await settings_api.load();
       final supported = await hwEncodeSupported();
       final canShare = await screenShareSupported();
+      final canCamera = await cameraShareSupported();
       if (!mounted) return;
       setState(() {
         _settings = loaded;
         _hwEncodeSupported = supported;
         _screenShareSupported = canShare;
+        _cameraShareSupported = canCamera;
       });
     } catch (e) {
       debugPrint('settings: load failed: $e');
@@ -1113,6 +1150,7 @@ class _HomePageState extends State<HomePage> {
       height: _settings.shareHeight,
       fps: _settings.shareFps,
       players: players,
+      cameraSupported: _cameraShareSupported,
     );
     if (options == null ||
         !mounted ||
@@ -1137,12 +1175,14 @@ class _HomePageState extends State<HomePage> {
       );
     }
     try {
+      _shareIsCamera = options.camera;
       await startScreenShare(
         sessionId: session.sessionId,
         maxHeight: options.height,
         maxFps: options.fps,
         shareAudio: options.audio,
         audioPlayers: options.audioPlayers,
+        camera: options.camera,
       );
       // share_started arrives as an event; the button flips there.
     } catch (e) {
@@ -1235,6 +1275,31 @@ class _HomePageState extends State<HomePage> {
           }
           _pruneShares();
         });
+      case 'poked':
+        // A nudge from another user. The Rust side already played the
+        // cue (on the voice stream, or a one-shot output stream when we
+        // are not in voice); this is the visible notification.
+        if (mounted) {
+          final from = _nameOf(ev.userId);
+          final where = _channels
+              .where((c) => c.id == ev.channelId)
+              .map((c) => c.name)
+              .firstOrNull;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                where == null
+                    ? '$from poked you'
+                    : '$from poked you from $where',
+              ),
+              duration: const Duration(seconds: 5),
+              action: SnackBarAction(
+                label: 'Poke back',
+                onPressed: () => unawaited(_poke(ev.userId)),
+              ),
+            ),
+          );
+        }
       case 'chat':
         _ingestChat(ev.messages, prepend: false);
         _scrollChat();
@@ -1374,7 +1439,7 @@ class _HomePageState extends State<HomePage> {
       case 'share_started':
         if (mounted) {
           setState(() => _sharing = true);
-          _status = 'sharing this screen';
+          _status = _shareIsCamera ? 'sharing camera' : 'sharing this screen';
           // The preview texture is fetched now, not at startup: a user
           // who never shares never pays for it.
           if (_settings.showSharePreview) _loadPreview();
@@ -1385,6 +1450,7 @@ class _HomePageState extends State<HomePage> {
           final ownFullscreen = _fullscreen == _session?.userId;
           setState(() {
             _sharing = false;
+            _shareIsCamera = false;
             _shareStats = null;
             _watched.remove(_session?.userId);
             if (ownFullscreen) _fullscreen = null;
@@ -1399,6 +1465,7 @@ class _HomePageState extends State<HomePage> {
           final ownFullscreen = _fullscreen == _session?.userId;
           setState(() {
             _sharing = false;
+            _shareIsCamera = false;
             _shareStats = null;
             _watched.remove(_session?.userId);
             if (ownFullscreen) _fullscreen = null;
@@ -1910,11 +1977,15 @@ class _HomePageState extends State<HomePage> {
     // Your own volume is not a thing the mix can apply (your voice never
     // comes back to you); only other people's rows open the dialog.
     final adjustable = !idle && !self;
-    return Tooltip(
-      message: adjustable ? '$name · click for volume' : name,
+    final row = Tooltip(
+      message: self
+          ? name
+          : (adjustable
+                ? '$name · click for volume / poke'
+                : '$name · click to poke'),
       child: InkWell(
         borderRadius: BorderRadius.circular(6),
-        onTap: adjustable ? () => _showVolumeDialog(userId) : null,
+        onTap: self ? null : () => _showUserDialog(userId, idle: idle),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 110),
           margin: const EdgeInsets.only(top: 4),
@@ -1997,6 +2068,24 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
       ),
+    );
+    if (!adjustable) return row;
+    // Wheel over a member trims their voice without opening the dialog.
+    // The same 0..2 clamp as the slider, in 5% steps.
+    return Listener(
+      onPointerSignal: (event) {
+        if (event is! PointerScrollEvent) return;
+        final dy = event.scrollDelta.dy;
+        // Claim the event: the roster sits in a ListView, and a wheel
+        // notch that trims a level must not also scroll the list out
+        // from under the pointer.
+        GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+          final delta = dy < 0 ? 0.05 : -0.05;
+          final next = (volume + delta).clamp(0.0, 2.0).toDouble();
+          if (next != volume) unawaited(_applyVolume(userId, next));
+        });
+      },
+      child: row,
     );
   }
 

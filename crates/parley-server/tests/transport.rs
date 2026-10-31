@@ -2743,3 +2743,62 @@ async fn away_status_is_broadcast_and_in_the_snapshot() {
     conn_b.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
+
+/// A poke is targeted: only the named user is notified, the sender gets
+/// no echo, and an offline target is a silent no-op rather than an error
+/// that could kill the session.
+#[tokio::test]
+async fn poke_reaches_only_the_target() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("poke");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_a, mut tx_a, mut rx_a) =
+        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, _tx_b, mut rx_b) =
+        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+    let (conn_c, _tx_c, mut rx_c) =
+        connect_and_auth(&endpoint, addr, "thirduser", "thirdpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::Poke(parley_proto::Poke { user_id: 2 }),
+    )
+    .await;
+
+    match read_server_msg(&mut rx_b).await.body {
+        Some(ServerBody::Poked(p)) => {
+            assert_eq!(p.from_user_id, 1, "server stamps the sender id");
+            assert_eq!(p.from_username, "testuser");
+            assert_eq!(p.channel_id, 0, "online but not in a channel");
+        }
+        other => panic!("expected poke, got {other:?}"),
+    }
+    expect_silence(&mut rx_a, Duration::from_millis(150)).await;
+    expect_silence(&mut rx_c, Duration::from_millis(150)).await;
+
+    // Offline target: nothing happens, and the session stays alive.
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::Poke(parley_proto::Poke { user_id: 99 }),
+    )
+    .await;
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::Heartbeat(Heartbeat { client_time_ms: 7 }),
+    )
+    .await;
+    match read_server_msg(&mut rx_a).await.body {
+        Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 7),
+        other => panic!("session died after an offline poke: {other:?}"),
+    }
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    conn_c.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}

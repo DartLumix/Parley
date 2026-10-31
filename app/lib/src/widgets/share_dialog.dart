@@ -14,6 +14,7 @@ typedef ShareOptions = ({
   int fps,
   bool audio,
   List<int> audioPlayers,
+  bool camera,
 });
 
 /// Ask for resolution, frame rate and audio before the source picker opens.
@@ -34,9 +35,11 @@ Future<ShareOptions?> showShareOptionsDialog(
   required int height,
   required int fps,
   List<ShareAudioPlayer> players = const [],
+  bool cameraSupported = true,
 }) {
   var chosenHeight = height;
   var chosenFps = fps;
+  var camera = false;
   // Everything playing is checked by default: the old whole-output
   // behaviour, minus this app itself.
   var audioOn = players.isNotEmpty;
@@ -45,7 +48,7 @@ Future<ShareOptions?> showShareOptionsDialog(
     context: context,
     builder: (context) => StatefulBuilder(
       builder: (context, setDialog) => AlertDialog(
-        title: const Text('Share screen'),
+        title: Text(camera ? 'Share camera' : 'Share screen'),
         content: SizedBox(
           width: 380,
           // Scrollable: the audio list can grow past the dialog's
@@ -55,13 +58,26 @@ Future<ShareOptions?> showShareOptionsDialog(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Pick the source in the system dialog that opens next. '
-                  'These are caps, not upscales — the stream runs at the '
-                  'fastest rate the encoder can hold up to the frame rate '
-                  'chosen here, and the screen tile shows the rate actually '
-                  'being sent.',
-                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                if (cameraSupported) ...[
+                  _choice<bool>(
+                    label: 'Source',
+                    value: camera,
+                    items: const [(false, 'Screen'), (true, 'Camera')],
+                    onChanged: (v) => setDialog(() => camera = v),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                Text(
+                  camera
+                      ? 'The camera stream uses the same video path as a '
+                            'screen share: resolution and frame rate are '
+                            'caps, and viewers can watch it like any share.'
+                      : 'Pick the source in the system dialog that opens next. '
+                            'These are caps, not upscales — the stream runs at '
+                            'the fastest rate the encoder can hold up to the '
+                            'frame rate chosen here, and the screen tile shows '
+                            'the rate actually being sent.',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
                 ),
                 const SizedBox(height: 12),
                 _choice<int>(
@@ -88,72 +104,74 @@ Future<ShareOptions?> showShareOptionsDialog(
                   ],
                   onChanged: (v) => setDialog(() => chosenFps = v),
                 ),
-                const Divider(height: 24),
-                Row(
-                  children: [
-                    const Expanded(
-                      child: Text(
-                        'Share audio',
-                        style: TextStyle(fontSize: 13),
+                if (!camera) ...[
+                  const Divider(height: 24),
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Share audio',
+                          style: TextStyle(fontSize: 13),
+                        ),
                       ),
-                    ),
-                    Switch(
-                      value: audioOn,
-                      onChanged: players.isEmpty
-                          ? null
-                          : (v) => setDialog(() => audioOn = v),
-                    ),
-                  ],
-                ),
-                if (players.isEmpty)
-                  const Text(
-                    'No application is playing audio right now. Start the '
-                    'playback you want to share, then share again.',
-                    style: TextStyle(color: Colors.white54, fontSize: 12),
-                  )
-                else if (audioOn)
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 190),
-                    child: SingleChildScrollView(
-                      child: Column(
-                        children: [
-                          for (final player in players)
-                            CheckboxListTile(
-                              dense: true,
-                              contentPadding: EdgeInsets.zero,
-                              value: selected.contains(player.id),
-                              onChanged: (v) => setDialog(() {
-                                if (v == true) {
-                                  selected.add(player.id);
-                                } else {
-                                  selected.remove(player.id);
-                                }
-                              }),
-                              title: Text(
-                                player.app,
-                                style: const TextStyle(fontSize: 13),
-                              ),
-                              subtitle: Text(
-                                player.description,
-                                style: const TextStyle(
-                                  color: Colors.white54,
-                                  fontSize: 11,
+                      Switch(
+                        value: audioOn,
+                        onChanged: players.isEmpty
+                            ? null
+                            : (v) => setDialog(() => audioOn = v),
+                      ),
+                    ],
+                  ),
+                  if (players.isEmpty)
+                    const Text(
+                      'No application is playing audio right now. Start the '
+                      'playback you want to share, then share again.',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    )
+                  else if (audioOn)
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 190),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          children: [
+                            for (final player in players)
+                              CheckboxListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                value: selected.contains(player.id),
+                                onChanged: (v) => setDialog(() {
+                                  if (v == true) {
+                                    selected.add(player.id);
+                                  } else {
+                                    selected.remove(player.id);
+                                  }
+                                }),
+                                title: Text(
+                                  player.app,
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                                subtitle: Text(
+                                  player.description,
+                                  style: const TextStyle(
+                                    color: Colors.white54,
+                                    fontSize: 11,
+                                  ),
                                 ),
                               ),
-                            ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                if (players.isNotEmpty)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 6),
-                    child: Text(
-                      'Only these apps are captured — Parley itself never is, '
-                      'so participants do not hear their own voice back.',
-                      style: TextStyle(color: Colors.white38, fontSize: 11),
+                  if (players.isNotEmpty)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 6),
+                      child: Text(
+                        'Only these apps are captured — Parley itself never is, '
+                        'so participants do not hear their own voice back.',
+                        style: TextStyle(color: Colors.white38, fontSize: 11),
+                      ),
                     ),
-                  ),
+                ],
               ],
             ),
           ),
@@ -167,13 +185,17 @@ Future<ShareOptions?> showShareOptionsDialog(
             onPressed: () => Navigator.pop<ShareOptions>(context, (
               height: chosenHeight,
               fps: chosenFps,
-              audio: audioOn && selected.isNotEmpty,
-              audioPlayers: audioOn
+              audio: !camera && audioOn && selected.isNotEmpty,
+              audioPlayers: !camera && audioOn
                   ? selected.toList(growable: false)
                   : const <int>[],
+              camera: camera,
             )),
-            icon: const Icon(Icons.screen_share, size: 18),
-            label: const Text('Start sharing'),
+            icon: Icon(
+              camera ? Icons.videocam : Icons.screen_share,
+              size: 18,
+            ),
+            label: Text(camera ? 'Start camera' : 'Start sharing'),
           ),
         ],
       ),

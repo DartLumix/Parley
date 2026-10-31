@@ -116,7 +116,18 @@ use std::os::fd::OwnedFd;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::{list_audio_players, start};
+pub use win::{list_audio_players, start, start_camera};
+#[cfg(not(windows))]
+mod camera;
+#[cfg(not(windows))]
+pub use camera::start_camera;
+
+/// Whether this build has a camera source. Linux captures V4L2 directly;
+/// Windows has no Media Foundation source yet, so the option is hidden
+/// rather than offered and then refused.
+pub fn camera_share_supported() -> bool {
+    cfg!(not(windows))
+}
 
 #[cfg(not(windows))]
 use crate::ShareEvent;

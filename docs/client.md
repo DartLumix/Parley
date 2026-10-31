@@ -104,15 +104,28 @@ same trust decision.
   turned-down person still lights up, because the meter is taken before
   your volume is applied.
 - **Volume** — click a name in a channel's roster for their voice slider
-  (0–200%). A screen sharer also gets a *Screen share audio* slider on
-  their open tile: that stream is trimmed separately, so their voice
-  keeps its level.
+  (0–200%), or scroll while hovering that row to change it in 5% steps
+  without opening the dialog. A screen sharer also gets a *Screen share
+  audio* slider on their open tile: that stream is trimmed separately,
+  so their voice keeps its level.
+- **Poke** — the same user dialog has a *Poke* button for anyone online,
+  in a channel or in the idle list. The server sends it to that user
+  alone; their client plays a distinct cue and shows a notification with
+  a *Poke back* action. *Mute all* keeps the cue silent, like every other
+  local sound.
 - **Screen share** — *Share screen* in the floating bar asks for a
   resolution and frame-rate cap first (defaults from Settings, *Source*
   means the capture's own size and rate — caps never upscale), then the
   platform asks which monitor or window (the desktop portal on Linux,
-  the Windows Graphics Capture picker on Windows). The same dialog has a
-  *Share audio* switch and the list of applications playing right now:
+  the Windows Graphics Capture picker on Windows). The dialog's *Source*
+  choice switches to *Camera* on Linux: the first V4L2 device that offers
+  YUYV is captured (1280x720, falling back to 960x540/640x480) and sent
+  through the same H.264 path and preview. A camera share has no share
+  audio, and because one user has one video stream it replaces a screen
+  share rather than running beside it. Windows hides the camera choice
+  until a Media Foundation source exists. For a screen share the same
+  dialog has a *Share audio* switch and the list of applications playing
+  right now:
   tick one or more and each is captured on its own (PipeWire nodes on
   Linux, WASAPI process loopback on Windows), so Parley's playback (the
   voice channel, other shares) is never in the stream and a viewer

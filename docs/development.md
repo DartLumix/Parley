@@ -62,7 +62,10 @@ refuses anything below 3.5 outright ("Compatibility with CMake < 3.5
 has been removed"). Windows runners already ship CMake 4, and any
 distribution rolling it forward will hit the same wall, so the builds
 that use the bundled Opus set
-`CMAKE_POLICY_VERSION_MINIMUM=3.5`. Setting it yourself is enough:
+`CMAKE_POLICY_VERSION_MINIMUM=3.5`. Both workflows set it in their
+top-level `env`, so every job inherits it — including the ones that only
+run tests and never install CMake themselves. Setting it yourself is
+enough:
 
 ```sh
 CMAKE_POLICY_VERSION_MINIMUM=3.5 LIBOPUS_NO_PKG=1 LIBOPUS_STATIC=1 \

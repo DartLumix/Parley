@@ -92,7 +92,7 @@ use crate::api::session::Command;
 #[cfg(feature = "audio-device")]
 const PERIOD_FRAMES: u32 = 1024;
 
-/// A pending join/leave cue: 0 none, 1 somebody joined, 2 somebody left.
+/// A pending cue: 0 none, 1 somebody joined, 2 somebody left, 3 a poke.
 /// Written by the UI thread, consumed by the render callback — an atomic
 /// swap, because the audio callback must never take a lock that a
 /// control path can hold.
@@ -107,12 +107,72 @@ pub(crate) fn play_chime(join: bool) {
     CHIME_REQUEST.store(u8::from(!join) + 1, Ordering::Relaxed);
 }
 
+/// Ask the next render callback for the poke cue. Silent when no voice
+/// render stream exists; the Dart side's platform alert covers that case.
+#[cfg(feature = "audio-device")]
+pub(crate) fn play_poke() {
+    CHIME_REQUEST.store(3, Ordering::Relaxed);
+}
+
+/// The same poke cue without a voice stream. A poke can arrive while we
+/// are online but not in a channel, and that is exactly when there is no
+/// render callback to carry `CHIME_REQUEST`: open the default output for
+/// one short cue and let it go. Best-effort — a busy or exclusive device
+/// costs the sound, never the notification.
+#[cfg(feature = "audio-device")]
+pub(crate) fn play_poke_standalone() {
+    std::thread::spawn(|| {
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            return;
+        };
+        let Ok(config) = preferred_output_config(&device) else {
+            return;
+        };
+        let channels = config.channels() as usize;
+        let samples = cues()[2].clone();
+        // One device period of slack so the last samples reach the sink
+        // before the stream is dropped (the buffer moves into the
+        // callback below, so its length is measured here).
+        let duration =
+            Duration::from_millis(samples.len() as u64 * 1000 / u64::from(PREFERRED_RATE) + 80);
+        let pos = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pos_for_cb = pos.clone();
+        let stream = match device.build_output_stream(
+            &config.config(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut at = pos_for_cb.load(Ordering::Relaxed);
+                for frame in data.chunks_mut(channels.max(1)) {
+                    let sample = samples.get(at).copied().unwrap_or(0.0);
+                    for x in frame.iter_mut() {
+                        *x = sample;
+                    }
+                    at += 1;
+                }
+                pos_for_cb.store(at, Ordering::Relaxed);
+            },
+            |e| eprintln!("poke: output stream: {e}"),
+            None,
+        ) {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("poke: could not open the output device: {e}");
+                return;
+            }
+        };
+        if stream.play().is_err() {
+            return;
+        }
+        std::thread::sleep(duration);
+    });
+}
+
 /// The two cues, rendered once at 48 kHz: a rising pair for a join, the
 /// same pair falling for a leave. 75 ms per note with raised-cosine
 /// edges, so a short device period cannot click.
 #[cfg(feature = "audio-device")]
-fn cues() -> &'static [Vec<f32>; 2] {
-    static CUES: std::sync::OnceLock<[Vec<f32>; 2]> = std::sync::OnceLock::new();
+fn cues() -> &'static [Vec<f32>; 3] {
+    static CUES: std::sync::OnceLock<[Vec<f32>; 3]> = std::sync::OnceLock::new();
     CUES.get_or_init(|| {
         let note = |freq: f32| {
             const RATE: f32 = 48_000.0;
@@ -133,7 +193,9 @@ fn cues() -> &'static [Vec<f32>; 2] {
         };
         let rising = [note(660.0), note(880.0)].concat();
         let falling = [note(880.0), note(660.0)].concat();
-        [rising, falling]
+        // Distinct from join/leave: three short rising blips.
+        let poke = [note(740.0), note(988.0), note(1319.0)].concat();
+        [rising, falling, poke]
     })
 }
 
@@ -875,6 +937,10 @@ fn build_streams(
                         cue = Some(cues()[1].as_slice());
                         cue_pos = 0;
                     }
+                    3 if !output_muted => {
+                        cue = Some(cues()[2].as_slice());
+                        cue_pos = 0;
+                    }
                     _ => {}
                 }
                 if let Some(samples) = cue {
@@ -922,8 +988,9 @@ mod cue_tests {
     use super::cues;
 
     #[test]
-    fn the_cues_are_two_short_notes() {
-        let [join, leave] = cues();
+    fn the_cues_are_two_short_notes_and_a_poke() {
+        let [join, leave, poke] = cues();
+        assert_eq!(poke.len(), 3600 * 3, "three 75 ms poke blips");
         assert_eq!(join.len(), 3600 * 2, "two 75 ms notes at 48 kHz");
         assert_eq!(leave.len(), join.len());
         for cue in [join, leave] {

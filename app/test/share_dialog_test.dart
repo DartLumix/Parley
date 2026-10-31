@@ -115,6 +115,28 @@ void main() {
     expect(value.audioPlayers, [101]);
   });
 
+  testWidgets('camera source hides audio and is returned', (tester) async {
+    final players = [
+      const ShareAudioPlayer(id: 101, app: 'Firefox', description: 'audio'),
+    ];
+    final result = await open(tester, players: players);
+
+    await tester.tap(find.byType(DropdownButton<bool>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Camera').last);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Share audio'), findsNothing);
+    expect(find.text('Firefox'), findsNothing);
+
+    await tester.tap(find.text('Start camera'));
+    await tester.pumpAndSettle();
+    final value = result()!;
+    expect(value.camera, isTrue);
+    expect(value.audio, isFalse);
+    expect(value.audioPlayers, isEmpty);
+  });
+
   testWidgets('cancel means no share', (tester) async {
     final result = await open(tester);
 

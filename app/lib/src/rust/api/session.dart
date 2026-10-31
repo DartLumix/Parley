@@ -91,6 +91,14 @@ Future<void> setStatus({required int sessionId, required String text}) =>
       text: text,
     );
 
+/// Poke one connected user (a transient notification with a cue). The
+/// server routes it to the target alone; poking yourself is ignored
+/// rather than sending a notification nobody wants.
+Future<void> pokeUser({required int sessionId, required int userId}) => RustLib
+    .instance
+    .api
+    .crateApiSessionPokeUser(sessionId: sessionId, userId: userId);
+
 /// Mute everything this client plays: voices, share audio and the
 /// local join/leave cues. Local only (the server never needs to know),
 /// applied at the mixer so per-user sliders survive the round trip.
@@ -359,6 +367,11 @@ Future<bool> hwEncodeSupported() =>
 Future<bool> screenShareSupported() =>
     RustLib.instance.api.crateApiSessionScreenShareSupported();
 
+/// Whether this build has a camera source to share. Linux is V4L2;
+/// Windows has no camera capture yet, so the dialog hides the choice.
+Future<bool> cameraShareSupported() =>
+    RustLib.instance.api.crateApiSessionCameraShareSupported();
+
 /// Real impl — see the stub above. `max_height` / `max_fps` are the
 /// pre-share dialog's caps; 0 means "the capture's own" (never
 /// upscaled, never sped up). A cap the running encoder cannot honour
@@ -376,12 +389,14 @@ Future<void> startScreenShare({
   required int maxFps,
   required bool shareAudio,
   required List<int> audioPlayers,
+  required bool camera,
 }) => RustLib.instance.api.crateApiSessionStartScreenShare(
   sessionId: sessionId,
   maxHeight: maxHeight,
   maxFps: maxFps,
   shareAudio: shareAudio,
   audioPlayers: audioPlayers,
+  camera: camera,
 );
 
 /// Real impl — see the stub above.
@@ -632,7 +647,7 @@ class ServerCertificate {
 /// Everything the server can tell the UI, as one flat event struct.
 /// `kind` is one of: "channel_list", "presence", "chat", "history",
 /// "voice_state", "voice_states", "video_started", "video_stats",
-/// "video_stopped", "manage", "session_closed".
+/// "video_stopped", "poked", "manage", "session_closed".
 class SessionEvent {
   final int sessionId;
   final String kind;

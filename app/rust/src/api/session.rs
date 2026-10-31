@@ -58,7 +58,7 @@ use parley_proto::VideoReport;
 use parley_proto::{
     AddUser, AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage,
     CreateChannel, DeleteChannel, FetchHistory, Heartbeat, Hello, HelloAck, JoinVoice, KickUser,
-    LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PinMessage, PresenceRequest,
+    LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PinMessage, Poke, PresenceRequest,
     RemoveUser, Role, SendChat, ServerBody, ServerMessage, SetMute, SetStatus, UpdateChannel,
     UpdateUser, VoiceStatesRequest, PROTOCOL_VERSION,
 };
@@ -146,6 +146,11 @@ pub(crate) enum Command {
     /// row to every session, exactly like mute.
     SetStatus {
         text: String,
+    },
+    /// Nudge one connected user. The server relays it to that user only
+    /// (answer: their `poked` event); the sender gets no echo.
+    Poke {
+        user_id: u32,
     },
     /// Voice-membership snapshot ("voice_states" event). VoiceState
     /// broadcasts cover every join/leave that happens while we are
@@ -260,6 +265,7 @@ impl Command {
             Command::Presence => ClientBody::PresenceRequest(PresenceRequest {}),
             Command::SetMute { muted } => ClientBody::SetMute(SetMute { muted }),
             Command::SetStatus { text } => ClientBody::SetStatus(SetStatus { text }),
+            Command::Poke { user_id } => ClientBody::Poke(Poke { user_id }),
             Command::VoiceStates => ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
             #[cfg(feature = "audio-device")]
             Command::ReceiverReport { gap_rate_permille } => {
@@ -538,7 +544,7 @@ pub struct VideoSurfaceInfo {
 /// Everything the server can tell the UI, as one flat event struct.
 /// `kind` is one of: "channel_list", "presence", "chat", "history",
 /// "voice_state", "voice_states", "video_started", "video_stats",
-/// "video_stopped", "manage", "session_closed".
+/// "video_stopped", "poked", "manage", "session_closed".
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub session_id: u32,
@@ -920,6 +926,33 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 let _ = rep;
             }
             Vec::new()
+        }
+        ServerBody::Poked(p) => {
+            // A peer nudged us: one transient event, no roster change.
+            // The cue is local: on the voice render stream when one
+            // exists, otherwise a one-shot output stream. "Mute
+            // everything" keeps pokes silent too, like every cue.
+            #[cfg(feature = "audio-device")]
+            {
+                let (in_voice, muted) = SESSIONS
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .map(|s| (s.voice.is_some(), s.mixer.lock().unwrap().output_muted()))
+                    .unwrap_or((false, false));
+                if !muted {
+                    if in_voice {
+                        crate::api::voice::play_poke();
+                    } else {
+                        crate::api::voice::play_poke_standalone();
+                    }
+                }
+            }
+            let mut e = ev("poked");
+            e.user_id = p.from_user_id;
+            e.username = p.from_username.clone();
+            e.channel_id = p.channel_id;
+            vec![e]
         }
         ServerBody::VoiceStateList(l) => {
             let mut e = ev("voice_states");
@@ -1549,6 +1582,16 @@ pub fn set_status(session_id: u32, text: String) -> Result<(), String> {
     send_command(session_id, Command::SetStatus { text })
 }
 
+/// Poke one connected user (a transient notification with a cue). The
+/// server routes it to the target alone; poking yourself is ignored
+/// rather than sending a notification nobody wants.
+pub fn poke_user(session_id: u32, user_id: u32) -> Result<(), String> {
+    if user_id == 0 || user_id == own_user_id(session_id) {
+        return Ok(());
+    }
+    send_command(session_id, Command::Poke { user_id })
+}
+
 /// Mute everything this client plays: voices, share audio and the
 /// local join/leave cues. Local only (the server never needs to know),
 /// applied at the mixer so per-user sliders survive the round trip.
@@ -1946,11 +1989,26 @@ pub fn screen_share_supported() -> bool {
     cfg!(feature = "screen-capture")
 }
 
+/// Whether this build has a camera source to share. Linux is V4L2;
+/// Windows has no camera capture yet, so the dialog hides the choice.
+pub fn camera_share_supported() -> bool {
+    #[cfg(feature = "screen-capture")]
+    {
+        parley_client::screen::camera_share_supported()
+    }
+    #[cfg(not(feature = "screen-capture"))]
+    {
+        false
+    }
+}
+
 /// Start sharing this machine's screen (the platform source picker
-/// opens). The share runs regardless of channel membership — viewers see
-/// it when they're in the same voice channel (FLAG_VIDEO rides the media
-/// path). Acceptance: share_started event, then the peer's Screens panel
-/// shows this machine.
+/// opens), or the first camera when `camera` is true. The share runs
+/// regardless of channel membership — viewers see it when they're in the
+/// same voice channel (FLAG_VIDEO rides the media path). A camera share
+/// has no share audio and no portal picker; it uses the same encoder and
+/// wire path. Acceptance: share_started event, then the peer's Screens
+/// panel shows this machine.
 #[cfg(not(feature = "screen-capture"))]
 pub fn start_screen_share(
     _session_id: u32,
@@ -1958,6 +2016,7 @@ pub fn start_screen_share(
     _max_fps: u32,
     _share_audio: bool,
     _audio_players: Vec<u32>,
+    _camera: bool,
 ) -> Result<(), String> {
     Err("screen-capture feature off".into())
 }
@@ -1980,6 +2039,7 @@ pub fn start_screen_share(
     max_fps: u32,
     share_audio: bool,
     audio_players: Vec<u32>,
+    camera: bool,
 ) -> Result<(), String> {
     // The own-share card reads the NEW share's shape, not the last one's
     // while the source picker is still open.
@@ -2073,18 +2133,34 @@ pub fn start_screen_share(
             // checks the settings switch per frame, so toggling it mid-
             // share costs nothing and needs no restart.
             let preview = crate::api::video::share_tap();
-            match parley_client::screen::start(
-                conn.clone(),
-                share_loss,
-                share_viewer_fps,
-                share_event_tx,
-                audio,
-                false,
-                options,
-                preview,
-            )
-            .await
-            {
+            // One video stream per sender, so a camera share and a screen
+            // share are alternatives, not two simultaneous sources. The
+            // camera path shares the encoder, preview and wire format; it
+            // has no portal, no DMA-BUF and no share audio.
+            let started = if camera {
+                parley_client::screen::start_camera(
+                    conn.clone(),
+                    share_loss,
+                    share_viewer_fps,
+                    share_event_tx,
+                    options,
+                    preview,
+                )
+                .await
+            } else {
+                parley_client::screen::start(
+                    conn.clone(),
+                    share_loss,
+                    share_viewer_fps,
+                    share_event_tx,
+                    audio,
+                    false,
+                    options,
+                    preview,
+                )
+                .await
+            };
+            match started {
                 Ok((handle, ctrl)) => {
                     // Spawn the mux NOW (the terminal client's
                     // sequencing): mic + system audio ride one music
@@ -2092,27 +2168,29 @@ pub fn start_screen_share(
                     // via the parked channel (None when voice isn't
                     // started yet — sys-only degradation).
                     #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
-                    if let Some(sys_rx) = sys_rx {
-                        // 7k: system audio only. Bundling the mic into the
-                        // share (the CLI's 6.9 shape) made the whole mux
-                        // one stream, so a viewer could not have the
-                        // sharer's voice without also getting the share's
-                        // sound — and the app gates share sound on
-                        // "watching". The mic keeps its own speech
-                        // encoder, at speech quality, all share long.
-                        let mic_rx = None;
-                        let route = share_mic_route().clone();
-                        let mux_conn = conn.clone();
-                        std::thread::spawn(move || {
-                            let returned = parley_client::screen::spawn_share_audio_mux(
-                                mic_rx, sys_rx, mux_conn, route,
-                            );
-                            // Mux exited (share over or error): park
-                            // the mic receiver back for reuse.
-                            if let Ok(Some(rx)) = returned.join() {
-                                *SHARE_MIC_MUX_SLOT.lock().unwrap() = Some(rx);
-                            }
-                        });
+                    if !camera {
+                        if let Some(sys_rx) = sys_rx {
+                            // 7k: system audio only. Bundling the mic into
+                            // the share (the CLI's 6.9 shape) made the whole
+                            // mux one stream, so a viewer could not have the
+                            // sharer's voice without also getting the share's
+                            // sound — and the app gates share sound on
+                            // "watching". The mic keeps its own speech
+                            // encoder, at speech quality, all share long.
+                            let mic_rx = None;
+                            let route = share_mic_route().clone();
+                            let mux_conn = conn.clone();
+                            std::thread::spawn(move || {
+                                let returned = parley_client::screen::spawn_share_audio_mux(
+                                    mic_rx, sys_rx, mux_conn, route,
+                                );
+                                // Mux exited (share over or error): park
+                                // the mic receiver back for reuse.
+                                if let Ok(Some(rx)) = returned.join() {
+                                    *SHARE_MIC_MUX_SLOT.lock().unwrap() = Some(rx);
+                                }
+                            });
+                        }
                     }
                     let _ = poke_tx.send(handle);
                     let _ = ctrl_slot.lock().unwrap().insert(ctrl);

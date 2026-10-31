@@ -41,7 +41,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -529691761;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -845420650;
 
 // Section: executor
 
@@ -283,6 +283,38 @@ fn wire__crate__api__settings__app_settings_default_impl(
             move |context| {
                 transform_result_sse::<_, ()>((move || {
                     let output_ok = Ok::<_, ()>(crate::api::settings::AppSettings::default())?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__session__camera_share_supported_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "camera_share_supported",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok = Ok::<_, ()>(crate::api::session::camera_share_supported())?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -1248,6 +1280,40 @@ fn wire__crate__api__session__poke_share_keyframe_impl(
         },
     )
 }
+fn wire__crate__api__session__poke_user_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "poke_user",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_session_id = <u32>::sse_decode(&mut deserializer);
+            let api_user_id = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::session::poke_user(api_session_id, api_user_id)?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__session__probe_server_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -1866,6 +1932,7 @@ fn wire__crate__api__session__start_screen_share_impl(
             let api_max_fps = <u32>::sse_decode(&mut deserializer);
             let api_share_audio = <bool>::sse_decode(&mut deserializer);
             let api_audio_players = <Vec<u32>>::sse_decode(&mut deserializer);
+            let api_camera = <bool>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
@@ -1875,6 +1942,7 @@ fn wire__crate__api__session__start_screen_share_impl(
                         api_max_fps,
                         api_share_audio,
                         api_audio_players,
+                        api_camera,
                     )?;
                     std::result::Result::Ok(output_ok)
                 })())
@@ -2699,77 +2767,84 @@ fn pde_ffi_dispatcher_primary_impl(
         5 => {
             wire__crate__api__settings__app_settings_default_impl(port, ptr, rust_vec_len, data_len)
         }
-        6 => wire__crate__api__session__connect_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__session__connect_with_token_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__session__disconnect_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__session__events_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__session__fetch_history_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__login__forget_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__session__hw_encode_enabled_impl(port, ptr, rust_vec_len, data_len),
-        13 => {
+        6 => wire__crate__api__session__camera_share_supported_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        7 => wire__crate__api__session__connect_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__session__connect_with_token_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__session__disconnect_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__session__events_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__session__fetch_history_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__login__forget_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__session__hw_encode_enabled_impl(port, ptr, rust_vec_len, data_len),
+        14 => {
             wire__crate__api__session__hw_encode_supported_impl(port, ptr, rust_vec_len, data_len)
         }
-        14 => wire__crate__api__session__is_connected_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__session__join_voice_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__session__leave_voice_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__session__list_channels_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__players__list_share_audio_players_impl(
+        15 => wire__crate__api__session__is_connected_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__session__join_voice_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__session__leave_voice_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__session__list_channels_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__players__list_share_audio_players_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        19 => wire__crate__api__login__load_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__settings__load_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__session__manage_add_user_impl(port, ptr, rust_vec_len, data_len),
-        22 => {
+        20 => wire__crate__api__login__load_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__settings__load_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__session__manage_add_user_impl(port, ptr, rust_vec_len, data_len),
+        23 => {
             wire__crate__api__session__manage_create_channel_impl(port, ptr, rust_vec_len, data_len)
         }
-        23 => {
+        24 => {
             wire__crate__api__session__manage_delete_channel_impl(port, ptr, rust_vec_len, data_len)
         }
-        24 => wire__crate__api__session__manage_kick_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__session__manage_remove_user_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__session__manage_state_impl(port, ptr, rust_vec_len, data_len),
-        27 => {
+        25 => wire__crate__api__session__manage_kick_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__session__manage_remove_user_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__session__manage_state_impl(port, ptr, rust_vec_len, data_len),
+        28 => {
             wire__crate__api__session__manage_update_channel_impl(port, ptr, rust_vec_len, data_len)
         }
-        28 => wire__crate__api__session__manage_update_user_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__session__mic_level_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__session__pin_message_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__session__play_voice_chime_impl(port, ptr, rust_vec_len, data_len),
-        32 => {
+        29 => wire__crate__api__session__manage_update_user_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__session__mic_level_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__session__pin_message_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__session__play_voice_chime_impl(port, ptr, rust_vec_len, data_len),
+        33 => {
             wire__crate__api__session__poke_share_keyframe_impl(port, ptr, rust_vec_len, data_len)
         }
-        33 => wire__crate__api__session__probe_server_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__session__request_presence_impl(port, ptr, rust_vec_len, data_len),
-        35 => {
+        34 => wire__crate__api__session__poke_user_impl(port, ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__session__probe_server_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__session__request_presence_impl(port, ptr, rust_vec_len, data_len),
+        37 => {
             wire__crate__api__session__request_voice_states_impl(port, ptr, rust_vec_len, data_len)
         }
-        36 => wire__crate__api__login__save_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__settings__save_impl(port, ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__session__screen_share_supported_impl(
+        38 => wire__crate__api__login__save_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__settings__save_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__session__screen_share_supported_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        39 => wire__crate__api__session__send_chat_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__session__set_hw_encode_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__session__set_mic_muted_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__session__set_output_muted_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__session__set_screen_watched_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__session__set_share_audio_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__session__set_share_volume_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__session__set_status_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__session__set_user_volume_impl(port, ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__video__share_preview_impl(port, ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__video__share_stats_impl(port, ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__session__start_screen_share_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__session__stop_screen_share_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__session__trust_server_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__video__video_prepare_impl(port, ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__session__voice_levels_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__session__send_chat_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__session__set_hw_encode_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__session__set_mic_muted_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__session__set_output_muted_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__session__set_screen_watched_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__session__set_share_audio_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__session__set_share_volume_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__session__set_status_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__session__set_user_volume_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__video__share_preview_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__video__share_stats_impl(port, ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__session__start_screen_share_impl(port, ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__session__stop_screen_share_impl(port, ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__session__trust_server_impl(port, ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__video__video_prepare_impl(port, ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__session__voice_levels_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

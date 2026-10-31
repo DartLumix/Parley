@@ -31,6 +31,7 @@ screen-capture = [
     "dep:ashpd",
     "dep:pipewire",
     "dep:futures-util",
+    "dep:v4l",
     "dep:windows",
     "dep:windows-capture",
     "dep:wasapi",
@@ -55,6 +56,9 @@ openh264 = { workspace = true, optional = true }
 ashpd = { workspace = true, optional = true, features = ["screencast"] }
 pipewire = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+# Camera capture: plain V4L2 (no portal, no GStreamer). Linux-only; the
+# Windows backend has no camera source yet.
+v4l = { version = "0.14", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true }

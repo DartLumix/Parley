@@ -20,8 +20,8 @@ use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ChannelMode, ClientBody,
-    ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, PresenceList, PresenceUser,
-    ReceiverReport, ServerBody, ServerMessage, ShareStopped, VideoReport,
+    ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked, PresenceList,
+    PresenceUser, ReceiverReport, ServerBody, ServerMessage, ShareStopped, VideoReport,
     VoiceState as PbVoiceState, VoiceStateList,
 };
 
@@ -591,6 +591,32 @@ async fn handle_client_message(
                     channel.unwrap_or(0),
                     channel.is_some(),
                 ));
+            }
+        }
+
+        Some(ClientBody::Poke(p)) => {
+            // A poke is a nudge between two people, not channel chatter:
+            // relay it to the named user only, and never echo it to the
+            // sender. The target must be connected; an offline target is
+            // simply not disturbed (the UI only offers online rows).
+            if p.user_id != 0 && p.user_id != info.id {
+                let delivered = registry.send_to_user(
+                    p.user_id,
+                    ServerMessage {
+                        body: Some(ServerBody::Poked(Poked {
+                            from_user_id: info.id,
+                            from_username: info.username.clone(),
+                            channel_id: voice.channel_of(info.id).unwrap_or(0),
+                        })),
+                    },
+                );
+                if !delivered {
+                    warn!(
+                        user_id = info.id,
+                        target = p.user_id,
+                        "poke target is offline"
+                    );
+                }
             }
         }
 

@@ -81,7 +81,7 @@ Connect to `your-server` (port 4443, the client default). The full runbooks are
 
 ## ✨ What it is
 
-- 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera video
+- 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera sharing on Linux, and poke notifications
 - 👀 Every share is a live 16:9 tile — including yours while you send — with *Watch*, several open at once, and per-share audio · pick a resolution/rate cap before the portal opens · settings for video, audio and your account
 - 🐧 Native clients: **Linux → Windows → Android → iOS** — no Electron, no webviews, ever. The Windows client (voice with echo cancellation, chat, sharing and watching — WGC capture + WASAPI per-app audio) builds from the same code
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
@@ -268,7 +268,7 @@ backend feature through `flutter_rust_bridge` before any real UI design.
 - [ ] Android / iOS bring-up
 - [ ] File transfer (QUIC streams), rich text, search, DMs, push, auto-update
 
-**Parked indefinitely** : camera video — returns after the client has adecent foundation (it needs UI preview; the pipeline exists).
+**Platform gap**: camera sharing is Linux-only for now. The V4L2 source feeds the same H.264 share pipeline; Windows needs a Media Foundation source reader before the camera choice can appear there.
 
 ---
 

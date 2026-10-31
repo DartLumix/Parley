@@ -3,6 +3,35 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.6] — 2026-10-31
+
+Three small things and a cleaner build: pokes between people, a camera
+source on Linux, and volume on the scroll wheel.
+
+### Added
+
+- **Pokes.** Click an online participant — in a channel or in the idle
+  list — and press *Poke*. The server relays it to that user alone; their
+  client plays a distinct three-note cue (while in voice; the platform
+  alert covers the rest) and shows a notification with a *Poke back*
+  action.
+- **Wheel volume.** Scrolling while hovering a member in a channel trims
+  their voice in 5% steps, without opening the volume dialog and without
+  scrolling the roster.
+- **Camera sharing (Linux).** The share dialog now chooses Screen or
+  Camera. The camera opens the first V4L2 device that offers YUYV, feeds
+  1280x720 (falling back to 960x540 / 640x480) through the same H.264
+  encoder, preview and wire path as a screen share, so viewers watch it
+  like any other share. Windows hides the camera choice until a Media
+  Foundation source exists.
+
+### Fixed
+
+- **CI on CMake 4.** `audiopus_sys` builds the bundled Opus 1.3, whose
+  CMakeLists predates CMake 3.5. The policy floor now lives in each
+  workflow's top-level `env`, so `verify` and `smoke` (the two jobs that
+  still failed on 0.4.5) inherit it along with the build jobs.
+
 ## [0.4.5] — 2026-10-31
 
 Windows reaches feature parity for sharing: it can start a screen share and

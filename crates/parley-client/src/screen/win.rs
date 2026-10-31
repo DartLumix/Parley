@@ -274,6 +274,21 @@ impl GraphicsCaptureApiHandler for Capture {
     }
 }
 
+/// Camera shares are a Linux feature for now: Windows would need a
+/// Media Foundation source reader, and offering a button that always
+/// fails is worse than hiding it. The bridge checks
+/// `camera_share_supported()` before showing the choice.
+pub async fn start_camera(
+    _conn: quinn::Connection,
+    _video_loss: Arc<AtomicU32>,
+    _viewer_fps: Arc<AtomicU32>,
+    _events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
+    _options: ShareOptions,
+    _preview: Option<PreviewSink>,
+) -> Result<(ShareHandle, ShareController), String> {
+    Err("camera capture is not available on Windows yet".to_string())
+}
+
 /// Entry point, matching the Linux one: pick a source, start capture,
 /// start share audio, hand back the keyframe poke + stop controller.
 /// Completion is reported as `ShareEvent::Ended` after teardown.

@@ -7,20 +7,25 @@
      CHANGELOG.md and stays on the web.
 
      Keep it short and user-facing: headings and bullet lists render as
-     headings and bullets, everything else as a paragraph.
+     headings and bullets, everything else as a paragraph. Asterisks and
+     backticks are stripped, so use plain words instead of emphasis.
 -->
 
-- **Screen sharing now works on Windows.** *Share screen* opens the
-  Windows picker for a monitor or a window, sends through the same H.264
-  path as Linux, and shows your own live preview. Sharing the desktop
-  normally costs nothing extra; a still screen keeps streaming too.
-- **Share audio on Windows.** Pick the applications whose sound should
-  travel with the stream (or share the whole default output). Parley's
-  own voices are never captured, so nobody hears themselves back.
-- **Fullscreen is real on Windows.** The fullscreen viewer takes the
-  whole monitor, not just the app's window, and restores the window
-  where it was when you leave it.
-- **A still screen no longer looks like a slow viewer.** The sender now
-  compares what a viewer decodes with what it actually sends, so a
-  desktop with nothing changing keeps its resolution instead of being
-  folded down to 480p.
+# Three small things, one cleaner build.
+
+## 01 · Poke
+
+Click anyone online and send a nudge. They get a sound, a notification,
+and a button to poke back.
+
+## 02 · Camera, on Linux
+
+Share a webcam exactly like a screen — same player, same quality. Camera
+and screen are alternatives for now; one video at a time.
+
+## 03 · Scroll to tune
+
+Hover a member and scroll. Their volume moves in 5% steps, and the roster
+stays put.
+
+Under the hood: the 0.4.5 build failure on newer CMake is fixed.
