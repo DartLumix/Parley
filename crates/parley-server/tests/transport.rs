@@ -21,7 +21,8 @@ use parley_proto::pb::manage_request::Action as ManageAction;
 use parley_proto::{
     AddUser, ChannelMode, ClientBody, ClientMessage, CreateChannel, DeleteChannel, Heartbeat,
     KickUser, ManageRequest, ManageResult, ManageStateRequest, PresenceRequest, ReceiverReport,
-    RemoveUser, Role, ServerBody, ServerMessage, StopShare, UpdateChannel, UpdateUser, VideoReport,
+    RemoveUser, RequestAvatar, Role, ServerBody, ServerMessage, StopShare, UpdateChannel,
+    UpdateProfile, UpdateUser, VideoReport,
 };
 
 use parley_proto::{FetchHistory, ListChannels, SendChat};
@@ -2741,6 +2742,118 @@ async fn away_status_is_broadcast_and_in_the_snapshot() {
 
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// Profile changes are authenticated by the current password, rename the
+/// live session without a reconnect, and move the avatar only when the
+/// revision is requested.
+#[tokio::test]
+async fn profile_update_checks_password_and_serves_avatars() {
+    init_logs();
+
+    let (config, server) = setup_server_with_user("profile");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn, mut tx, mut rx) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+
+    // Wrong old password: an ordinary refusal on the caller's stream, not
+    // a session error.
+    send_client_msg(
+        &mut tx,
+        ClientBody::UpdateProfile(UpdateProfile {
+            current_password: "wrong".to_string(),
+            new_username: "renamed".to_string(),
+            new_password: "newpass".to_string(),
+            avatar: Vec::new(),
+            avatar_mime: String::new(),
+            clear_avatar: false,
+        }),
+    )
+    .await;
+    match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::ProfileResult(r)) => {
+            assert!(!r.ok);
+            assert!(r.error.contains("current password"), "{} ", r.error);
+        }
+        other => panic!("expected a profile refusal, got {other:?}"),
+    }
+
+    let avatar = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+    send_client_msg(
+        &mut tx,
+        ClientBody::UpdateProfile(UpdateProfile {
+            current_password: "testpass".to_string(),
+            new_username: "renamed".to_string(),
+            new_password: "newpass".to_string(),
+            avatar: avatar.clone(),
+            avatar_mime: "image/png".to_string(),
+            clear_avatar: false,
+        }),
+    )
+    .await;
+    match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::ProfileResult(r)) => {
+            assert!(r.ok, "{} ", r.error);
+            assert_eq!(r.username, "renamed");
+        }
+        other => panic!("expected a profile success, got {other:?}"),
+    }
+
+    send_client_msg(
+        &mut tx,
+        ClientBody::RequestAvatar(RequestAvatar { user_id: 1 }),
+    )
+    .await;
+    match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::AvatarData(a)) => {
+            assert_eq!(a.user_id, 1);
+            assert_eq!(a.avatar_version, 1);
+            assert_eq!(a.avatar_mime, "image/png");
+            assert_eq!(a.avatar, avatar);
+        }
+        other => panic!("expected avatar bytes, got {other:?}"),
+    }
+
+    // Clearing bumps the revision and answers with empty bytes, so a
+    // cached picture is dropped instead of being asked for forever.
+    send_client_msg(
+        &mut tx,
+        ClientBody::UpdateProfile(UpdateProfile {
+            current_password: "newpass".to_string(),
+            new_username: "renamed".to_string(),
+            new_password: String::new(),
+            avatar: Vec::new(),
+            avatar_mime: String::new(),
+            clear_avatar: true,
+        }),
+    )
+    .await;
+    match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::ProfileResult(r)) => assert!(r.ok, "{} ", r.error),
+        other => panic!("expected a clear success, got {other:?}"),
+    }
+    send_client_msg(
+        &mut tx,
+        ClientBody::RequestAvatar(RequestAvatar { user_id: 1 }),
+    )
+    .await;
+    match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::AvatarData(a)) => {
+            assert_eq!(a.avatar_version, 2);
+            assert!(a.avatar.is_empty());
+        }
+        other => panic!("expected an empty avatar, got {other:?}"),
+    }
+
+    // The new credentials are the ones that work from now on.
+    let (conn2, _tx2, _rx2) = connect_and_auth(&endpoint, addr, "renamed", "newpass").await;
+
+    conn.close(0u32.into(), b"done");
+    conn2.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 

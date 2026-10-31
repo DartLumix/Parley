@@ -10,6 +10,10 @@ use tokio::sync::mpsc;
 pub struct ClientHandle {
     pub user_id: u32,
     pub username: String,
+    /// Avatar revision as of registration, and after a profile update.
+    /// The bytes themselves are never broadcast — a client asks for them
+    /// only when this number differs from its cached copy.
+    pub avatar_version: u64,
     /// Permission tier as of registration. A role change disconnects the
     /// target, so this snapshot cannot go stale while the session lives.
     pub role: crate::db::UserRole,
@@ -123,13 +127,23 @@ impl SessionRegistry {
         }
     }
 
-    pub fn online_users(&self) -> Vec<(u32, String)> {
+    pub fn online_users(&self) -> Vec<(u32, String, u64)> {
         self.clients
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, h)| (*id, h.username.clone()))
+            .map(|(id, h)| (*id, h.username.clone(), h.avatar_version))
             .collect()
+    }
+
+    /// A profile change (name and/or avatar) landed. Keep the live entry
+    /// in step so chat stamps, pokes and presence show the new values
+    /// without forcing a reconnect.
+    pub fn update_identity(&self, user_id: u32, username: String, avatar_version: u64) {
+        if let Some(handle) = self.clients.lock().unwrap().get_mut(&user_id) {
+            handle.username = username;
+            handle.avatar_version = avatar_version;
+        }
     }
 
     /// Connected users with their permission tier, for read-only

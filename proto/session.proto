@@ -22,6 +22,10 @@ message PresenceRequest {}
 message PresenceUser {
   uint32 user_id = 1;
   string username = 2;
+  // Bumped whenever the avatar changes; 0 means the account has none.
+  // The bytes are fetched separately (RequestAvatar) so a presence poll
+  // every few seconds never drags every avatar with it.
+  uint64 avatar_version = 3;
 }
 
 message PresenceList {
@@ -182,6 +186,45 @@ message VideoReport {
   uint32 viewer_fps = 3;
 }
 
+// --- Profiles ---
+
+// Client -> server: change the caller's own profile. `current_password`
+// is always required (even for an avatar-only change). Empty username or
+// password means "unchanged"; non-empty avatar bytes replace the picture,
+// and clear_avatar removes it. Answered only to the caller by
+// ProfileResult; the new name/avatar version is announced to everyone
+// through the normal PresenceList broadcast.
+message UpdateProfile {
+  string current_password = 1;
+  string new_username = 2;
+  string new_password = 3;
+  bytes avatar = 4;
+  string avatar_mime = 5;
+  bool clear_avatar = 6;
+}
+
+message ProfileResult {
+  bool ok = 1;
+  string error = 2;
+  // The name now in force (empty on failure) — lets the caller refresh
+  // its own label without another presence round trip.
+  string username = 3;
+}
+
+// Client -> server: fetch one user's avatar. Answered only to the
+// requester, so the bytes travel once per version instead of on every
+// presence poll.
+message RequestAvatar {
+  uint32 user_id = 1;
+}
+
+message AvatarData {
+  uint32 user_id = 1;
+  uint64 avatar_version = 2;
+  string avatar_mime = 3;
+  bytes avatar = 4;
+}
+
 // --- Server management ---
 
 message ManagedUser {
@@ -293,6 +336,8 @@ message ClientMessage {
     SetStatus set_status = 14;
     PinMessage pin_message = 15;
     Poke poke = 16;
+    UpdateProfile update_profile = 17;
+    RequestAvatar request_avatar = 18;
   }
 }
 
@@ -310,5 +355,7 @@ message ServerMessage {
     VideoReport video_report = 10;
     ManageResult manage_result = 11;
     Poked poked = 12;
+    AvatarData avatar_data = 13;
+    ProfileResult profile_result = 14;
   }
 }

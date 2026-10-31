@@ -68,6 +68,9 @@ pub struct UserInfo {
     pub id: u32,
     pub username: String,
     pub role: UserRole,
+    /// Avatar revision (0 = no avatar). Clients compare it against what
+    /// they hold and request the bytes only when it moves.
+    pub avatar_version: u64,
 }
 
 impl UserInfo {
@@ -99,6 +102,10 @@ pub struct MessageRow {
 
 /// (id, name, music, ephemeral) per channel (6d, 0.4.3).
 pub type ChannelRow = (u64, String, bool, bool);
+
+/// (bytes, mime, revision) per user. Empty bytes + revision 0 means no
+/// picture, which clients cache instead of asking again.
+pub type AvatarRow = (Vec<u8>, String, u64);
 
 /// How long an unpinned message lives in an ephemeral channel.
 pub const EPHEMERAL_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -132,6 +139,9 @@ impl Db {
                 password_hash TEXT NOT NULL,
                 is_admin INTEGER NOT NULL DEFAULT 0,
                 role INTEGER NOT NULL DEFAULT 0,
+                avatar BLOB,
+                avatar_mime TEXT NOT NULL DEFAULT '',
+                avatar_version INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS sessions (
@@ -205,6 +215,21 @@ impl Db {
             conn.execute_batch(
                 "ALTER TABLE users ADD COLUMN role INTEGER NOT NULL DEFAULT 0;
                  UPDATE users SET role = 2 WHERE is_admin <> 0;",
+            )?;
+        }
+        // Profile pictures: existing databases gain the three columns in
+        // place. An account with no picture advertises revision 0, which
+        // clients render as initials instead of an image.
+        let has_avatar: bool = {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'avatar'")?;
+            stmt.exists([])?
+        };
+        if !has_avatar {
+            conn.execute_batch(
+                "ALTER TABLE users ADD COLUMN avatar BLOB;
+                 ALTER TABLE users ADD COLUMN avatar_mime TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE users ADD COLUMN avatar_version INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
         Ok(Self { conn })
@@ -336,22 +361,32 @@ impl Db {
 
     /// Returns Some(UserInfo) on success, None on bad credentials.
     pub fn verify_user(&self, username: &str, password: &str) -> Result<Option<UserInfo>, Error> {
-        let row: Option<(i64, String, String, i64)> = self
+        let row: Option<(i64, String, String, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT id, username, password_hash, role FROM users WHERE username = ?1",
+                "SELECT id, username, password_hash, role, avatar_version \
+                 FROM users WHERE username = ?1",
                 rusqlite::params![username],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
 
         match row {
-            Some((id, name, hash, role)) => {
+            Some((id, name, hash, role, avatar_version)) => {
                 if verify_password(password, &hash)? {
                     Ok(Some(UserInfo {
                         id: id as u32,
                         username: name,
                         role: UserRole::from_i64(role),
+                        avatar_version: avatar_version as u64,
                     }))
                 } else {
                     Ok(None)
@@ -374,20 +409,21 @@ impl Db {
     }
 
     pub fn verify_session_token(&self, token: &str) -> Result<Option<UserInfo>, Error> {
-        let row: Option<(i64, String, i64)> = self
+        let row: Option<(i64, String, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT u.id, u.username, u.role FROM sessions s
+                "SELECT u.id, u.username, u.role, u.avatar_version FROM sessions s
              JOIN users u ON u.id = s.user_id WHERE s.token = ?1",
                 rusqlite::params![token],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
         match row {
-            Some((id, name, role)) => Ok(Some(UserInfo {
+            Some((id, name, role, avatar_version)) => Ok(Some(UserInfo {
                 id: id as u32,
                 username: name,
                 role: UserRole::from_i64(role),
+                avatar_version: avatar_version as u64,
             })),
             None => Ok(None),
         }
@@ -424,6 +460,41 @@ impl Db {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// The account's avatar bytes, MIME and revision. `None` only when
+    /// the user id does not exist; an account without a picture returns
+    /// empty bytes and version 0, which clients cache as "none".
+    pub fn avatar(&self, user_id: u32) -> Result<Option<AvatarRow>, Error> {
+        let row: Option<(Option<Vec<u8>>, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT avatar, avatar_mime, avatar_version FROM users WHERE id = ?1",
+                rusqlite::params![user_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(bytes, mime, version)| (bytes.unwrap_or_default(), mime, version as u64)))
+    }
+
+    /// Replace (or clear, with `bytes = None`) the avatar and bump its
+    /// revision. Returns the new revision. The version is what tells a
+    /// connected client its cached copy is stale.
+    pub fn set_avatar(&self, user_id: u32, bytes: Option<&[u8]>, mime: &str) -> Result<u64, Error> {
+        let changed = self.conn.execute(
+            "UPDATE users SET avatar = ?1, avatar_mime = ?2,
+             avatar_version = avatar_version + 1 WHERE id = ?3",
+            rusqlite::params![bytes, mime, user_id as i64],
+        )?;
+        if changed == 0 {
+            return Err(Error::Internal("user not found".into()));
+        }
+        let version: i64 = self.conn.query_row(
+            "SELECT avatar_version FROM users WHERE id = ?1",
+            rusqlite::params![user_id as i64],
+            |row| row.get(0),
+        )?;
+        Ok(version as u64)
     }
 
     /// Apply only the fields that were provided. The role guard runs in
@@ -685,6 +756,17 @@ impl Db {
             DbCmd::GetUser { user_id, reply } => {
                 let _ = reply.send(self.get_user(user_id));
             }
+            DbCmd::Avatar { user_id, reply } => {
+                let _ = reply.send(self.avatar(user_id));
+            }
+            DbCmd::SetAvatar {
+                user_id,
+                bytes,
+                mime,
+                reply,
+            } => {
+                let _ = reply.send(self.set_avatar(user_id, bytes.as_deref(), &mime));
+            }
             DbCmd::CreateUser {
                 username,
                 password,
@@ -813,6 +895,16 @@ pub enum DbCmd {
     GetUser {
         user_id: u32,
         reply: oneshot::Sender<Result<Option<ManagedUserRow>, Error>>,
+    },
+    Avatar {
+        user_id: u32,
+        reply: oneshot::Sender<Result<Option<AvatarRow>, Error>>,
+    },
+    SetAvatar {
+        user_id: u32,
+        bytes: Option<Vec<u8>>,
+        mime: String,
+        reply: oneshot::Sender<Result<u64, Error>>,
     },
     CreateUser {
         username: String,
@@ -976,6 +1068,32 @@ impl DbHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCmd::GetUser { user_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn avatar(&self, user_id: u32) -> Result<Option<AvatarRow>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::Avatar { user_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn set_avatar(
+        &self,
+        user_id: u32,
+        bytes: Option<&[u8]>,
+        mime: &str,
+    ) -> Result<u64, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::SetAvatar {
+                user_id,
+                bytes: bytes.map(|b| b.to_vec()),
+                mime: mime.to_string(),
+                reply,
+            })
             .map_err(|_| gone())?;
         rx.await.map_err(|_| gone())?
     }

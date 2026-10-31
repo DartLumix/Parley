@@ -11,7 +11,7 @@
      backticks are stripped, so use plain words instead of emphasis.
 -->
 
-# Looks sharp.
+# More than a voice.
 
 ## 01 · Streams hold the line
 
@@ -21,8 +21,12 @@ Frames leave at the stream's bitrate instead of in a burst. Fast motion no longe
 
 Share a webcam on Windows too (beta), or switch on Include camera and stay in the bottom-right corner of any screen share. One stream, one tile, both views.
 
-## 03 · If it fails, keep going
+## 03 · Make it yours
 
-A camera that cannot open never takes a screen share down. Windows shows the error; the stream keeps running.
+A new Profile page sits next to Settings. Change your username or password — the current one is required — and add a picture straight from your files. Your initials fill in until you do, and your picture follows you onto the roster and beside your chat messages.
 
-Under the hood: six bitrate rungs, byte-level pacing, and a server that stays a pure relay unless you opt into transcoding.
+## 04 · A poke that gets through
+
+Pokes now ring even with your headphones muted, while AFK or deafened. That is the whole point of a poke.
+
+Under the hood: six bitrate rungs, byte-level pacing, avatar bytes fetched once per revision, and a server that stays a pure relay unless you opt into transcoding.

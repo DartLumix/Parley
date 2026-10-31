@@ -916,6 +916,11 @@ pub mod imp {
             }),
             manage: None,
             manage_error: String::new(),
+            avatar: Vec::new(),
+            avatar_mime: String::new(),
+            avatar_version: 0,
+            ok: false,
+            profile_error: String::new(),
         }
     }
 

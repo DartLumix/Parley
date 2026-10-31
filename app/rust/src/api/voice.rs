@@ -925,8 +925,11 @@ fn build_streams(
                 // The join/leave cue rides on top of the mix, LOCAL only:
                 // it is added after the AEC/share-echo reference, so it is
                 // never subtracted from the mic and never sent to peers.
-                // "Mute everything" mutes the cues too — the request is
-                // still consumed, so it cannot fire later on unmute.
+                // "Mute everything" mutes the social join/leave cues — the
+                // request is still consumed, so it cannot fire later on
+                // unmute. Poke (3) is the exception: it is an alert meant
+                // to reach an away/deafened user, so it plays regardless
+                // of the headphone mute.
                 let output_muted = mixer.lock().unwrap().output_muted();
                 match CHIME_REQUEST.swap(0, Ordering::Relaxed) {
                     1 if !output_muted => {
@@ -937,7 +940,7 @@ fn build_streams(
                         cue = Some(cues()[1].as_slice());
                         cue_pos = 0;
                     }
-                    3 if !output_muted => {
+                    3 => {
                         cue = Some(cues()[2].as_slice());
                         cue_pos = 0;
                     }

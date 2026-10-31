@@ -41,7 +41,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -845420650;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 257614495;
 
 // Section: executor
 
@@ -1347,6 +1347,41 @@ fn wire__crate__api__session__probe_server_impl(
         },
     )
 }
+fn wire__crate__api__session__request_avatar_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "request_avatar",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_session_id = <u32>::sse_decode(&mut deserializer);
+            let api_user_id = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok =
+                        crate::api::session::request_avatar(api_session_id, api_user_id)?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__session__request_presence_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2018,6 +2053,53 @@ fn wire__crate__api__session__trust_server_impl(
         },
     )
 }
+fn wire__crate__api__session__update_profile_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "update_profile",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_session_id = <u32>::sse_decode(&mut deserializer);
+            let api_current_password = <String>::sse_decode(&mut deserializer);
+            let api_new_username = <String>::sse_decode(&mut deserializer);
+            let api_new_password = <String>::sse_decode(&mut deserializer);
+            let api_avatar = <Vec<u8>>::sse_decode(&mut deserializer);
+            let api_avatar_mime = <String>::sse_decode(&mut deserializer);
+            let api_clear_avatar = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::session::update_profile(
+                        api_session_id,
+                        api_current_password,
+                        api_new_username,
+                        api_new_password,
+                        api_avatar,
+                        api_avatar_mime,
+                        api_clear_avatar,
+                    )?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__video__video_prepare_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2507,9 +2589,11 @@ impl SseDecode for crate::api::session::PresenceEntry {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut var_userId = <u32>::sse_decode(deserializer);
         let mut var_username = <String>::sse_decode(deserializer);
+        let mut var_avatarVersion = <u64>::sse_decode(deserializer);
         return crate::api::session::PresenceEntry {
             user_id: var_userId,
             username: var_username,
+            avatar_version: var_avatarVersion,
         };
     }
 }
@@ -2564,6 +2648,11 @@ impl SseDecode for crate::api::session::SessionEvent {
         let mut var_manage =
             <Option<crate::api::session::ManageStateInfo>>::sse_decode(deserializer);
         let mut var_manageError = <String>::sse_decode(deserializer);
+        let mut var_avatar = <Vec<u8>>::sse_decode(deserializer);
+        let mut var_avatarMime = <String>::sse_decode(deserializer);
+        let mut var_avatarVersion = <u64>::sse_decode(deserializer);
+        let mut var_ok = <bool>::sse_decode(deserializer);
+        let mut var_profileError = <String>::sse_decode(deserializer);
         return crate::api::session::SessionEvent {
             session_id: var_sessionId,
             kind: var_kind,
@@ -2580,6 +2669,11 @@ impl SseDecode for crate::api::session::SessionEvent {
             surface: var_surface,
             manage: var_manage,
             manage_error: var_manageError,
+            avatar: var_avatar,
+            avatar_mime: var_avatarMime,
+            avatar_version: var_avatarVersion,
+            ok: var_ok,
+            profile_error: var_profileError,
         };
     }
 }
@@ -2819,34 +2913,36 @@ fn pde_ffi_dispatcher_primary_impl(
         }
         34 => wire__crate__api__session__poke_user_impl(port, ptr, rust_vec_len, data_len),
         35 => wire__crate__api__session__probe_server_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__session__request_presence_impl(port, ptr, rust_vec_len, data_len),
-        37 => {
+        36 => wire__crate__api__session__request_avatar_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__session__request_presence_impl(port, ptr, rust_vec_len, data_len),
+        38 => {
             wire__crate__api__session__request_voice_states_impl(port, ptr, rust_vec_len, data_len)
         }
-        38 => wire__crate__api__login__save_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__settings__save_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__session__screen_share_supported_impl(
+        39 => wire__crate__api__login__save_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__settings__save_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__session__screen_share_supported_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        41 => wire__crate__api__session__send_chat_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__session__set_hw_encode_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__session__set_mic_muted_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__session__set_output_muted_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__session__set_screen_watched_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__session__set_share_audio_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__session__set_share_volume_impl(port, ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__session__set_status_impl(port, ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__session__set_user_volume_impl(port, ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__video__share_preview_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__video__share_stats_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__session__start_screen_share_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__session__stop_screen_share_impl(port, ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__session__trust_server_impl(port, ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__video__video_prepare_impl(port, ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__session__voice_levels_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__session__send_chat_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__session__set_hw_encode_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__session__set_mic_muted_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__session__set_output_muted_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__session__set_screen_watched_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__session__set_share_audio_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__session__set_share_volume_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__session__set_status_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__session__set_user_volume_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__video__share_preview_impl(port, ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__video__share_stats_impl(port, ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__session__start_screen_share_impl(port, ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__session__stop_screen_share_impl(port, ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__session__trust_server_impl(port, ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__session__update_profile_impl(port, ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__video__video_prepare_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__session__voice_levels_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3068,6 +3164,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::session::PresenceEntry {
         [
             self.user_id.into_into_dart().into_dart(),
             self.username.into_into_dart().into_dart(),
+            self.avatar_version.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -3144,6 +3241,11 @@ impl flutter_rust_bridge::IntoDart for crate::api::session::SessionEvent {
             self.surface.into_into_dart().into_dart(),
             self.manage.into_into_dart().into_dart(),
             self.manage_error.into_into_dart().into_dart(),
+            self.avatar.into_into_dart().into_dart(),
+            self.avatar_mime.into_into_dart().into_dart(),
+            self.avatar_version.into_into_dart().into_dart(),
+            self.ok.into_into_dart().into_dart(),
+            self.profile_error.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -3649,6 +3751,7 @@ impl SseEncode for crate::api::session::PresenceEntry {
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <u32>::sse_encode(self.user_id, serializer);
         <String>::sse_encode(self.username, serializer);
+        <u64>::sse_encode(self.avatar_version, serializer);
     }
 }
 
@@ -3689,6 +3792,11 @@ impl SseEncode for crate::api::session::SessionEvent {
         <Option<crate::api::session::VideoSurfaceInfo>>::sse_encode(self.surface, serializer);
         <Option<crate::api::session::ManageStateInfo>>::sse_encode(self.manage, serializer);
         <String>::sse_encode(self.manage_error, serializer);
+        <Vec<u8>>::sse_encode(self.avatar, serializer);
+        <String>::sse_encode(self.avatar_mime, serializer);
+        <u64>::sse_encode(self.avatar_version, serializer);
+        <bool>::sse_encode(self.ok, serializer);
+        <String>::sse_encode(self.profile_error, serializer);
     }
 }
 

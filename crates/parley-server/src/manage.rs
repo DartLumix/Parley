@@ -237,7 +237,7 @@ async fn state(
     let online: HashSet<u32> = registry
         .online_users()
         .into_iter()
-        .map(|(id, _)| id)
+        .map(|(id, _, _)| id)
         .collect();
     let mut state = ManageState {
         users: users

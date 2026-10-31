@@ -8,5 +8,21 @@ vendor/*/Cargo.lock
 .env
 app/build/
 app/.dart_tool/
-.freebuff/
 app/data/
+
+# Local AI-assistant/editor state. None of this is part of the project:
+# per-machine chat history, task state and prompt files. `AGENTS.md`, the
+# committed FRB bindings and the hand-written docs stay tracked.
+.freebuff/
+.claude/
+.cursor/
+.codex/
+.continue/
+.windsurf/
+.aider*
+*.local.md
+*.prompt.md
+
+# Local UI captures and recordings made while debugging.
+/screenshots/
+/scratch/

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -15,6 +16,7 @@ import 'widgets/fullscreen_share.dart';
 import 'widgets/login_view.dart';
 import 'widgets/manage_page.dart';
 import 'widgets/pill.dart';
+import 'widgets/profile_page.dart';
 import 'widgets/screens_panel.dart';
 import 'widgets/share_dialog.dart';
 import 'widgets/settings_page.dart';
@@ -128,6 +130,16 @@ class _HomePageState extends State<HomePage> {
   /// Users whose microphone the server says is muted (SetMute), from the
   /// snapshot and every broadcast since.
   final Set<int> _mutedUsers = {};
+
+  /// Avatars by user id, and the server revision each cached copy
+  /// belongs to. Presence carries only the revision; the bytes are
+  /// requested once and kept for the session.
+  final Map<int, Uint8List> _avatars = {};
+  final Map<int, int> _avatarVersions = {};
+
+  /// The profile save in flight, completed by the server's
+  /// `profile_result` event so the page shows the real answer.
+  Completer<String?>? _profileSave;
 
   /// Away texts by user id (SetStatus), same sources. Absence means
   /// "no status" — the empty string never enters the map.
@@ -538,6 +550,9 @@ class _HomePageState extends State<HomePage> {
       _afkStatus = null;
       _outputMuted = false;
       _shareStats = null;
+      _avatars.clear();
+      _avatarVersions.clear();
+      _profileSave = null;
     });
     setWindowFullscreen(false);
     _muteAllShares();
@@ -776,6 +791,9 @@ class _HomePageState extends State<HomePage> {
       _volume.clear();
       _shareVolume.clear();
       _shareStats = null;
+      _avatars.clear();
+      _avatarVersions.clear();
+      _profileSave = null;
     });
     setWindowFullscreen(false);
     _syncScreenWatch();
@@ -1096,6 +1114,64 @@ class _HomePageState extends State<HomePage> {
     if (mounted) await _loadSettings();
   }
 
+  Future<void> _openProfile() async {
+    final session = _session;
+    if (session == null) return;
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => ProfilePage(
+          username: _ownName,
+          role: session.role,
+          avatar: _avatars[session.userId],
+          onSave: _saveProfile,
+        ),
+      ),
+    );
+    if (changed == true && mounted) {
+      setState(() => _status = 'profile updated');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Profile updated')),
+      );
+    }
+  }
+
+  /// Send a profile change and wait for the server's answer, which arrives
+  /// on the ordinary event stream. The UI must never report success for a
+  /// wrong old password, so there is no optimistic path here.
+  Future<String?> _saveProfile({
+    required String currentPassword,
+    required String newUsername,
+    required String newPassword,
+    required Uint8List? avatar,
+    required bool clearAvatar,
+  }) async {
+    final session = _session;
+    if (session == null) return 'not connected';
+    final pending = Completer<String?>();
+    _profileSave = pending;
+    try {
+      await updateProfile(
+        sessionId: session.sessionId,
+        currentPassword: currentPassword,
+        newUsername: newUsername,
+        newPassword: newPassword,
+        avatar: (clearAvatar || avatar == null) ? const <int>[] : avatar,
+        avatarMime: (clearAvatar || avatar == null) ? '' : 'image/png',
+        clearAvatar: clearAvatar,
+      );
+    } catch (e) {
+      if (identical(_profileSave, pending)) _profileSave = null;
+      return 'profile update failed: $e';
+    }
+    try {
+      return await pending.future.timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      return 'the server did not answer the profile update';
+    } finally {
+      if (identical(_profileSave, pending)) _profileSave = null;
+    }
+  }
+
   /// The sharer's own preview texture, created on first use and reused
   /// for every later share in this process.
   Future<void> _loadPreview() async {
@@ -1273,9 +1349,78 @@ class _HomePageState extends State<HomePage> {
             final online = {for (final u in ev.users) u.userId};
             _mutedUsers.removeWhere((id) => !online.contains(id));
             _statuses.removeWhere((id, _) => !online.contains(id));
+            _avatars.removeWhere((id, _) => !online.contains(id));
+            _avatarVersions.removeWhere((id, _) => !online.contains(id));
           }
           _pruneShares();
         });
+        // Presence carries avatar revisions, not images. Ask once per new
+        // revision; an empty answer (version 0) is cached too.
+        final sessionId = _session?.sessionId;
+        if (sessionId != null) {
+          for (final u in ev.users) {
+            final version = u.avatarVersion.toInt();
+            if (_avatarVersions[u.userId] != version) {
+              _avatarVersions[u.userId] = version;
+              unawaited(
+                requestAvatar(
+                  sessionId: sessionId,
+                  userId: u.userId,
+                ).catchError((Object _) {}),
+              );
+            }
+          }
+        }
+      case 'avatar':
+        setState(() {
+          _avatarVersions[ev.userId] = ev.avatarVersion.toInt();
+          if (ev.avatar.isEmpty) {
+            _avatars.remove(ev.userId);
+          } else {
+            _avatars[ev.userId] = ev.avatar;
+          }
+        });
+      case 'profile_result':
+        // The server is the authority on a profile change: only now may
+        // the page close. A rename also refreshes our own label and the
+        // remembered login name.
+        if (ev.ok) {
+          final me = _session?.userId;
+          if (me != null && ev.username.isNotEmpty) {
+            setState(() {
+              _usernames[me] = ev.username;
+              _user.text = ev.username;
+            });
+            final s = _session;
+            if (s != null) {
+              _saved = login_api.SavedLogin(
+                server: s.server,
+                user: ev.username,
+                token: s.sessionToken,
+              );
+              unawaited(
+                login_api
+                    .save(
+                      server: s.server,
+                      user: ev.username,
+                      token: s.sessionToken,
+                    )
+                    .catchError((Object _) {}),
+              );
+            }
+          }
+        }
+        final pending = _profileSave;
+        _profileSave = null;
+        if (pending != null && !pending.isCompleted) {
+          pending.complete(
+            ev.ok
+                ? null
+                : (ev.profileError.isEmpty
+                      ? 'profile update failed'
+                      : ev.profileError),
+          );
+        }
       case 'poked':
         // A nudge from another user. The Rust side already played the
         // cue (on the voice stream, or a one-shot output stream when we
@@ -1594,6 +1739,12 @@ class _HomePageState extends State<HomePage> {
                   ),
                   onPressed: _openManage,
                 ),
+              if (_session != null)
+                IconButton(
+                  tooltip: 'Profile',
+                  icon: const Icon(Icons.account_circle_outlined, size: 20),
+                  onPressed: _openProfile,
+                ),
               IconButton(
                 tooltip: 'Settings',
                 icon: const Icon(Icons.settings_outlined, size: 20),
@@ -1723,7 +1874,8 @@ class _HomePageState extends State<HomePage> {
     // plus breathing room so the longest name is not flush against the
     // edge (the speaker list is the one place a long handle must stay
     // readable).
-    const rowChrome = 24.0 + 15 + 9 + 34 + 12;
+    // 24 card padding + 28 avatar column + 15 mic icon + 9 + 34 + 12.
+    const rowChrome = 24.0 + 28 + 15 + 9 + 34 + 12;
     for (final u in _presence) {
       final name = u.userId == _session?.userId
           ? '${_nameOf(u.userId)} (you)'
@@ -1959,6 +2111,27 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// A cached picture in a circle, or the name's initial as a fallback.
+  /// Presence announces a revision first; the bytes arrive a moment later.
+  Widget _avatar(int userId, {double size = 22}) {
+    final bytes = _avatars[userId];
+    if (bytes != null) {
+      return CircleAvatar(
+        radius: size / 2,
+        backgroundImage: MemoryImage(bytes),
+      );
+    }
+    final name = _nameOf(userId);
+    return CircleAvatar(
+      radius: size / 2,
+      backgroundColor: barSurface,
+      child: Text(
+        name.isEmpty ? '?' : name[0].toUpperCase(),
+        style: TextStyle(fontSize: size * 0.46, color: Colors.white70),
+      ),
+    );
+  }
+
   /// One roster row. It lights up while that person is actually making
   /// sound (local peak meter, not a flag), shows a muted mic when they say
   /// they are muted, and opens the volume dialog on click.
@@ -2013,6 +2186,8 @@ class _HomePageState extends State<HomePage> {
           ),
           child: Row(
             children: [
+              _avatar(userId, size: 22),
+              const SizedBox(width: 6),
               if (idle)
                 Container(
                   width: 6,
@@ -2136,6 +2311,11 @@ class _HomePageState extends State<HomePage> {
                           child: Row(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
+                              Padding(
+                                padding: const EdgeInsets.only(top: 1),
+                                child: _avatar(m.userId, size: 20),
+                              ),
+                              const SizedBox(width: 6),
                               if (m.pinned)
                                 const Padding(
                                   padding: EdgeInsets.only(top: 3, right: 4),

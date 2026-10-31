@@ -5,6 +5,19 @@ All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 
 ## [0.4.8] — 2026-10-31
 
+### Added
+
+- **Profile settings.** A Profile button next to Settings opens a page
+  for changing your username or password. Every change is authorized by
+  the current password, and the server is the only authority on success.
+- **Profile pictures.** Pick an image from the file explorer; it is
+  resized to a 256 px PNG on the client and stored with the account. The
+  roster and chat rows show it, and other clients fetch the bytes once
+  per revision instead of on every presence poll.
+- **Pokes reach a muted user.** A poke now plays its cue even with the
+  headphones button on, and while AFK or deafened. The visible
+  notification was already unconditional; the sound no longer is.
+
 ### Fixed
 
 - **Server transcode no longer defaults on.** A small VPS cannot decode

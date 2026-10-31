@@ -19,10 +19,10 @@ use crate::transcode::{ReportAction, TranscodeManager};
 use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
-    AuthDenied, AuthOk, AuthRequest, Channel as PbChannel, ChannelList, ChannelMode, ClientBody,
-    ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked, PresenceList,
-    PresenceUser, ReceiverReport, ServerBody, ServerMessage, ShareStopped, VideoReport,
-    VoiceState as PbVoiceState, VoiceStateList,
+    AuthDenied, AuthOk, AuthRequest, AvatarData, Channel as PbChannel, ChannelList, ChannelMode,
+    ClientBody, ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked,
+    PresenceList, PresenceUser, ProfileResult, ReceiverReport, ServerBody, ServerMessage,
+    ShareStopped, VideoReport, VoiceState as PbVoiceState, VoiceStateList,
 };
 
 pub struct Server {
@@ -243,7 +243,9 @@ async fn serve(
         db.verify_user(&auth.username, &auth.password).await?
     };
 
-    let info = match user_info {
+    // Mutable: a profile update can rename the live session without a
+    // reconnect, so every later chat stamp and poke uses the new name.
+    let mut info = match user_info {
         Some(info) => info,
         None => {
             session::write_message(
@@ -272,6 +274,7 @@ async fn serve(
     let session_gen = registry.register(ClientHandle {
         user_id: info.id,
         username: info.username.clone(),
+        avatar_version: info.avatar_version,
         role: info.role,
         conn: conn.clone(),
         tx: event_tx,
@@ -349,8 +352,17 @@ async fn serve(
             msg = msg_rx.recv() => match msg {
                 Some(m) => {
                     match handle_client_message(
-                        m, &info, session_gen, &mut tx, db, registry, voice, transcode,
-                    ).await {
+                        m,
+                        &mut info,
+                        session_gen,
+                        &mut tx,
+                        db,
+                        registry,
+                        voice,
+                        transcode,
+                    )
+                    .await
+                    {
                         Ok(true) => {}
                         Ok(false) => break Ok(()),
                         Err(e) => break Err(e),
@@ -420,7 +432,7 @@ async fn serve(
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     msg: ClientMessage,
-    info: &crate::db::UserInfo,
+    info: &mut crate::db::UserInfo,
     session_gen: u64,
     tx: &mut quinn::SendStream,
     db: &DbHandle,
@@ -632,6 +644,109 @@ async fn handle_client_message(
                     channel.is_some(),
                 ));
             }
+        }
+
+        Some(ClientBody::UpdateProfile(p)) => {
+            // The current password authorizes every profile change,
+            // including an avatar-only one: a token alone must not let a
+            // shared machine rewrite the account.
+            if db
+                .verify_user(&info.username, &p.current_password)
+                .await?
+                .is_none()
+            {
+                reply_profile(tx, false, "current password is incorrect", "").await?;
+                return Ok(true);
+            }
+
+            let new_username = p.new_username.trim();
+            if new_username.chars().count() > 32 || new_username.chars().any(char::is_control) {
+                reply_profile(tx, false, "username must be 1-32 characters", "").await?;
+                return Ok(true);
+            }
+            if p.new_password.len() > 256 {
+                reply_profile(tx, false, "password is too long", "").await?;
+                return Ok(true);
+            }
+            if !p.avatar.is_empty() {
+                if p.avatar.len() > MAX_AVATAR_BYTES {
+                    reply_profile(tx, false, "picture is too large (48 KiB max)", "").await?;
+                    return Ok(true);
+                }
+                if !avatar_mime_ok(&p.avatar_mime) {
+                    reply_profile(tx, false, "unsupported picture format", "").await?;
+                    return Ok(true);
+                }
+            }
+
+            let rename =
+                (!new_username.is_empty() && new_username != info.username).then_some(new_username);
+            let repass = (!p.new_password.is_empty()).then_some(p.new_password.as_str());
+            let avatar_change = !p.avatar.is_empty() || p.clear_avatar;
+            if rename.is_none() && repass.is_none() && !avatar_change {
+                reply_profile(tx, false, "nothing to change", &info.username).await?;
+                return Ok(true);
+            }
+
+            if (rename.is_some() || repass.is_some())
+                && let Err(e) = db.update_user(info.id, rename, repass, None).await
+            {
+                reply_profile(tx, false, &e.to_string(), "").await?;
+                return Ok(true);
+            }
+            if let Some(name) = rename {
+                info.username = name.to_string();
+            }
+
+            if !p.avatar.is_empty() {
+                match db
+                    .set_avatar(info.id, Some(&p.avatar), &p.avatar_mime)
+                    .await
+                {
+                    Ok(version) => info.avatar_version = version,
+                    Err(e) => {
+                        reply_profile(tx, false, &e.to_string(), "").await?;
+                        return Ok(true);
+                    }
+                }
+            } else if p.clear_avatar {
+                match db.set_avatar(info.id, None, "").await {
+                    Ok(version) => info.avatar_version = version,
+                    Err(e) => {
+                        reply_profile(tx, false, &e.to_string(), "").await?;
+                        return Ok(true);
+                    }
+                }
+            }
+
+            // The live entry carries the new name/version for chat stamps,
+            // pokes and the roster; the broadcast tells every other client
+            // to refresh its cached name and avatar version.
+            registry.update_identity(info.id, info.username.clone(), info.avatar_version);
+            registry.broadcast(presence_message(registry));
+            reply_profile(tx, true, "", &info.username).await?;
+        }
+
+        Some(ClientBody::RequestAvatar(r)) => {
+            // Empty bytes + version 0 is a valid, cacheable answer for
+            // an account with no picture (or an unknown id): the client
+            // then stops asking until the version moves.
+            let (avatar, avatar_mime, avatar_version) = db
+                .avatar(r.user_id)
+                .await?
+                .unwrap_or_else(|| (Vec::new(), String::new(), 0));
+            session::write_message(
+                tx,
+                &ServerMessage {
+                    body: Some(ServerBody::AvatarData(AvatarData {
+                        user_id: r.user_id,
+                        avatar_version,
+                        avatar_mime,
+                        avatar,
+                    })),
+                },
+            )
+            .await?;
         }
 
         Some(ClientBody::VoiceStatesRequest(_)) => {
@@ -846,13 +961,55 @@ fn presence_message(registry: &SessionRegistry) -> ServerMessage {
         body: Some(ServerBody::PresenceList(PresenceList {
             users: users
                 .into_iter()
-                .map(|(id, name)| PresenceUser {
+                .map(|(id, name, avatar_version)| PresenceUser {
                     user_id: id,
                     username: name,
+                    avatar_version,
                 })
                 .collect(),
         })),
     }
+}
+
+/// Pictures are resized client-side (a square thumbnail) before they hit
+/// the wire; this is the server's backstop, not the normal size. It stays
+/// well below `parley_proto::frame::MAX_SIZE` (64 KiB) so an avatar can
+/// never turn a control message into a session-ending frame.
+const MAX_AVATAR_BYTES: usize = 48 * 1024;
+// A control frame is length-prefixed and capped at 64 KiB. The avatar is
+// the only variable-size field in a profile message; keep a wide margin
+// for the frame prefix and the protobuf tags so this can never kill a
+// session by construction.
+const _: () = assert!(MAX_AVATAR_BYTES + 8 * 1024 < parley_proto::frame::MAX_SIZE);
+
+fn avatar_mime_ok(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
+/// One profile-result reply. Every failure is an ordinary answer, never a
+/// dropped session: a wrong old password is a form error, not a protocol
+/// error.
+async fn reply_profile(
+    tx: &mut quinn::SendStream,
+    ok: bool,
+    error: &str,
+    username: &str,
+) -> Result<(), Error> {
+    session::write_message(
+        tx,
+        &ServerMessage {
+            body: Some(ServerBody::ProfileResult(ProfileResult {
+                ok,
+                error: error.to_string(),
+                username: username.to_string(),
+            })),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn now_ms() -> u64 {

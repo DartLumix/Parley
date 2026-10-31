@@ -198,6 +198,38 @@ Future<void> fetchHistory({
 Future<void> requestPresence({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionRequestPresence(sessionId: sessionId);
 
+/// Change this account's username, password and/or picture. The current
+/// password is checked server-side. `avatar` empty means unchanged unless
+/// `clear_avatar` is set; `avatar_mime` describes the bytes. The outcome
+/// arrives as a "profile_result" event (the server answer, not a local
+/// guess: a wrong old password must not look like success).
+Future<void> updateProfile({
+  required int sessionId,
+  required String currentPassword,
+  required String newUsername,
+  required String newPassword,
+  required List<int> avatar,
+  required String avatarMime,
+  required bool clearAvatar,
+}) => RustLib.instance.api.crateApiSessionUpdateProfile(
+  sessionId: sessionId,
+  currentPassword: currentPassword,
+  newUsername: newUsername,
+  newPassword: newPassword,
+  avatar: avatar,
+  avatarMime: avatarMime,
+  clearAvatar: clearAvatar,
+);
+
+/// Fetch one user's picture (response: an "avatar" event). The Dart side
+/// calls this only when a presence row advertises a version it does not
+/// hold, so a poll every 10 s carries numbers, never images.
+Future<void> requestAvatar({required int sessionId, required int userId}) =>
+    RustLib.instance.api.crateApiSessionRequestAvatar(
+      sessionId: sessionId,
+      userId: userId,
+    );
+
 /// Request the voice-membership snapshot (response: "voice_states"
 /// event): every user currently in a voice channel, with its channel
 /// id. The UI uses it for the per-channel roster; joins/leaves that
@@ -595,10 +627,19 @@ class PresenceEntry {
   final int userId;
   final String username;
 
-  const PresenceEntry({required this.userId, required this.username});
+  /// Bumped whenever this user's picture changes; 0 = no picture. The
+  /// bytes are requested separately and cached by version.
+  final BigInt avatarVersion;
+
+  const PresenceEntry({
+    required this.userId,
+    required this.username,
+    required this.avatarVersion,
+  });
 
   @override
-  int get hashCode => userId.hashCode ^ username.hashCode;
+  int get hashCode =>
+      userId.hashCode ^ username.hashCode ^ avatarVersion.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -606,7 +647,8 @@ class PresenceEntry {
       other is PresenceEntry &&
           runtimeType == other.runtimeType &&
           userId == other.userId &&
-          username == other.username;
+          username == other.username &&
+          avatarVersion == other.avatarVersion;
 }
 
 /// What a server presents on the wire, beside what this machine has
@@ -688,6 +730,16 @@ class SessionEvent {
   /// "manage": empty on success, the server's reason otherwise.
   final String manageError;
 
+  /// "avatar": the picture bytes (empty when the user has none) and
+  /// the revision they belong to.
+  final Uint8List avatar;
+  final String avatarMime;
+  final BigInt avatarVersion;
+
+  /// "profile_result": did the server accept the change, and why not.
+  final bool ok;
+  final String profileError;
+
   const SessionEvent({
     required this.sessionId,
     required this.kind,
@@ -704,6 +756,11 @@ class SessionEvent {
     this.surface,
     this.manage,
     required this.manageError,
+    required this.avatar,
+    required this.avatarMime,
+    required this.avatarVersion,
+    required this.ok,
+    required this.profileError,
   });
 
   @override
@@ -722,7 +779,12 @@ class SessionEvent {
       states.hashCode ^
       surface.hashCode ^
       manage.hashCode ^
-      manageError.hashCode;
+      manageError.hashCode ^
+      avatar.hashCode ^
+      avatarMime.hashCode ^
+      avatarVersion.hashCode ^
+      ok.hashCode ^
+      profileError.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -743,7 +805,12 @@ class SessionEvent {
           states == other.states &&
           surface == other.surface &&
           manage == other.manage &&
-          manageError == other.manageError;
+          manageError == other.manageError &&
+          avatar == other.avatar &&
+          avatarMime == other.avatarMime &&
+          avatarVersion == other.avatarVersion &&
+          ok == other.ok &&
+          profileError == other.profileError;
 }
 
 /// Connected-session snapshot returned at connect time.

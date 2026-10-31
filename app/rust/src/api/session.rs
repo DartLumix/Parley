@@ -59,8 +59,8 @@ use parley_proto::{
     AddUser, AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage,
     CreateChannel, DeleteChannel, FetchHistory, Heartbeat, Hello, HelloAck, JoinVoice, KickUser,
     LeaveVoice, ListChannels, ManageRequest, ManageStateRequest, PinMessage, Poke, PresenceRequest,
-    RemoveUser, Role, SendChat, ServerBody, ServerMessage, SetMute, SetStatus, UpdateChannel,
-    UpdateUser, VoiceStatesRequest, PROTOCOL_VERSION,
+    RemoveUser, RequestAvatar, Role, SendChat, ServerBody, ServerMessage, SetMute, SetStatus,
+    UpdateChannel, UpdateProfile, UpdateUser, VoiceStatesRequest, PROTOCOL_VERSION,
 };
 
 use crate::frb_generated::StreamSink;
@@ -150,6 +150,23 @@ pub(crate) enum Command {
     /// Nudge one connected user. The server relays it to that user only
     /// (answer: their `poked` event); the sender gets no echo.
     Poke {
+        user_id: u32,
+    },
+    /// Change our own account. `current_password` must match; empty
+    /// username/password means unchanged; non-empty avatar bytes replace
+    /// the picture; `clear_avatar` removes it (ignored when bytes are
+    /// present). Answer: a "profile_result" event.
+    UpdateProfile {
+        current_password: String,
+        new_username: String,
+        new_password: String,
+        avatar: Vec<u8>,
+        avatar_mime: String,
+        clear_avatar: bool,
+    },
+    /// Fetch one user's avatar bytes (answer: an "avatar" event). Sent
+    /// only when the presence listing shows a version we do not hold.
+    RequestAvatar {
         user_id: u32,
     },
     /// Voice-membership snapshot ("voice_states" event). VoiceState
@@ -266,6 +283,24 @@ impl Command {
             Command::SetMute { muted } => ClientBody::SetMute(SetMute { muted }),
             Command::SetStatus { text } => ClientBody::SetStatus(SetStatus { text }),
             Command::Poke { user_id } => ClientBody::Poke(Poke { user_id }),
+            Command::UpdateProfile {
+                current_password,
+                new_username,
+                new_password,
+                avatar,
+                avatar_mime,
+                clear_avatar,
+            } => ClientBody::UpdateProfile(UpdateProfile {
+                current_password,
+                new_username,
+                new_password,
+                avatar,
+                avatar_mime,
+                clear_avatar,
+            }),
+            Command::RequestAvatar { user_id } => {
+                ClientBody::RequestAvatar(RequestAvatar { user_id })
+            }
             Command::VoiceStates => ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
             #[cfg(feature = "audio-device")]
             Command::ReceiverReport { gap_rate_permille } => {
@@ -457,6 +492,9 @@ pub struct ChannelInfo {
 pub struct PresenceEntry {
     pub user_id: u32,
     pub username: String,
+    /// Bumped whenever this user's picture changes; 0 = no picture. The
+    /// bytes are requested separately and cached by version.
+    pub avatar_version: u64,
 }
 
 /// One chat row (live or history).
@@ -573,6 +611,14 @@ pub struct SessionEvent {
     pub manage: Option<ManageStateInfo>,
     /// "manage": empty on success, the server's reason otherwise.
     pub manage_error: String,
+    /// "avatar": the picture bytes (empty when the user has none) and
+    /// the revision they belong to.
+    pub avatar: Vec<u8>,
+    pub avatar_mime: String,
+    pub avatar_version: u64,
+    /// "profile_result": did the server accept the change, and why not.
+    pub ok: bool,
+    pub profile_error: String,
 }
 
 /// Connected-session snapshot returned at connect time.
@@ -697,6 +743,11 @@ fn closed_event(session_id: u32) -> SessionEvent {
         surface: None,
         manage: None,
         manage_error: String::new(),
+        avatar: Vec::new(),
+        avatar_mime: String::new(),
+        avatar_version: 0,
+        ok: false,
+        profile_error: String::new(),
     }
 }
 
@@ -724,6 +775,11 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         surface: None,
         manage: None,
         manage_error: String::new(),
+        avatar: Vec::new(),
+        avatar_mime: String::new(),
+        avatar_version: 0,
+        ok: false,
+        profile_error: String::new(),
     };
     let Some(body) = msg.body.as_ref() else {
         return Vec::new();
@@ -772,8 +828,24 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 .map(|u| PresenceEntry {
                     user_id: u.user_id,
                     username: u.username.clone(),
+                    avatar_version: u.avatar_version,
                 })
                 .collect();
+            vec![e]
+        }
+        ServerBody::AvatarData(a) => {
+            let mut e = ev("avatar");
+            e.user_id = a.user_id;
+            e.avatar = a.avatar.clone();
+            e.avatar_mime = a.avatar_mime.clone();
+            e.avatar_version = a.avatar_version;
+            vec![e]
+        }
+        ServerBody::ProfileResult(p) => {
+            let mut e = ev("profile_result");
+            e.ok = p.ok;
+            e.profile_error = p.error.clone();
+            e.username = p.username.clone();
             vec![e]
         }
         ServerBody::ChatMessage(m) => {
@@ -930,22 +1002,23 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         ServerBody::Poked(p) => {
             // A peer nudged us: one transient event, no roster change.
             // The cue is local: on the voice render stream when one
-            // exists, otherwise a one-shot output stream. "Mute
-            // everything" keeps pokes silent too, like every cue.
+            // exists, otherwise a one-shot output stream. A poke is an
+            // ALERT, not playback: it must reach someone who is away,
+            // deafened or muted (that is what the poke is for). The cue
+            // path in voice.rs therefore bypasses the headphone mute for
+            // this request only.
             #[cfg(feature = "audio-device")]
             {
-                let (in_voice, muted) = SESSIONS
+                let in_voice = SESSIONS
                     .lock()
                     .unwrap()
                     .get(&session_id)
-                    .map(|s| (s.voice.is_some(), s.mixer.lock().unwrap().output_muted()))
-                    .unwrap_or((false, false));
-                if !muted {
-                    if in_voice {
-                        crate::api::voice::play_poke();
-                    } else {
-                        crate::api::voice::play_poke_standalone();
-                    }
+                    .map(|s| s.voice.is_some())
+                    .unwrap_or(false);
+                if in_voice {
+                    crate::api::voice::play_poke();
+                } else {
+                    crate::api::voice::play_poke_standalone();
                 }
             }
             let mut e = ev("poked");
@@ -1729,6 +1802,44 @@ pub fn fetch_history(
 /// Request the presence listing (response: "presence" event).
 pub fn request_presence(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::Presence)
+}
+
+/// Change this account's username, password and/or picture. The current
+/// password is checked server-side. `avatar` empty means unchanged unless
+/// `clear_avatar` is set; `avatar_mime` describes the bytes. The outcome
+/// arrives as a "profile_result" event (the server answer, not a local
+/// guess: a wrong old password must not look like success).
+#[allow(clippy::too_many_arguments)]
+pub fn update_profile(
+    session_id: u32,
+    current_password: String,
+    new_username: String,
+    new_password: String,
+    avatar: Vec<u8>,
+    avatar_mime: String,
+    clear_avatar: bool,
+) -> Result<(), String> {
+    send_command(
+        session_id,
+        Command::UpdateProfile {
+            current_password,
+            new_username,
+            new_password,
+            avatar,
+            avatar_mime,
+            clear_avatar,
+        },
+    )
+}
+
+/// Fetch one user's picture (response: an "avatar" event). The Dart side
+/// calls this only when a presence row advertises a version it does not
+/// hold, so a poll every 10 s carries numbers, never images.
+pub fn request_avatar(session_id: u32, user_id: u32) -> Result<(), String> {
+    if user_id == 0 {
+        return Ok(());
+    }
+    send_command(session_id, Command::RequestAvatar { user_id })
 }
 
 /// Request the voice-membership snapshot (response: "voice_states"
