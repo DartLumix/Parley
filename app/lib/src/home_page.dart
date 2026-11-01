@@ -140,6 +140,13 @@ class _HomePageState extends State<HomePage> {
   final Map<int, double> _volume = {};
   final Map<int, double> _shareVolume = {};
 
+  /// Scroll-to-volume accumulator per user, in logical pixels. A mouse
+  /// wheel is one big scroll event per notch; a touchpad is a stream of
+  /// tiny ones, so both feed the same counter and one deliberate swipe
+  /// equals a handful of 5% steps rather than a jump on the first pixel.
+  final Map<int, double> _volumeScroll = {};
+  static const double _volumeScrollStep = 40;
+
   /// Speaking indicator: decayed peaks polled from the Rust mixer while
   /// in voice, keyed by user id. Missing = silent.
   final Map<int, double> _levels = {};
@@ -425,6 +432,30 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       debugPrint('volume: $e');
     }
+  }
+
+  /// One scroll step over a member trims their voice by 5%, the same
+  /// step and 0..2 clamp as the dialog slider. `dy` is a pointer's
+  /// vertical scroll delta: negative is "up", which turns it louder.
+  void _scrollVolume(int userId, double current, double dy) {
+    if (dy == 0) return;
+    final total = (_volumeScroll[userId] ?? 0) + dy;
+    // Truncates toward zero, so reversing direction cancels the leftover
+    // travel before it starts moving the other way.
+    final notches = total ~/ _volumeScrollStep;
+    final left = total - notches * _volumeScrollStep;
+    if (left == 0) {
+      _volumeScroll.remove(userId);
+    } else {
+      _volumeScroll[userId] = left;
+    }
+    if (notches == 0) return;
+    // _volume is the freshest level (the dialog may have moved it, and a
+    // fast swipe can step several times between two frames). `current` is
+    // only the value this row was built with.
+    final level = _volume[userId] ?? current;
+    final next = (level - notches * 0.05).clamp(0.0, 2.0).toDouble();
+    if (next != level) unawaited(_applyVolume(userId, next));
   }
 
   Future<void> _applyShareVolume(int userId, double gain) async {
@@ -1169,9 +1200,8 @@ class _HomePageState extends State<HomePage> {
     );
     if (changed == true && mounted) {
       setState(() => _status = 'profile updated');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Profile updated')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Profile updated')));
     }
   }
 
@@ -1501,7 +1531,13 @@ class _HomePageState extends State<HomePage> {
                     ? '$from poked you'
                     : '$from poked you from $where',
               ),
-              duration: const Duration(seconds: 5),
+              duration: const Duration(seconds: 10),
+              // Flutter 3.47 defaults `persist` to true as soon as a
+              // snackbar has an action, which turns the duration into a
+              // no-op: a poke notification would stay until poked back
+              // (and poking back only moved it to the other side).
+              // Explicit false keeps both the action and the timer.
+              persist: false,
               action: SnackBarAction(
                 label: 'Poke back',
                 onPressed: () => unawaited(_poke(ev.userId)),
@@ -1530,9 +1566,7 @@ class _HomePageState extends State<HomePage> {
           joined: ev.joined,
           eventChannel: ev.channelId,
         )) {
-          unawaited(
-            _membershipCue(ev.userId, ev.joined).catchError((_) {}),
-          );
+          unawaited(_membershipCue(ev.userId, ev.joined).catchError((_) {}));
         }
         // Your own events play your own cue too — the sound is yours,
         // and a join/AFK confirmation is useful. Peers hear it through
@@ -1552,9 +1586,7 @@ class _HomePageState extends State<HomePage> {
             ev.status.isNotEmpty &&
             (ev.userId == me ||
                 (mine != null && _voiceChannel[ev.userId] == mine))) {
-          unawaited(
-            _personalCue(ev.userId, 'afk').catchError((_) {}),
-          );
+          unawaited(_personalCue(ev.userId, 'afk').catchError((_) {}));
         }
         setState(() {
           if (ev.joined) {
@@ -1847,9 +1879,8 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Download failed: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Download failed: $e')));
       }
     }
   }
@@ -1882,9 +1913,8 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       if (mounted) {
         setState(() => _status = 'upload failed: $e');
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Upload failed: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Upload failed: $e')));
       }
     }
   }
@@ -2466,20 +2496,38 @@ class _HomePageState extends State<HomePage> {
     if (!adjustable) return row;
     // Wheel over a member trims their voice without opening the dialog.
     // The same 0..2 clamp as the slider, in 5% steps.
+    //
+    // Two input paths land here: a mouse wheel is one ~53px scroll event
+    // per notch, while a touchpad is either a stream of tiny scroll
+    // events or a pan/zoom sequence. All of them accumulate into one
+    // per-user distance, so a two-finger swipe nudges the level instead
+    // of slamming it to 0% or 200%.
     return Listener(
       onPointerSignal: (event) {
         if (event is! PointerScrollEvent) return;
-        final dy = event.scrollDelta.dy;
         // Claim the event: the roster sits in a ListView, and a wheel
         // notch that trims a level must not also scroll the list out
         // from under the pointer.
         GestureBinding.instance.pointerSignalResolver.register(event, (_) {
-          final delta = dy < 0 ? 0.05 : -0.05;
-          final next = (volume + delta).clamp(0.0, 2.0).toDouble();
-          if (next != volume) unawaited(_applyVolume(userId, next));
+          _scrollVolume(userId, volume, event.scrollDelta.dy);
         });
       },
-      child: row,
+      onPointerPanZoomUpdate: (event) {
+        _scrollVolume(userId, volume, event.panDelta.dy);
+      },
+      child: RawGestureDetector(
+        // Pan/zoom is also a scroll for the list underneath. Claiming the
+        // sequence here means a two-finger swipe over a name trims that
+        // user without moving the roster; touch and mouse drags are left
+        // alone (see _PanZoomClaim).
+        gestures: <Type, GestureRecognizerFactory>{
+          _PanZoomClaim: GestureRecognizerFactoryWithHandlers<_PanZoomClaim>(
+            () => _PanZoomClaim(debugOwner: this),
+            (_) {},
+          ),
+        },
+        child: row,
+      ),
     );
   }
 
@@ -2548,8 +2596,7 @@ class _HomePageState extends State<HomePage> {
                                 ),
                               Expanded(
                                 child: Column(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.start,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text.rich(
                                       TextSpan(
@@ -2948,5 +2995,18 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+}
+
+/// Takes a trackpad pan/zoom sequence away from the roster's scroll view,
+/// so the same two-finger swipe that trims a volume does not also scroll
+/// the channel list. Ordinary pointers are deliberately not tracked: a
+/// mouse or touch drag over a name still belongs to the list.
+class _PanZoomClaim extends VerticalDragGestureRecognizer {
+  _PanZoomClaim({super.debugOwner});
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    // No super call: this recognizer competes for pan/zoom only.
   }
 }
