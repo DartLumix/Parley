@@ -105,7 +105,14 @@ jobs:
           cid=$(docker create "parley:${VERSION}")
           docker cp "$cid:/parley-server" "dist/parley-server-${VERSION}-x86_64-linux-musl"
           docker rm "$cid"
-          docker save "parley:${VERSION}" | gzip -9 > "dist/parley-image-${VERSION}.tar.gz"
+          # Ship BOTH names. Installs made from older kits pin
+          # `parley:latest` in their .env, so a tarball that only carries
+          # parley:<version> makes `docker load` + `docker compose up -d`
+          # a no-op: the container keeps the old image and the new client
+          # talks to an old server (profile changes timed out exactly so).
+          docker tag "parley:${VERSION}" parley:latest
+          docker save parley:latest "parley:${VERSION}" \
+            | gzip -9 > "dist/parley-image-${VERSION}.tar.gz"
           ls -lh dist
       # The image tarball above is the authoritative artifact: it works
       # without registry credentials. GHCR is the convenience path.

@@ -271,10 +271,26 @@ troubleshooting: [client.md](client.md).
 tar xf parley-deploy-<new>.tar.gz && cd parley-deploy-<new>
 docker load -i parley-image-<new>.tar.gz
 docker compose up -d
+docker ps --format '{{.Names}}\t{{.Image}}'   # must show parley:<new>
 ```
 
 The volume keeps accounts, history and the certificate — the
 fingerprint does not change, so nobody has to re-pin.
+
+The compose file runs `${PARLEY_IMAGE:-parley:latest}`, so the tag in
+`.env` decides what starts — and a hand-edited compose file may pin a
+literal `image: parley:0.4.3`, which no `.env` value can override.
+Kits released so far put only `parley:<new>` in the tarball, so the
+common case is: `docker load` succeeds, `docker compose up -d` reports
+**Running** (not *Recreated*), and the old image keeps serving. Kits
+built from this tree carry both names; on an older kit either point
+`image:`/`PARLEY_IMAGE` at `parley:<new>`, or run
+`docker tag parley:<new> parley:latest`, before `up -d`.
+
+A client and a server from different releases still connect — the
+protocol is additive — but a message type the server does not know is
+ignored, so a new feature answers nothing and the app shows a timeout.
+That is the symptom of a stale container, not of a broken client.
 
 ## Backup and restore
 
@@ -301,6 +317,7 @@ stored in the database itself, so the volume backup covers them too.
 | `adduser` prints BUSY | server was writing; run it again |
 | container restarts in a loop | port already bound on the host; change `PARLEY_PORT` |
 | `docker compose up` cannot find `parley:latest` | the image was not loaded (`docker load`) and `PARLEY_IMAGE` points elsewhere |
+| a new client feature times out after an upgrade | the container is still the old image: an older server ignores message types it does not know. `docker ps` shows the tag actually running — see [Upgrades](#upgrades) |
 
 ## Building the image from source instead
 

@@ -1228,7 +1228,8 @@ class _HomePageState extends State<HomePage> {
     try {
       return await pending.future.timeout(const Duration(seconds: 12));
     } on TimeoutException {
-      return 'the server did not answer the profile update';
+      return 'the server did not answer — profile changes need a server on '
+          '0.4.8 or newer';
     } finally {
       if (identical(_profileSave, pending)) _profileSave = null;
     }
