@@ -6,10 +6,12 @@
 // Static analysis wrongly picks the IO variant, thus ignore this
 // ignore_for_file: argument_type_not_assignable
 
+import 'api/blob.dart';
 import 'api/login.dart';
 import 'api/players.dart';
 import 'api/session.dart';
 import 'api/settings.dart';
+import 'api/soundboard.dart';
 import 'api/video.dart';
 import 'api/video/imp.dart';
 
@@ -210,6 +212,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ShareStats dco_decode_share_stats(dynamic raw);
+
+  @protected
+  SoundboardStatus dco_decode_soundboard_status(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -426,6 +431,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ShareStats sse_decode_share_stats(SseDeserializer deserializer);
+
+  @protected
+  SoundboardStatus sse_decode_soundboard_status(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -709,6 +717,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_share_stats(ShareStats self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_soundboard_status(
+    SoundboardStatus self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

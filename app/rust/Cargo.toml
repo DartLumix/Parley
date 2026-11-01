@@ -1,6 +1,6 @@
 [package]
 name = "parley_flutter"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 
 [lib]
@@ -15,6 +15,7 @@ crate-type = ["cdylib", "staticlib"]
 # `aec` on Unix, `aec-rust` on Windows.
 audio-device = [
     "dep:cpal",
+    "dep:symphonia",
     "parley-core/audio-device",
     "parley-client/audio-device",
 ]
@@ -23,6 +24,9 @@ audio-device = [
 # compile error below, so a release can never quietly ship without echo
 # cancellation.
 aec = ["audio-device", "parley-client/aec"]
+# Personal sounds are MP3 files the user drops into sounds/. Symphonia
+# decodes them in pure Rust (no system codec); the output still goes
+# through cpal, so it lives behind the same feature.
 # Echo cancellation, Windows: Sonora's pure-Rust port of the same AEC3
 # pipeline, because the C++ APM's build script is Unix-only. Same API,
 # same call sites (`parley-client::aec`) — only the filter differs, and
@@ -53,6 +57,8 @@ parley-client = { path = "../../crates/parley-client", default-features = false 
 quinn = { workspace = true }
 prost = { workspace = true }
 cpal = { workspace = true, optional = true }
+# MP3 cues (sounds/join.mp3 …). Pure Rust, MP3 feature only.
+symphonia = { version = "0.5", default-features = false, features = ["mp3"], optional = true }
 # 7f texture bridge (see the video feature above).
 irondash_texture = { workspace = true, optional = true }
 irondash_engine_context = { workspace = true, optional = true }

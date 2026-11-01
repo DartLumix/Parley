@@ -1,6 +1,7 @@
 //! Server engine. The binary (src/main.rs) is a thin launcher;
 //! tests and future embedders consume this library.
 
+pub mod blob;
 pub mod config;
 pub mod db;
 pub mod error;

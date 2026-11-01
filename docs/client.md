@@ -196,6 +196,26 @@ same trust decision.
   It applies the next time an encoder is created (the next share); a
   share in flight keeps the backend it started with.
 
+## Chat files and personal sounds
+
+**Chat files.** The paperclip next to the chat composer uploads the
+picked file into the joined channel (up to 100 MB). The message carries
+the name, size and type; the bytes stay on the server until a reader
+clicks the card, which asks where to save and streams the file over its
+own QUIC stream. Files live in the server's data volume under `files/`
+and disappear with their message when an ephemeral channel expires.
+
+**Personal sounds.** The Profile page has a *Soundboard* with a switch
+per event (join, leave, AFK). Put an MP3 named `join.mp3`, `leave.mp3` or
+`afk.mp3` in the `sounds/` folder next to the app binary (the page shows
+the exact path), switch it on and press *Apply sounds*. The file is
+stored per account and every client fetches it once per revision into
+its own cache, then plays it locally when you join, leave or go away —
+it is never mixed into the voice stream. Without a custom sound the
+built-in join/leave chime is used; AFK stays silent. *Mute everything*
+silences personal sounds too. Installs and in-app updates keep the
+folder.
+
 ## Troubleshooting
 
 | symptom | meaning / fix |
@@ -217,6 +237,8 @@ same trust decision.
 | *Check for updates* reports "no releases at …" | no `v*` release is published yet, or the GitHub API is rate-limiting. The check reads `releases/latest`, which needs no token and no account |
 | the update card says this copy is not writable | it is a package-manager install (`/opt/parley`); update with `pacman`/`yay`. Only a `install.sh` copy under `~/.local` is the app's to replace |
 | Parley does not come back after installing an update | the reason is in `~/.cache/parley/update.log` (`%LOCALAPPDATA%\parley\update.log` on Windows); the previous build is still on disk and starts normally |
+| *Apply sounds* says a file is missing | the MP3 must be named exactly `join.mp3`/`leave.mp3`/`afk.mp3` in the folder the Profile page prints, and edited files need another *Apply* |
+| a chat file card will not download | the message expired (24 h ephemeral, unless pinned) or the server's disk is full — the server log names the missing id |
 
 Logs: run `~/.local/opt/parley/parley` from a terminal to see
 `video:`/`voice:`/`window:` lines; the login page shows the build

@@ -1,6 +1,7 @@
 //! The QUIC listener: bind, accept, dispatch, session loop.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -32,6 +33,8 @@ pub struct Server {
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
     transcode: Arc<TranscodeManager>,
+    /// Chat attachment root (sharded by file id).
+    files_dir: PathBuf,
     /// Read-only HTTP snapshot for a dashboard; `None` when disabled.
     presence: Option<PresenceServer>,
 }
@@ -42,6 +45,8 @@ impl Server {
 
         let db = Db::open(&config.data_dir.join("parley.db"))?;
         db.bootstrap_admin()?;
+        let files_dir = config.files_dir();
+        std::fs::create_dir_all(&files_dir)?;
         db.purge_stale_sessions()?;
         // Expired ephemeral chat is also filtered on read; sweeping at
         // boot keeps the file from carrying yesterday's rows until the
@@ -121,6 +126,7 @@ impl Server {
             registry,
             voice,
             transcode,
+            files_dir,
             presence,
         })
     }
@@ -152,6 +158,7 @@ impl Server {
         // filtering makes the exact cadence invisible to clients.
         {
             let purge_db = db.clone();
+            let purge_files = self.files_dir.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
                 tick.tick().await; // the first tick fires immediately
@@ -161,6 +168,20 @@ impl Server {
                         Ok(0) => {}
                         Ok(n) => info!(removed = n, "purged expired chat messages"),
                         Err(e) => warn!(error = %e, "chat purge failed"),
+                    }
+                    // Attachment bytes follow their message out. The row
+                    // is deleted first, so a crash between the two leaves
+                    // at worst an unreferenced file, never a dead row.
+                    match purge_db.orphan_files().await {
+                        Ok(ids) => {
+                            for id in ids {
+                                let path = crate::blob::file_path(&purge_files, id);
+                                if let Err(e) = tokio::fs::remove_file(&path).await {
+                                    warn!(file_id = id, error = %e, "attachment cleanup");
+                                }
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "attachment cleanup failed"),
                     }
                 }
             });
@@ -185,7 +206,10 @@ impl Server {
                     let registry = self.registry.clone();
                     let voice = self.voice.clone();
                     let transcode = self.transcode.clone();
-                    tokio::spawn(handle_connection(conn, db, registry, voice, transcode));
+                    let files_dir = self.files_dir.clone();
+                    tokio::spawn(handle_connection(
+                        conn, db, registry, voice, transcode, files_dir,
+                    ));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
             }
@@ -200,9 +224,10 @@ async fn handle_connection(
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
     transcode: Arc<TranscodeManager>,
+    files_dir: PathBuf,
 ) {
     let peer = conn.remote_address();
-    match serve(conn.clone(), &db, &registry, &voice, &transcode).await {
+    match serve(conn.clone(), &db, &registry, &voice, &transcode, &files_dir).await {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -215,6 +240,7 @@ async fn serve(
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
     transcode: &Arc<TranscodeManager>,
+    files_dir: &std::path::Path,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
 
@@ -271,10 +297,12 @@ async fn serve(
     // generation guards the OLD session's cleanup against tearing down
     // its successor (6c).
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let sound_versions = db.sound_versions(info.id).await?;
     let session_gen = registry.register(ClientHandle {
         user_id: info.id,
         username: info.username.clone(),
         avatar_version: info.avatar_version,
+        sound_versions,
         role: info.role,
         conn: conn.clone(),
         tx: event_tx,
@@ -303,6 +331,16 @@ async fn serve(
         },
     )
     .await?;
+
+    // Bulk transfers (chat attachments, personal sounds) ride their own
+    // streams on this connection. The acceptor dies with the connection.
+    crate::blob::spawn_acceptor(
+        conn.clone(),
+        info.id,
+        db.clone(),
+        registry.clone(),
+        files_dir.to_path_buf(),
+    );
 
     // --- Dedicated reader tasks ---
     // Each reader owns its source, so an in-flight read is never
@@ -498,6 +536,7 @@ async fn handle_client_message(
                     text,
                     timestamp_ms: ts,
                     pinned: false,
+                    ..Default::default()
                 })),
             });
         }
@@ -521,6 +560,10 @@ async fn handle_client_message(
                                 text: m.text,
                                 timestamp_ms: m.timestamp_ms,
                                 pinned: m.pinned,
+                                attachment_id: m.attachment_id,
+                                attachment_name: m.attachment_name,
+                                attachment_size: m.attachment_size,
+                                attachment_mime: m.attachment_mime,
                             })
                             .collect(),
                     })),
@@ -544,6 +587,10 @@ async fn handle_client_message(
                         text: m.text,
                         timestamp_ms: m.timestamp_ms,
                         pinned: m.pinned,
+                        attachment_id: m.attachment_id,
+                        attachment_name: m.attachment_name,
+                        attachment_size: m.attachment_size,
+                        attachment_mime: m.attachment_mime,
                     })),
                 });
             }
@@ -955,17 +1002,22 @@ pub(crate) fn voice_state_message(
     }
 }
 
-fn presence_message(registry: &SessionRegistry) -> ServerMessage {
+pub(crate) fn presence_message(registry: &SessionRegistry) -> ServerMessage {
     let users = registry.online_users();
     ServerMessage {
         body: Some(ServerBody::PresenceList(PresenceList {
             users: users
                 .into_iter()
-                .map(|(id, name, avatar_version)| PresenceUser {
-                    user_id: id,
-                    username: name,
-                    avatar_version,
-                })
+                .map(
+                    |(id, name, avatar_version, (join, leave, afk))| PresenceUser {
+                        user_id: id,
+                        username: name,
+                        avatar_version,
+                        sound_join_version: join,
+                        sound_leave_version: leave,
+                        sound_afk_version: afk,
+                    },
+                )
                 .collect(),
         })),
     }

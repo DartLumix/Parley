@@ -286,6 +286,11 @@ docker run --rm -v parley-data:/data -v "$PWD":/backup busybox \
 Restore into a fresh volume with `tar xzf` the same way (stop the
 container first). Everything the server knows is in that volume.
 
+Chat attachments are part of it: they live under `files/`, sharded by
+id, capped at 100 MB each. The ten-minute ephemeral sweep deletes a
+file together with its message. Personal sounds (≤ 1 MB each) are
+stored in the database itself, so the volume backup covers them too.
+
 ## Troubleshooting
 
 | symptom | cause / fix |

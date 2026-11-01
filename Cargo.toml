@@ -13,11 +13,11 @@ exclude = ["vendor/moq-vaapi"]
 
 
 [workspace.package]
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util", "fs"] }
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"

@@ -98,6 +98,32 @@ pub struct MessageRow {
     pub text: String,
     pub timestamp_ms: u64,
     pub pinned: bool,
+    /// Attached file (0 = none). The name, size and MIME ride with the
+    /// row; the bytes live on disk and are fetched over a blob stream.
+    pub attachment_id: u64,
+    pub attachment_name: String,
+    pub attachment_size: u64,
+    pub attachment_mime: String,
+}
+
+/// A stored chat attachment: where it sits on disk plus the metadata
+/// clients render before downloading it.
+#[derive(Debug, Clone)]
+pub struct FileRow {
+    pub id: u64,
+    pub channel_id: u64,
+    pub user_id: u32,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// A personal sound: the MP3 bytes and the revision presence advertises.
+#[derive(Debug, Clone)]
+pub struct SoundRow {
+    pub version: u64,
+    pub mime: String,
+    pub bytes: Vec<u8>,
 }
 
 /// (id, name, music, ephemeral) per channel (6d, 0.4.3).
@@ -160,7 +186,25 @@ impl Db {
                 user_id INTEGER NOT NULL,
                 text TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                attachment_id INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                mime TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL,
+                created_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sounds (
+                user_id INTEGER NOT NULL,
+                kind INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                mime TEXT NOT NULL DEFAULT '',
+                bytes BLOB NOT NULL,
+                PRIMARY KEY (user_id, kind)
             );
             ",
         )?;
@@ -202,6 +246,18 @@ impl Db {
         if !has_pinned {
             conn.execute_batch(
                 "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // 0.4.9: chat attachments. Existing rows simply have no file.
+        let has_attachment: bool = {
+            let mut stmt = conn.prepare(
+                "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'attachment_id'",
+            )?;
+            stmt.exists([])?
+        };
+        if !has_attachment {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN attachment_id INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
         // Role migration: older databases only have the is_admin boolean.
@@ -623,9 +679,12 @@ impl Db {
         // The expiry filter is applied on read as well as by the purge
         // task, so a message can never reappear between two sweeps.
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.channel_id, m.user_id, u.username, m.text, m.timestamp_ms, m.pinned
+            "SELECT m.id, m.channel_id, m.user_id, u.username, m.text, m.timestamp_ms, m.pinned,
+                    m.attachment_id, COALESCE(f.name, ''), COALESCE(f.size, 0),
+                    COALESCE(f.mime, '')
              FROM messages m JOIN users u ON u.id = m.user_id
              JOIN channels c ON c.id = m.channel_id
+             LEFT JOIN files f ON f.id = m.attachment_id
              WHERE m.channel_id = ?1 AND (?2 = 0 OR m.id < ?2)
                AND (m.pinned <> 0 OR c.ephemeral = 0 OR m.timestamp_ms >= ?4)
              ORDER BY m.id DESC LIMIT ?3",
@@ -641,6 +700,10 @@ impl Db {
                     text: row.get(4)?,
                     timestamp_ms: row.get::<_, i64>(5)? as u64,
                     pinned: row.get::<_, i64>(6)? != 0,
+                    attachment_id: row.get::<_, i64>(7)? as u64,
+                    attachment_name: row.get(8)?,
+                    attachment_size: row.get::<_, i64>(9)? as u64,
+                    attachment_mime: row.get(10)?,
                 })
             },
         )?;
@@ -666,8 +729,11 @@ impl Db {
         let row = self
             .conn
             .query_row(
-                "SELECT m.id, m.channel_id, m.user_id, u.username, m.text, m.timestamp_ms, m.pinned
+                "SELECT m.id, m.channel_id, m.user_id, u.username, m.text, m.timestamp_ms, m.pinned,
+                        m.attachment_id, COALESCE(f.name, ''), COALESCE(f.size, 0),
+                        COALESCE(f.mime, '')
                  FROM messages m JOIN users u ON u.id = m.user_id
+                 LEFT JOIN files f ON f.id = m.attachment_id
                  WHERE m.id = ?1",
                 rusqlite::params![message_id as i64],
                 |row| {
@@ -679,6 +745,10 @@ impl Db {
                         text: row.get(4)?,
                         timestamp_ms: row.get::<_, i64>(5)? as u64,
                         pinned: row.get::<_, i64>(6)? != 0,
+                        attachment_id: row.get::<_, i64>(7)? as u64,
+                        attachment_name: row.get(8)?,
+                        attachment_size: row.get::<_, i64>(9)? as u64,
+                        attachment_mime: row.get(10)?,
                     })
                 },
             )
@@ -688,6 +758,8 @@ impl Db {
 
     /// Drop unpinned messages older than the ephemeral TTL in channels
     /// that still have disappearing chat on. Returns how many rows went.
+    /// Attached files are cleaned separately by [`Self::orphan_files`],
+    /// which reports the ids whose bytes can leave the disk.
     pub fn purge_expired_messages(&self) -> Result<u64, Error> {
         let cutoff = now_ms().saturating_sub(EPHEMERAL_TTL_MS) as i64;
         let removed = self.conn.execute(
@@ -697,6 +769,151 @@ impl Db {
             rusqlite::params![cutoff],
         )?;
         Ok(removed as u64)
+    }
+
+    /// Delete attachment rows no message points at any more (an expired
+    /// or deleted message). Returns their ids so the caller can remove
+    /// the disk files. Rows are removed in the same transaction, so two
+    /// concurrent sweeps cannot hand the same id out twice.
+    pub fn orphan_files(&self) -> Result<Vec<u64>, Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ids: Vec<u64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM files
+                 WHERE id NOT IN (SELECT attachment_id FROM messages WHERE attachment_id <> 0)",
+            )?;
+            let rows = stmt.query_map([], |row| Ok(row.get::<_, i64>(0)? as u64))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for id in &ids {
+            tx.execute(
+                "DELETE FROM files WHERE id = ?1",
+                rusqlite::params![*id as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Store an uploaded file's metadata and the chat row that announces
+    /// it, in one transaction. Returns (message id, timestamp, file id).
+    pub fn insert_file_message(
+        &self,
+        channel_id: u64,
+        user_id: u32,
+        text: &str,
+        name: &str,
+        mime: &str,
+        size: u64,
+    ) -> Result<(u64, u64, u64), Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ts = now_ms() as i64;
+        tx.execute(
+            "INSERT INTO files (channel_id, user_id, name, mime, size, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![channel_id as i64, user_id, name, mime, size as i64, ts],
+        )?;
+        let file_id = tx.last_insert_rowid() as u64;
+        tx.execute(
+            "INSERT INTO messages (channel_id, user_id, text, timestamp_ms, attachment_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![channel_id as i64, user_id, text, ts, file_id as i64],
+        )?;
+        let message_id = tx.last_insert_rowid() as u64;
+        tx.commit()?;
+        Ok((message_id, ts as u64, file_id))
+    }
+
+    /// One attachment's metadata, or None when the id is unknown.
+    pub fn file(&self, file_id: u64) -> Result<Option<FileRow>, Error> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, channel_id, user_id, name, mime, size FROM files WHERE id = ?1",
+                rusqlite::params![file_id as i64],
+                |row| {
+                    Ok(FileRow {
+                        id: row.get::<_, i64>(0)? as u64,
+                        channel_id: row.get::<_, i64>(1)? as u64,
+                        user_id: row.get::<_, i32>(2)? as u32,
+                        name: row.get(3)?,
+                        mime: row.get(4)?,
+                        size: row.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// (join, leave, afk) revisions for one account; 0 means no sound.
+    pub fn sound_versions(&self, user_id: u32) -> Result<(u64, u64, u64), Error> {
+        let mut out = [0u64; 3];
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, version FROM sounds WHERE user_id = ?1 AND kind BETWEEN 1 AND 3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![user_id as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows.filter_map(|r| r.ok()) {
+            if let Some(slot) = out.get_mut(row.0 as usize - 1) {
+                *slot = row.1 as u64;
+            }
+        }
+        Ok((out[0], out[1], out[2]))
+    }
+
+    /// Replace (Some) or remove (None) one personal sound. Removing the
+    /// row makes the advertised revision 0, which every client already
+    /// reads as "no custom sound".
+    pub fn set_sound(
+        &self,
+        user_id: u32,
+        kind: u32,
+        bytes: Option<&[u8]>,
+        mime: &str,
+    ) -> Result<u64, Error> {
+        let Some(bytes) = bytes else {
+            self.conn.execute(
+                "DELETE FROM sounds WHERE user_id = ?1 AND kind = ?2",
+                rusqlite::params![user_id as i64, kind as i64],
+            )?;
+            return Ok(0);
+        };
+        self.conn.execute(
+            "INSERT INTO sounds (user_id, kind, version, mime, bytes)
+             VALUES (?1, ?2, 1, ?3, ?4)
+             ON CONFLICT(user_id, kind) DO UPDATE SET
+               version = version + 1,
+               mime = excluded.mime,
+               bytes = excluded.bytes",
+            rusqlite::params![user_id as i64, kind as i64, mime, bytes],
+        )?;
+        let version: i64 = self.conn.query_row(
+            "SELECT version FROM sounds WHERE user_id = ?1 AND kind = ?2",
+            rusqlite::params![user_id as i64, kind as i64],
+            |row| row.get(0),
+        )?;
+        Ok(version as u64)
+    }
+
+    /// One personal sound for download.
+    pub fn sound(&self, user_id: u32, kind: u32) -> Result<Option<SoundRow>, Error> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT version, mime, bytes FROM sounds WHERE user_id = ?1 AND kind = ?2",
+                rusqlite::params![user_id as i64, kind as i64],
+                |row| {
+                    Ok(SoundRow {
+                        version: row.get::<_, i64>(0)? as u64,
+                        mime: row.get(1)?,
+                        bytes: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn channel_exists(&self, channel_id: u64) -> Result<bool, Error> {
@@ -802,6 +1019,43 @@ impl Db {
             DbCmd::PurgeExpiredMessages { reply } => {
                 let _ = reply.send(self.purge_expired_messages());
             }
+            DbCmd::OrphanFiles { reply } => {
+                let _ = reply.send(self.orphan_files());
+            }
+            DbCmd::InsertFileMessage {
+                channel_id,
+                user_id,
+                text,
+                name,
+                mime,
+                size,
+                reply,
+            } => {
+                let _ = reply
+                    .send(self.insert_file_message(channel_id, user_id, &text, &name, &mime, size));
+            }
+            DbCmd::File { file_id, reply } => {
+                let _ = reply.send(self.file(file_id));
+            }
+            DbCmd::SoundVersions { user_id, reply } => {
+                let _ = reply.send(self.sound_versions(user_id));
+            }
+            DbCmd::SetSound {
+                user_id,
+                kind,
+                bytes,
+                mime,
+                reply,
+            } => {
+                let _ = reply.send(self.set_sound(user_id, kind, bytes.as_deref(), &mime));
+            }
+            DbCmd::Sound {
+                user_id,
+                kind,
+                reply,
+            } => {
+                let _ = reply.send(self.sound(user_id, kind));
+            }
             DbCmd::CreateChannel {
                 name,
                 music,
@@ -888,6 +1142,38 @@ pub enum DbCmd {
     },
     PurgeExpiredMessages {
         reply: oneshot::Sender<Result<u64, Error>>,
+    },
+    OrphanFiles {
+        reply: oneshot::Sender<Result<Vec<u64>, Error>>,
+    },
+    InsertFileMessage {
+        channel_id: u64,
+        user_id: u32,
+        text: String,
+        name: String,
+        mime: String,
+        size: u64,
+        reply: oneshot::Sender<Result<(u64, u64, u64), Error>>,
+    },
+    File {
+        file_id: u64,
+        reply: oneshot::Sender<Result<Option<FileRow>, Error>>,
+    },
+    SoundVersions {
+        user_id: u32,
+        reply: oneshot::Sender<Result<(u64, u64, u64), Error>>,
+    },
+    SetSound {
+        user_id: u32,
+        kind: u32,
+        bytes: Option<Vec<u8>>,
+        mime: String,
+        reply: oneshot::Sender<Result<u64, Error>>,
+    },
+    Sound {
+        user_id: u32,
+        kind: u32,
+        reply: oneshot::Sender<Result<Option<SoundRow>, Error>>,
     },
     ListUsers {
         reply: oneshot::Sender<Result<Vec<ManagedUserRow>, Error>>,
@@ -1202,6 +1488,87 @@ impl DbHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCmd::PurgeExpiredMessages { reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn orphan_files(&self) -> Result<Vec<u64>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::OrphanFiles { reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_file_message(
+        &self,
+        channel_id: u64,
+        user_id: u32,
+        text: &str,
+        name: &str,
+        mime: &str,
+        size: u64,
+    ) -> Result<(u64, u64, u64), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::InsertFileMessage {
+                channel_id,
+                user_id,
+                text: text.to_string(),
+                name: name.to_string(),
+                mime: mime.to_string(),
+                size,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn file(&self, file_id: u64) -> Result<Option<FileRow>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::File { file_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn sound_versions(&self, user_id: u32) -> Result<(u64, u64, u64), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::SoundVersions { user_id, reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn set_sound(
+        &self,
+        user_id: u32,
+        kind: u32,
+        bytes: Option<&[u8]>,
+        mime: &str,
+    ) -> Result<u64, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::SetSound {
+                user_id,
+                kind,
+                bytes: bytes.map(|b| b.to_vec()),
+                mime: mime.to_string(),
+                reply,
+            })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn sound(&self, user_id: u32, kind: u32) -> Result<Option<SoundRow>, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::Sound {
+                user_id,
+                kind,
+                reply,
+            })
             .map_err(|_| gone())?;
         rx.await.map_err(|_| gone())?
     }

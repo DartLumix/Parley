@@ -398,7 +398,7 @@ struct LiveSession {
     _endpoint: quinn::Endpoint,
     /// Kept alive: dropping it closes the QUIC connection (streams die
     /// with it; the server ends the session on control-stream close).
-    _conn: quinn::Connection,
+    conn: quinn::Connection,
     /// Writer-side command channel.
     cmd_tx: UnboundedSender<Command>,
     /// Flipped false by the reader task when the control stream ends.
@@ -508,6 +508,12 @@ pub struct ChatEntry {
     pub timestamp_ms: u64,
     /// Pinned rows survive the 24-hour ephemeral expiry.
     pub pinned: bool,
+    /// An attached file (0 = plain text). The bytes are fetched on
+    /// click, never with the chat row.
+    pub attachment_id: u64,
+    pub attachment_name: String,
+    pub attachment_size: u64,
+    pub attachment_mime: String,
 }
 
 /// One voice-state snapshot row.
@@ -821,6 +827,25 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             vec![e]
         }
         ServerBody::PresenceList(list) => {
+            // Personal-sound revisions: fetch anything this machine has
+            // not cached yet. Cheap when nothing moved.
+            crate::api::soundboard::observe_presence(
+                session_id,
+                &list
+                    .users
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.user_id,
+                            (
+                                u.sound_join_version,
+                                u.sound_leave_version,
+                                u.sound_afk_version,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
             let mut e = ev("presence");
             e.users = list
                 .users
@@ -861,6 +886,10 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 text: m.text.clone(),
                 timestamp_ms: m.timestamp_ms,
                 pinned: m.pinned,
+                attachment_id: m.attachment_id,
+                attachment_name: m.attachment_name.clone(),
+                attachment_size: m.attachment_size,
+                attachment_mime: m.attachment_mime.clone(),
             });
             vec![e]
         }
@@ -878,6 +907,10 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                     text: m.text.clone(),
                     timestamp_ms: m.timestamp_ms,
                     pinned: m.pinned,
+                    attachment_id: m.attachment_id,
+                    attachment_name: m.attachment_name.clone(),
+                    attachment_size: m.attachment_size,
+                    attachment_mime: m.attachment_mime.clone(),
                 })
                 .collect();
             vec![e]
@@ -1210,7 +1243,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
         }
         (
             s.mixer.clone(),
-            s._conn.clone(),
+            s.conn.clone(),
             s.user_id,
             s.loss_report.clone(),
             s.cmd_tx.clone(),
@@ -1505,7 +1538,7 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
         session_id,
         LiveSession {
             _endpoint: endpoint,
-            _conn: conn.clone(),
+            conn: conn.clone(),
             cmd_tx,
             alive,
             sinks,
@@ -1563,6 +1596,39 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     })
 }
 
+/// "Mute everything" (headphones) as the mixer holds it. Personal cues
+/// follow this flag; a poke deliberately does not.
+#[cfg(feature = "audio-device")]
+pub(crate) fn output_muted(session_id: u32) -> bool {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| s.mixer.lock().unwrap().output_muted())
+        .unwrap_or(false)
+}
+
+/// Is this session in a voice channel (so a render callback exists)?
+#[cfg(feature = "audio-device")]
+pub(crate) fn in_voice(session_id: u32) -> bool {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| s.voice.is_some())
+        .unwrap_or(false)
+}
+
+/// The live QUIC connection, for blob transfers (attachments, sounds).
+pub(crate) fn connection(session_id: u32) -> Result<quinn::Connection, String> {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| s.conn.clone())
+        .ok_or(format!("no session {session_id}"))
+}
+
 fn send_command(session_id: u32, cmd: Command) -> Result<(), String> {
     let sessions = SESSIONS.lock().unwrap();
     let s = sessions
@@ -1618,7 +1684,7 @@ pub fn disconnect(session_id: u32) -> Result<(), String> {
     #[cfg(feature = "video")]
     drop(display);
     let (conn, endpoint) = match SESSIONS.lock().unwrap().remove(&session_id) {
-        Some(s) => (s._conn, s._endpoint),
+        Some(s) => (s.conn, s._endpoint),
         None => return Err(format!("no session {session_id}")),
     };
     #[cfg(feature = "video")]
@@ -2169,7 +2235,7 @@ pub fn start_screen_share(
             s.event_tx.clone(),
             s.share_loss.clone(),
             s.share_viewer_fps.clone(),
-            s._conn.clone(),
+            s.conn.clone(),
             s.share_poke.clone(),
             s.share_ctrl.clone(),
         )
@@ -2702,6 +2768,7 @@ mod disconnect_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            files_dir: dir.join("data").join("files"),
             presence_listen: "127.0.0.1:0".to_string(),
             video: Default::default(),
         };
@@ -2774,6 +2841,7 @@ mod resume_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            files_dir: dir.join("data").join("files"),
             presence_listen: "127.0.0.1:0".to_string(),
             video: Default::default(),
         };
@@ -2840,6 +2908,7 @@ mod tofu_tests {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
+            files_dir: dir.join("data").join("files"),
             presence_listen: "127.0.0.1:0".to_string(),
             video: Default::default(),
         };

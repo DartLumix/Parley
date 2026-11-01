@@ -26,6 +26,12 @@ message PresenceUser {
   // The bytes are fetched separately (RequestAvatar) so a presence poll
   // every few seconds never drags every avatar with it.
   uint64 avatar_version = 3;
+  // Personal join/leave/AFK sound revisions (0 = the default / none).
+  // Clients fetch the MP3 over a blob stream only when a revision moves;
+  // the bytes never ride a presence poll.
+  uint64 sound_join_version = 4;
+  uint64 sound_leave_version = 5;
+  uint64 sound_afk_version = 6;
 }
 
 message PresenceList {
@@ -72,6 +78,13 @@ message ChatMessage {
   // as a ChatMessage with the same id and the new flag; clients update
   // the row in place.
   bool pinned = 7;
+  // A file attached by the sender (BlobUpload). 0 = plain text. Name,
+  // size and MIME ride with the row so the chat card renders from the
+  // message alone and the bytes are fetched only on click.
+  uint64 attachment_id = 8;
+  string attachment_name = 9;
+  uint64 attachment_size = 10;
+  string attachment_mime = 11;
 }
 
 // Client -> server: pin or unpin one message (answer: a ChatMessage

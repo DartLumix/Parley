@@ -99,6 +99,34 @@ const PERIOD_FRAMES: u32 = 1024;
 #[cfg(feature = "audio-device")]
 static CHIME_REQUEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// The custom cue waiting for the render callback: a personal join,
+/// leave or AFK sound decoded on the control thread. The callback reads
+/// the slot with `try_read` only — it must never block on a control-path
+/// lock — and leaves the pending flag set when the writer held it.
+#[cfg(feature = "audio-device")]
+static CUSTOM_SLOT: std::sync::LazyLock<std::sync::RwLock<Option<std::sync::Arc<Vec<f32>>>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+#[cfg(feature = "audio-device")]
+static CUSTOM_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A cue being played: one of the built-in chimes (a static slice) or a
+/// decoded personal sound (an owned buffer).
+#[cfg(feature = "audio-device")]
+enum Cue {
+    Default(&'static [f32]),
+    Custom(std::sync::Arc<Vec<f32>>),
+}
+
+#[cfg(feature = "audio-device")]
+impl Cue {
+    fn samples(&self) -> &[f32] {
+        match self {
+            Cue::Default(s) => s,
+            Cue::Custom(s) => s,
+        }
+    }
+}
+
 /// Ask the next render callback for a join (true) or leave (false) cue.
 /// Silent until a voice render stream exists, which is exactly the only
 /// time a cue means anything.
@@ -121,7 +149,15 @@ pub(crate) fn play_poke() {
 /// costs the sound, never the notification.
 #[cfg(feature = "audio-device")]
 pub(crate) fn play_poke_standalone() {
-    std::thread::spawn(|| {
+    play_samples_standalone(cues()[2].clone());
+}
+
+/// Play one decoded buffer without a voice stream. A personal join/
+/// leave/AFK cue can arrive while the user is online but not in a
+/// channel; there is no render callback to carry it then.
+#[cfg(feature = "audio-device")]
+fn play_samples_standalone(samples: Vec<f32>) {
+    std::thread::spawn(move || {
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
             return;
@@ -130,7 +166,6 @@ pub(crate) fn play_poke_standalone() {
             return;
         };
         let channels = config.channels() as usize;
-        let samples = cues()[2].clone();
         // One device period of slack so the last samples reach the sink
         // before the stream is dropped (the buffer moves into the
         // callback below, so its length is measured here).
@@ -165,6 +200,23 @@ pub(crate) fn play_poke_standalone() {
         }
         std::thread::sleep(duration);
     });
+}
+
+/// Play one user's personal cue, if the session is not muted. Voice
+/// callbacks mix it on top of the call; otherwise a one-shot output
+/// stream plays it. Returns false when mute swallowed it.
+#[cfg(feature = "audio-device")]
+pub(crate) fn play_custom_cue(session_id: u32, samples: Vec<f32>) -> bool {
+    if crate::api::session::output_muted(session_id) {
+        return false;
+    }
+    if crate::api::session::in_voice(session_id) {
+        *CUSTOM_SLOT.write().unwrap() = Some(std::sync::Arc::new(samples));
+        CUSTOM_PENDING.store(true, Ordering::Release);
+    } else {
+        play_samples_standalone(samples);
+    }
+    true
 }
 
 /// The two cues, rendered once at 48 kHz: a rising pair for a join, the
@@ -883,7 +935,7 @@ fn build_streams(
         // The cue being played: its samples and how far in the callback
         // is. Advances by whole device periods, so a period too short to
         // finish a note just continues it next time.
-        let mut cue: Option<&'static [f32]> = None;
+        let mut cue: Option<Cue> = None;
         let mut cue_pos = 0usize;
         out_dev.build_output_stream(
             cfg,
@@ -933,20 +985,36 @@ fn build_streams(
                 let output_muted = mixer.lock().unwrap().output_muted();
                 match CHIME_REQUEST.swap(0, Ordering::Relaxed) {
                     1 if !output_muted => {
-                        cue = Some(cues()[0].as_slice());
+                        cue = Some(Cue::Default(cues()[0].as_slice()));
                         cue_pos = 0;
                     }
                     2 if !output_muted => {
-                        cue = Some(cues()[1].as_slice());
+                        cue = Some(Cue::Default(cues()[1].as_slice()));
                         cue_pos = 0;
                     }
                     3 => {
-                        cue = Some(cues()[2].as_slice());
+                        cue = Some(Cue::Default(cues()[2].as_slice()));
                         cue_pos = 0;
                     }
                     _ => {}
                 }
-                if let Some(samples) = cue {
+                // A personal cue follows the same mute rule as the
+                // social chimes: "mute everything" silences it too.
+                if CUSTOM_PENDING.swap(false, Ordering::Acquire) {
+                    if output_muted {
+                        let _ = CUSTOM_SLOT.write().map(|mut slot| slot.take());
+                    } else if let Ok(slot) = CUSTOM_SLOT.try_read() {
+                        if let Some(samples) = slot.as_ref() {
+                            cue = Some(Cue::Custom(samples.clone()));
+                            cue_pos = 0;
+                        }
+                    } else {
+                        // The writer is mid-swap: try again next period.
+                        CUSTOM_PENDING.store(true, Ordering::Release);
+                    }
+                }
+                if let Some(playing) = &cue {
+                    let samples = playing.samples();
                     for (i, frame) in data.chunks_mut(out_channels.max(1)).enumerate() {
                         if let Some(s) = samples.get(cue_pos + i) {
                             for x in frame.iter_mut() {

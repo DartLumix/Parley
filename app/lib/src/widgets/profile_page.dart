@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
+import '../rust/api/soundboard.dart';
 import '../theme.dart';
 
 /// Pictures are square thumbnails, never full photos: the widest attempt
@@ -71,12 +72,23 @@ class ProfilePage extends StatefulWidget {
     required this.role,
     required this.avatar,
     required this.onSave,
+    this.soundboard,
+    this.onSoundboard,
   });
 
   final String username;
   final String role;
   final Uint8List? avatar;
   final SaveProfile onSave;
+  /// Local files + the last applied toggles. Null keeps the section out
+  /// (the widget tests that only exercise the account form).
+  final SoundboardStatus? soundboard;
+  final Future<String?> Function({
+    required bool join,
+    required bool leave,
+    required bool afk,
+  })?
+  onSoundboard;
 
   @override
   State<ProfilePage> createState() => _ProfilePageState();
@@ -94,6 +106,11 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _clearAvatar = false;
   bool _busy = false;
   String? _error;
+  late bool _joinSound = widget.soundboard?.joinEnabled ?? false;
+  late bool _leaveSound = widget.soundboard?.leaveEnabled ?? false;
+  late bool _afkSound = widget.soundboard?.afkEnabled ?? false;
+  bool _savingSounds = false;
+  String? _soundStatus;
 
   @override
   void dispose() {
@@ -330,7 +347,105 @@ class _ProfilePageState extends State<ProfilePage> {
             icon: const Icon(Icons.check, size: 18),
             label: Text(_busy ? 'Saving…' : 'Save changes'),
           ),
+          if (widget.soundboard != null) ...[
+            const SizedBox(height: 26),
+            const Divider(),
+            _section(theme, 'Soundboard'),
+            Text(
+              'Drop one MP3 per event in this folder and switch it on. '
+              'You and everyone in the channel hear it when you join, '
+              'leave or go AFK. Edited a file? Press Apply again.',
+              style: const TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            SelectableText(
+              widget.soundboard!.dir,
+              style: const TextStyle(
+                color: accentSoft,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+            ),
+            const SizedBox(height: 8),
+            _soundRow(
+              'Join sound',
+              'join.mp3',
+              _joinSound,
+              widget.soundboard!.joinFile,
+              (v) => setState(() => _joinSound = v),
+            ),
+            _soundRow(
+              'Leave sound',
+              'leave.mp3',
+              _leaveSound,
+              widget.soundboard!.leaveFile,
+              (v) => setState(() => _leaveSound = v),
+            ),
+            _soundRow(
+              'AFK sound',
+              'afk.mp3',
+              _afkSound,
+              widget.soundboard!.afkFile,
+              (v) => setState(() => _afkSound = v),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: _savingSounds ? null : _saveSounds,
+              icon: const Icon(Icons.graphic_eq, size: 18),
+              label: Text(_savingSounds ? 'Applying…' : 'Apply sounds'),
+            ),
+            if (_soundStatus != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _soundStatus!,
+                style: TextStyle(
+                  color: _soundStatus == 'Sounds applied'
+                      ? Colors.greenAccent
+                      : Colors.redAccent,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ],
         ],
+      ),
+    );
+  }
+
+  Future<void> _saveSounds() async {
+    final save = widget.onSoundboard;
+    if (save == null) return;
+    setState(() {
+      _savingSounds = true;
+      _soundStatus = null;
+    });
+    final error = await save(join: _joinSound, leave: _leaveSound, afk: _afkSound);
+    if (!mounted) return;
+    setState(() {
+      _savingSounds = false;
+      _soundStatus = error ?? 'Sounds applied';
+    });
+  }
+
+  Widget _soundRow(
+    String title,
+    String file,
+    bool enabled,
+    bool present,
+    ValueChanged<bool> onChanged,
+  ) {
+    return SwitchListTile(
+      value: enabled,
+      onChanged: _savingSounds ? null : onChanged,
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(title, style: const TextStyle(fontSize: 13)),
+      subtitle: Text(
+        present ? 'sounds/$file' : 'sounds/$file — missing',
+        style: TextStyle(
+          fontSize: 11,
+          color: present ? Colors.white38 : Colors.orangeAccent,
+        ),
       ),
     );
   }

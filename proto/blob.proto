@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package parley;
+
+// Bulk transfers ride their own QUIC stream. The control stream is
+// length-prefixed at 64 KiB and carries presence, chat and voice state
+// in order; a 100 MB attachment or a 1 MB sound must never queue in
+// front of a chat message. One stream per transfer also gives the
+// transfer QUIC flow control for free — the sender is paced by the
+// receiver, not by a growing in-memory buffer.
+//
+// Wire shape on a fresh bidirectional stream:
+//   1. one length-prefixed BlobRequest (session::write_message)
+//   2. upload: exactly `size` raw bytes, sender -> server
+//      download: exactly `size` raw bytes, server -> sender
+//   3. upload only: one length-prefixed BlobReply (the final answer)
+//   A download's BlobReply comes BEFORE the bytes and carries `size`.
+
+enum BlobKind {
+  CHAT_FILE = 0;
+  SOUND_JOIN = 1;
+  SOUND_LEAVE = 2;
+  SOUND_AFK = 3;
+}
+
+message BlobRequest {
+  oneof body {
+    BlobUpload upload = 1;
+    BlobDownload download = 2;
+  }
+}
+
+message BlobUpload {
+  BlobKind kind = 1;
+  // CHAT_FILE only: the channel the message lands in.
+  uint64 channel_id = 2;
+  // Original file name, shown in the chat card and restored on save.
+  string file_name = 3;
+  string mime = 4;
+  uint64 size = 5;
+  // CHAT_FILE only: optional text accompanying the attachment.
+  string caption = 6;
+}
+
+message BlobDownload {
+  // Exactly one target.
+  oneof target {
+    // A chat attachment's server id.
+    uint64 file_id = 1;
+    // A personal sound: whose, and which event.
+    SoundRef sound = 2;
+  }
+}
+
+message SoundRef {
+  BlobKind kind = 1;
+  uint32 user_id = 2;
+}
+
+message BlobReply {
+  bool ok = 1;
+  string error = 2;
+  // CHAT_FILE: the new attachment id.
+  uint64 file_id = 3;
+  uint64 size = 4;
+  string file_name = 5;
+  string mime = 6;
+  // SOUND_*: the revision now advertised in presence (0 = sound
+  // removed). Lets the uploader refresh its own row without waiting
+  // for the presence broadcast.
+  uint64 sound_version = 7;
+}

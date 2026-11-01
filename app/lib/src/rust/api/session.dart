@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `disable_voice`, `enable_voice`, `into_client_body`, `mode_code`, `now_ms`, `own_user_id`, `probe`, `read_frame`, `role_code`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `connection`, `disable_voice`, `enable_voice`, `in_voice`, `into_client_body`, `mode_code`, `now_ms`, `output_muted`, `own_user_id`, `probe`, `read_frame`, `role_code`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Auth`, `Command`, `LiveSession`, `Probe`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
@@ -487,6 +487,13 @@ class ChatEntry {
   /// Pinned rows survive the 24-hour ephemeral expiry.
   final bool pinned;
 
+  /// An attached file (0 = plain text). The bytes are fetched on
+  /// click, never with the chat row.
+  final BigInt attachmentId;
+  final String attachmentName;
+  final BigInt attachmentSize;
+  final String attachmentMime;
+
   const ChatEntry({
     required this.messageId,
     required this.channelId,
@@ -495,6 +502,10 @@ class ChatEntry {
     required this.text,
     required this.timestampMs,
     required this.pinned,
+    required this.attachmentId,
+    required this.attachmentName,
+    required this.attachmentSize,
+    required this.attachmentMime,
   });
 
   @override
@@ -505,7 +516,11 @@ class ChatEntry {
       username.hashCode ^
       text.hashCode ^
       timestampMs.hashCode ^
-      pinned.hashCode;
+      pinned.hashCode ^
+      attachmentId.hashCode ^
+      attachmentName.hashCode ^
+      attachmentSize.hashCode ^
+      attachmentMime.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -518,7 +533,11 @@ class ChatEntry {
           username == other.username &&
           text == other.text &&
           timestampMs == other.timestampMs &&
-          pinned == other.pinned;
+          pinned == other.pinned &&
+          attachmentId == other.attachmentId &&
+          attachmentName == other.attachmentName &&
+          attachmentSize == other.attachmentSize &&
+          attachmentMime == other.attachmentMime;
 }
 
 /// A full management snapshot. The page replaces its tables with this on

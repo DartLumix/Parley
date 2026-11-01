@@ -3,6 +3,42 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.4.9] — 2026-11-01
+
+Cues of your own and files in chat; the bundled notes now carry the
+whole 0.4.4 → 0.4.9 jump for anyone updating from an older build.
+
+### Added
+
+- **Personal join/leave/AFK sounds.** Three optional MP3s
+  (`join.mp3`, `leave.mp3`, `afk.mp3`) live in `<app dir>/sounds/` and
+  *Profile → Soundboard* has one switch per event, uploading the
+  enabled files to the account. Presence carries a revision per file,
+  so a client downloads an unseen revision once and plays the cue
+  locally when the event happens; a missing file falls back to the
+  built-in chime. *Mute everything* silences personal cues and pokes
+  still bypass it. The folder survives the in-app updater and
+  `install.sh`.
+- **Chat file sharing.** A paperclip beside the composer uploads a
+  file (100 MB cap) into the joined channel; the row carries name,
+  size and MIME, and clicking it saves the bytes. Storage is
+  `<data_dir>/files` (new `files_dir` override) sharded on disk, with
+  metadata in SQLite; an ephemeral message deletes its attachment and
+  a sweep removes orphans. Each transfer runs on its own QUIC stream,
+  so a large upload never queues in front of chat, presence or voice
+  state.
+
+### Changed
+
+- **The bundled notes describe the jump.** `app/assets/patch_notes.md`
+  is written as 0.4.4 → 0.4.9, so a client updating from an older
+  release sees everything it skipped, not only the last version.
+
+Protocol additions are additive (`blob.proto`, presence revisions,
+attachment metadata). Voice and chat against an older build still work,
+but files and personal sounds need both sides on 0.4.9 — the server
+goes first.
+
 ## [0.4.8] — 2026-10-31
 
 ### Added

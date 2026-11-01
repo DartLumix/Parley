@@ -546,6 +546,14 @@ if [ ! -f "$NEW/$BIN" ]; then
 fi
 chmod +x "$NEW/$BIN" 2>/dev/null
 
+# Personal sounds live in <app dir>/sounds. The swap replaces the whole
+# directory, so carry the user's own files across rather than deleting
+# them with the old build.
+if [ -d "$DEST/sounds" ]; then
+    rm -rf "$NEW/sounds"
+    cp -R "$DEST/sounds" "$NEW/sounds"
+fi
+
 OLD="$DEST.old.$$"
 rm -rf "$OLD"
 if ! mv "$DEST" "$OLD"; then
@@ -607,6 +615,15 @@ try {
     if (-not (Test-Path (Join-Path $new $bin))) {
         Write-Log "the package does not contain $bin; refusing to install"
         exit 1
+    }
+
+    # Personal sounds live in <app dir>\sounds; keep them across the
+    # directory swap (the staged build has no such folder).
+    $userSounds = Join-Path $dest 'sounds'
+    if (Test-Path -LiteralPath $userSounds) {
+        $newSounds = Join-Path $new 'sounds'
+        Remove-Item -Recurse -Force $newSounds -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $userSounds -Destination $newSounds -Recurse -Force
     }
 
     $old = "$dest.old"

@@ -2,13 +2,16 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
+import 'rust/api/blob.dart' as blob_api;
 import 'rust/api/login.dart' as login_api;
 import 'rust/api/players.dart';
 import 'rust/api/session.dart';
 import 'rust/api/settings.dart' as settings_api;
+import 'rust/api/soundboard.dart' as soundboard_api;
 import 'rust/api/video.dart' as video_api;
 import 'theme.dart';
 import 'update/notes.dart' as notes;
@@ -60,6 +63,22 @@ String chatStamp(DateTime when, {DateTime? now}) {
   return local.year == today.year
       ? '$date $hour:$minute'
       : '${local.year}-$date $hour:$minute';
+}
+
+/// Human file size for a chat attachment card: B / KB / MB / GB with
+/// one decimal only where it adds information.
+String fileSizeLabel(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  final kb = bytes / 1024;
+  if (kb < 1024) {
+    return kb < 10 ? '${kb.toStringAsFixed(1)} KB' : '${kb.round()} KB';
+  }
+  final mb = kb / 1024;
+  if (mb < 1024) {
+    return mb < 10 ? '${mb.toStringAsFixed(1)} MB' : '${mb.round()} MB';
+  }
+  final gb = mb / 1024;
+  return gb < 10 ? '${gb.toStringAsFixed(1)} GB' : '${gb.round()} GB';
 }
 
 /// The clamp bounds for the left column (channels + rosters).
@@ -1117,6 +1136,21 @@ class _HomePageState extends State<HomePage> {
   Future<void> _openProfile() async {
     final session = _session;
     if (session == null) return;
+    soundboard_api.SoundboardStatus board;
+    try {
+      board = await soundboard_api.soundboardStatus();
+    } catch (_) {
+      board = const soundboard_api.SoundboardStatus(
+        dir: 'sounds',
+        joinFile: false,
+        leaveFile: false,
+        afkFile: false,
+        joinEnabled: false,
+        leaveEnabled: false,
+        afkEnabled: false,
+      );
+    }
+    if (!mounted) return;
     final changed = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
         builder: (_) => ProfilePage(
@@ -1124,6 +1158,12 @@ class _HomePageState extends State<HomePage> {
           role: session.role,
           avatar: _avatars[session.userId],
           onSave: _saveProfile,
+          soundboard: board,
+          onSoundboard: ({
+            required bool join,
+            required bool leave,
+            required bool afk,
+          }) => _applySoundboard(session.sessionId, join, leave, afk),
         ),
       ),
     );
@@ -1132,6 +1172,28 @@ class _HomePageState extends State<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Profile updated')),
       );
+    }
+  }
+
+  /// Upload the Soundboard selection. The local files are the source of
+  /// truth; the bridge refuses a toggle whose MP3 is missing before
+  /// anything reaches the wire.
+  Future<String?> _applySoundboard(
+    int sessionId,
+    bool join,
+    bool leave,
+    bool afk,
+  ) async {
+    try {
+      await soundboard_api.applySoundboard(
+        sessionId: sessionId,
+        join: join,
+        leave: leave,
+        afk: afk,
+      );
+      return null;
+    } catch (e) {
+      return '$e';
     }
   }
 
@@ -1467,7 +1529,31 @@ class _HomePageState extends State<HomePage> {
           joined: ev.joined,
           eventChannel: ev.channelId,
         )) {
-          unawaited(playVoiceChime(join: ev.joined).catchError((_) {}));
+          unawaited(
+            _membershipCue(ev.userId, ev.joined).catchError((_) {}),
+          );
+        }
+        // Your own events play your own cue too — the sound is yours,
+        // and a join/AFK confirmation is useful. Peers hear it through
+        // the same transition on their side.
+        final me = _session?.userId;
+        if (ev.userId == me) {
+          if (ev.joined && _joinedChannelId != ev.channelId && mine == null) {
+            unawaited(_personalCue(ev.userId, 'join').catchError((_) {}));
+          } else if (!ev.joined && _joinedChannelId != null) {
+            unawaited(_personalCue(ev.userId, 'leave').catchError((_) {}));
+          }
+        }
+        // AFK is a status transition, not a membership one: one cue when
+        // a peer in this channel sets their away text (or when we do).
+        final wasAfk = (_statuses[ev.userId] ?? '').isNotEmpty;
+        if (!wasAfk &&
+            ev.status.isNotEmpty &&
+            (ev.userId == me ||
+                (mine != null && _voiceChannel[ev.userId] == mine))) {
+          unawaited(
+            _personalCue(ev.userId, 'afk').catchError((_) {}),
+          );
         }
         setState(() {
           if (ev.joined) {
@@ -1659,6 +1745,31 @@ class _HomePageState extends State<HomePage> {
     setState(() => _chat.clear());
   }
 
+  /// A personal join/leave cue when the user uploaded one, the default
+  /// chime otherwise. The bridge's cache is filled from presence, so a
+  /// peer who joined before us still has their sound ready.
+  Future<void> _membershipCue(int userId, bool joined) async {
+    final session = _session;
+    if (session == null) return;
+    final played = await soundboard_api.playPersonalSound(
+      sessionId: session.sessionId,
+      userId: userId,
+      kind: joined ? 'join' : 'leave',
+    );
+    if (!played) await playVoiceChime(join: joined);
+  }
+
+  /// AFK has no built-in chime: only a personal sound plays.
+  Future<void> _personalCue(int userId, String kind) async {
+    final session = _session;
+    if (session == null) return;
+    await soundboard_api.playPersonalSound(
+      sessionId: session.sessionId,
+      userId: userId,
+      kind: kind,
+    );
+  }
+
   Future<void> _sendChat() async {
     if (_session == null || _joinedChannelId == null) return;
     final text = _chatInput.text.trim();
@@ -1669,6 +1780,112 @@ class _HomePageState extends State<HomePage> {
       channelId: _joinedChannelId!,
       text: text,
     );
+  }
+
+  /// One chat attachment row: name, size, and a click to save it. The
+  /// bytes are still on the server — the click is the download.
+  Widget _attachmentChip(ChatEntry m) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: () => unawaited(_downloadAttachment(m)),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          decoration: BoxDecoration(
+            color: barSurface,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: Colors.white12),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.attach_file, size: 14, color: accentSoft),
+              const SizedBox(width: 5),
+              Flexible(
+                child: Text(
+                  m.attachmentName,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                fileSizeLabel(m.attachmentSize.toInt()),
+                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              const SizedBox(width: 6),
+              const Icon(Icons.download, size: 14, color: Colors.white54),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _downloadAttachment(ChatEntry m) async {
+    final session = _session;
+    if (session == null) return;
+    final location = await getSaveLocation(suggestedName: m.attachmentName);
+    if (location == null || !mounted) return;
+    try {
+      final bytes = await blob_api.downloadChatFile(
+        sessionId: session.sessionId,
+        fileId: m.attachmentId,
+        path: location.path,
+      );
+      if (mounted) {
+        setState(() => _status = 'saved ${m.attachmentName}');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Saved ${m.attachmentName} (${fileSizeLabel(bytes.toInt())})',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Download failed: $e')));
+      }
+    }
+  }
+
+  /// Pick one file and upload it into the joined channel. The server
+  /// echoes a normal chat row with the attachment metadata; the caption
+  /// is whatever is typed in the composer.
+  Future<void> _attachFile() async {
+    final session = _session;
+    final channel = _joinedChannelId;
+    if (session == null || channel == null) return;
+    final XFile? file;
+    try {
+      file = await openFile();
+    } catch (e) {
+      if (mounted) setState(() => _status = 'file picker failed: $e');
+      return;
+    }
+    if (file == null) return;
+    setState(() => _status = 'uploading ${file!.name}…');
+    try {
+      await blob_api.uploadChatFile(
+        sessionId: session.sessionId,
+        channelId: channel,
+        path: file.path,
+        caption: _chatInput.text.trim(),
+      );
+      _chatInput.clear();
+      if (mounted) setState(() => _status = 'uploaded ${file!.name}');
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = 'upload failed: $e');
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Upload failed: $e')));
+      }
+    }
   }
 
   String _nameOf(int userId) => _usernames[userId] ?? 'user $userId';
@@ -2329,35 +2546,43 @@ class _HomePageState extends State<HomePage> {
                                   ),
                                 ),
                               Expanded(
-                                child: Text.rich(
-                                  TextSpan(
-                                    style: const TextStyle(fontSize: 13),
-                                    children: [
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.start,
+                                  children: [
+                                    Text.rich(
                                       TextSpan(
-                                        text: '${m.username} ',
-                                        style: TextStyle(
-                                          color: own
-                                              ? accentSoft
-                                              : Colors.white70,
-                                          fontWeight: FontWeight.bold,
-                                        ),
+                                        style: const TextStyle(fontSize: 13),
+                                        children: [
+                                          TextSpan(
+                                            text: '${m.username} ',
+                                            style: TextStyle(
+                                              color: own
+                                                  ? accentSoft
+                                                  : Colors.white70,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                          TextSpan(
+                                            text:
+                                                '${chatStamp(DateTime.fromMillisecondsSinceEpoch(m.timestampMs.toInt()))}  ',
+                                            style: const TextStyle(
+                                              color: Colors.white38,
+                                              fontSize: 11,
+                                            ),
+                                          ),
+                                          TextSpan(
+                                            text: m.text,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                      TextSpan(
-                                        text:
-                                            '${chatStamp(DateTime.fromMillisecondsSinceEpoch(m.timestampMs.toInt()))}  ',
-                                        style: const TextStyle(
-                                          color: Colors.white38,
-                                          fontSize: 11,
-                                        ),
-                                      ),
-                                      TextSpan(
-                                        text: m.text,
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                                    ),
+                                    if (m.attachmentId != BigInt.zero)
+                                      _attachmentChip(m),
+                                  ],
                                 ),
                               ),
                               IconButton(
@@ -2403,7 +2628,12 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  IconButton(
+                    onPressed: _attachFile,
+                    tooltip: 'Attach a file',
+                    icon: const Icon(Icons.attach_file, size: 20),
+                  ),
+                  const SizedBox(width: 4),
                   ElevatedButton(
                     onPressed: _sendChat,
                     child: const Text('Send'),

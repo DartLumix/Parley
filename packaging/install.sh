@@ -55,9 +55,21 @@ if command -v ldd >/dev/null 2>&1; then
 fi
 
 mkdir -p "$PREFIX/opt" "$PREFIX/bin" "$(dirname "$DESKTOP")" "$(dirname "$ICON")"
+# Personal sounds live in the install directory (sounds/join.mp3 …).
+# Re-installing replaces that directory, so carry the user's files over.
+SOUNDS_BACKUP=""
+if [ -d "$DEST/sounds" ]; then
+    SOUNDS_BACKUP=$(mktemp -d)
+    cp -R "$DEST/sounds/." "$SOUNDS_BACKUP/"
+fi
 rm -rf "$DEST"
 mkdir -p "$DEST"
 cp -R "$HERE"/. "$DEST"/
+if [ -n "$SOUNDS_BACKUP" ]; then
+    mkdir -p "$DEST/sounds"
+    cp -R "$SOUNDS_BACKUP/." "$DEST/sounds/"
+    rm -rf "$SOUNDS_BACKUP"
+fi
 chmod +x "$DEST/parley" "$DEST/install.sh" 2>/dev/null || true
 ln -sfn "$DEST/parley" "$BIN"
 cp "$HERE/parley.svg" "$ICON"

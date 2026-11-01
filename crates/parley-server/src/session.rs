@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
+/// (join, leave, afk) revisions for one account's personal sounds.
+pub type SoundVersions = (u64, u64, u64);
+
 pub struct ClientHandle {
     pub user_id: u32,
     pub username: String,
@@ -14,6 +17,10 @@ pub struct ClientHandle {
     /// The bytes themselves are never broadcast — a client asks for them
     /// only when this number differs from its cached copy.
     pub avatar_version: u64,
+    /// (join, leave, afk) personal-sound revisions as of registration,
+    /// and after an upload. Presence carries them; the MP3 bytes are
+    /// fetched over a blob stream only when one of these moves.
+    pub sound_versions: SoundVersions,
     /// Permission tier as of registration. A role change disconnects the
     /// target, so this snapshot cannot go stale while the session lives.
     pub role: crate::db::UserRole,
@@ -33,6 +40,7 @@ pub struct OnlineUser {
     pub id: u32,
     pub username: String,
     pub role: crate::db::UserRole,
+    pub sound_versions: (u64, u64, u64),
 }
 
 #[derive(Default)]
@@ -127,13 +135,30 @@ impl SessionRegistry {
         }
     }
 
-    pub fn online_users(&self) -> Vec<(u32, String, u64)> {
+    pub fn online_users(&self) -> Vec<(u32, String, u64, SoundVersions)> {
         self.clients
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, h)| (*id, h.username.clone(), h.avatar_version))
+            .map(|(id, h)| (*id, h.username.clone(), h.avatar_version, h.sound_versions))
             .collect()
+    }
+
+    /// The live name for one connected user (chat stamps, blobs).
+    pub fn username_of(&self, user_id: u32) -> Option<String> {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(&user_id)
+            .map(|h| h.username.clone())
+    }
+
+    /// One personal sound was replaced or removed: keep the live entry
+    /// in step before the presence broadcast that announces it.
+    pub fn update_sound_versions(&self, user_id: u32, versions: SoundVersions) {
+        if let Some(handle) = self.clients.lock().unwrap().get_mut(&user_id) {
+            handle.sound_versions = versions;
+        }
     }
 
     /// A profile change (name and/or avatar) landed. Keep the live entry
@@ -158,6 +183,7 @@ impl SessionRegistry {
                 id: h.user_id,
                 username: h.username.clone(),
                 role: h.role,
+                sound_versions: h.sound_versions,
             })
             .collect()
     }

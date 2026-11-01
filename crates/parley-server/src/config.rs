@@ -13,6 +13,10 @@ pub struct Config {
     pub listen: String,
     /// Directory for persistent state (cert, key, database).
     pub data_dir: PathBuf,
+    /// Chat attachments. Empty (the default) means `<data_dir>/files`,
+    /// which keeps them on the container's existing volume; a host with
+    /// a separate disk can point this elsewhere.
+    pub files_dir: PathBuf,
     /// Read-only HTTP presence endpoint (`GET /api/presence`) for a
     /// dashboard on the same host. Loopback by default; an empty string
     /// disables it. The container sets 0.0.0.0 and compose publishes the
@@ -28,6 +32,7 @@ impl Default for Config {
         Self {
             listen: "0.0.0.0:4443".to_string(),
             data_dir: "data".into(),
+            files_dir: PathBuf::new(),
             presence_listen: "127.0.0.1:4444".to_string(),
             video: VideoConfig::default(),
         }
@@ -93,6 +98,17 @@ impl VideoConfig {
 }
 
 impl Config {
+    /// Where attachments live. Deriving from `data_dir` (rather than a
+    /// second relative default) is load-bearing for the container: its
+    /// data dir is `/data`, so attachments must land there too.
+    pub fn files_dir(&self) -> PathBuf {
+        if self.files_dir.as_os_str().is_empty() {
+            self.data_dir.join("files")
+        } else {
+            self.files_dir.clone()
+        }
+    }
+
     /// Load from `path`, or defaults if the file doesn't exist.
     pub fn load_or_default(path: &Path) -> Result<Self, Error> {
         if !path.exists() {

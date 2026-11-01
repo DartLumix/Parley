@@ -3,10 +3,12 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
+import 'api/blob.dart';
 import 'api/login.dart';
 import 'api/players.dart';
 import 'api/session.dart';
 import 'api/settings.dart';
+import 'api/soundboard.dart';
 import 'api/video.dart';
 import 'api/video/imp.dart';
 
@@ -208,6 +210,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ShareStats dco_decode_share_stats(dynamic raw);
+
+  @protected
+  SoundboardStatus dco_decode_soundboard_status(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -424,6 +429,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ShareStats sse_decode_share_stats(SseDeserializer deserializer);
+
+  @protected
+  SoundboardStatus sse_decode_soundboard_status(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -707,6 +715,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_share_stats(ShareStats self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_soundboard_status(
+    SoundboardStatus self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

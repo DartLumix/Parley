@@ -285,9 +285,11 @@ fn setup_server_with_user(tag: &str) -> (Config, Server) {
 }
 
 fn setup_server_with_video(tag: &str, video: VideoConfig) -> (Config, Server) {
+    let data = test_dir(tag);
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        data_dir: test_dir(tag),
+        data_dir: data.clone(),
+        files_dir: data.join("files"),
         // Every test in this file binds its own presence port; `:0`
         // keeps parallel servers from fighting over the default.
         presence_listen: "127.0.0.1:0".to_string(),
@@ -307,9 +309,11 @@ fn setup_server_with_video(tag: &str, video: VideoConfig) -> (Config, Server) {
 /// One account per permission tier: `admin` (id 1), `mod` (id 2) and
 /// `bob` (id 3). Tests rely on those ids when a request names a target.
 fn setup_server_with_roles(tag: &str) -> (Config, Server) {
+    let data = test_dir(tag);
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        data_dir: test_dir(tag),
+        data_dir: data.clone(),
+        files_dir: data.join("files"),
         presence_listen: "127.0.0.1:0".to_string(),
         video: VideoConfig::default(),
     };
@@ -454,9 +458,11 @@ async fn heartbeat_roundtrip() {
 async fn presence_shows_connected_users() {
     init_logs();
 
+    let data = test_dir("presence");
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        data_dir: test_dir("presence"),
+        data_dir: data.clone(),
+        files_dir: data.join("files"),
         presence_listen: "127.0.0.1:0".to_string(),
         video: Default::default(),
     };
@@ -1043,9 +1049,11 @@ async fn kick_removes_from_channel_and_allows_rejoin() {
 
 #[tokio::test]
 async fn fingerprint_survives_restart() {
+    let data = test_dir("restart");
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        data_dir: test_dir("restart"),
+        data_dir: data.clone(),
+        files_dir: data.join("files"),
         presence_listen: "127.0.0.1:0".to_string(),
         video: Default::default(),
     };
@@ -2913,5 +2921,175 @@ async fn poke_reaches_only_the_target() {
     conn_a.close(0u32.into(), b"done");
     conn_b.close(0u32.into(), b"done");
     conn_c.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// 0.4.9: chat attachments and personal sounds ride their own QUIC
+/// streams. This exercises the whole path: upload header + bytes, the
+/// chat row the server broadcasts, a download that returns the exact
+/// bytes, and a sound revision appearing in presence.
+#[tokio::test]
+async fn blob_uploads_and_downloads_roundtrip() {
+    use parley_proto::{BlobDownload, BlobKind, BlobReply, BlobRequest, BlobUpload, SoundRef};
+
+    init_logs();
+    let (config, server) = setup_server_with_user("blobs");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn, mut tx, mut rx) = connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+
+    send_client_msg(&mut tx, ClientBody::ListChannels(ListChannels {})).await;
+    let channel_id = match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::ChannelList(list)) => list.channels[0].id,
+        other => panic!("expected channel list, got {other:?}"),
+    };
+
+    // --- upload a 70 KB file ---
+    let payload: Vec<u8> = (0..70_000).map(|i| (i % 251) as u8).collect();
+    let (mut btx, mut brx) = conn.open_bi().await.unwrap();
+    session::write_message(
+        &mut btx,
+        &BlobRequest {
+            body: Some(parley_proto::pb::blob_request::Body::Upload(BlobUpload {
+                kind: BlobKind::ChatFile as i32,
+                channel_id,
+                file_name: "notes.bin".into(),
+                mime: "application/octet-stream".into(),
+                size: payload.len() as u64,
+                caption: "here it is".into(),
+            })),
+        },
+    )
+    .await
+    .unwrap();
+    btx.write_all(&payload).await.unwrap();
+    btx.finish().unwrap();
+    let reply: BlobReply = session::read_message(&mut brx).await.unwrap();
+    assert!(reply.ok, "upload rejected: {}", reply.error);
+    assert_eq!(reply.size, payload.len() as u64);
+    let file_id = reply.file_id;
+
+    // The chat row carries the attachment metadata and lands for the
+    // uploader too.
+    let chat = match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::ChatMessage(m)) => m,
+        other => panic!("expected the chat broadcast, got {other:?}"),
+    };
+    assert_eq!(chat.attachment_id, file_id);
+    assert_eq!(chat.attachment_name, "notes.bin");
+    assert_eq!(chat.attachment_size, payload.len() as u64);
+    assert_eq!(chat.text, "here it is");
+
+    // History carries the same metadata — reopening the channel must
+    // not lose the card (or the download).
+    send_client_msg(
+        &mut tx,
+        ClientBody::FetchHistory(FetchHistory {
+            channel_id,
+            limit: 10,
+            before_message_id: 0,
+        }),
+    )
+    .await;
+    match read_server_msg(&mut rx).await.body {
+        Some(ServerBody::HistoryResult(r)) => {
+            let row = r
+                .messages
+                .iter()
+                .find(|m| m.attachment_id == file_id)
+                .expect("attachment row in history");
+            assert_eq!(row.attachment_name, "notes.bin");
+            assert_eq!(row.attachment_size, payload.len() as u64);
+        }
+        other => panic!("expected history, got {other:?}"),
+    }
+
+    // --- download it back byte for byte ---
+    let (mut dtx, mut drx) = conn.open_bi().await.unwrap();
+    session::write_message(
+        &mut dtx,
+        &BlobRequest {
+            body: Some(parley_proto::pb::blob_request::Body::Download(
+                BlobDownload {
+                    target: Some(parley_proto::pb::blob_download::Target::FileId(file_id)),
+                },
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    dtx.finish().unwrap();
+    let reply: BlobReply = session::read_message(&mut drx).await.unwrap();
+    assert!(reply.ok, "download rejected: {}", reply.error);
+    let mut got = vec![0u8; reply.size as usize];
+    drx.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, payload);
+
+    // --- upload a personal join sound ---
+    let mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00fake-mp3-body".to_vec();
+    let (mut stx, mut srx) = conn.open_bi().await.unwrap();
+    session::write_message(
+        &mut stx,
+        &BlobRequest {
+            body: Some(parley_proto::pb::blob_request::Body::Upload(BlobUpload {
+                kind: BlobKind::SoundJoin as i32,
+                channel_id: 0,
+                file_name: String::new(),
+                mime: "audio/mpeg".into(),
+                size: mp3.len() as u64,
+                caption: String::new(),
+            })),
+        },
+    )
+    .await
+    .unwrap();
+    stx.write_all(&mp3).await.unwrap();
+    stx.finish().unwrap();
+    let reply: BlobReply = session::read_message(&mut srx).await.unwrap();
+    assert!(reply.ok, "sound rejected: {}", reply.error);
+    assert_eq!(reply.sound_version, 1);
+
+    // Presence advertises the revision so every client can fetch it.
+    let presence: ServerMessage = session::read_message(&mut rx).await.unwrap();
+    match presence.body {
+        Some(ServerBody::PresenceList(list)) => {
+            let me = list
+                .users
+                .iter()
+                .find(|u| u.user_id == 1)
+                .expect("uploader is online");
+            assert_eq!(me.sound_join_version, 1);
+        }
+        other => panic!("expected presence after a sound upload, got {other:?}"),
+    }
+
+    // --- download the sound ---
+    let (mut gtx, mut grx) = conn.open_bi().await.unwrap();
+    session::write_message(
+        &mut gtx,
+        &BlobRequest {
+            body: Some(parley_proto::pb::blob_request::Body::Download(
+                BlobDownload {
+                    target: Some(parley_proto::pb::blob_download::Target::Sound(SoundRef {
+                        kind: BlobKind::SoundJoin as i32,
+                        user_id: 1,
+                    })),
+                },
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    gtx.finish().unwrap();
+    let reply: BlobReply = session::read_message(&mut grx).await.unwrap();
+    assert!(reply.ok, "sound download rejected: {}", reply.error);
+    let mut got = vec![0u8; reply.size as usize];
+    grx.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, mp3);
+
+    conn.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
