@@ -195,6 +195,8 @@ pub(crate) enum Command {
         /// sharer's pace governor steps resolution down to it; see
         /// `screen::PaceGovernor`.
         viewer_fps: u32,
+        /// Request-only report: the assembler is waiting for an IDR.
+        keyframe_request: bool,
     },
     /// 7g: after the local share's supervisor reported Ended, tell the
     /// server (never before Ended — no datagram may follow the notice).
@@ -313,10 +315,12 @@ impl Command {
             Command::VideoReport {
                 gap_rate_permille,
                 viewer_fps,
+                keyframe_request,
             } => ClientBody::VideoReport(VideoReport {
                 gap_rate_permille,
                 reporter_id: 0, // server stamps the authenticated id
                 viewer_fps,
+                keyframe_request,
             }),
             #[cfg(feature = "screen-capture")]
             Command::StopShare => ClientBody::StopShare(parley_proto::StopShare {}),
@@ -1002,6 +1006,17 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         // routes VideoReport to the other voice-channel members; our
         // own echo is excluded (reporter_id stamped server-side).
         ServerBody::VideoReport(rep) => {
+            // A keyframe request is not loss feedback: latch an IDR on
+            // our share and do not let its zero gap rate clear the real
+            // ladder signal. The force flag is idempotent, so a burst of
+            // requests costs one keyframe, not one per report.
+            if rep.keyframe_request
+                && rep.reporter_id != 0
+                && rep.reporter_id != own_user_id(session_id)
+            {
+                let _ = poke_share_keyframe(session_id);
+                return Vec::new();
+            }
             #[cfg(feature = "screen-capture")]
             {
                 let is_echo = rep.reporter_id == 0 || rep.reporter_id == own_user_id(session_id);
@@ -2490,17 +2505,19 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// session death). What it cannot cover is a sender whose capture or
 /// process died mid-share: the socket may stay up, the room hears
 /// nothing, and every viewer keeps a card whose Watch button shows a
-/// frozen last frame. Five seconds of silence on a stream that paced at
-/// 25–30 fps is dead by any measure; the surface is HIDDEN rather than
-/// marked stopped, so a sender that starts sending again (a stall, not
-/// a death) re-announces the same texture without a reconnect.
+/// frozen last frame. Screen capture is damage-driven, so a still screen
+/// legitimately sends nothing; the sender now refreshes its last frame
+/// once a second, and ten seconds without a single datagram means the
+/// sender really is gone. The surface is HIDDEN rather than marked
+/// stopped, so a sender that starts sending again (a stall, not a death)
+/// re-announces the same texture without a reconnect.
 #[cfg(feature = "video")]
 fn start_share_watchdog(
     session_id: u32,
     hub: SharedVideoReceiveHub,
     events: UnboundedSender<SessionEvent>,
 ) {
-    const IDLE: Duration = Duration::from_secs(5);
+    const IDLE: Duration = Duration::from_secs(10);
     rt().spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut expired: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -2560,10 +2577,13 @@ fn start_video_reporter(
     cmd_tx: UnboundedSender<Command>,
 ) {
     rt().spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         // One log line every 10 s: the viewer side's accounting must be
         // visible while a share is bad, not only after it recovers.
         let mut log_every_other = true;
+        // The report itself stays on its five-second cadence; the faster
+        // tick exists for keyframe requests, which must not wait for it.
+        let mut ticks = 0u32;
         loop {
             tick.tick().await;
             // The reporter holds a command sender, which would otherwise
@@ -2591,6 +2611,20 @@ fn start_video_reporter(
                     .unwrap_or(0);
                 s.share_viewer_fps.store(worst, Ordering::Relaxed);
             }
+            // A stalled assembler wants an IDR now, not at the sender's
+            // next two-second boundary. Request-only: zero loss, zero
+            // fps, so the sender's ladder keeps its real signal.
+            if !hub.keyframe_waiting().is_empty() {
+                let _ = cmd_tx.send(Command::VideoReport {
+                    gap_rate_permille: 0,
+                    viewer_fps: 0,
+                    keyframe_request: true,
+                });
+            }
+            ticks += 1;
+            if !ticks.is_multiple_of(5) {
+                continue;
+            }
             let Some(worst) = hub.gap_rate_permille() else {
                 continue; // no active streams: nothing to report
             };
@@ -2608,6 +2642,7 @@ fn start_video_reporter(
                 .send(Command::VideoReport {
                     gap_rate_permille: worst,
                     viewer_fps: fps,
+                    keyframe_request: false,
                 })
                 .is_err()
             {

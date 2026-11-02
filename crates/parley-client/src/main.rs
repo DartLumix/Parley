@@ -565,6 +565,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = rep_outbound.send(ClientMessage {
                     body: Some(ClientBody::VideoReport(VideoReport {
                         gap_rate_permille: worst,
+                        keyframe_request: false,
                         reporter_id: 0, // server stamps the authenticated id
                         // The terminal viewer's mpv pipe declares one fixed
                         // raw-video rate; it cannot follow a cadence that
@@ -713,7 +714,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // 6e: a viewer's video loss report steers our
                         // share bitrate. Skip own echo and unstamped.
                         if rep.reporter_id != 0 && rep.reporter_id != ok.user_id {
-                            ctrl_video_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
+                            if rep.keyframe_request {
+                                // A viewer's assembler is stalled; the
+                                // handle latches an IDR for the next frame.
+                                // A viewer-only build has no share handle,
+                                // so there is nothing to poke.
+                                #[cfg(feature = "screen-capture")]
+                                if let Some(h) = ctrl_poke.lock().unwrap().as_ref() {
+                                    h.force_keyframe();
+                                }
+                            } else {
+                                ctrl_video_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
+                            }
                         }
                     }
                     Some(ServerBody::HeartbeatAck(a)) if measure_flag => {

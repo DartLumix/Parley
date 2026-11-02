@@ -646,6 +646,26 @@ impl VideoReceiveHub {
         rates.into_iter().min()
     }
 
+    /// Senders whose assembler is stalled waiting for a keyframe. The
+    /// viewer uses this to ask the sharer for an IDR immediately. A
+    /// stream is only considered if it delivered a fragment in the last
+    /// five seconds — a dead share must not keep generating requests.
+    pub fn keyframe_waiting(&self) -> Vec<u32> {
+        let now = std::time::Instant::now();
+        let inner = self.inner.lock().unwrap();
+        let mut v: Vec<u32> = inner
+            .streams
+            .iter()
+            .filter(|(_, s)| {
+                s.assembler.needs_keyframe()
+                    && now.duration_since(s.last_packet) < Duration::from_secs(5)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Worst per-sender video gap rate since the last call (resets each
     /// sender's window). None when no streams are active. Feeds the
     /// sender's 6e ladder via VideoReport.

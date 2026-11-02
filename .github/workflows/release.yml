@@ -205,6 +205,11 @@ jobs:
           VERSION: ${{ needs.meta.outputs.version }}
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
+          # The tag's commit, not github.sha: a workflow_dispatch run
+          # checks out the tag while github.sha still points at the
+          # default branch. Baked into the app so a re-pushed tag with
+          # rebuilt artifacts is visible to the updater.
+          export PARLEY_BUILD="$(git rev-parse HEAD)"
           tools/package-client.sh "$VERSION" dist
           tools/package-cli.sh "$VERSION" dist
           tools/package-deploy.sh "$VERSION" dist \
@@ -268,7 +273,10 @@ jobs:
         run: |
           flutter config --enable-windows-desktop
           flutter pub get
-          flutter build windows --release --dart-define=PARLEY_VERSION=$env:VERSION
+          $build = (git rev-parse HEAD).Trim()
+          flutter build windows --release `
+            --dart-define=PARLEY_VERSION=$env:VERSION `
+            --dart-define=PARLEY_BUILD=$build
       - name: package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -353,6 +361,11 @@ jobs:
           # a standalone copy so the smoke job can load it; it must not
           # become a second release asset.
           rm -f dist/parley-image-*.tar.gz
+          # What the updater reads to notice a rebuilt release under the
+          # same tag. It must be generated before SHA256SUMS so the file
+          # is covered by the checksums too.
+          printf '{"version":"%s","build":"%s"}\n' \
+            "$VERSION" "$(git rev-parse HEAD)" > dist/RELEASE.json
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           # CHANGELOG.md is wrapped at 80 columns; GitHub renders every
           # newline as a hard break, so refill each paragraph and bullet

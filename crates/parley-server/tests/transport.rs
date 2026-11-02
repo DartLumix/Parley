@@ -1501,6 +1501,7 @@ async fn a_slow_viewer_gets_a_transcoded_tier() {
                     gap_rate_permille: 0,
                     reporter_id: 0,
                     viewer_fps: 5,
+                    keyframe_request: false,
                 }),
             )
             .await;
@@ -2274,6 +2275,7 @@ async fn video_report_routed_to_channel_members_only() {
             gap_rate_permille: 77,
             reporter_id: 0, // server stamps
             viewer_fps: 42, // must survive the server's rebuild
+            keyframe_request: false,
         }),
     )
     .await;
@@ -2537,6 +2539,7 @@ async fn video_routing_is_order_robust() {
             // 7h: this fixture is a 30 fps stream; the rate hint is
             // advisory and the assembler must not require it.
             high_rate: false,
+            copy: false,
             data: &f.data,
         });
     }

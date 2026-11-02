@@ -89,7 +89,7 @@
 //! here too; main.rs routes the mic to it via a tee while sharing.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -359,6 +359,27 @@ pub const PREVIEW_MAX_HEIGHT: usize = 1440;
 /// preview can only drop preview frames.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(16);
 
+/// How long a capture may deliver nothing before the encoder repeats its
+/// last frame.
+///
+/// Screen capture is damage-driven, not clock-driven: xdg-desktop-portal /
+/// PipeWire and Windows Graphics Capture both send a frame only when the
+/// captured surface CHANGES. A still desktop legitimately emits nothing
+/// for minutes. Viewers use packet arrival as the share's heartbeat (see
+/// the bridge's watchdog), so without a repeat they would hide a perfectly
+/// healthy stream after a few still seconds. One tiny P-frame a second
+/// keeps the transport alive and costs almost nothing for the same image.
+const FRAME_KEEPALIVE: Duration = Duration::from_millis(1000);
+
+/// Wall-clock IDR cadence.
+///
+/// The encoder's `intra_frame_period` is counted in FRAMES, which is the
+/// wrong clock for a damage-driven source: a still screen fed at the 1 Hz
+/// keepalive above would only produce an IDR once a minute, so a viewer
+/// that lost a packet could wait that long to recover. Forcing one every
+/// two seconds keeps the recovery window bounded in real time.
+const KEYFRAME_EVERY: Duration = Duration::from_secs(2);
+
 /// Stop switch for a running share.
 ///
 /// `request_stop` only ASKS: completion is reported later as
@@ -387,6 +408,11 @@ struct UserData {
     height: u32,
     tx: SyncSender<ToEncoder>,
     drops: u64,
+    /// Wakes the share supervisor when PipeWire reports an error state.
+    /// A proof-of-life timer is not enough: an errored stream can keep
+    /// the thread alive while producing nothing, which used to look like
+    /// a share that silently stopped.
+    die: tokio::sync::mpsc::UnboundedSender<()>,
     /// 7j: DMA-BUF capture. Some ONLY in that mode, and in that mode it
     /// also holds the encoder: the producer's buffer is guaranteed valid
     /// only until this callback queues it back, so the GPU has to be done
@@ -708,14 +734,25 @@ impl SendPacer {
         self.bps = bps.max(1);
     }
 
-    /// Block until `bytes` may be sent at the current target rate.
-    fn wait(&mut self, bytes: usize) {
+    /// Block until `bytes` may be sent at `bps * factor`.
+    ///
+    /// Deadlines advance from the previous deadline, never from "now":
+    /// every sleep overshoots by some microseconds, and resetting the
+    /// schedule after each wakeup turns that into a permanent rate
+    /// deficit (a 15 Mbps stream that actually delivers 12). A late
+    /// wakeup is caught up by sending the next fragments immediately.
+    fn wait_burst(&mut self, bytes: usize, factor: u32) {
         let now = std::time::Instant::now();
+        // After an idle stretch, do not let the whole gap become burst
+        // credit; one frame's worth of catch-up is plenty.
+        if self.next + Duration::from_millis(50) < now {
+            self.next = now;
+        }
         if self.next > now {
             std::thread::sleep(self.next - now);
         }
-        let start = std::time::Instant::now();
-        self.next = start + Duration::from_micros(pace_micros(bytes, self.bps));
+        let bps = self.bps.saturating_mul(factor.max(1));
+        self.next += Duration::from_micros(pace_micros(bytes, bps));
     }
 }
 
@@ -755,6 +792,8 @@ struct ShareEncoder {
     window: std::time::Instant,
     /// Start of the last encode — what both pacing rules measure from.
     last_encode: Option<std::time::Instant>,
+    /// When a keyframe was last put on the wire, for [`KEYFRAME_EVERY`].
+    last_keyframe: std::time::Instant,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
@@ -917,6 +956,7 @@ fn pw_thread(
     dmabuf: bool,
     sender: ShareSenderArgs,
 ) {
+    let die = sender.die.clone();
     // MainLoopBox::new calls pw::init() itself (refcounted in C, no
     // deinit exists — repeated init across share restarts is the
     // designed pattern).
@@ -961,6 +1001,7 @@ fn pw_thread(
         height: 0,
         tx,
         drops: 0,
+        die,
         inline,
         drm_format: 0,
         modifier: 0,
@@ -984,8 +1025,12 @@ fn pw_thread(
 
     let _listener = match stream
         .add_local_listener_with_user_data(data)
-        .state_changed(|_, _, old, new| {
+        .state_changed(|_, user_data, old, new| {
             println!("share: pw stream {:?} -> {:?}", old, new);
+            if matches!(new, pw::stream::StreamState::Error(_)) {
+                eprintln!("share: pipewire stream failed — ending the share");
+                let _ = user_data.die.send(());
+            }
         })
         .param_changed(|_, user_data, id, param| {
             let Some(param) = param else { return };
@@ -1668,6 +1713,7 @@ impl ShareEncoder {
             started: std::time::Instant::now(),
             warned_no_feedback: false,
             last_encode: None,
+            last_keyframe: std::time::Instant::now(),
         }
     }
 
@@ -1799,7 +1845,15 @@ impl ShareEncoder {
                     });
                 }
             }
-            Err(e) => eprintln!("share: encoder init failed: {e}"),
+            Err(e) => {
+                eprintln!("share: encoder init failed: {e}");
+                // With no previous encoder there is nothing to keep
+                // sending: the share would sit "active" forever with a
+                // black tile. End it instead of lying to the UI.
+                if self.encoder.is_none() {
+                    let _ = self.die.send(());
+                }
+            }
         }
     }
 
@@ -1850,6 +1904,10 @@ impl ShareEncoder {
             enc.force_keyframe();
             println!("share: IDR re-poke (loss epoch)");
         }
+        if self.last_keyframe.elapsed() >= KEYFRAME_EVERY {
+            enc.force_keyframe();
+            self.last_keyframe = std::time::Instant::now();
+        }
         if self.force_idr.swap(false, Ordering::Relaxed) {
             enc.force_keyframe();
             println!("share: forced keyframe (viewer joined)");
@@ -1863,6 +1921,22 @@ impl ShareEncoder {
         let Some((w, h)) = self.encoder.as_ref().map(|e| e.dimensions()) else {
             return true;
         };
+        // A capture buffer is trusted input only after this check. The
+        // strided conversion walks `stride` bytes per row straight into
+        // openh264's SIMD path, which cannot bounds-check a slice it was
+        // handed as a raw view; a short mapping (a compositor race, a
+        // truncated memfd) would otherwise read past it. Skipping one
+        // frame is always better than a segfault in a share.
+        if self.source.0 == 0
+            || self.source.1 == 0
+            || stride < self.source.0.saturating_mul(4)
+            || data.len()
+                < stride
+                    .saturating_mul(self.source.1.saturating_sub(1))
+                    .saturating_add(self.source.0.saturating_mul(4))
+        {
+            return true;
+        }
         self.last_encode = Some(std::time::Instant::now());
         // The preview sees the CAPTURE, before any resolution cap — it is
         // the sharer checking "is the right window in the frame", not a
@@ -2070,24 +2144,54 @@ impl ShareEncoder {
             eff_fps > 45.0,
         );
         self.frame_id = self.frame_id.wrapping_add(1);
-        for dg in dgs {
-            // Byte pacing, not frame-interval pacing: a fragment may only
-            // leave when the link has budget for it. See `SendPacer`.
-            self.pacer.wait(dg.len());
-            if let Err(e) = self.conn.send_datagram(dg.into()) {
-                // Real reason, not a guess: TooLarge (the estimate moved
-                // under us) and ConnectionLost are very different
-                // diagnoses — and only the second one means the share is
-                // over. Dropping the frame and re-reading the budget keeps
-                // the session alive; the viewer rebases on the next
-                // keyframe. This used to end the share outright, so a
-                // transient MTU collapse looked like the share crashing.
-                println!(
-                    "share: send_datagram failed: {e}; dropping this frame and re-reading the \
-                     datagram budget"
-                );
-                self.max_payload = fragment_budget_for(&self.conn);
-                return self.conn.close_reason().is_none();
+        if keyframe {
+            self.last_keyframe = std::time::Instant::now();
+        }
+        // A keyframe is the recovery anchor. Send it twice when the link
+        // has shown loss, when the ladder is already on a robust rung,
+        // and always for the first frame of a share. A single lost
+        // fragment otherwise destroys the whole IDR and the viewer waits
+        // for the next intra period; two independent copies make that
+        // event p^2 instead of p. The second pass is flagged so the
+        // assembler ignores it once the frame has completed.
+        let copies = if keyframe
+            && (self.encoded == 0
+                || self.ladder.on_robust_rung()
+                || self.video_loss.load(Ordering::Relaxed) > 0)
+        {
+            2
+        } else {
+            1
+        };
+        // A keyframe may burst to 4x the stream's pace: at a low rung a
+        // 100 KB IDR otherwise occupies the link for seconds, exactly when
+        // a stalled viewer needs it most. P-frames keep the strict budget.
+        let burst = if keyframe { 4 } else { 1 };
+        for pass in 0..copies {
+            for dg in &dgs {
+                let bytes = if pass == 0 {
+                    dg.clone()
+                } else {
+                    parley_proto::video::mark_copy(dg)
+                };
+                // Byte pacing, not frame-interval pacing: a fragment may only
+                // leave when the link has budget for it. See `SendPacer`.
+                self.pacer.wait_burst(bytes.len(), burst);
+                if let Err(e) = self.conn.send_datagram(bytes.into()) {
+                    // Real reason, not a guess: TooLarge (the estimate moved
+                    // under us) and ConnectionLost are very different
+                    // diagnoses — and only the second one means the share is
+                    // over. Dropping the frame and re-reading the budget keeps
+                    // the session alive; the viewer rebases on the next
+                    // keyframe. This used to end the share outright, so a
+                    // transient MTU collapse looked like the share crashing.
+                    println!(
+                        "share: send_datagram failed: {e}; dropping this frame and re-reading the \
+                         datagram budget"
+                    );
+                    self.max_payload = fragment_budget_for(&self.conn);
+                    return self.conn.close_reason().is_none();
+                }
             }
         }
         self.encoded += 1;
@@ -2179,7 +2283,31 @@ fn encoder_thread(
         tap,
         preview_tx,
     });
-    while let Ok(msg) = rx.recv() {
+    // The newest capture, kept so a still screen can be refreshed at
+    // [`FRAME_KEEPALIVE`]. The Arc makes this one atomic increment, not a
+    // second copy of a 1440p frame.
+    let mut last_frame: Option<(Arc<Vec<u8>>, usize)> = None;
+    loop {
+        let msg = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Timeout) => {
+                // Damage-driven capture sends nothing while the screen is
+                // unchanged. Re-encode the last frame once a second so
+                // viewers keep receiving packets (and keyframes stay on a
+                // wall clock, see KEYFRAME_EVERY).
+                if let Some((data, stride)) = &last_frame
+                    && share
+                        .last_encode
+                        .is_none_or(|t| t.elapsed() >= FRAME_KEEPALIVE)
+                    && !share.encode_bgra(data, *stride)
+                {
+                    let _ = share.die.send(());
+                    return;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match msg {
             ToEncoder::Negotiated { width, height, fps } => share.negotiate(width, height, fps),
             ToEncoder::Frame {
@@ -2222,6 +2350,7 @@ fn encoder_thread(
                 if let Some((width, height, f)) = renegotiate {
                     share.negotiate(width, height, f);
                 }
+                last_frame = Some((bgra.clone(), stride));
                 // The Arc came in with the frame: the preview thread
                 // shares these pixels with the encoder instead of
                 // copying them.
@@ -2233,6 +2362,11 @@ fn encoder_thread(
             }
         }
     }
+    // The capture side ended (device unplugged, portal gone, camera
+    // read failed). Tell the supervisor explicitly: without this the
+    // share stayed "active" in the UI with no encoder and no error, which
+    // presented as a random, silent stream death.
+    let _ = share.die.send(());
     println!("share: capture ended");
 }
 
@@ -3194,20 +3328,21 @@ pub async fn start(
         if closed.is_none() {
             eprintln!("share: portal Closed watch failed — stop must come from \"stop\"");
         }
-        let external = match closed.as_mut() {
+        let (external, reason) = match closed.as_mut() {
             Some(signals) => tokio::select! {
                 biased;
-                _ = stop_rx.recv() => false, // user "stop" (or all controllers dropped)
-                _ = signals.next() => true,  // desktop closed the session
-                _ = die_rx.recv() => false,  // encoder thread died (send failure / pw death)
+                _ = stop_rx.recv() => (false, "stop requested"),
+                _ = signals.next() => (true, "the desktop closed the capture session"),
+                _ = die_rx.recv() => (false, "capture pipeline ended"),
             },
             None => {
                 tokio::select! {
-                    _ = stop_rx.recv() => false,
-                    _ = die_rx.recv() => false,
+                    _ = stop_rx.recv() => (false, "stop requested"),
+                    _ = die_rx.recv() => (false, "capture pipeline ended"),
                 }
             }
         };
+        eprintln!("share: ending — {reason}");
 
         // Teardown, in order: pw loop stop → join threads → close the
         // portal session (kills the desktop's sharing indicator) →

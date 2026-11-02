@@ -23,7 +23,8 @@ class UpdateSection extends StatefulWidget {
   final Future<void> Function(
     updater.UpdateCheck check,
     void Function(double? progress) onProgress,
-  )? installAndRestart;
+  )?
+  installAndRestart;
   final Future<String?> Function()? loadNotes;
 
   @override
@@ -96,7 +97,9 @@ class _UpdateSectionState extends State<UpdateSection> {
         if (!mounted) return;
         setState(() {
           _progress = fraction;
-          _phase = fraction == null ? 'Verifying and installing…' : 'Downloading…';
+          _phase = fraction == null
+              ? 'Verifying and installing…'
+              : 'Downloading…';
         });
       });
       // The real install ends this process; only an injected one returns.
@@ -116,8 +119,7 @@ class _UpdateSectionState extends State<UpdateSection> {
   Future<void> _defaultInstall(
     updater.UpdateCheck check,
     void Function(double? progress) onProgress,
-  ) =>
-      updater.installAndRestart(check, onProgress: onProgress);
+  ) => updater.installAndRestart(check, onProgress: onProgress);
 
   Future<void> _showNotes() async {
     final text = await (widget.loadNotes ?? notes.loadPatchNotes)();
@@ -213,7 +215,11 @@ class _UpdateSectionState extends State<UpdateSection> {
       case updater.UpdateStatus.available:
         return _line(
           accentSoft,
-          'Version ${check.latest} is available — you have ${check.current}.',
+          check.rebuilt
+              ? 'A rebuilt ${check.latest} is available — you have an older '
+                    'build of the same version.'
+              : 'Version ${check.latest} is available — you have '
+                    '${check.current}.',
         );
       case updater.UpdateStatus.blocked:
         return _line(
@@ -226,7 +232,7 @@ class _UpdateSectionState extends State<UpdateSection> {
   }
 
   Widget _line(Color color, String text) => Padding(
-        padding: const EdgeInsets.only(top: 6),
-        child: Text(text, style: TextStyle(color: color, fontSize: 12)),
-      );
+    padding: const EdgeInsets.only(top: 6),
+    child: Text(text, style: TextStyle(color: color, fontSize: 12)),
+  );
 }

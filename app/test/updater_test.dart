@@ -9,6 +9,7 @@ Map<String, dynamic> releaseBody(
   bool windowsAsset = true,
   bool sums = true,
   String sumsName = 'SHA256SUMS',
+  String? build,
 }) {
   final version = tag.startsWith('v') ? tag.substring(1) : tag;
   return {
@@ -29,6 +30,11 @@ Map<String, dynamic> releaseBody(
         {
           'name': sumsName,
           'browser_download_url': 'https://example.invalid/$sumsName',
+        },
+      if (build != null)
+        {
+          'name': 'RELEASE.json',
+          'browser_download_url': 'https://example.invalid/RELEASE.json',
         },
     ],
   };
@@ -98,18 +104,20 @@ void main() {
       expect(windows.assetUrl, 'https://example.invalid/windows.zip');
     });
 
-    test('a release with no build for this platform is blocked, not failed',
-        () {
-      final check = evaluateRelease(
-        releaseBody('v0.4.4', windowsAsset: false),
-        current: '0.4.3',
-        windows: true,
-        repo: 'DartLumix/Parley',
-      );
-      expect(check.status, UpdateStatus.blocked);
-      expect(check.detail, contains('parley-0.4.4-windows-x86_64.zip'));
-      expect(check.detail, contains('DartLumix/Parley'));
-    });
+    test(
+      'a release with no build for this platform is blocked, not failed',
+      () {
+        final check = evaluateRelease(
+          releaseBody('v0.4.4', windowsAsset: false),
+          current: '0.4.3',
+          windows: true,
+          repo: 'DartLumix/Parley',
+        );
+        expect(check.status, UpdateStatus.blocked);
+        expect(check.detail, contains('parley-0.4.4-windows-x86_64.zip'));
+        expect(check.detail, contains('DartLumix/Parley'));
+      },
+    );
 
     test('an unverifiable release is blocked', () {
       final check = evaluateRelease(
@@ -131,6 +139,56 @@ void main() {
       expect(check.status, UpdateStatus.blocked);
       expect(check.latest, '0.4.4');
       expect(check.detail, contains('/opt/parley'));
+    });
+  });
+
+  group('rebuilt releases', () {
+    test('a different commit under the same tag is an update', () {
+      final check = evaluateRelease(
+        releaseBody('v0.4.9', build: 'bbbb'),
+        current: '0.4.9',
+        windows: false,
+        currentBuild: 'aaaa',
+        remoteBuild: 'bbbb',
+      );
+      expect(check.status, UpdateStatus.available);
+      expect(check.rebuilt, isTrue);
+      expect(check.latest, '0.4.9');
+      expect(check.assetName, 'parley-0.4.9-linux-x86_64.tar.gz');
+    });
+
+    test('the same commit is still up to date', () {
+      final check = evaluateRelease(
+        releaseBody('v0.4.9', build: 'aaaa'),
+        current: '0.4.9',
+        windows: false,
+        currentBuild: 'aaaa',
+        remoteBuild: 'aaaa',
+      );
+      expect(check.status, UpdateStatus.upToDate);
+      expect(check.rebuilt, isFalse);
+    });
+
+    test('a build without an id keeps the version-only answer', () {
+      final check = evaluateRelease(
+        releaseBody('v0.4.9', build: 'bbbb'),
+        current: '0.4.9',
+        windows: false,
+        currentBuild: '',
+        remoteBuild: 'bbbb',
+      );
+      expect(check.status, UpdateStatus.upToDate);
+    });
+
+    test('a pre-build-id install still sees a re-uploaded asset', () {
+      final check = evaluateRelease(
+        releaseBody('v0.4.9'),
+        current: '0.4.9',
+        windows: false,
+        artifactNewerThanInstall: true,
+      );
+      expect(check.status, UpdateStatus.available);
+      expect(check.rebuilt, isTrue);
     });
   });
 
@@ -177,7 +235,10 @@ not a checksum line
       expect(script, contains('while kill -0 "\$APP_PID"'));
       // The staged download is the whole tarball, so the install directory is
       // its single top-level entry.
-      expect(script, contains('tar -xzf "\$ARCHIVE" -C "\$NEW" --strip-components=1'));
+      expect(
+        script,
+        contains('tar -xzf "\$ARCHIVE" -C "\$NEW" --strip-components=1'),
+      );
       // A swap that cannot happen must restore rather than leave a hole.
       expect(script, contains('mv "\$OLD" "\$DEST"'));
       expect(script, contains('setsid "\$DEST/\$BIN"'));
@@ -209,8 +270,15 @@ not a checksum line
       expect(script, contains(r"$dest = 'C:\Users\a b\Parley'"));
       expect(script, contains('Get-Process -Id \$appPid'));
       expect(script, contains('Move-Item -LiteralPath \$dest'));
-      expect(script, contains('Move-Item -LiteralPath \$old -Destination \$dest'));
+      expect(
+        script,
+        contains('Move-Item -LiteralPath \$old -Destination \$dest'),
+      );
       expect(script, contains('Start-Process'));
+      // Windows refuses to rename a directory that is a process's CWD.
+      expect(script, contains(r'Set-Location -LiteralPath $env:TEMP'));
+      expect(script, contains(r'$LASTEXITCODE'));
+      expect(script, contains(r'-PassThru'));
     });
   });
 

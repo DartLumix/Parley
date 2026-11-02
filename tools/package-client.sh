@@ -15,6 +15,9 @@ set -euo pipefail
 VERSION=${1:?usage: package-client.sh <version> [outdir]}
 OUT=${2:-dist}
 BUILD_NUMBER=${BUILD_NUMBER:-1}
+# The commit this build came from, baked into the app so the updater can
+# tell a rebuilt release from an unchanged one. Optional for a local build.
+BUILD_ID=${PARLEY_BUILD:-}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NAME="parley-${VERSION}-linux-x86_64"
@@ -29,10 +32,15 @@ echo "==> bridge (release, all features)"
     --features audio-device,aec,video,screen-capture,hw-encode)
 
 echo "==> Flutter bundle"
+BUILD_ARGS=()
+if [ -n "$BUILD_ID" ]; then
+    BUILD_ARGS+=(--dart-define=PARLEY_BUILD="$BUILD_ID")
+fi
 (cd "$ROOT/app" && flutter build linux --release \
     --build-name "$VERSION" \
     --build-number "$BUILD_NUMBER" \
-    --dart-define=PARLEY_VERSION="$VERSION")
+    --dart-define=PARLEY_VERSION="$VERSION" \
+    "${BUILD_ARGS[@]}")
 
 test -x "$BUNDLE/parley" || { echo "no bundle at $BUNDLE" >&2; exit 1; }
 test -f "$BUNDLE/lib/libparley_flutter.so" || {

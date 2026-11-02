@@ -140,10 +140,11 @@ class UpdateCheck {
     this.assetUrl,
     this.sumsUrl,
     this.detail,
+    this.rebuilt = false,
   });
 
   const UpdateCheck.upToDate(String current)
-      : this._(status: UpdateStatus.upToDate, current: current);
+    : this._(status: UpdateStatus.upToDate, current: current);
 
   const UpdateCheck.available({
     required String current,
@@ -151,28 +152,30 @@ class UpdateCheck {
     required String assetName,
     required String assetUrl,
     required String sumsUrl,
+    bool rebuilt = false,
   }) : this._(
-          status: UpdateStatus.available,
-          current: current,
-          latest: latest,
-          assetName: assetName,
-          assetUrl: assetUrl,
-          sumsUrl: sumsUrl,
-        );
+         status: UpdateStatus.available,
+         current: current,
+         latest: latest,
+         assetName: assetName,
+         assetUrl: assetUrl,
+         sumsUrl: sumsUrl,
+         rebuilt: rebuilt,
+       );
 
   const UpdateCheck.blocked({
     required String current,
     required String latest,
     required String detail,
   }) : this._(
-          status: UpdateStatus.blocked,
-          current: current,
-          latest: latest,
-          detail: detail,
-        );
+         status: UpdateStatus.blocked,
+         current: current,
+         latest: latest,
+         detail: detail,
+       );
 
   const UpdateCheck.failed({required String current, required String detail})
-      : this._(status: UpdateStatus.failed, current: current, detail: detail);
+    : this._(status: UpdateStatus.failed, current: current, detail: detail);
 
   final UpdateStatus status;
 
@@ -189,6 +192,21 @@ class UpdateCheck {
   /// A sentence for the user, for [UpdateStatus.blocked] and
   /// [UpdateStatus.failed].
   final String? detail;
+
+  /// True when [latest] equals [current] but the published artifacts
+  /// were rebuilt from a different commit (a tag moved under the same
+  /// version). [UpdateStatus.available] in that case, not up to date.
+  final bool rebuilt;
+}
+
+/// One asset out of a release body by file name, or null.
+Map<String, dynamic>? _asset(Map<String, dynamic> release, String name) {
+  for (final asset in (release['assets'] as List?) ?? const []) {
+    if (asset is Map && asset['name'] == name) {
+      return Map<String, dynamic>.from(asset);
+    }
+  }
+  return null;
 }
 
 /// Turn a `GET /repos/{repo}/releases/latest` body into a decision.
@@ -202,22 +220,27 @@ UpdateCheck evaluateRelease(
   required bool windows,
   String repo = '',
   String? blocker,
+  String currentBuild = '',
+  String remoteBuild = '',
+  bool artifactNewerThanInstall = false,
 }) {
   final latest = Version.parse((release['tag_name'] as String?) ?? '');
-  if (latest <= Version.parse(current)) return UpdateCheck.upToDate(current);
+  final currentVersion = Version.parse(current);
+  final newer = latest > currentVersion;
+  // Same tag, new bytes: the release was rebuilt in place. A build id
+  // catches that exactly; a pre-build-id copy falls back to comparing
+  // the release asset's upload time with when this install was written.
+  final rebuilt =
+      !newer &&
+      latest == currentVersion &&
+      ((currentBuild.isNotEmpty &&
+              remoteBuild.isNotEmpty &&
+              currentBuild != remoteBuild) ||
+          artifactNewerThanInstall);
+  if (!newer && !rebuilt) return UpdateCheck.upToDate(current);
 
   final version = latest.toString();
   final name = assetNameFor(version, windows: windows);
-  final assets = (release['assets'] as List?) ?? const [];
-
-  Map<String, dynamic>? find(String wanted) {
-    for (final asset in assets) {
-      if (asset is Map && asset['name'] == wanted) {
-        return Map<String, dynamic>.from(asset);
-      }
-    }
-    return null;
-  }
 
   if (blocker != null) {
     return UpdateCheck.blocked(
@@ -227,23 +250,26 @@ UpdateCheck evaluateRelease(
     );
   }
 
-  final url = find(name)?['browser_download_url'] as String?;
+  final url = _asset(release, name)?['browser_download_url'] as String?;
   if (url == null || url.isEmpty) {
     return UpdateCheck.blocked(
       current: current,
       latest: version,
-      detail: 'release $version has no $name'
+      detail:
+          'release $version has no $name'
           '${repo.isEmpty ? '' : ' at $repo'} — publish it, or install this '
-              'build by hand',
+          'build by hand',
     );
   }
 
-  final sums = find('SHA256SUMS')?['browser_download_url'] as String?;
+  final sums =
+      _asset(release, 'SHA256SUMS')?['browser_download_url'] as String?;
   if (sums == null || sums.isEmpty) {
     return UpdateCheck.blocked(
       current: current,
       latest: version,
-      detail: 'release $version has no SHA256SUMS, so the download could not '
+      detail:
+          'release $version has no SHA256SUMS, so the download could not '
           'be verified',
     );
   }
@@ -254,13 +280,17 @@ UpdateCheck evaluateRelease(
     assetName: name,
     assetUrl: url,
     sumsUrl: sums,
+    rebuilt: rebuilt,
   );
 }
 
 /// Ask the channel. Never throws: a missing or private mirror, a rate limit
 /// or a dead network all come back as [UpdateStatus.failed] with a reason the
 /// settings page can show.
-Future<UpdateCheck> checkForUpdate({HttpClient? client, String? current}) async {
+Future<UpdateCheck> checkForUpdate({
+  HttpClient? client,
+  String? current,
+}) async {
   final now = current ?? parleyVersion;
   final repo = updateRepo;
   final owned = client ?? HttpClient();
@@ -294,12 +324,62 @@ Future<UpdateCheck> checkForUpdate({HttpClient? client, String? current}) async 
         detail: 'unexpected answer from $repo',
       );
     }
+    final release = Map<String, dynamic>.from(decoded);
+    // A moved tag publishes new bytes under the same version. Ask the
+    // release which commit its artifacts came from; older releases have
+    // no RELEASE.json, and a missing/odd one simply means "compare the
+    // version", which is what every pre-build-id release did.
+    final sameVersion =
+        Version.parse((release['tag_name'] as String?) ?? '') ==
+        Version.parse(now);
+    var remoteBuild = '';
+    if (parleyBuild.isNotEmpty && sameVersion) {
+      final url =
+          _asset(release, 'RELEASE.json')?['browser_download_url'] as String?;
+      if (url != null && url.isNotEmpty) {
+        try {
+          final answer = await _get(owned, Uri.parse(url));
+          if (answer.status == 200) {
+            final body = jsonDecode(answer.body);
+            if (body is Map && body['build'] is String) {
+              remoteBuild = body['build'] as String;
+            }
+          }
+        } on Object {
+          // Keep the version-only answer rather than failing the check.
+        }
+      }
+    }
+    // A build that predates PARLEY_BUILD cannot compare commits. Its
+    // install directory's mtime is when its files were written, so a
+    // re-uploaded asset timestamped after that is a rebuilt release.
+    // (This is the fallback the user asked for: artifact date, but only
+    // when there is no build id to do the job exactly.)
+    var artifactNewerThanInstall = false;
+    if (parleyBuild.isEmpty && sameVersion) {
+      final updatedAt = DateTime.tryParse(
+        (_asset(release, assetNameFor(now, windows: _windows))?['updated_at']
+                as String?) ??
+            '',
+      );
+      try {
+        final installed = installDir().statSync().modified;
+        artifactNewerThanInstall =
+            updatedAt != null &&
+            updatedAt.isAfter(installed.add(const Duration(seconds: 60)));
+      } on Object {
+        // No install directory to date (or no clock): version only.
+      }
+    }
     return evaluateRelease(
-      Map<String, dynamic>.from(decoded),
+      release,
       current: now,
       windows: _windows,
       repo: repo,
       blocker: await installBlocker(),
+      currentBuild: parleyBuild,
+      remoteBuild: remoteBuild,
+      artifactNewerThanInstall: artifactNewerThanInstall,
     );
   } on Object catch (e) {
     return UpdateCheck.failed(
@@ -345,7 +425,8 @@ Directory updateRoot() {
 
   final base = _windows
       ? (env('LOCALAPPDATA') ?? Directory.systemTemp.path)
-      : (env('XDG_CACHE_HOME') ?? '${env('HOME') ?? Directory.systemTemp.path}/.cache');
+      : (env('XDG_CACHE_HOME') ??
+            '${env('HOME') ?? Directory.systemTemp.path}/.cache');
   return Directory('$base${_sep}parley');
 }
 
@@ -362,9 +443,7 @@ Future<void> installAndRestart(
   if (check.status != UpdateStatus.available) {
     throw const UpdateException('there is nothing to install');
   }
-  final stage = Directory(
-    '${updateRoot().path}${_sep}update-${check.latest}',
-  );
+  final stage = Directory('${updateRoot().path}${_sep}update-${check.latest}');
   if (stage.existsSync()) stage.deleteSync(recursive: true);
   final downloads = Directory('${stage.path}${_sep}download')
     ..createSync(recursive: true);
@@ -474,15 +553,19 @@ String linuxSwapScript({
   required String newDir,
   required String bin,
   required String log,
-}) =>
-    _fill(_linuxTemplate, {
-      'PID': '$pid',
-      'DEST': dest,
-      'ARCHIVE': archive,
-      'NEW': newDir,
-      'BIN': bin,
-      'LOG': log,
-    }, powershell: false, raw: const {'PID'});
+}) => _fill(
+  _linuxTemplate,
+  {
+    'PID': '$pid',
+    'DEST': dest,
+    'ARCHIVE': archive,
+    'NEW': newDir,
+    'BIN': bin,
+    'LOG': log,
+  },
+  powershell: false,
+  raw: const {'PID'},
+);
 
 /// The Windows swap script as text (see [linuxSwapScript]).
 @visibleForTesting
@@ -493,15 +576,19 @@ String windowsSwapScript({
   required String newDir,
   required String bin,
   required String log,
-}) =>
-    _fill(_windowsTemplate, {
-      'PID': '$pid',
-      'DEST': dest,
-      'ARCHIVE': archive,
-      'NEW': newDir,
-      'BIN': bin,
-      'LOG': log,
-    }, powershell: true, raw: const {'PID'});
+}) => _fill(
+  _windowsTemplate,
+  {
+    'PID': '$pid',
+    'DEST': dest,
+    'ARCHIVE': archive,
+    'NEW': newDir,
+    'BIN': bin,
+    'LOG': log,
+  },
+  powershell: true,
+  raw: const {'PID'},
+);
 
 const String _linuxTemplate = r'''
 #!/bin/sh
@@ -592,6 +679,10 @@ function Write-Log([string]$message) {
 }
 
 Write-Log "parley update: replacing $dest"
+# A process cannot rename a directory that is its own working directory.
+# `_spawn` already points this script at the update root; this is the
+# belt-and-braces version for a shortcut or a launcher that ignored it.
+Set-Location -LiteralPath $env:TEMP
 
 $deadline = (Get-Date).AddSeconds(90)
 while (Get-Process -Id $appPid -ErrorAction SilentlyContinue) {
@@ -607,9 +698,16 @@ try {
     New-Item -ItemType Directory -Force -Path $new | Out-Null
     # The zip holds the bundle contents at its top level, so it unpacks
     # straight into the new directory.
+    $unpacked = $false
     if (Get-Command tar.exe -ErrorAction SilentlyContinue) {
         & tar.exe -xf $archive -C $new
-    } else {
+        if ($LASTEXITCODE -eq 0) {
+            $unpacked = $true
+        } else {
+            Write-Log "tar.exe failed ($LASTEXITCODE); trying Expand-Archive"
+        }
+    }
+    if (-not $unpacked) {
         Expand-Archive -LiteralPath $archive -DestinationPath $new -Force
     }
     if (-not (Test-Path (Join-Path $new $bin))) {
@@ -648,9 +746,17 @@ try {
         Move-Item -LiteralPath $old -Destination $dest
         exit 1
     }
-    Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue
+    # The install has already succeeded at this point. A file left open
+    # in the old directory must not stop the new build from starting.
+    try {
+        Remove-Item -Recurse -Force $old -ErrorAction Stop
+    } catch {
+        Write-Log "could not remove $old (harmless): $_"
+    }
     Write-Log 'installed; starting the new build'
-    Start-Process -FilePath (Join-Path $dest $bin) -WorkingDirectory $dest
+    $child = Start-Process -FilePath (Join-Path $dest $bin) `
+        -WorkingDirectory $dest -PassThru
+    Write-Log "started $bin as pid $($child.Id)"
     exit 0
 } catch {
     Write-Log "update failed: $_"
@@ -661,6 +767,12 @@ try {
 /// Start the swap script in its own session, so it survives this process —
 /// which is the point: it is waiting for exactly that.
 Future<void> _spawn(File script) async {
+  // NEVER with the install directory as the child's working directory:
+  // Windows refuses to rename a directory while any process is sitting
+  // in it, and Explorer launches an app with its own folder as the CWD.
+  // That was why the Windows updater downloaded, closed the app, and
+  // then quietly failed to move the old build aside.
+  final cwd = updateRoot()..createSync(recursive: true);
   if (_windows) {
     await Process.start(
       'powershell.exe',
@@ -673,12 +785,14 @@ Future<void> _spawn(File script) async {
         '-File',
         script.path,
       ],
+      workingDirectory: cwd.path,
       mode: ProcessStartMode.detached,
     );
   } else {
     await Process.start(
       '/bin/sh',
       [script.path],
+      workingDirectory: cwd.path,
       mode: ProcessStartMode.detached,
     );
   }
@@ -734,8 +848,8 @@ Future<String> _sha256Of(File file) async {
 /// the file does not list [name].
 String? sha256FromSums(String sums, String name) {
   for (final line in const LineSplitter().convert(sums)) {
-    final match =
-        RegExp(r'^([0-9a-fA-F]{64})\s+\*?(.+)$').firstMatch(line.trim());
+    final match = RegExp(r'^([0-9a-fA-F]{64})\s+\*?(.+)$')
+        .firstMatch(line.trim());
     if (match == null) continue;
     final file = match.group(2)!.trim();
     if (file == name || file.endsWith('/$name')) {
@@ -796,6 +910,7 @@ String _quoted(String value, {required bool powershell}) => powershell
     ? "'${value.replaceAll("'", "''")}'"
     : "'${value.replaceAll("'", "'\\''")}'";
 
-String get _binaryName => File(Platform.resolvedExecutable).uri.pathSegments.last;
+String get _binaryName =>
+    File(Platform.resolvedExecutable).uri.pathSegments.last;
 
 String get _sep => Platform.pathSeparator;

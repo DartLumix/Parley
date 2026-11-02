@@ -44,6 +44,23 @@ pub const FRAG_KEYFRAME: u8 = 1 << 0;
 /// ignore it.
 pub const FRAG_HIGH_RATE: u8 = 1 << 1;
 
+/// This fragment is a member of the sender's second copy of a
+/// keyframe. The assembler stores in-progress copies normally (a copy
+/// can replace a lost original), but once the frame is complete a
+/// flagged copy is never allowed to start a new partial frame.
+pub const FRAG_COPY: u8 = 1 << 2;
+
+/// Hard cap on one frame's fragment count. A 4K IDR is a few hundred
+/// fragments; 8192 leaves room for a very large one while refusing a
+/// sender that would otherwise make the assembler allocate a map of
+/// 65k entries.
+pub const MAX_FRAME_FRAGMENTS: u16 = 8192;
+
+/// Hard cap on the bytes one frame may accumulate. Generous (a 4K
+/// keyframe is around 1 MB), but bounded: a broken or hostile sender
+/// must not be able to grow a receiver's memory without limit.
+pub const MAX_FRAME_BYTES: usize = 12 * 1024 * 1024;
+
 /// Nominal frame rate implied by a fragment's rate hint.
 pub fn hinted_frame_rate(high_rate: bool) -> f32 {
     if high_rate { 60.0 } else { 30.0 }
@@ -58,6 +75,8 @@ pub struct VideoFragment<'a> {
     pub keyframe: bool,
     /// 7h: see [`FRAG_HIGH_RATE`].
     pub high_rate: bool,
+    /// See [`FRAG_COPY`].
+    pub copy: bool,
     pub data: &'a [u8],
 }
 
@@ -94,6 +113,9 @@ pub fn decode_fragment(payload: &[u8]) -> Result<VideoFragment<'_>, &'static str
     if frag_count == 0 {
         return Err("fragment count must be nonzero");
     }
+    if frag_count > MAX_FRAME_FRAGMENTS {
+        return Err("fragment count exceeds the frame cap");
+    }
     if frag_idx >= frag_count {
         return Err("fragment index out of range");
     }
@@ -103,8 +125,25 @@ pub fn decode_fragment(payload: &[u8]) -> Result<VideoFragment<'_>, &'static str
         frag_count,
         keyframe: payload[8] & FRAG_KEYFRAME != 0,
         high_rate: payload[8] & FRAG_HIGH_RATE != 0,
+        copy: payload[8] & FRAG_COPY != 0,
         data: &payload[VIDEO_HEADER_LEN..],
     })
+}
+
+/// Return a copy of a media datagram with [`FRAG_COPY`] set in its
+/// video flags. The second pass of a duplicated keyframe uses this.
+///
+/// The flags byte sits at `HEADER_LEN + VIDEO_HEADER_LEN - 1` (the last
+/// byte of the video sub-header). A datagram too short to carry it is
+/// returned unchanged; every caller feeds datagrams produced by
+/// [`fragment_frame_with_max`].
+pub fn mark_copy(datagram: &[u8]) -> Vec<u8> {
+    let mut out = datagram.to_vec();
+    let flags = crate::media::HEADER_LEN + VIDEO_HEADER_LEN - 1;
+    if out.len() > flags {
+        out[flags] |= FRAG_COPY;
+    }
+    out
 }
 
 /// Splits one encoded H.264 frame into fragments, each pre-wrapped with
@@ -196,6 +235,11 @@ pub struct VideoAssembler {
     current: std::collections::HashMap<u16, Vec<u8>>,
     current_frame_id: Option<u32>,
     current_frag_count: u16,
+    /// Bytes held in `current`, for [`MAX_FRAME_BYTES`].
+    current_bytes: usize,
+    /// The most recently completed frame id. Every later fragment with
+    /// an id at or below this is a duplicate/straggler, not a new frame.
+    completed_frame: Option<u32>,
     current_is_keyframe: bool,
     /// 7h: rate hint of the in-progress frame (from its fragments).
     current_high_rate: bool,
@@ -209,6 +253,10 @@ pub struct VideoAssembler {
     pub frames_dropped: u64,
     /// Fragments dropped because we're waiting for a keyframe (stat).
     pub fragments_skipped: u64,
+    /// Fragments ignored because their frame had already completed
+    /// (the sender's second keyframe pass, or a late reordered
+    /// original). Stat only.
+    pub duplicates_ignored: u64,
     /// 6e window counters for gap_rate_permille: frames displayed /
     /// frames known-missed since the last read.
     win_completed: u64,
@@ -234,6 +282,8 @@ impl VideoAssembler {
             current: std::collections::HashMap::new(),
             current_frame_id: None,
             current_frag_count: 0,
+            current_bytes: 0,
+            completed_frame: None,
             current_is_keyframe: false,
             current_high_rate: false,
             waiting_for_keyframe: true,
@@ -241,6 +291,7 @@ impl VideoAssembler {
             frames_completed: 0,
             frames_dropped: 0,
             fragments_skipped: 0,
+            duplicates_ignored: 0,
             win_completed: 0,
             win_missed: 0,
             missed_ids: std::collections::HashSet::new(),
@@ -250,6 +301,31 @@ impl VideoAssembler {
     /// Feed one decoded video fragment. Completed frames appear in
     /// `pop_frame()`.
     pub fn push_fragment(&mut self, frag: VideoFragment<'_>) {
+        // Frame ids are scoped to one encoder epoch. A server-transcoded
+        // tier restarts at 0 while the original stream may be at 75; a
+        // fresh share does the same. Without this reset every tier
+        // fragment would look like a straggler and the switch would
+        // never display. A late original of the SAME first frame is
+        // guarded by `done != 0`: that frame already completed, so a
+        // keyframe-zero after it is a new epoch, not a copy.
+        if frag.keyframe
+            && frag.frame_id == 0
+            && !frag.copy
+            && self.completed_frame.is_some_and(|done| done != 0)
+        {
+            self.reset_epoch();
+        }
+        // A duplicated keyframe fragment or a late original belongs to
+        // a frame that has already been assembled. Treating it as a new
+        // frame would start a one-fragment partial frame, which the next
+        // delta would then report as loss. This is what makes the
+        // sender's second keyframe pass safe.
+        if let Some(done) = self.completed_frame
+            && frag.frame_id <= done
+        {
+            self.duplicates_ignored += 1;
+            return;
+        }
         // Accept fragments for the current frame in ANY order — the
         // network reorders, and completion is set-based, not sequence-based.
         if self.waiting_for_keyframe {
@@ -300,6 +376,18 @@ impl VideoAssembler {
         }
     }
 
+    /// A fresh encoder epoch starts its frame ids at 0. Drop the old
+    /// in-progress state but keep completed output and statistics; the
+    /// consumer still has to display frames already assembled behind
+    /// the switch.
+    fn reset_epoch(&mut self) {
+        self.current.clear();
+        self.current_frame_id = None;
+        self.current_bytes = 0;
+        self.completed_frame = None;
+        self.waiting_for_keyframe = false;
+    }
+
     fn start_frame(&mut self, frag: &VideoFragment<'_>) {
         // A keyframe fragment begins a new loss epoch: the dedupe set
         // resets (its counts are already banked in win_missed).
@@ -307,6 +395,7 @@ impl VideoAssembler {
             self.missed_ids.clear();
         }
         self.current.clear();
+        self.current_bytes = 0;
         self.current_frame_id = Some(frag.frame_id);
         self.current_frag_count = frag.frag_count;
         self.current_is_keyframe = frag.keyframe;
@@ -322,16 +411,36 @@ impl VideoAssembler {
     }
 
     fn store_fragment(&mut self, frag: VideoFragment<'_>) {
-        self.current.insert(frag.frag_idx, frag.data.to_vec());
+        let previous = self.current.insert(frag.frag_idx, frag.data.to_vec());
+        self.current_bytes += frag.data.len();
+        if let Some(old) = previous {
+            self.current_bytes -= old.len();
+        }
+        // Bound memory independently of the fragment-count cap: a
+        // sender can claim a legal fragment count and still send huge
+        // fragments. Dropping the frame is the same path as a loss.
+        if self.current_bytes > MAX_FRAME_BYTES {
+            let id = self.current_frame_id.unwrap_or(frag.frame_id);
+            self.current.clear();
+            self.current_frame_id = None;
+            self.current_bytes = 0;
+            self.waiting_for_keyframe = true;
+            self.frames_dropped += 1;
+            self.note_missed(id);
+            return;
+        }
         if self.current.len() == self.current_frag_count as usize {
             // Frame complete: concatenate in order.
-            let mut data = Vec::new();
+            let frame_id = self.current_frame_id.unwrap();
+            let mut data = Vec::with_capacity(self.current_bytes);
             for idx in 0..self.current_frag_count {
                 // Unwrap: len == frag_count guarantees every idx present.
-                data.extend_from_slice(&self.current[&idx]);
+                if let Some(part) = self.current.get(&idx) {
+                    data.extend_from_slice(part);
+                }
             }
             let frame = AssembledFrame {
-                frame_id: self.current_frame_id.unwrap(),
+                frame_id,
                 keyframe: self.current_is_keyframe,
                 high_rate: self.current_high_rate,
                 data,
@@ -341,7 +450,18 @@ impl VideoAssembler {
             self.win_completed += 1;
             self.current.clear();
             self.current_frame_id = None;
+            self.current_bytes = 0;
+            // Every later fragment for this id — the flagged second
+            // copy, or a reordered original — is a duplicate.
+            self.completed_frame = Some(frame_id);
         }
+    }
+
+    /// True while the assembler has dropped a frame and is waiting for
+    /// a keyframe. The viewer uses this to request an IDR immediately
+    /// instead of waiting for the sender's intra period.
+    pub fn needs_keyframe(&self) -> bool {
+        self.waiting_for_keyframe
     }
 
     /// Pop one completed frame, if any.
@@ -563,6 +683,98 @@ mod tests {
         assert!(decode_fragment(&f).is_err());
         let f = encode_fragment(1, 5, 3, false, false, &[0xFF; 10]); // idx >= count
         assert!(decode_fragment(&f).is_err());
+    }
+
+    #[test]
+    fn duplicated_keyframe_completes_once() {
+        // The sender sends an IDR twice; every copy after completion
+        // must be ignored, and the next delta must still be accepted.
+        let data: Vec<u8> = (0..2600u32).map(|i| (i % 249) as u8).collect();
+        let dgs = fragments(4, true, &data, 0);
+        let mut asm = VideoAssembler::new();
+        for f in decode_all(&dgs) {
+            asm.push_fragment(f);
+        }
+        for dg in &dgs {
+            let copy = mark_copy(dg);
+            let m = crate::media::decode(&copy).unwrap();
+            asm.push_fragment(decode_fragment(m.payload).unwrap());
+        }
+        assert_eq!(asm.frames_completed, 1, "the copies are not a frame");
+        assert_eq!(asm.duplicates_ignored, dgs.len() as u64);
+        assert_eq!(asm.pop_frame().unwrap().data, data);
+        assert!(asm.pop_frame().is_none());
+
+        // A following delta (frame 5) starts normally.
+        let delta = vec![0x42; 1200];
+        for f in decode_all(&fragments(5, false, &delta, 20)) {
+            asm.push_fragment(f);
+        }
+        assert_eq!(asm.pop_frame().unwrap().data, delta);
+    }
+
+    #[test]
+    fn a_copy_recovers_a_lost_original() {
+        let data: Vec<u8> = (0..3600u32).map(|i| (i % 241) as u8).collect();
+        let dgs = fragments(8, true, &data, 0);
+        let mut asm = VideoAssembler::new();
+        for (i, dg) in dgs.iter().enumerate() {
+            if i == 1 {
+                continue; // lose this original
+            }
+            let m = crate::media::decode(dg).unwrap();
+            asm.push_fragment(decode_fragment(m.payload).unwrap());
+        }
+        // The flagged copy fills the missing index and completes the frame.
+        let copy = mark_copy(&dgs[1]);
+        let m = crate::media::decode(&copy).unwrap();
+        let frag = decode_fragment(m.payload).unwrap();
+        assert!(frag.copy);
+        asm.push_fragment(frag);
+        assert_eq!(asm.frames_completed, 1);
+        assert_eq!(asm.pop_frame().unwrap().data, data);
+    }
+
+    #[test]
+    fn late_original_after_completion_is_ignored() {
+        let data: Vec<u8> = vec![0x33; 2400];
+        let dgs = fragments(3, true, &data, 0);
+        let mut asm = VideoAssembler::new();
+        for f in decode_all(&dgs) {
+            asm.push_fragment(f);
+        }
+        // Re-deliver the last original (reordering, not a copy).
+        let m = crate::media::decode(dgs.last().unwrap()).unwrap();
+        asm.push_fragment(decode_fragment(m.payload).unwrap());
+        assert_eq!(asm.duplicates_ignored, 1);
+        assert_eq!(asm.frames_completed, 1);
+        assert!(asm.pop_frame().is_some());
+        assert!(asm.pop_frame().is_none());
+    }
+
+    #[test]
+    fn a_new_epoch_keyframe_zero_resets_a_completed_stream() {
+        // The original stream completes frame 5, then a server tier (or a
+        // restarted share) starts again at 0. That keyframe must be
+        // accepted, not mistaken for a straggler.
+        let mut asm = VideoAssembler::new();
+        for f in decode_all(&fragments(5, true, &[0x11; 1000], 0)) {
+            asm.push_fragment(f);
+        }
+        assert_eq!(asm.frames_completed, 1);
+        let fresh: Vec<u8> = vec![0x22; 1500];
+        for f in decode_all(&fragments(0, true, &fresh, 0)) {
+            asm.push_fragment(f);
+        }
+        assert_eq!(asm.frames_completed, 2);
+        assert_eq!(asm.pop_frame().unwrap().data, vec![0x11; 1000]);
+        assert_eq!(asm.pop_frame().unwrap().data, fresh);
+    }
+
+    #[test]
+    fn oversized_fragment_count_is_rejected() {
+        let payload = encode_fragment(0, 0, MAX_FRAME_FRAGMENTS + 1, true, false, &[0]);
+        assert!(decode_fragment(&payload).is_err());
     }
 
     #[test]

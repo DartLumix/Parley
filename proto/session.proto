@@ -197,6 +197,13 @@ message VideoReport {
   // Additive: a server that predates it forwards 0, and a sender that
   // predates it ignores the field.
   uint32 viewer_fps = 3;
+  // Request-only report: the viewer's assembler is waiting for a
+  // keyframe (a gap, a decoder reset or a mid-stream join) and wants
+  // the sharer to force an IDR now instead of waiting for the intra
+  // period. gap_rate_permille is 0 on these, so a sender must not treat
+  // the zero as "loss cleared". The server routes it exactly like any
+  // other VideoReport; every voice-channel sharer latches one IDR.
+  bool keyframe_request = 4;
 }
 
 // --- Profiles ---

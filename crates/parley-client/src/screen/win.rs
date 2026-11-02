@@ -775,12 +775,25 @@ pub async fn start(
     }
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tokio::spawn(async move {
-        tokio::select! {
+        let external = tokio::select! {
             biased;
-            _ = stop_rx.recv() => {}
-            _ = die_rx.recv() => {}
-
-        }
+            _ = stop_rx.recv() => {
+                eprintln!("share: ending — stop requested");
+                false
+            }
+            _ = die_rx.recv() => {
+                let closed = closed.load(Ordering::Relaxed);
+                eprintln!(
+                    "share: ending — {}",
+                    if closed {
+                        "the captured window or session closed"
+                    } else {
+                        "capture pipeline ended"
+                    }
+                );
+                closed
+            }
+        };
         stop_flag.store(true, Ordering::Relaxed);
         // WM_QUIT ends WGC's GetMessage loop. Post only after `new`
         // recorded the id, i.e. after the queue exists.
@@ -823,9 +836,7 @@ pub async fn start(
                 Err(_) => eprintln!("camera overlay: did not stop within 2 s — leaked"),
             }
         }
-        let _ = events.send(ShareEvent::Ended {
-            external: closed.load(Ordering::Relaxed),
-        });
+        let _ = events.send(ShareEvent::Ended { external });
     });
 
     Ok((handle, ShareController { stop_tx }))

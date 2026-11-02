@@ -135,6 +135,30 @@ impl SessionRegistry {
         }
     }
 
+    /// Send one datagram to several users with ONE registry lock.
+    ///
+    /// The previous forwarding path locked the whole registry once per
+    /// viewer and called `send_datagram` under it. At 1080p60 that is a
+    /// few thousand global-lock acquisitions per second, and every
+    /// connection's send waited for every other. The connections are
+    /// cloned out here (a refcount each) and the sends run unlocked.
+    pub fn send_datagram_many(&self, users: &[u32], data: &bytes::Bytes) -> usize {
+        let conns: Vec<quinn::Connection> = {
+            let clients = self.clients.lock().unwrap();
+            users
+                .iter()
+                .filter_map(|id| clients.get(id).map(|h| h.conn.clone()))
+                .collect()
+        };
+        let mut sent = 0;
+        for conn in conns {
+            if conn.send_datagram(data.clone()).is_ok() {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
     pub fn online_users(&self) -> Vec<(u32, String, u64, SoundVersions)> {
         self.clients
             .lock()

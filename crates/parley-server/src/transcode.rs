@@ -232,6 +232,11 @@ impl TranscodeManager {
     /// header). Records the live share, meters the sender's own rate,
     /// and hands the fragment to an active job.
     pub fn note_video(&self, sender_id: u32, channel_id: u64, payload: &[u8]) {
+        // Off by default: do not decode, meter, or take a mutex for
+        // every video datagram when no job can ever exist.
+        if !self.config.transcode || self.config.max_transcodes == 0 {
+            return;
+        }
         let Ok(frag) = decode_fragment(payload) else {
             return;
         };
@@ -265,6 +270,10 @@ impl TranscodeManager {
     /// job is waiting for its first keyframe, yes: the viewer keeps the
     /// old stream until a transcoded picture is ready.
     pub fn should_forward(&self, sender_id: u32, viewer_id: u32) -> bool {
+        // Hot path: this runs once per viewer per video datagram.
+        if !self.config.transcode || self.config.max_transcodes == 0 {
+            return true;
+        }
         let inner = self.inner.lock().unwrap();
         match inner.jobs.get(&sender_id) {
             Some(job) => {
@@ -713,16 +722,27 @@ fn run_worker(
                 // ~35 datagrams back-to-back — the same burst that made
                 // the direct path lose frames, only now on the server's
                 // uplink. Pace by the tier's own bitrate instead.
+                // Deadlines advance additively (a sleep that overshoots
+                // is caught up by the next fragments), and a keyframe
+                // gets a 4x burst: a tier's IDR is the one frame a
+                // stalled viewer must receive, and pacing it at the
+                // average rate can take longer than the frame interval.
+                let bps = encoded
+                    .bps
+                    .max(1)
+                    .saturating_mul(if encoded.keyframe { 4 } else { 1 });
                 let mut next = Instant::now();
                 for dg in &dgs {
                     let now = Instant::now();
+                    if next + Duration::from_millis(50) < now {
+                        next = now;
+                    }
                     if next > now {
                         std::thread::sleep(next - now);
                     }
-                    let micros = ((dg.len() as u64).saturating_mul(8_000_000)
-                        / u64::from(encoded.bps.max(1)))
-                    .max(1);
-                    next = Instant::now() + Duration::from_micros(micros);
+                    let micros =
+                        ((dg.len() as u64).saturating_mul(8_000_000) / u64::from(bps)).max(1);
+                    next += Duration::from_micros(micros);
                     for (viewer_id, v) in &viewers {
                         // Re-check membership, not just the job's viewer
                         // set: a viewer who switched channels must not

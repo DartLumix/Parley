@@ -878,8 +878,13 @@ async fn handle_client_message(
             // the sharer lower its own stream, and the viewer would get
             // a double-degraded picture.
             if let Some(channel_id) = voice.channel_of(info.id) {
-                if transcode.on_report(info.id, channel_id, rep.viewer_fps)
-                    == ReportAction::Suppress
+                // A request-only report is not a decode-capability
+                // sample: forwarding it must not create a transcode job
+                // (viewer_fps is 0 because the assembler is stalled, not
+                // because the machine is slow).
+                if !rep.keyframe_request
+                    && transcode.on_report(info.id, channel_id, rep.viewer_fps)
+                        == ReportAction::Suppress
                 {
                     return Ok(true);
                 }
@@ -888,6 +893,7 @@ async fn handle_client_message(
                         reporter_id: info.id,
                         gap_rate_permille: rep.gap_rate_permille,
                         viewer_fps: rep.viewer_fps,
+                        keyframe_request: rep.keyframe_request,
                     })),
                 };
                 for member in voice.members_of(channel_id) {
@@ -971,11 +977,11 @@ fn route_datagram(
         decoded.payload,
     ));
 
-    for member in voice.members_of(channel_id) {
-        if member != sender.id && (!is_video || transcode.should_forward(sender.id, member)) {
-            registry.send_datagram(member, forwarded.clone());
-        }
-    }
+    let mut targets = voice.members_of(channel_id);
+    targets.retain(|member| {
+        *member != sender.id && (!is_video || transcode.should_forward(sender.id, *member))
+    });
+    registry.send_datagram_many(&targets, &forwarded);
 }
 
 /// Presence push: the PresenceList for the current online set,
