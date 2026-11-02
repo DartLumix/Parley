@@ -36,8 +36,8 @@
 
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -133,6 +133,10 @@ struct CaptureFlags {
     /// post WM_QUIT from the supervisor.
     tid: Arc<AtomicU32>,
     latest: Arc<Mutex<Option<LatestFrame>>>,
+    /// True while a copied frame is queued or being encoded.
+    pending: Arc<AtomicBool>,
+    /// Frames skipped because the encoder was busy.
+    capture_drops: Arc<AtomicU64>,
 }
 
 struct Capture {
@@ -143,6 +147,8 @@ struct Capture {
     closed: Arc<AtomicBool>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     latest: Arc<Mutex<Option<LatestFrame>>>,
+    pending: Arc<AtomicBool>,
+    capture_drops: Arc<AtomicU64>,
 }
 
 impl GraphicsCaptureApiHandler for Capture {
@@ -166,6 +172,7 @@ impl GraphicsCaptureApiHandler for Capture {
             .map_err(|_| "encoder is gone".to_string())?;
         let keepalive_latest = flags.latest.clone();
         let keepalive_tx = flags.tx.clone();
+        let keepalive_pending = flags.pending.clone();
         let tx = flags.tx;
         let stop = flags.stop.clone();
         // One thread for the whole share: it repeats the newest frame
@@ -181,18 +188,28 @@ impl GraphicsCaptureApiHandler for Capture {
                     if frame.at.elapsed() < KEEPALIVE_AFTER {
                         continue;
                     }
-                    if keepalive_tx
-                        .try_send(ToEncoder::Frame {
-                            data: frame.data,
-                            stride: frame.stride,
-                        })
-                        .is_ok()
-                    {
-                        // Re-stamp the copy we just queued, not the one
-                        // the capture callback stores, so the next repeat
-                        // waits a full second again.
-                        if let Some(slot) = keepalive_latest.lock().unwrap().as_mut() {
-                            slot.at = Instant::now();
+                    if keepalive_pending.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    match keepalive_tx.try_send(ToEncoder::Frame {
+                        data: frame.data,
+                        stride: frame.stride,
+                    }) {
+                        Ok(()) => {
+                            // Re-stamp the copy we just queued, not the one
+                            // the capture callback stores, so the next repeat
+                            // waits a full second again.
+                            if let Some(slot) = keepalive_latest.lock().unwrap().as_mut() {
+                                slot.at = Instant::now();
+                            }
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            // The encoder has a frame queued and will clear
+                            // `pending` when that encode finishes.
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            keepalive_pending.store(false, Ordering::Release);
+                            break;
                         }
                     }
                 }
@@ -207,6 +224,8 @@ impl GraphicsCaptureApiHandler for Capture {
             closed: flags.closed,
             die: flags.die,
             latest: flags.latest,
+            pending: flags.pending,
+            capture_drops: flags.capture_drops,
         })
     }
 
@@ -236,24 +255,41 @@ impl GraphicsCaptureApiHandler for Capture {
         if width == 0 || height == 0 || stride < width as usize * 4 {
             return Ok(());
         }
+        // A window can be resized mid-share; the encoder follows. Send
+        // the format before the busy gate: a pending old frame must not
+        // swallow the new size.
+        if width != self.width || height != self.height {
+            self.width = width;
+            self.height = height;
+            if self
+                .tx
+                .send(ToEncoder::Negotiated {
+                    width,
+                    height,
+                    fps: CAPTURE_FPS,
+                })
+                .is_err()
+            {
+                self.pending.store(false, Ordering::Release);
+                return Ok(());
+            }
+        }
+        // Do not copy a frame the encoder cannot consume. The encoder
+        // clears this after every encode; a full queue leaves it closed
+        // until the queued frame has been dealt with.
+        if self.pending.swap(true, Ordering::AcqRel) {
+            self.capture_drops.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         // The frame as WGC mapped it: row stride kept (BGRA + padding).
         // The shared encoder's strided path walks it directly.
         let raw = buffer.as_raw_buffer();
         let len = height as usize * stride;
         let Some(bytes) = raw.get(..len) else {
+            self.pending.store(false, Ordering::Release);
             return Ok(()); // truncated mapping: skip this frame
         };
         let data = Arc::new(bytes.to_vec());
-        // A window can be resized mid-share; the encoder follows.
-        if width != self.width || height != self.height {
-            self.width = width;
-            self.height = height;
-            let _ = self.tx.send(ToEncoder::Negotiated {
-                width,
-                height,
-                fps: CAPTURE_FPS,
-            });
-        }
         {
             let mut slot = self.latest.lock().unwrap();
             match slot.as_mut() {
@@ -274,7 +310,16 @@ impl GraphicsCaptureApiHandler for Capture {
         // Bounded and non-blocking: if the encoder is behind, the newest
         // frame wins on the next callback (the shared skip-to-newest
         // rule) instead of stalling the WGC callback.
-        let _ = self.tx.try_send(ToEncoder::Frame { data, stride });
+        match self.tx.try_send(ToEncoder::Frame { data, stride }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.capture_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.pending.store(false, Ordering::Release);
+                let _ = self.die.send(());
+            }
+        }
         Ok(())
     }
 
@@ -488,6 +533,8 @@ pub async fn start_camera(
 ) -> Result<(ShareHandle, ShareController), String> {
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ToEncoder>(4);
     let force_idr = Arc::new(AtomicBool::new(false));
+    let pending = Arc::new(AtomicBool::new(false));
+    let capture_drops = Arc::new(AtomicU64::new(0));
     let handle = ShareHandle {
         flag: force_idr.clone(),
     };
@@ -495,17 +542,31 @@ pub async fn start_camera(
     let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    let encoder_pending = pending.clone();
+    let encoder_drops = capture_drops.clone();
     let enc_handle = std::thread::Builder::new()
         .name("parley-camera-encode".into())
         .spawn(move || {
             encoder_thread(
-                frame_rx, conn, force_idr, video_loss, viewer_fps, die_tx, options, None, preview,
+                frame_rx,
+                conn,
+                force_idr,
+                video_loss,
+                viewer_fps,
+                encoder_pending,
+                encoder_drops,
+                die_tx,
+                options,
+                None,
+                preview,
             )
         })
         .map_err(|e| format!("camera encoder thread: {e}"))?;
 
     let (ready_tx, ready_rx) = sync_channel::<Result<(u32, u32), String>>(1);
     let stop_for_capture = stop.clone();
+    let capture_pending = pending.clone();
+    let capture_drops = capture_drops.clone();
     let capture_handle = std::thread::Builder::new()
         .name("parley-camera".into())
         .spawn(move || {
@@ -538,7 +599,19 @@ pub async fn start_camera(
             }
             let row = cam.width * 4;
             if let Err(e) = mf_read(&cam, &stop_for_capture, |data| {
-                let _ = frame_tx.try_send(ToEncoder::Frame { data, stride: row });
+                if capture_pending.swap(true, Ordering::AcqRel) {
+                    capture_drops.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                match frame_tx.try_send(ToEncoder::Frame { data, stride: row }) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        capture_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        capture_pending.store(false, Ordering::Release);
+                    }
+                }
             }) {
                 eprintln!("camera: capture ended: {e}");
             }
@@ -650,6 +723,8 @@ pub async fn start(
     let closed = Arc::new(AtomicBool::new(false));
     let tid = Arc::new(AtomicU32::new(0));
     let latest: Arc<Mutex<Option<LatestFrame>>> = Arc::new(Mutex::new(None));
+    let pending = Arc::new(AtomicBool::new(false));
+    let capture_drops = Arc::new(AtomicU64::new(0));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
@@ -663,6 +738,8 @@ pub async fn start(
         die: die_tx.clone(),
         tid: tid.clone(),
         latest,
+        pending: pending.clone(),
+        capture_drops: capture_drops.clone(),
     };
     let capture_die = die_tx.clone();
     let capture_stop = stop_flag.clone();
@@ -749,6 +826,8 @@ pub async fn start(
                 force_idr,
                 video_loss,
                 viewer_fps,
+                pending,
+                capture_drops,
                 die_tx,
                 options,
                 overlay_for_encoder,
