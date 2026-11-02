@@ -88,7 +88,7 @@
 //! fidelity-class content. The mux ([system + mic] → one stream) lives
 //! here too; main.rs routes the mic to it via a tee while sharing.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -407,6 +407,14 @@ struct UserData {
     width: u32,
     height: u32,
     tx: SyncSender<ToEncoder>,
+    /// True while a copied frame is queued or being encoded. Checked
+    /// BEFORE the pixel copy so a 144 Hz compositor cannot make the
+    /// capture thread copy frames the bounded channel will discard.
+    pending: Arc<AtomicBool>,
+    /// Cumulative capture frames skipped because the encoder was busy.
+    /// Read by the governor as the "source is active and the encoder is
+    /// behind" signal; a still screen never increments it.
+    capture_drops: Arc<AtomicU64>,
     drops: u64,
     /// Wakes the share supervisor when PipeWire reports an error state.
     /// A proof-of-life timer is not enough: an errored stream can keep
@@ -472,6 +480,11 @@ struct PaceGovernor {
     /// rate, not a decode deficit — and folding the stream down to 480p
     /// for it would be the old 5 fps bug with a new cause.
     sent_fps: f64,
+    /// The encoder itself cannot hold the pace: sent frames are below
+    /// the target AND capture frames are piling up. Set by the share
+    /// before each step. A viewer report cannot reveal this, because a
+    /// viewer can only report what was actually sent.
+    encoder_backlog: bool,
     /// The last cadence/resolution change was a probe upward. A low
     /// report after it backs off for longer than a normal step down.
     probing: bool,
@@ -502,6 +515,7 @@ impl PaceGovernor {
             low: 0,
             good: 0,
             sent_fps: 0.0,
+            encoder_backlog: false,
             probing: false,
             retry_after: None,
         }
@@ -570,7 +584,7 @@ impl PaceGovernor {
         // Only a viewer that missed frames the sender actually SENDS is
         // behind. Unmeasured (0) keeps the old behaviour.
         let viewer_behind = self.sent_fps <= 0.0 || r < self.sent_fps * 0.8;
-        if r < current * 0.8 && viewer_behind {
+        if (r < current * 0.8 && viewer_behind) || self.encoder_backlog {
             self.low += 1;
             self.good = 0;
             if self.low < 2 {
@@ -589,10 +603,18 @@ impl PaceGovernor {
                     self.retry_after = Some(now + FAILED_PROBE_COOLDOWN);
                     self.probing = false;
                 }
-                println!(
-                    "share: viewer reports {reported} fps at {current:.0} → {h}p (loss {loss}‰, \
-                     was {current_h}p)"
-                );
+                if self.encoder_backlog {
+                    println!(
+                        "share: encoder backlog ({:.0} fps sent) at {current:.0} → {h}p (loss \
+                         {loss}‰, was {current_h}p)",
+                        self.sent_fps
+                    );
+                } else {
+                    println!(
+                        "share: viewer reports {reported} fps at {current:.0} → {h}p (loss \
+                         {loss}‰, was {current_h}p)"
+                    );
+                }
             } else if let Some(f) = lower_fps(current) {
                 self.fps_cap = f;
                 self.low = 0;
@@ -600,9 +622,18 @@ impl PaceGovernor {
                     self.retry_after = Some(now + FAILED_PROBE_COOLDOWN);
                     self.probing = false;
                 }
-                println!(
-                    "share: viewer reports {reported} fps at {current_h}p → pacing at {f:.0} fps"
-                );
+                if self.encoder_backlog {
+                    println!(
+                        "share: encoder backlog ({:.0} fps sent) at {current_h}p → pacing at \
+                         {f:.0} fps",
+                        self.sent_fps
+                    );
+                } else {
+                    println!(
+                        "share: viewer reports {reported} fps at {current_h}p → pacing at {f:.0} \
+                         fps"
+                    );
+                }
             }
             return (self.fps_cap, self.height_cap);
         }
@@ -818,6 +849,15 @@ struct ShareEncoder {
     scaled: Vec<u8>,
     /// When the last preview frame was handed off.
     last_preview: Option<std::time::Instant>,
+    /// Capture frames the pw callback skipped because this encoder was
+    /// busy (see `UserData::pending`). Cumulative.
+    capture_drops: Arc<AtomicU64>,
+    /// Frames sent in the last one-second measurement window, and the
+    /// capture skips in that same window. The window is what keeps an
+    /// old slow period from making a later still screen look overloaded.
+    sent_last_second: u64,
+    capture_skips_last_second: u64,
+    last_capture_skips: u64,
     /// The encoder's own size, for the sharer's card (see
     /// [`StreamInfo`]) — the STREAM's shape, not the capture's.
     stream: (u32, u32),
@@ -926,6 +966,10 @@ struct ShareSenderArgs {
     /// [`PaceGovernor`]: a busy viewer needs fewer pixels per picture
     /// before it needs fewer pictures.
     viewer_fps: Arc<AtomicU32>,
+    /// Capture frames dropped because the encoder was busy. The governor
+    /// reads this to distinguish an overwhelmed encoder from a still
+    /// source.
+    capture_drops: Arc<AtomicU64>,
     options: ShareOptions,
     /// The camera overlay's latest-frame slot, when the dialog asked for
     /// one and the camera opened. `None` on a camera-only share.
@@ -947,10 +991,13 @@ struct ShareSenderArgs {
 /// context, mainloop — in reverse declaration order, which is the
 /// required C teardown order).
 #[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
 fn pw_thread(
     node_id: u32,
     fd: OwnedFd,
     tx: SyncSender<ToEncoder>,
+    pending: Arc<AtomicBool>,
+    capture_drops: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     setup: tokio::sync::oneshot::Sender<Result<(), pw::Error>>,
     dmabuf: bool,
@@ -1000,6 +1047,8 @@ fn pw_thread(
         width: 0,
         height: 0,
         tx,
+        pending: pending.clone(),
+        capture_drops: capture_drops.clone(),
         drops: 0,
         die,
         inline,
@@ -1207,6 +1256,23 @@ fn pw_thread(
             // Row-wise repack: handles both padded strides and the
             // tightly-packed case, and never panics on short buffers.
             let stride = if stride == 0 { w * 4 } else { stride };
+            // Do not copy a frame the encoder cannot consume: the
+            // channel is bounded, so a busy encoder already has one
+            // queued or in flight. The encoder clears this after every
+            // encode. Without this check a 144 Hz compositor copies a
+            // 1440p frame ~144 times a second just for try_send to drop
+            // almost all of them.
+            if user_data.pending.swap(true, Ordering::AcqRel) {
+                user_data.capture_drops.fetch_add(1, Ordering::Relaxed);
+                user_data.drops += 1;
+                if user_data.drops.is_multiple_of(128) {
+                    eprintln!(
+                        "share: encoder behind — {} frames dropped so far",
+                        user_data.drops
+                    );
+                }
+                return;
+            }
             // 7g: copy the frame ONCE, as mapped (stride intact), then
             // hand the padded buffer to the encoder — the strided SIMD
             // path walks the rows directly (bench: ~2× the old path).
@@ -1214,26 +1280,36 @@ fn pw_thread(
             for y in 0..h {
                 let start = offset + y * stride;
                 let Some(row) = mapped.get(start..start + w * 4) else {
+                    user_data.pending.store(false, Ordering::Release);
                     return; // truncated buffer: skip the frame
                 };
                 let dst = y * stride;
                 data.resize(dst + row.len(), 0);
                 data[dst..dst + row.len()].copy_from_slice(row);
             }
-            if user_data
-                .tx
-                .try_send(ToEncoder::Frame {
-                    data: Arc::new(data),
-                    stride,
-                })
-                .is_err()
-            {
-                user_data.drops += 1;
-                if user_data.drops.is_multiple_of(128) {
-                    eprintln!(
-                        "share: encoder behind — {} frames dropped so far",
-                        user_data.drops
-                    );
+            match user_data.tx.try_send(ToEncoder::Frame {
+                data: Arc::new(data),
+                stride,
+            }) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // The channel has a frame queued, so the encoder is
+                    // already busy and will clear `pending` when it
+                    // finishes. Keep the gate closed; reopening it here
+                    // would let the next capture callback copy another
+                    // frame only to hit the same full channel.
+                    user_data.capture_drops.fetch_add(1, Ordering::Relaxed);
+                    user_data.drops += 1;
+                    if user_data.drops.is_multiple_of(128) {
+                        eprintln!(
+                            "share: encoder behind — {} frames dropped so far",
+                            user_data.drops
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    user_data.pending.store(false, Ordering::Release);
+                    let _ = user_data.die.send(());
                 }
             }
         })
@@ -1705,6 +1781,10 @@ impl ShareEncoder {
             source: (0, 0),
             scaled: Vec::new(),
             last_preview: None,
+            capture_drops: sender.capture_drops,
+            sent_last_second: 0,
+            capture_skips_last_second: 0,
+            last_capture_skips: 0,
             stream: (0, 0),
             shown_fps: 0.0,
             sent_fps: 0.0,
@@ -1864,6 +1944,16 @@ impl ShareEncoder {
         let reported = self.viewer_fps.load(Ordering::Relaxed);
         let loss = self.video_loss.load(Ordering::Relaxed);
         self.governor.sent_fps = self.sent_fps;
+        // A viewer can only report what was actually sent. If the
+        // encoder is delivering below the pace while capture frames are
+        // piling up, the resolution — not the viewer — is the lever. A
+        // still source has capture_drops at zero, so it cannot trigger
+        // this; neither can a 144 Hz compositor whose encoder is keeping
+        // up, because sent_fps is then at the target.
+        let pace = self.paced_fps();
+        self.governor.encoder_backlog = self.sent_fps > 0.0
+            && self.sent_fps < pace * 0.8
+            && self.capture_skips_last_second > self.sent_last_second / 2;
         let (fps_cap, height_cap) = self.governor.step(
             base,
             reported,
@@ -1918,9 +2008,9 @@ impl ShareEncoder {
     /// Encode one BGRA frame (strided) and send it. Returns false when the
     /// connection is gone; a dropped frame returns true.
     fn encode_bgra(&mut self, data: &Arc<Vec<u8>>, stride: usize) -> bool {
-        let Some((w, h)) = self.encoder.as_ref().map(|e| e.dimensions()) else {
+        if self.encoder.is_none() {
             return true;
-        };
+        }
         // A capture buffer is trusted input only after this check. The
         // strided conversion walks `stride` bytes per row straight into
         // openh264's SIMD path, which cannot bounds-check a slice it was
@@ -1949,40 +2039,57 @@ impl ShareEncoder {
         // The copy is only paid while a camera frame is actually live: a
         // camera that failed to open leaves the screen path untouched.
         if let Some((cam, cw, ch)) = self.overlay.as_ref().and_then(CameraOverlay::latest) {
-            let need = w * h * 4;
             let mut canvas = std::mem::take(&mut self.overlay_buf);
-            canvas.resize(need, 0);
-            let copied = if (sw, sh) == (w, h) && stride == w * 4 {
-                data.get(..need).is_some_and(|src| {
-                    canvas.copy_from_slice(src);
-                    true
-                })
-            } else {
-                scale_bgra(data, sw, sh, stride, w, h, &mut canvas)
-            };
-            let alive = if copied {
+            let alive = self.frame_encode(|enc, out| {
+                // Read the size AFTER `prepare`: a governor step or a
+                // format change can rebuild the encoder on this very
+                // frame. Using the pre-rebuild size here is what handed
+                // a 1080p buffer to a 720p openh264 encoder and panicked
+                // in the RGB conversion.
+                let (w, h) = enc.dimensions();
+                if w == 0 || h == 0 {
+                    return Ok(true);
+                }
+                let need = w * h * 4;
+                canvas.resize(need, 0);
+                let copied = if (sw, sh) == (w, h) && stride == w * 4 {
+                    data.get(..need).is_some_and(|src| {
+                        canvas.copy_from_slice(src);
+                        true
+                    })
+                } else {
+                    scale_bgra(data, sw, sh, stride, w, h, &mut canvas)
+                };
+                if !copied {
+                    return Ok(true); // truncated capture: skip this frame
+                }
                 Self::draw_camera_overlay(&mut canvas, w, h, &cam, cw, ch);
-                self.frame_encode(|enc, out| enc.encode_bgra_strided(&canvas, w, h, w * 4, out))
-            } else {
-                true // truncated capture: skip this frame, keep the share up
-            };
+                enc.encode_bgra_strided(&canvas, w, h, w * 4, out)
+            });
             self.overlay_buf = canvas;
             return alive;
-        }
-        if (sw, sh) == (w, h) || w == 0 || h == 0 {
-            return self.frame_encode(|enc, out| enc.encode_bgra_strided(data, w, h, stride, out));
         }
         // Resolution cap: nearest-neighbour downscale into the reused
         // buffer, then the tight encode path. A capped stream is a lower
         // bar for the ladder, so this runs once per sent frame, not per
-        // captured one.
+        // captured one. The size is read inside the closure, after
+        // `prepare` has applied any rebuild, for the same reason as the
+        // overlay path above.
         let mut scaled = std::mem::take(&mut self.scaled);
-        let alive = if scale_bgra(data, sw, sh, stride, w, h, &mut scaled) {
-            let tight = w * 4;
-            self.frame_encode(|enc, out| enc.encode_bgra_strided(&scaled, w, h, tight, out))
-        } else {
-            true // truncated capture: skip this frame, keep the share up
-        };
+        let alive = self.frame_encode(|enc, out| {
+            let (w, h) = enc.dimensions();
+            if w == 0 || h == 0 {
+                return Ok(true);
+            }
+            if (sw, sh) == (w, h) {
+                enc.encode_bgra_strided(data, w, h, stride, out)
+            } else if scale_bgra(data, sw, sh, stride, w, h, &mut scaled) {
+                let tight = w * 4;
+                enc.encode_bgra_strided(&scaled, w, h, tight, out)
+            } else {
+                Ok(true) // truncated capture: skip this frame
+            }
+        });
         self.scaled = scaled;
         alive
     }
@@ -2204,6 +2311,10 @@ impl ShareEncoder {
         if report >= Duration::from_secs(1) {
             let raw = f64::from(self.report_frames) / report.as_secs_f64();
             self.sent_fps = raw;
+            self.sent_last_second = u64::from(self.report_frames);
+            let skips = self.capture_drops.load(Ordering::Relaxed);
+            self.capture_skips_last_second = skips.saturating_sub(self.last_capture_skips);
+            self.last_capture_skips = skips;
             // Nearest 5 fps: one burst must not print "43 fps".
             let measured = ((raw / 5.0).round() * 5.0).max(1.0);
             self.report_start = std::time::Instant::now();
@@ -2241,6 +2352,22 @@ impl ShareEncoder {
     }
 }
 
+/// Sends the share's death signal even if the encoder thread unwinds.
+/// Without it a panic left the capture thread pushing into a closed
+/// channel and the session "active" with no encoder.
+struct EncoderDeathGuard(Option<tokio::sync::mpsc::UnboundedSender<()>>);
+
+impl Drop for EncoderDeathGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("share: encoder thread panicked — ending the share");
+        }
+        if let Some(die) = self.0.take() {
+            let _ = die.send(());
+        }
+    }
+}
+
 /// Encode → fragment → paced send, for the memfd capture path. Owns the
 /// encoder once the format is negotiated; drops frames that arrive before
 /// that. Exits when the frame channel closes (the pw thread ended).
@@ -2264,11 +2391,15 @@ fn encoder_thread(
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
     viewer_fps: Arc<AtomicU32>,
+    pending: Arc<AtomicBool>,
+    capture_drops: Arc<AtomicU64>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     options: ShareOptions,
     overlay: Option<CameraOverlay>,
     tap: Option<PreviewSink>,
 ) {
+    // A panic here must end the share, not leave it looking active.
+    let _death = EncoderDeathGuard(Some(die.clone()));
     // The preview gets its own thread for the life of this share; it
     // ends when the encoder drops the channel (share teardown).
     let preview_tx = tap.as_ref().map(|t| spawn_preview_thread(t.clone()));
@@ -2278,6 +2409,7 @@ fn encoder_thread(
         force_idr,
         video_loss,
         viewer_fps,
+        capture_drops,
         options,
         overlay,
         tap,
@@ -2299,10 +2431,13 @@ fn encoder_thread(
                     && share
                         .last_encode
                         .is_none_or(|t| t.elapsed() >= FRAME_KEEPALIVE)
-                    && !share.encode_bgra(data, *stride)
                 {
-                    let _ = share.die.send(());
-                    return;
+                    let alive = share.encode_bgra(data, *stride);
+                    pending.store(false, Ordering::Release);
+                    if !alive {
+                        let _ = share.die.send(());
+                        return;
+                    }
                 }
                 continue;
             }
@@ -2354,7 +2489,9 @@ fn encoder_thread(
                 // The Arc came in with the frame: the preview thread
                 // shares these pixels with the encoder instead of
                 // copying them.
-                if !share.encode_bgra(&bgra, stride) {
+                let alive = share.encode_bgra(&bgra, stride);
+                pending.store(false, Ordering::Release);
+                if !alive {
                     // The connection itself is gone: nothing left to do.
                     let _ = share.die.send(());
                     return;
@@ -3211,6 +3348,8 @@ pub async fn start(
     };
 
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ToEncoder>(4);
+    let pending = Arc::new(AtomicBool::new(false));
+    let capture_drops = Arc::new(AtomicU64::new(0));
     let force_idr = Arc::new(AtomicBool::new(false));
     let handle = ShareHandle {
         flag: force_idr.clone(),
@@ -3233,6 +3372,7 @@ pub async fn start(
         force_idr: force_idr.clone(),
         video_loss: video_loss.clone(),
         viewer_fps: viewer_fps.clone(),
+        capture_drops: capture_drops.clone(),
         options,
         overlay: overlay.clone(),
         tap: preview.clone(),
@@ -3242,11 +3382,15 @@ pub async fn start(
     let overlay_for_encoder = overlay.clone();
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
     let stop_for_thread = stop_flag.clone();
+    let pw_pending = pending.clone();
+    let pw_capture_drops = capture_drops.clone();
     let pw_handle = std::thread::spawn(move || {
         pw_thread(
             node_id,
             fd,
             frame_tx,
+            pw_pending,
+            pw_capture_drops,
             stop_for_thread,
             setup_tx,
             dmabuf,
@@ -3267,6 +3411,8 @@ pub async fn start(
                 force_idr,
                 video_loss,
                 viewer_fps.clone(),
+                pending,
+                capture_drops,
                 die_tx,
                 options,
                 overlay_for_encoder,
@@ -3705,6 +3851,25 @@ mod tests {
             g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false),
             (0.0, Some(720)),
             "two reports short of the real send rate lower resolution"
+        );
+    }
+
+    /// A viewer cannot report the encoder's own shortfall: if 10 frames
+    /// are sent where 30 were promised and capture frames are piling up,
+    /// the report is 10 fps and the stream still needs to get cheaper.
+    #[test]
+    fn an_encoder_that_cannot_hold_the_pace_lowers_resolution() {
+        let t0 = std::time::Instant::now();
+        let mut g = fresh_governor(t0);
+        g.sent_fps = 10.0;
+        g.encoder_backlog = true;
+        assert_eq!(
+            g.step_at(t0 + SAMPLE_EVERY, 30.0, 10, 1080, 1080, 0, false),
+            (0.0, None)
+        );
+        assert_eq!(
+            g.step_at(t0 + 2 * SAMPLE_EVERY, 30.0, 10, 1080, 1080, 0, false),
+            (0.0, Some(720))
         );
     }
 

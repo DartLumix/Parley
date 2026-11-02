@@ -257,6 +257,15 @@ impl VideoEncoder for VaapiEncoder {
     }
 
     fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error> {
+        let expected = self.width.saturating_mul(self.height).saturating_mul(4);
+        if bgra.len() != expected {
+            return Err(Error::Codec(format!(
+                "vaapi encoder is {}x{} ({expected} bytes), got {}",
+                self.width,
+                self.height,
+                bgra.len()
+            )));
+        }
         // 7i: no CPU conversion and no repack — the crate uploads packed
         // BGRA rows straight into a BGRX surface (honoring the pitch) and
         // the video processor produces the NV12 the encoder consumes.
@@ -291,6 +300,21 @@ impl VideoEncoder for VaapiEncoder {
         stride: usize,
         out: &mut Vec<u8>,
     ) -> Result<bool, Error> {
+        if width == 0 || height == 0 || stride < width.saturating_mul(4) {
+            return Err(Error::Codec(format!(
+                "vaapi strided frame {width}x{height} has invalid stride {stride}"
+            )));
+        }
+        let needed = stride
+            .saturating_mul(height.saturating_sub(1))
+            .saturating_add(width.saturating_mul(4));
+        if bgra.len() < needed {
+            return Err(Error::Codec(format!(
+                "vaapi strided frame is {} bytes, {width}x{height} at stride {stride} needs \
+                 {needed}",
+                bgra.len()
+            )));
+        }
         if width != self.width || height != self.height {
             // Renegotiated size: the plain path re-derives dims from
             // self.width/height and never mismatches.

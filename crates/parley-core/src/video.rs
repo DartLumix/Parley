@@ -451,6 +451,19 @@ impl VideoEncoder for SoftwareEncoder {
     }
 
     fn encode_bgra(&mut self, bgra: &[u8]) -> Result<(Vec<u8>, bool), Error> {
+        // openh264's `BgraSliceU8::new` asserts on a length mismatch.
+        // A caller that rebuilt the encoder mid-frame used to take the
+        // whole encoder thread down with it; return an error and let the
+        // share drop one frame instead.
+        let expected = self.width.saturating_mul(self.height).saturating_mul(4);
+        if bgra.len() != expected {
+            return Err(Error::Codec(format!(
+                "software encoder is {}x{} ({expected} bytes), got {}",
+                self.width,
+                self.height,
+                bgra.len()
+            )));
+        }
         let src = openh264::formats::BgraSliceU8::new(bgra, (self.width, self.height));
         self.yuv.read_bgra8(src);
         let stream = self
@@ -477,9 +490,23 @@ impl VideoEncoder for SoftwareEncoder {
         stride: usize,
         out: &mut Vec<u8>,
     ) -> Result<bool, Error> {
+        if width == 0 || height == 0 || stride < width.saturating_mul(4) {
+            return Err(Error::Codec(format!(
+                "strided frame {width}x{height} has invalid stride {stride}"
+            )));
+        }
+        let needed = stride
+            .saturating_mul(height.saturating_sub(1))
+            .saturating_add(width.saturating_mul(4));
+        if bgra.len() < needed {
+            return Err(Error::Codec(format!(
+                "strided frame is {} bytes, {width}x{height} at stride {stride} needs {needed}",
+                bgra.len()
+            )));
+        }
         if width != self.width || height != self.height {
-            // Renegotiated size: fall back to the copy path (encode_bgra
-            // re-derives dims from self.width/height — never mismatch).
+            // Renegotiated size: fall back to the copy path; the copy
+            // path's length guard turns a mismatch into an error.
             return strided_fallback(self, bgra, width, height, stride, out);
         }
         if stride == width * 4 {
@@ -676,9 +703,23 @@ fn encoder_produces_decodable_keyframe(enc: &mut dyn VideoEncoder) -> Result<(),
     let mut dec = VideoDecoder::new()?;
     match dec.decode_with_dims(&annexb) {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(Error::Codec(
-            "keyframe decoded to no picture — a mid-stream receiver could never start".into(),
-        )),
+        Ok(None) => {
+            // Some drivers' first IDR is buffered until the decoder sees
+            // another access unit. Feed the same keyframe once more
+            // before calling the stream unusable; a stream with missing
+            // SPS/PPS still fails (the decoder errors, not None).
+            match dec.decode_with_dims(&annexb) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(Error::Codec(
+                    "keyframe decoded to no picture after two feeds — a mid-stream receiver \
+                     could never start"
+                        .into(),
+                )),
+                Err(e) => Err(Error::Codec(format!(
+                    "keyframe rejected by a fresh decoder: {e}"
+                ))),
+            }
+        }
         Err(e) => Err(Error::Codec(format!(
             "keyframe rejected by a fresh decoder: {e}"
         ))),
@@ -940,6 +981,25 @@ mod tests {
             frame.starts_with(&[0, 0, 0, 1]) || frame.starts_with(&[0, 0, 1]),
             "encoder output must be Annex-B (start code first), got {:?}",
             &frame[..4.min(frame.len())]
+        );
+    }
+
+    #[test]
+    fn mismatched_frame_is_an_error_not_a_panic() {
+        let mut enc = SoftwareEncoder::new(64, 48).unwrap();
+        let expected = 64 * 48 * 4;
+        let too_big = vec![0u8; expected + 4];
+        let too_small = vec![0u8; expected - 4];
+        assert!(enc.encode_bgra(&too_big).is_err());
+        assert!(enc.encode_bgra(&too_small).is_err());
+        let mut out = Vec::new();
+        assert!(
+            enc.encode_bgra_strided(&too_small, 64, 48, 64 * 4, &mut out)
+                .is_err()
+        );
+        assert!(
+            enc.encode_bgra_strided(&too_small, 64, 48, 10, &mut out)
+                .is_err()
         );
     }
 

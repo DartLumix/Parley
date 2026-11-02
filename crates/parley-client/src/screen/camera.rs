@@ -21,7 +21,7 @@
 
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
@@ -298,6 +298,8 @@ pub async fn start_camera(
     println!("camera: {card} {width}x{height} YUYV @ {CAMERA_FPS:.0} fps (stride {stride})");
 
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ToEncoder>(4);
+    let pending = Arc::new(AtomicBool::new(false));
+    let capture_drops = Arc::new(AtomicU64::new(0));
     let force_idr = Arc::new(AtomicBool::new(false));
     let handle = ShareHandle {
         flag: force_idr.clone(),
@@ -310,7 +312,17 @@ pub async fn start_camera(
         .name("parley-camera-encode".into())
         .spawn(move || {
             encoder_thread(
-                frame_rx, conn, force_idr, video_loss, viewer_fps, die_tx, options, None, preview,
+                frame_rx,
+                conn,
+                force_idr,
+                video_loss,
+                viewer_fps,
+                pending,
+                capture_drops,
+                die_tx,
+                options,
+                None,
+                preview,
             )
         })
         .map_err(|e| format!("camera encoder thread: {e}"))?;
