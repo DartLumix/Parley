@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `append_mono`, `blob_kind`, `cache_dir`, `cache_path`, `download_sound`, `get`, `kind_index`, `load_mp3`, `local_file`, `observe_presence`, `prefs_path`, `read_prefs`, `resample`, `sounds_dir`, `write_prefs`
+// These functions are ignored because they are not marked as `pub`: `append_mono`, `blob_kind`, `cache_dir`, `cache_path`, `download_sound`, `kind_index`, `load_mp3`, `local_file`, `observe_presence`, `prefs_path`, `read_prefs`, `resample`, `sounds_dir`, `write_prefs`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Prefs`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `fmt`, `fmt`
 // These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`

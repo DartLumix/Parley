@@ -20,6 +20,7 @@ class SettingsPage extends StatefulWidget {
     this.user,
     this.onSignOut,
     this.onSave,
+    this.loadAudioDevices,
   });
 
   final settings_api.AppSettings settings;
@@ -37,14 +38,24 @@ class SettingsPage extends StatefulWidget {
   /// own so the page's wiring is exercised without Flutter bindings.
   final Future<void> Function(settings_api.AppSettings)? onSave;
 
+  /// Enumerates the host's devices. Injected in tests, where there is no
+  /// native bridge; a failure still leaves the default options usable.
+  final Future<settings_api.AudioDevices> Function()? loadAudioDevices;
+
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
 class _SettingsPageState extends State<SettingsPage> {
   late settings_api.AppSettings _settings = widget.settings;
+  late final Future<settings_api.AudioDevices> _audioDevices =
+      _loadAudioDevices();
   bool _saving = false;
   String? _error;
+
+  Future<settings_api.AudioDevices> _loadAudioDevices() async {
+    return (widget.loadAudioDevices ?? settings_api.audioDevices)();
+  }
 
   Future<void> _update(settings_api.AppSettings next) async {
     setState(() {
@@ -142,6 +153,55 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 16),
           _section(theme, 'Audio'),
+          FutureBuilder<settings_api.AudioDevices>(
+            future: _audioDevices,
+            builder: (context, snapshot) {
+              final devices = snapshot.data;
+              if (snapshot.hasError) {
+                return const Padding(
+                  padding: EdgeInsets.only(bottom: 4),
+                  child: Text(
+                    'Could not list audio devices; system defaults are used.',
+                    style: TextStyle(color: Colors.amberAccent, fontSize: 11),
+                  ),
+                );
+              }
+              return Column(
+                children: [
+                  _deviceDropdown(
+                    label: 'Microphone',
+                    caption:
+                        'Capture device for voice. Applies to the next '
+                        'channel you join; a removed device falls back to '
+                        'the system default.',
+                    value: s.inputDevice,
+                    items: _deviceItems(
+                      devices?.inputs ?? const [],
+                      s.inputDevice,
+                    ),
+                    onChanged: (v) => _update(_copy(inputDevice: v)),
+                  ),
+                  _deviceDropdown(
+                    label: 'Speakers / output',
+                    caption:
+                        'Where voices and shared audio play. Applies to '
+                        'the next channel you join.',
+                    value: s.outputDevice,
+                    items: _deviceItems(
+                      devices?.outputs ?? const [],
+                      s.outputDevice,
+                    ),
+                    onChanged: (v) => _update(_copy(outputDevice: v)),
+                  ),
+                  if (snapshot.connectionState == ConnectionState.waiting)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 4),
+                      child: LinearProgressIndicator(minHeight: 2),
+                    ),
+                ],
+              );
+            },
+          ),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Echo cancellation'),
@@ -153,6 +213,62 @@ class _SettingsPageState extends State<SettingsPage> {
             value: s.echoCancel,
             onChanged: (v) => _update(_copy(echoCancel: v)),
           ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Microphone auto gain'),
+            subtitle: const Text(
+              'Lifts a quiet microphone and turns a hot one down before '
+              'encoding. Off by default; it changes the signal, so a good '
+              'interface can stay untouched. Applies to the next channel '
+              'you join.',
+            ),
+            value: s.micAutogain,
+            onChanged: (v) => _update(_copy(micAutogain: v)),
+          ),
+          if (s.micAutogain)
+            Padding(
+              padding: const EdgeInsets.only(top: 2, bottom: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Target level',
+                          style: TextStyle(fontSize: 14),
+                        ),
+                      ),
+                      Text(
+                        '${s.micAutogainTargetDb} dBFS',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Slider(
+                    value: s.micAutogainTargetDb.clamp(-36, -6).toDouble(),
+                    min: -36,
+                    max: -6,
+                    divisions: 30,
+                    label: '${s.micAutogainTargetDb} dBFS',
+                    onChanged: (v) => setState(
+                      () => _settings = _copy(micAutogainTargetDb: v.round()),
+                    ),
+                    onChangeEnd: (v) =>
+                        _update(_copy(micAutogainTargetDb: v.round())),
+                  ),
+                  const Text(
+                    'The auto gain aims for this average level. Lower it if '
+                    'your voice sounds too loud to peers; raise it for a '
+                    'quiet headset.',
+                    style: TextStyle(color: Colors.white38, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
           const SizedBox(height: 16),
           _section(theme, 'Account'),
           ListTile(
@@ -178,7 +294,9 @@ class _SettingsPageState extends State<SettingsPage> {
               label: const Text('Sign out'),
               style: OutlinedButton.styleFrom(
                 foregroundColor: Colors.redAccent,
-                side: BorderSide(color: Colors.redAccent.withValues(alpha: 0.5)),
+                side: BorderSide(
+                  color: Colors.redAccent.withValues(alpha: 0.5),
+                ),
                 alignment: Alignment.centerLeft,
               ),
             ),
@@ -204,6 +322,10 @@ class _SettingsPageState extends State<SettingsPage> {
     int? shareHeight,
     int? shareFps,
     bool? echoCancel,
+    String? inputDevice,
+    String? outputDevice,
+    bool? micAutogain,
+    int? micAutogainTargetDb,
   }) {
     final s = _settings;
     return settings_api.AppSettings(
@@ -212,6 +334,40 @@ class _SettingsPageState extends State<SettingsPage> {
       shareHeight: shareHeight ?? s.shareHeight,
       shareFps: shareFps ?? s.shareFps,
       echoCancel: echoCancel ?? s.echoCancel,
+      inputDevice: inputDevice ?? s.inputDevice,
+      outputDevice: outputDevice ?? s.outputDevice,
+      micAutogain: micAutogain ?? s.micAutogain,
+      micAutogainTargetDb: micAutogainTargetDb ?? s.micAutogainTargetDb,
+    );
+  }
+
+  List<(String, String)> _deviceItems(List<String> names, String selected) {
+    final seen = <String>{''};
+    final items = <(String, String)>[('', 'System default')];
+    for (final name in names) {
+      if (name.isNotEmpty && seen.add(name)) items.add((name, name));
+    }
+    // A saved device may have disappeared since the list was loaded. Keep
+    // it visible so the dropdown can render the user's actual value.
+    if (selected.isNotEmpty && seen.add(selected)) {
+      items.add((selected, '$selected (unavailable)'));
+    }
+    return items;
+  }
+
+  Widget _deviceDropdown({
+    required String label,
+    required String caption,
+    required String value,
+    required List<(String, String)> items,
+    required ValueChanged<String> onChanged,
+  }) {
+    return _dropdown<String>(
+      label: label,
+      caption: caption,
+      value: value,
+      items: items,
+      onChanged: onChanged,
     );
   }
 

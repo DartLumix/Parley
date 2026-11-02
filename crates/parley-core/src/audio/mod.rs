@@ -1,6 +1,7 @@
 //! Audio pipeline: codec, jitter, mixing (device-agnostic), device I/O
 //! (client-only, cpal), send/recv pipelines.
 
+pub mod agc;
 pub mod codec;
 #[cfg(feature = "audio-device")]
 pub mod device;
@@ -8,6 +9,7 @@ pub mod jitter;
 pub mod mixer;
 pub mod pipeline;
 
+pub use agc::MicAutogain;
 pub use codec::{
     FRAME_MS, MAX_PACKET_SIZE, OpusDecoder, OpusEncoder, SAMPLE_RATE, SAMPLES_PER_FRAME,
 };

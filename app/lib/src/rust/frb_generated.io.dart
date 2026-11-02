@@ -98,6 +98,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AppSettings dco_decode_app_settings(dynamic raw);
 
   @protected
+  AudioDevices dco_decode_audio_devices(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
@@ -125,7 +128,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   double dco_decode_f_64(dynamic raw);
 
   @protected
+  int dco_decode_i_32(dynamic raw);
+
+  @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw);
 
   @protected
   List<ChannelInfo> dco_decode_list_channel_info(dynamic raw);
@@ -295,6 +304,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AppSettings sse_decode_app_settings(SseDeserializer deserializer);
 
   @protected
+  AudioDevices sse_decode_audio_devices(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
@@ -326,7 +338,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   double sse_decode_f_64(SseDeserializer deserializer);
 
   @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
+
+  @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
 
   @protected
   List<ChannelInfo> sse_decode_list_channel_info(SseDeserializer deserializer);
@@ -458,9 +476,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   VoiceLevel sse_decode_voice_level(SseDeserializer deserializer);
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
-
-  @protected
   void sse_encode_AnyhowException(
     AnyhowException self,
     SseSerializer serializer,
@@ -528,6 +543,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_app_settings(AppSettings self, SseSerializer serializer);
 
   @protected
+  void sse_encode_audio_devices(AudioDevices self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
@@ -570,7 +588,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_f_64(double self, SseSerializer serializer);
 
   @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
+
+  @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_channel_info(
@@ -748,9 +772,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_voice_level(VoiceLevel self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class

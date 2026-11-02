@@ -15,6 +15,15 @@ void main() {
     shareHeight: 0,
     shareFps: 0,
     echoCancel: true,
+    inputDevice: '',
+    outputDevice: '',
+    micAutogain: false,
+    micAutogainTargetDb: -18,
+  );
+
+  Future<AudioDevices> devices() async => const AudioDevices(
+    inputs: ['USB Mic', 'Built-in Mic'],
+    outputs: ['Headphones', 'Speakers'],
   );
 
   Widget host(List<AppSettings> saved, {bool hw = true}) {
@@ -26,12 +35,12 @@ void main() {
         server: 'chat.example:4443',
         user: 'elliot',
         onSave: (s) async => saved.add(s),
+        loadAudioDevices: devices,
       ),
     );
   }
 
-  testWidgets('toggling a switch persists exactly that change',
-      (tester) async {
+  testWidgets('toggling a switch persists exactly that change', (tester) async {
     final saved = <AppSettings>[];
     await tester.pumpWidget(host(saved));
     await tester.pumpAndSettle();
@@ -46,8 +55,9 @@ void main() {
     expect(saved.single.showSharePreview, initial.showSharePreview);
   });
 
-  testWidgets('the preview lives on the screen tile, not in Settings',
-      (tester) async {
+  testWidgets('the preview lives on the screen tile, not in Settings', (
+    tester,
+  ) async {
     await tester.pumpWidget(host(<AppSettings>[]));
     await tester.pumpAndSettle();
     expect(find.text('Show my own stream while sharing'), findsNothing);
@@ -76,8 +86,9 @@ void main() {
     expect(saved.last.shareHeight, 720, reason: 'the two choices compose');
   });
 
-  testWidgets('the account section shows the live session and sign-out',
-      (tester) async {
+  testWidgets('the account section shows the live session and sign-out', (
+    tester,
+  ) async {
     var signedOut = false;
     await tester.pumpWidget(
       MaterialApp(
@@ -88,12 +99,14 @@ void main() {
           server: 'chat.example:4443',
           user: 'elliot',
           onSave: (_) async {},
+          loadAudioDevices: devices,
           onSignOut: () async => signedOut = true,
         ),
       ),
     );
     await tester.pumpAndSettle();
 
+    await tester.scrollUntilVisible(find.text('chat.example:4443'), 200);
     expect(find.text('chat.example:4443'), findsOneWidget);
     expect(find.text('elliot'), findsOneWidget);
     // No hardware switch when the build has no VAAPI backend.
@@ -104,5 +117,46 @@ void main() {
     await tester.tap(find.text('Sign out'));
     await tester.pumpAndSettle();
     expect(signedOut, isTrue);
+  });
+
+  testWidgets('input and output devices persist by their exact names', (
+    tester,
+  ) async {
+    final saved = <AppSettings>[];
+    await tester.pumpWidget(host(saved));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byType(DropdownButton<String>).first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('USB Mic').last);
+    await tester.pumpAndSettle();
+    expect(saved.last.inputDevice, 'USB Mic');
+
+    await tester.tap(find.byType(DropdownButton<String>).last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Speakers').last);
+    await tester.pumpAndSettle();
+    expect(saved.last.outputDevice, 'Speakers');
+    expect(saved.last.inputDevice, 'USB Mic', reason: 'the two compose');
+  });
+
+  testWidgets('auto gain is opt-in and its target is saved on release', (
+    tester,
+  ) async {
+    final saved = <AppSettings>[];
+    await tester.pumpWidget(host(saved));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Slider), findsNothing);
+    await tester.scrollUntilVisible(find.text('Microphone auto gain'), 200);
+    await tester.tap(find.text('Microphone auto gain'));
+    await tester.pumpAndSettle();
+    expect(saved.last.micAutogain, isTrue);
+    expect(find.byType(Slider), findsOneWidget);
+
+    await tester.drag(find.byType(Slider), const Offset(-80, 0));
+    await tester.pumpAndSettle();
+    expect(saved.last.micAutogainTargetDb, lessThan(-18));
+    expect(saved.last.micAutogainTargetDb, greaterThanOrEqualTo(-36));
   });
 }

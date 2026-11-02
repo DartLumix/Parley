@@ -29,6 +29,48 @@ pub fn list_devices() -> Result<(Vec<String>, Vec<String>), Error> {
     Ok((inputs, outputs))
 }
 
+/// Resolve a saved input device by its cpal name, falling back to the
+/// system default when the name is empty or has disappeared since it was
+/// chosen. A missing saved device must not make the user unable to join
+/// voice; the fallback is announced in the log.
+pub fn input_device(name: Option<&str>) -> Result<cpal::Device, Error> {
+    let host = cpal::default_host();
+    if let Some(want) = name.filter(|name| !name.is_empty()) {
+        let devices = host
+            .input_devices()
+            .map_err(|e| Error::AudioDevice(e.to_string()))?;
+        if let Some(device) = devices
+            .into_iter()
+            .find(|d| d.name().map(|name| name == want).unwrap_or(false))
+        {
+            return Ok(device);
+        }
+        eprintln!("parley: input device \"{want}\" is unavailable; using the system default");
+    }
+    host.default_input_device()
+        .ok_or_else(|| Error::AudioDevice("no default input device".into()))
+}
+
+/// Resolve a saved output device by name, with the same fallback rule as
+/// [`input_device`].
+pub fn output_device(name: Option<&str>) -> Result<cpal::Device, Error> {
+    let host = cpal::default_host();
+    if let Some(want) = name.filter(|name| !name.is_empty()) {
+        let devices = host
+            .output_devices()
+            .map_err(|e| Error::AudioDevice(e.to_string()))?;
+        if let Some(device) = devices
+            .into_iter()
+            .find(|d| d.name().map(|name| name == want).unwrap_or(false))
+        {
+            return Ok(device);
+        }
+        eprintln!("parley: output device \"{want}\" is unavailable; using the system default");
+    }
+    host.default_output_device()
+        .ok_or_else(|| Error::AudioDevice("no default output device".into()))
+}
+
 /// The default input device and a supported config, resampled
 /// conceptually to 48 kHz mono by the pipeline (cpal gives us whatever
 /// the device wants; conversion happens in the callback later).

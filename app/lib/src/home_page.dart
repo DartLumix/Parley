@@ -227,6 +227,10 @@ class _HomePageState extends State<HomePage> {
     shareHeight: 0,
     shareFps: 0,
     echoCancel: true,
+    inputDevice: '',
+    outputDevice: '',
+    micAutogain: false,
+    micAutogainTargetDb: -18,
   );
   // The sharer's own preview texture (Rust creates it once per process).
   video_api.SharePreview? _preview;
@@ -1295,6 +1299,10 @@ class _HomePageState extends State<HomePage> {
         shareHeight: _settings.shareHeight,
         shareFps: _settings.shareFps,
         echoCancel: _settings.echoCancel,
+        inputDevice: _settings.inputDevice,
+        outputDevice: _settings.outputDevice,
+        micAutogain: _settings.micAutogain,
+        micAutogainTargetDb: _settings.micAutogainTargetDb,
       ),
     );
     if (on && _preview == null && _sharing) await _loadPreview();
@@ -1339,6 +1347,10 @@ class _HomePageState extends State<HomePage> {
             shareHeight: options.height,
             shareFps: options.fps,
             echoCancel: _settings.echoCancel,
+            inputDevice: _settings.inputDevice,
+            outputDevice: _settings.outputDevice,
+            micAutogain: _settings.micAutogain,
+            micAutogainTargetDb: _settings.micAutogainTargetDb,
           ),
         ),
       );

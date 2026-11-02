@@ -41,7 +41,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -612524230;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -215191583;
 
 // Section: executor
 
@@ -324,6 +324,38 @@ fn wire__crate__api__soundboard__apply_soundboard_impl(
                         api_leave,
                         api_afk,
                     )?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__settings__audio_devices_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "audio_devices",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::settings::audio_devices()?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -2471,12 +2503,32 @@ impl SseDecode for crate::api::settings::AppSettings {
         let mut var_shareHeight = <u32>::sse_decode(deserializer);
         let mut var_shareFps = <u32>::sse_decode(deserializer);
         let mut var_echoCancel = <bool>::sse_decode(deserializer);
+        let mut var_inputDevice = <String>::sse_decode(deserializer);
+        let mut var_outputDevice = <String>::sse_decode(deserializer);
+        let mut var_micAutogain = <bool>::sse_decode(deserializer);
+        let mut var_micAutogainTargetDb = <i32>::sse_decode(deserializer);
         return crate::api::settings::AppSettings {
             hw_encode: var_hwEncode,
             show_share_preview: var_showSharePreview,
             share_height: var_shareHeight,
             share_fps: var_shareFps,
             echo_cancel: var_echoCancel,
+            input_device: var_inputDevice,
+            output_device: var_outputDevice,
+            mic_autogain: var_micAutogain,
+            mic_autogain_target_db: var_micAutogainTargetDb,
+        };
+    }
+}
+
+impl SseDecode for crate::api::settings::AudioDevices {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_inputs = <Vec<String>>::sse_decode(deserializer);
+        let mut var_outputs = <Vec<String>>::sse_decode(deserializer);
+        return crate::api::settings::AudioDevices {
+            inputs: var_inputs,
+            outputs: var_outputs,
         };
     }
 }
@@ -2541,10 +2593,29 @@ impl SseDecode for f64 {
     }
 }
 
+impl SseDecode for i32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_i32::<NativeEndian>().unwrap()
+    }
+}
+
 impl SseDecode for i64 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         deserializer.cursor.read_i64::<NativeEndian>().unwrap()
+    }
+}
+
+impl SseDecode for Vec<String> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<String>::sse_decode(deserializer));
+        }
+        return ans_;
     }
 }
 
@@ -3045,13 +3116,6 @@ impl SseDecode for crate::api::session::VoiceLevel {
     }
 }
 
-impl SseDecode for i32 {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        deserializer.cursor.read_i32::<NativeEndian>().unwrap()
-    }
-}
-
 fn pde_ffi_dispatcher_primary_impl(
     func_id: i32,
     port: flutter_rust_bridge::for_generated::MessagePort,
@@ -3086,97 +3150,98 @@ fn pde_ffi_dispatcher_primary_impl(
             wire__crate__api__settings__app_settings_default_impl(port, ptr, rust_vec_len, data_len)
         }
         6 => wire__crate__api__soundboard__apply_soundboard_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__session__camera_share_supported_impl(
+        7 => wire__crate__api__settings__audio_devices_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__session__camera_share_supported_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        8 => wire__crate__api__session__connect_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__session__connect_with_token_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__session__disconnect_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__blob__download_chat_file_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__session__events_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__session__fetch_history_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__login__forget_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__session__hw_encode_enabled_impl(port, ptr, rust_vec_len, data_len),
-        16 => {
+        9 => wire__crate__api__session__connect_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__session__connect_with_token_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__session__disconnect_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__blob__download_chat_file_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__session__events_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__session__fetch_history_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__login__forget_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__session__hw_encode_enabled_impl(port, ptr, rust_vec_len, data_len),
+        17 => {
             wire__crate__api__session__hw_encode_supported_impl(port, ptr, rust_vec_len, data_len)
         }
-        17 => wire__crate__api__session__is_connected_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__session__join_voice_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__session__leave_voice_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__session__list_channels_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__players__list_share_audio_players_impl(
+        18 => wire__crate__api__session__is_connected_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__session__join_voice_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__session__leave_voice_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__session__list_channels_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__players__list_share_audio_players_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        22 => wire__crate__api__login__load_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__settings__load_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__session__manage_add_user_impl(port, ptr, rust_vec_len, data_len),
-        25 => {
+        23 => wire__crate__api__login__load_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__settings__load_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__session__manage_add_user_impl(port, ptr, rust_vec_len, data_len),
+        26 => {
             wire__crate__api__session__manage_create_channel_impl(port, ptr, rust_vec_len, data_len)
         }
-        26 => {
+        27 => {
             wire__crate__api__session__manage_delete_channel_impl(port, ptr, rust_vec_len, data_len)
         }
-        27 => wire__crate__api__session__manage_kick_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__session__manage_remove_user_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__session__manage_state_impl(port, ptr, rust_vec_len, data_len),
-        30 => {
+        28 => wire__crate__api__session__manage_kick_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__session__manage_remove_user_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__session__manage_state_impl(port, ptr, rust_vec_len, data_len),
+        31 => {
             wire__crate__api__session__manage_update_channel_impl(port, ptr, rust_vec_len, data_len)
         }
-        31 => wire__crate__api__session__manage_update_user_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__session__mic_level_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__session__pin_message_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__soundboard__play_personal_sound_impl(
+        32 => wire__crate__api__session__manage_update_user_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__session__mic_level_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__session__pin_message_impl(port, ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__soundboard__play_personal_sound_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        35 => wire__crate__api__session__play_voice_chime_impl(port, ptr, rust_vec_len, data_len),
-        36 => {
+        36 => wire__crate__api__session__play_voice_chime_impl(port, ptr, rust_vec_len, data_len),
+        37 => {
             wire__crate__api__session__poke_share_keyframe_impl(port, ptr, rust_vec_len, data_len)
         }
-        37 => wire__crate__api__session__poke_user_impl(port, ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__session__probe_server_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__session__request_avatar_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__session__request_presence_impl(port, ptr, rust_vec_len, data_len),
-        41 => {
+        38 => wire__crate__api__session__poke_user_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__session__probe_server_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__session__request_avatar_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__session__request_presence_impl(port, ptr, rust_vec_len, data_len),
+        42 => {
             wire__crate__api__session__request_voice_states_impl(port, ptr, rust_vec_len, data_len)
         }
-        42 => wire__crate__api__login__save_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__settings__save_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__session__screen_share_supported_impl(
+        43 => wire__crate__api__login__save_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__settings__save_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__session__screen_share_supported_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        45 => wire__crate__api__session__send_chat_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__session__set_hw_encode_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__session__set_mic_muted_impl(port, ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__session__set_output_muted_impl(port, ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__session__set_screen_watched_impl(port, ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__session__set_share_audio_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__session__set_share_volume_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__session__set_status_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__session__set_user_volume_impl(port, ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__video__share_preview_impl(port, ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__video__share_stats_impl(port, ptr, rust_vec_len, data_len),
-        56 => {
+        46 => wire__crate__api__session__send_chat_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__session__set_hw_encode_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__session__set_mic_muted_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__session__set_output_muted_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__session__set_screen_watched_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__session__set_share_audio_impl(port, ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__session__set_share_volume_impl(port, ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__session__set_status_impl(port, ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__session__set_user_volume_impl(port, ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__video__share_preview_impl(port, ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__video__share_stats_impl(port, ptr, rust_vec_len, data_len),
+        57 => {
             wire__crate__api__soundboard__soundboard_status_impl(port, ptr, rust_vec_len, data_len)
         }
-        57 => wire__crate__api__session__start_screen_share_impl(port, ptr, rust_vec_len, data_len),
-        58 => wire__crate__api__session__stop_screen_share_impl(port, ptr, rust_vec_len, data_len),
-        59 => wire__crate__api__session__trust_server_impl(port, ptr, rust_vec_len, data_len),
-        60 => wire__crate__api__session__update_profile_impl(port, ptr, rust_vec_len, data_len),
-        61 => wire__crate__api__blob__upload_chat_file_impl(port, ptr, rust_vec_len, data_len),
-        62 => wire__crate__api__video__video_prepare_impl(port, ptr, rust_vec_len, data_len),
-        63 => wire__crate__api__session__voice_levels_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__session__start_screen_share_impl(port, ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__session__stop_screen_share_impl(port, ptr, rust_vec_len, data_len),
+        60 => wire__crate__api__session__trust_server_impl(port, ptr, rust_vec_len, data_len),
+        61 => wire__crate__api__session__update_profile_impl(port, ptr, rust_vec_len, data_len),
+        62 => wire__crate__api__blob__upload_chat_file_impl(port, ptr, rust_vec_len, data_len),
+        63 => wire__crate__api__video__video_prepare_impl(port, ptr, rust_vec_len, data_len),
+        64 => wire__crate__api__session__voice_levels_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3259,6 +3324,10 @@ impl flutter_rust_bridge::IntoDart for crate::api::settings::AppSettings {
             self.share_height.into_into_dart().into_dart(),
             self.share_fps.into_into_dart().into_dart(),
             self.echo_cancel.into_into_dart().into_dart(),
+            self.input_device.into_into_dart().into_dart(),
+            self.output_device.into_into_dart().into_dart(),
+            self.mic_autogain.into_into_dart().into_dart(),
+            self.mic_autogain_target_db.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -3271,6 +3340,27 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::settings::AppSettings>
     for crate::api::settings::AppSettings
 {
     fn into_into_dart(self) -> crate::api::settings::AppSettings {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::settings::AudioDevices {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.inputs.into_into_dart().into_dart(),
+            self.outputs.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::settings::AudioDevices
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::settings::AudioDevices>
+    for crate::api::settings::AudioDevices
+{
+    fn into_into_dart(self) -> crate::api::settings::AudioDevices {
         self
     }
 }
@@ -3783,6 +3873,18 @@ impl SseEncode for crate::api::settings::AppSettings {
         <u32>::sse_encode(self.share_height, serializer);
         <u32>::sse_encode(self.share_fps, serializer);
         <bool>::sse_encode(self.echo_cancel, serializer);
+        <String>::sse_encode(self.input_device, serializer);
+        <String>::sse_encode(self.output_device, serializer);
+        <bool>::sse_encode(self.mic_autogain, serializer);
+        <i32>::sse_encode(self.mic_autogain_target_db, serializer);
+    }
+}
+
+impl SseEncode for crate::api::settings::AudioDevices {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Vec<String>>::sse_encode(self.inputs, serializer);
+        <Vec<String>>::sse_encode(self.outputs, serializer);
     }
 }
 
@@ -3827,10 +3929,27 @@ impl SseEncode for f64 {
     }
 }
 
+impl SseEncode for i32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_i32::<NativeEndian>(self).unwrap();
+    }
+}
+
 impl SseEncode for i64 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         serializer.cursor.write_i64::<NativeEndian>(self).unwrap();
+    }
+}
+
+impl SseEncode for Vec<String> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <String>::sse_encode(item, serializer);
+        }
     }
 }
 
@@ -4184,13 +4303,6 @@ impl SseEncode for crate::api::session::VoiceLevel {
         <u32>::sse_encode(self.user_id, serializer);
         <f64>::sse_encode(self.voice, serializer);
         <f64>::sse_encode(self.share, serializer);
-    }
-}
-
-impl SseEncode for i32 {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        serializer.cursor.write_i32::<NativeEndian>(self).unwrap();
     }
 }
 

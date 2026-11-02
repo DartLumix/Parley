@@ -39,6 +39,17 @@ pub struct AppSettings {
     /// Run echo cancellation on speech channels. Music channels never
     /// use it (transparency wins there), whatever this says.
     pub echo_cancel: bool,
+    /// Capture device name, or empty for the system default. A saved
+    /// device that has since disappeared falls back to the default.
+    pub input_device: String,
+    /// Render device name, or empty for the system default.
+    pub output_device: String,
+    /// Apply automatic gain to the microphone before encoding. Off by
+    /// default: it changes the signal, and a user with a good interface
+    /// should not have that done silently.
+    pub mic_autogain: bool,
+    /// Target RMS level for automatic gain, in dBFS (-36..-6).
+    pub mic_autogain_target_db: i32,
 }
 
 impl Default for AppSettings {
@@ -53,7 +64,62 @@ impl Default for AppSettings {
             share_height: 0,
             share_fps: 0,
             echo_cancel: true,
+            input_device: String::new(),
+            output_device: String::new(),
+            mic_autogain: false,
+            mic_autogain_target_db: -18,
         }
+    }
+}
+
+/// The device names the settings page offers. Plain strings because they
+/// cross the Flutter bridge; the configured value is the exact name cpal
+/// reports, and an empty string means "system default".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDevices {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+/// Enumerate the default host's devices. A build without `audio-device`
+/// has no cpal and returns the same kind of readable error as voice start.
+pub fn audio_devices() -> Result<AudioDevices, String> {
+    #[cfg(feature = "audio-device")]
+    {
+        let (inputs, outputs) =
+            parley_core::audio::device::list_devices().map_err(|e| e.to_string())?;
+        Ok(AudioDevices { inputs, outputs })
+    }
+    #[cfg(not(feature = "audio-device"))]
+    {
+        Err("audio-device support is not built in".to_string())
+    }
+}
+
+/// A consistent snapshot of the audio preferences for one voice start.
+/// Read once, on the device thread, so a save cannot change half of the
+/// stream setup while it is being built.
+#[cfg(feature = "audio-device")]
+#[derive(Debug, Clone)]
+pub(crate) struct AudioPrefs {
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub mic_autogain: bool,
+    pub mic_autogain_target_db: i32,
+}
+
+#[cfg(feature = "audio-device")]
+pub(crate) fn audio_prefs() -> AudioPrefs {
+    let settings = CURRENT.read().unwrap();
+    let named = |name: &str| {
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    };
+    AudioPrefs {
+        input_device: named(&settings.input_device),
+        output_device: named(&settings.output_device),
+        mic_autogain: settings.mic_autogain,
+        mic_autogain_target_db: settings.mic_autogain_target_db.clamp(-36, -6),
     }
 }
 
@@ -167,6 +233,8 @@ mod tests {
         assert!(parsed.hw_encode);
         assert_eq!(parsed.share_height, AppSettings::default().share_height);
         assert!(parsed.show_share_preview, "default keeps the preview on");
+        assert!(!parsed.mic_autogain, "autogain stays opt-in");
+        assert_eq!(parsed.mic_autogain_target_db, -18);
     }
 
     #[test]
@@ -179,6 +247,10 @@ mod tests {
             share_height: 720,
             share_fps: 30,
             echo_cancel: false,
+            input_device: "Studio Mic".to_string(),
+            output_device: "Headphones".to_string(),
+            mic_autogain: true,
+            mic_autogain_target_db: -20,
         };
         write(&path, &settings).expect("write");
         assert_eq!(read_at(&path).expect("read"), settings);
@@ -208,6 +280,10 @@ mod tests {
             share_height: 1080,
             share_fps: 60,
             echo_cancel: false,
+            input_device: String::new(),
+            output_device: String::new(),
+            mic_autogain: true,
+            mic_autogain_target_db: -22,
         };
         install(settings.clone());
         assert_eq!(load(), settings);
@@ -215,6 +291,14 @@ mod tests {
         assert!(!show_share_preview());
         #[cfg(feature = "audio-device")]
         assert!(!echo_cancel());
+        #[cfg(feature = "audio-device")]
+        {
+            let audio = audio_prefs();
+            assert_eq!(audio.input_device, None);
+            assert_eq!(audio.output_device, None);
+            assert!(audio.mic_autogain);
+            assert_eq!(audio.mic_autogain_target_db, -22);
+        }
         // `install` is the only writer of the process-global preference,
         // so this is what the next share depends on.
         #[cfg(feature = "video")]

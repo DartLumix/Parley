@@ -7,8 +7,14 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `config_dir`, `echo_cancel`, `install`, `read_at`, `read`, `settings_path`, `show_share_preview`, `write`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `eq`, `fmt`
+// These functions are ignored because they are not marked as `pub`: `audio_prefs`, `config_dir`, `echo_cancel`, `install`, `read_at`, `read`, `settings_path`, `show_share_preview`, `write`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AudioPrefs`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `eq`, `fmt`, `fmt`, `fmt`
+
+/// Enumerate the default host's devices. A build without `audio-device`
+/// has no cpal and returns the same kind of readable error as voice start.
+Future<AudioDevices> audioDevices() =>
+    RustLib.instance.api.crateApiSettingsAudioDevices();
 
 /// The settings as the UI should show them.
 Future<AppSettings> load() => RustLib.instance.api.crateApiSettingsLoad();
@@ -40,12 +46,31 @@ class AppSettings {
   /// use it (transparency wins there), whatever this says.
   final bool echoCancel;
 
+  /// Capture device name, or empty for the system default. A saved
+  /// device that has since disappeared falls back to the default.
+  final String inputDevice;
+
+  /// Render device name, or empty for the system default.
+  final String outputDevice;
+
+  /// Apply automatic gain to the microphone before encoding. Off by
+  /// default: it changes the signal, and a user with a good interface
+  /// should not have that done silently.
+  final bool micAutogain;
+
+  /// Target RMS level for automatic gain, in dBFS (-36..-6).
+  final int micAutogainTargetDb;
+
   const AppSettings({
     required this.hwEncode,
     required this.showSharePreview,
     required this.shareHeight,
     required this.shareFps,
     required this.echoCancel,
+    required this.inputDevice,
+    required this.outputDevice,
+    required this.micAutogain,
+    required this.micAutogainTargetDb,
   });
 
   static Future<AppSettings> default_() =>
@@ -57,7 +82,11 @@ class AppSettings {
       showSharePreview.hashCode ^
       shareHeight.hashCode ^
       shareFps.hashCode ^
-      echoCancel.hashCode;
+      echoCancel.hashCode ^
+      inputDevice.hashCode ^
+      outputDevice.hashCode ^
+      micAutogain.hashCode ^
+      micAutogainTargetDb.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -68,5 +97,30 @@ class AppSettings {
           showSharePreview == other.showSharePreview &&
           shareHeight == other.shareHeight &&
           shareFps == other.shareFps &&
-          echoCancel == other.echoCancel;
+          echoCancel == other.echoCancel &&
+          inputDevice == other.inputDevice &&
+          outputDevice == other.outputDevice &&
+          micAutogain == other.micAutogain &&
+          micAutogainTargetDb == other.micAutogainTargetDb;
+}
+
+/// The device names the settings page offers. Plain strings because they
+/// cross the Flutter bridge; the configured value is the exact name cpal
+/// reports, and an empty string means "system default".
+class AudioDevices {
+  final List<String> inputs;
+  final List<String> outputs;
+
+  const AudioDevices({required this.inputs, required this.outputs});
+
+  @override
+  int get hashCode => inputs.hashCode ^ outputs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AudioDevices &&
+          runtimeType == other.runtimeType &&
+          inputs == other.inputs &&
+          outputs == other.outputs;
 }

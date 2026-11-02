@@ -68,11 +68,15 @@
 use parley_core::audio::mixer::SharedMixer;
 
 #[cfg(feature = "audio-device")]
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 #[cfg(feature = "audio-device")]
-use parley_core::audio::device::{preferred_input_config, preferred_output_config, PREFERRED_RATE};
+use parley_core::audio::device::{
+    input_device, output_device, preferred_input_config, preferred_output_config, PREFERRED_RATE,
+};
 #[cfg(feature = "audio-device")]
 use parley_core::audio::pipeline::SendPipeline;
+#[cfg(feature = "audio-device")]
+use parley_core::audio::MicAutogain;
 #[cfg(feature = "audio-device")]
 use parley_proto::media::FLAG_STEREO;
 #[cfg(feature = "audio-device")]
@@ -158,8 +162,8 @@ pub(crate) fn play_poke_standalone() {
 #[cfg(feature = "audio-device")]
 fn play_samples_standalone(samples: Vec<f32>) {
     std::thread::spawn(move || {
-        let host = cpal::default_host();
-        let Some(device) = host.default_output_device() else {
+        let audio = crate::api::settings::audio_prefs();
+        let Ok(device) = output_device(audio.output_device.as_deref()) else {
             return;
         };
         let Ok(config) = preferred_output_config(&device) else {
@@ -820,13 +824,11 @@ fn build_streams(
     muted: Arc<AtomicBool>,
     mic_level: Arc<AtomicU32>,
 ) -> Result<AudioStreams, String> {
-    let host = cpal::default_host();
-    let in_dev = host
-        .default_input_device()
-        .ok_or("no default input device")?;
-    let out_dev = host
-        .default_output_device()
-        .ok_or("no default output device")?;
+    let audio = crate::api::settings::audio_prefs();
+    let in_dev =
+        input_device(audio.input_device.as_deref()).map_err(|e| format!("input device: {e}"))?;
+    let out_dev =
+        output_device(audio.output_device.as_deref()).map_err(|e| format!("output device: {e}"))?;
     let in_name = in_dev.name().unwrap_or_else(|_| "?".into());
     let out_name = out_dev.name().unwrap_or_else(|_| "?".into());
 
@@ -860,6 +862,9 @@ fn build_streams(
         let drops = drops.clone();
         let muted = muted.clone();
         let mic_level = mic_level.clone();
+        let autogain_enabled = audio.mic_autogain;
+        let autogain_target = audio.mic_autogain_target_db;
+        let mut autogain = MicAutogain::new(autogain_enabled, autogain_target);
         let mut first = true;
         in_dev.build_input_stream(
             cfg,
@@ -872,10 +877,6 @@ fn build_streams(
                         frames as f64 / 48.0
                     );
                 }
-                // Self meter: the peak of THIS chunk, before downmix.
-                // Muted zeroes it — the indicator must not claim a live
-                // mic while the button says muted.
-                let peak = data.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
                 // Muted: drop the chunk before the encoder. Sending
                 // nothing (rather than encoded silence) keeps the
                 // muted mic off the wire entirely.
@@ -883,16 +884,23 @@ fn build_streams(
                     mic_level.store(0f32.to_bits(), Ordering::Relaxed);
                     return;
                 }
-                mic_level.store(peak.to_bits(), Ordering::Relaxed);
                 // Downmix to mono (sum/channels — the terminal
                 // client's downmix).
-                let mono: Vec<f32> = if in_channels > 1 {
+                let mut mono: Vec<f32> = if in_channels > 1 {
                     data.chunks(in_channels)
                         .map(|c| c.iter().sum::<f32>() / in_channels as f32)
                         .collect()
                 } else {
                     data.to_vec()
                 };
+                // Opt-in AGC is part of the capture path: it changes what
+                // peers hear, never the AEC reference or local playback.
+                autogain.process(&mut mono);
+                // Self meter: the peak after downmix/AGC, so the indicator
+                // shows the level actually being sent. Muted already
+                // returned above and zeroed it.
+                let peak = mono.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+                mic_level.store(peak.to_bits(), Ordering::Relaxed);
                 if pcm_tx.try_send(mono).is_err() {
                     let n = drops.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_multiple_of(128) {
