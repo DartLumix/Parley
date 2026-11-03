@@ -795,6 +795,19 @@ impl Db {
         Ok(ids)
     }
 
+    /// Remove one chat row. Used when an attachment's metadata was
+    /// committed but its bytes could not be moved into place: the row
+    /// would otherwise advertise a file nobody can download. Any file
+    /// row it pointed at becomes an orphan and the periodic sweep
+    /// removes it.
+    pub fn delete_message(&self, message_id: u64) -> Result<bool, Error> {
+        let removed = self.conn.execute(
+            "DELETE FROM messages WHERE id = ?1",
+            rusqlite::params![message_id as i64],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Store an uploaded file's metadata and the chat row that announces
     /// it, in one transaction. Returns (message id, timestamp, file id).
     pub fn insert_file_message(
@@ -1022,6 +1035,9 @@ impl Db {
             DbCmd::OrphanFiles { reply } => {
                 let _ = reply.send(self.orphan_files());
             }
+            DbCmd::DeleteMessage { message_id, reply } => {
+                let _ = reply.send(self.delete_message(message_id));
+            }
             DbCmd::InsertFileMessage {
                 channel_id,
                 user_id,
@@ -1145,6 +1161,10 @@ pub enum DbCmd {
     },
     OrphanFiles {
         reply: oneshot::Sender<Result<Vec<u64>, Error>>,
+    },
+    DeleteMessage {
+        message_id: u64,
+        reply: oneshot::Sender<Result<bool, Error>>,
     },
     InsertFileMessage {
         channel_id: u64,
@@ -1496,6 +1516,14 @@ impl DbHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(DbCmd::OrphanFiles { reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    pub async fn delete_message(&self, message_id: u64) -> Result<bool, Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::DeleteMessage { message_id, reply })
             .map_err(|_| gone())?;
         rx.await.map_err(|_| gone())?
     }

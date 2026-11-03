@@ -275,8 +275,8 @@ jobs:
           flutter pub get
           $build = (git rev-parse HEAD).Trim()
           flutter build windows --release `
-            --dart-define=PARLEY_VERSION=$env:VERSION `
-            --dart-define=PARLEY_BUILD=$build
+            "--dart-define=PARLEY_VERSION=$env:VERSION" `
+            "--dart-define=PARLEY_BUILD=$build"
       - name: package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -304,6 +304,125 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-assets
+          path: dist/*
+          if-no-files-found: error
+
+  # The phone build. `flutter build apk --debug` is an installable test
+  # build; publishing it would put a debug-signed APK on the release page,
+  # and every later update would fail Android's signature check. The
+  # keystore and its passwords come from repository secrets, never from
+  # the tree, and the job refuses to build without them.
+  android:
+    name: Android APK
+    needs: [meta]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;android-37" \
+            "build-tools;37.0.0" \
+            "ndk;28.2.13676358"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: signing material
+        env:
+          KEYSTORE_BASE64: ${{ secrets.PARLEY_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::PARLEY_ANDROID_KEYSTORE_BASE64 is not set; refusing to publish a debug-signed APK"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/parley-release.jks"
+      - name: flutter build
+        working-directory: app
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          PARLEY_ANDROID_KEYSTORE: ${{ runner.temp }}/parley-release.jks
+          PARLEY_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.PARLEY_ANDROID_KEYSTORE_PASSWORD }}
+          PARLEY_ANDROID_KEY_ALIAS: ${{ secrets.PARLEY_ANDROID_KEY_ALIAS }}
+          PARLEY_ANDROID_KEY_PASSWORD: ${{ secrets.PARLEY_ANDROID_KEY_PASSWORD }}
+        run: |
+          flutter pub get
+          flutter build apk --release \
+            "--dart-define=PARLEY_VERSION=$VERSION" \
+            "--dart-define=PARLEY_BUILD=$(git -C .. rev-parse HEAD)"
+      - name: verify the APK is a signed release build with our icon
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          EXPECTED_CERT_SHA: ${{ secrets.PARLEY_ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          apk="app/build/app/outputs/flutter-apk/app-release.apk"
+          test -f "$apk"
+          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/37.0.0)
+          "$build_tools/zipalign" -c -v 4 "$apk" >/dev/null
+          "$build_tools/apksigner" verify --print-certs "$apk" | tee certs.txt
+          if grep -qi "Android Debug" certs.txt; then
+            echo "::error::the release APK is debug-signed"
+            exit 1
+          fi
+          # build-tools 35+ prints "V2 Signer: certificate SHA-256 digest:",
+          # older ones "Signer #1 certificate SHA-256 digest:". Accept both.
+          cert_sha=$(sed -n -E 's/^.*certificate SHA-256 digest: //p' certs.txt \
+            | head -1 | tr 'A-F' 'a-f' | tr -d ': ')
+          if [ -z "$cert_sha" ]; then
+            echo "::error::the release APK has no signer certificate"
+            exit 1
+          fi
+          if [ -n "$EXPECTED_CERT_SHA" ]; then
+            expected=$(printf '%s' "$EXPECTED_CERT_SHA" | tr 'A-F' 'a-f' | tr -d ': ')
+            if [ "$cert_sha" != "$expected" ]; then
+              echo "::error::the APK signer is not PARLEY_ANDROID_CERT_SHA256"
+              exit 1
+            fi
+          fi
+          badging=$("$build_tools/aapt2" dump badging "$apk")
+          echo "$badging" | grep -q "package: name='dev.parley.app' versionName='$VERSION'"
+          echo "$badging" | grep -q "application-label:'Parley'"
+          echo "$badging" | grep -q "application-icon"
+          if echo "$badging" | grep -q "application-debuggable"; then
+            echo "::error::the release APK is debuggable"
+            exit 1
+          fi
+          # AGP obfuscates resource file names in a release build, so the
+          # launcher icon is not at res/mipmap-*/ic_launcher.png in the
+          # archive. Follow the icon the manifest actually resolves and
+          # require it to be the two-layer adaptive icon we generated.
+          icon_path=$(printf '%s\n' "$badging" \
+            | sed -n "s/^application-icon-640:'\\(.*\\)'/\\1/p" | head -1)
+          if [ -z "$icon_path" ]; then
+            echo "::error::the APK declares no launcher icon"
+            exit 1
+          fi
+          "$build_tools/aapt2" dump xmltree --file "$icon_path" "$apk" \
+            | grep -q "E: foreground"
+          mkdir -p dist
+          cp "$apk" "dist/parley-${VERSION}-android.apk"
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-assets
           path: dist/*
           if-no-files-found: error
 
@@ -343,7 +462,7 @@ jobs:
 
   publish:
     name: GitHub release
-    needs: [meta, verify, server, client, windows, smoke]
+    needs: [meta, verify, server, client, windows, android, smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -411,6 +530,7 @@ jobs:
             echo
             echo "- \`parley-${VERSION}-linux-x86_64.tar.gz\` — desktop client (extract, run \`./install.sh\`)"
             echo "- \`parley-${VERSION}-windows-x86_64.zip\` — Windows desktop client (extract, run \`parley.exe\`; voice with echo cancellation, screen sharing with system or per-app audio)"
+            echo "- \`parley-${VERSION}-android.apk\` — Android client (release-signed; open the file to install, allow installs from this source when asked)"
             echo "- \`parley-cli-${VERSION}-linux-x86_64.tar.gz\` — terminal client and \`--check\` smoke tool"
             echo "- \`parley-server-${VERSION}-x86_64-linux-musl\` — static server, if you do not want Docker"
             echo "- \`parley-deploy-${VERSION}.tar.gz\` — deploy kit: compose file, env template, VPS runbook, AND the server image"
@@ -418,6 +538,7 @@ jobs:
             echo
             echo "Deploy: \`tar xf parley-deploy-${VERSION}.tar.gz\`, \`docker load -i parley-deploy-${VERSION}/parley-image-${VERSION}.tar.gz\`, \`docker compose up -d\`."
             echo "Client: \`tar xf parley-${VERSION}-linux-x86_64.tar.gz && cd parley-${VERSION}-linux-x86_64 && ./install.sh\`. Windows: unzip and run \`parley.exe\`."
+            echo "Android: download \`parley-${VERSION}-android.apk\`, open it, and allow installs from this source when Android asks."
           } >> notes.md
           cat notes.md
       - name: publish

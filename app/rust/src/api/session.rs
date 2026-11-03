@@ -152,6 +152,9 @@ pub(crate) enum Command {
     Poke {
         user_id: u32,
     },
+    /// Disconnect every other device on this account. Tokens stay valid;
+    /// those devices can reconnect without re-entering credentials.
+    LogOutOtherDevices,
     /// Change our own account. `current_password` must match; empty
     /// username/password means unchanged; non-empty avatar bytes replace
     /// the picture; `clear_avatar` removes it (ignored when bytes are
@@ -285,6 +288,9 @@ impl Command {
             Command::SetMute { muted } => ClientBody::SetMute(SetMute { muted }),
             Command::SetStatus { text } => ClientBody::SetStatus(SetStatus { text }),
             Command::Poke { user_id } => ClientBody::Poke(Poke { user_id }),
+            Command::LogOutOtherDevices => {
+                ClientBody::LogOutOtherDevices(parley_proto::LogOutOtherDevices {})
+            }
             Command::UpdateProfile {
                 current_password,
                 new_username,
@@ -309,6 +315,7 @@ impl Command {
                 ClientBody::ReceiverReport(ReceiverReport {
                     gap_rate_permille,
                     reporter_id: 0, // server stamps the authenticated id
+                    reporter_media_id: 0,
                 })
             }
             #[cfg(feature = "video")]
@@ -321,6 +328,7 @@ impl Command {
                 reporter_id: 0, // server stamps the authenticated id
                 viewer_fps,
                 keyframe_request,
+                reporter_media_id: 0,
             }),
             #[cfg(feature = "screen-capture")]
             Command::StopShare => ClientBody::StopShare(parley_proto::StopShare {}),
@@ -414,8 +422,14 @@ struct LiveSession {
     /// device reader/callback (start_voice takes it; membership events
     /// below add/remove voices).
     mixer: SharedMixer,
-    /// Authenticated user id (media reader's self-echo filter).
+    /// Authenticated user id.
     user_id: u32,
+    /// The server's connection generation for this device.
+    server_session_id: u64,
+    /// This device's media identity (voice/video datagrams). Read by
+    /// the voice startup path; a default-feature build has no voice.
+    #[cfg_attr(not(feature = "audio-device"), allow(dead_code))]
+    media_id: u32,
     /// Mic mute: the capture callback drops chunks while this is set
     /// (no packets at all, rather than silence packets). Session-scoped
     /// and deliberately not cleared by leave/join — muting is a user
@@ -499,6 +513,17 @@ pub struct PresenceEntry {
     /// Bumped whenever this user's picture changes; 0 = no picture. The
     /// bytes are requested separately and cached by version.
     pub avatar_version: u64,
+    /// "desktop" / "mobile", one entry per live device. One account still
+    /// has one presence row; the UI draws the badges beside the name.
+    pub devices: Vec<String>,
+}
+
+/// One other live device on the account, as the login prompt names it.
+#[derive(Debug, Clone)]
+pub struct DeviceSessionInfo {
+    pub session_id: u64,
+    pub kind: String,
+    pub name: String,
 }
 
 /// One chat row (live or history).
@@ -635,12 +660,20 @@ pub struct SessionEvent {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub session_id: u32,
+    /// The server-side connection generation. Distinct from the bridge's
+    /// local `session_id`; used to tell this device's voice events from
+    /// another device on the same account.
+    pub server_session_id: u64,
+    /// The compact per-device identity stamped into media datagrams.
+    pub media_id: u32,
     pub user_id: u32,
     pub session_token: String,
     pub server: String,
     pub fingerprint: String,
     /// "user" | "mod" | "admin" — gates the management page.
     pub role: String,
+    /// Other devices already signed in when this one authenticated.
+    pub other_sessions: Vec<DeviceSessionInfo>,
 }
 
 /// What a server presents on the wire, beside what this machine has
@@ -858,6 +891,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                     user_id: u.user_id,
                     username: u.username.clone(),
                     avatar_version: u.avatar_version,
+                    devices: u.devices.iter().map(|kind| device_label(*kind)).collect(),
                 })
                 .collect();
             vec![e]
@@ -958,7 +992,9 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             // the voice_state event still flows (the UI shows
             // membership truth). Featureless builds (CI): no local
             // voice exists — membership events stay pure UI state.
-            if v.user_id == own_user_id(session_id) {
+            if v.session_id == own_server_session_id(session_id)
+                && v.user_id == own_user_id(session_id)
+            {
                 if v.joined {
                     #[cfg(feature = "audio-device")]
                     enable_voice(session_id, v.channel_id);
@@ -981,15 +1017,17 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
         ServerBody::ReceiverReport(rep) => {
             // 7e2 (4d): a peer's loss report steers OUR send ladder —
             // it describes what that peer received (worst voice in
-            // its mix). Skip unstamped reports and our own echo (the
-            // server excludes the reporter from routing;
-            // belt-and-suspenders, the terminal client's filter).
+            // its mix). Skip unstamped reports and our own echo. The
+            // echo test is the reporter's MEDIA id, not its account id:
+            // a phone and a desktop on one account are different
+            // receivers, and the desktop must hear the phone's loss.
             // Stored for the voice encoder's 1 Hz tick — not a UI
             // event: the ladder is invisible by design. Featureless
             // builds have no voice path; reports are simply dropped.
             #[cfg(feature = "audio-device")]
             {
-                let is_echo = rep.reporter_id == 0 || rep.reporter_id == own_user_id(session_id);
+                let is_echo =
+                    rep.reporter_id == 0 || rep.reporter_media_id == own_media_id(session_id);
                 if !is_echo {
                     if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
                         s.loss_report
@@ -1012,14 +1050,15 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             // requests costs one keyframe, not one per report.
             if rep.keyframe_request
                 && rep.reporter_id != 0
-                && rep.reporter_id != own_user_id(session_id)
+                && rep.reporter_media_id != own_media_id(session_id)
             {
                 let _ = poke_share_keyframe(session_id);
                 return Vec::new();
             }
             #[cfg(feature = "screen-capture")]
             {
-                let is_echo = rep.reporter_id == 0 || rep.reporter_id == own_user_id(session_id);
+                let is_echo =
+                    rep.reporter_id == 0 || rep.reporter_media_id == own_media_id(session_id);
                 if !is_echo {
                     if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
                         s.share_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
@@ -1029,7 +1068,10 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                             reports.retain(|_, (_, when)| {
                                 now.duration_since(*when) < Duration::from_secs(15)
                             });
-                            reports.insert(rep.reporter_id, (rep.viewer_fps, now));
+                            // Per receiving device, not per account: two
+                            // devices on one account can sustain different
+                            // rates, and only the slower one should steer.
+                            reports.insert(rep.reporter_media_id, (rep.viewer_fps, now));
                             let worst = reports
                                 .values()
                                 .map(|(fps, _)| *fps)
@@ -1193,6 +1235,31 @@ fn own_user_id(session_id: u32) -> u32 {
         .unwrap_or(0)
 }
 
+fn own_media_id(session_id: u32) -> u32 {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| s.media_id)
+        .unwrap_or(0)
+}
+
+fn own_server_session_id(session_id: u32) -> u64 {
+    SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|s| s.server_session_id)
+        .unwrap_or(0)
+}
+
+fn device_label(kind: i32) -> String {
+    match parley_proto::DeviceKind::try_from(kind) {
+        Ok(parley_proto::DeviceKind::DeviceMobile) => "mobile".to_string(),
+        _ => "desktop".to_string(),
+    }
+}
+
 /// 7e: the profile for a channel, from the cached listing. Unknown
 /// channels default to speech (the conservative choice: AEC on).
 #[cfg(feature = "audio-device")]
@@ -1259,7 +1326,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
         (
             s.mixer.clone(),
             s.conn.clone(),
-            s.user_id,
+            s.media_id,
             s.loss_report.clone(),
             s.cmd_tx.clone(),
             #[cfg(feature = "video")]
@@ -1294,17 +1361,26 @@ fn enable_voice(session_id: u32, channel_id: u64) {
                 match sessions.get_mut(&session_id) {
                     Some(s) if current == epoch => {
                         s.voice = Some(ctrl);
+                        crate::android_log::info(&format!(
+                            "voice: enabled for session {session_id}"
+                        ));
                         println!("voice: enabled for session {session_id}");
                     }
                     _ => {
                         drop(ctrl); // superseded: tear down what just started
+                        crate::android_log::info(&format!(
+                            "voice: session {session_id} superseded mid-install"
+                        ));
                         println!(
                             "voice: enable for session {session_id} superseded mid-install — torn down"
                         );
                     }
                 }
             }
-            Err(e) => eprintln!("voice: enable failed: {e}"),
+            Err(e) => {
+                crate::android_log::error(&format!("voice: enable failed: {e}"));
+                eprintln!("voice: enable failed: {e}");
+            }
         }
     });
 }
@@ -1339,6 +1415,29 @@ fn teardown_voice(session_id: u32) {
 
 #[cfg(not(feature = "audio-device"))]
 fn teardown_voice(_session_id: u32) {}
+
+/// The device label the server stores beside this session.
+fn device_kind() -> i32 {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        parley_proto::DeviceKind::DeviceMobile as i32
+    } else {
+        parley_proto::DeviceKind::DeviceDesktop as i32
+    }
+}
+
+fn device_name() -> String {
+    if cfg!(target_os = "android") {
+        "Android".to_string()
+    } else if cfg!(target_os = "ios") {
+        "iOS".to_string()
+    } else if cfg!(target_os = "windows") {
+        "Windows".to_string()
+    } else if cfg!(target_os = "macos") {
+        "macOS".to_string()
+    } else {
+        "Linux".to_string()
+    }
+}
 
 /// Connect + authenticate. Blocks until the handshake completes (runs
 /// on an FRB worker thread; Dart sees a Future).
@@ -1412,6 +1511,8 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
             username: user,
             password,
             session_token,
+            device_kind: device_kind(),
+            device_name: device_name(),
         },
     )
     .await
@@ -1559,6 +1660,8 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
             sinks,
             mixer: session_mixer.clone(),
             user_id: ok.user_id,
+            server_session_id: ok.session_id,
+            media_id: ok.media_id,
             mic_muted: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "audio-device")]
             mic_level: Arc::new(AtomicU32::new(0)),
@@ -1603,11 +1706,22 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     .to_string();
     Ok(SessionInfo {
         session_id,
+        server_session_id: ok.session_id,
+        media_id: ok.media_id,
         user_id: ok.user_id,
         session_token: ok.session_token,
         server,
         fingerprint,
         role,
+        other_sessions: ok
+            .other_sessions
+            .iter()
+            .map(|device| DeviceSessionInfo {
+                session_id: device.session_id,
+                kind: device_label(device.kind),
+                name: device.name.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -1851,6 +1965,12 @@ pub fn join_voice(session_id: u32, channel_id: u64) -> Result<(), String> {
 /// event — which then disables the local voice devices; 7e).
 pub fn leave_voice(session_id: u32) -> Result<(), String> {
     send_command(session_id, Command::LeaveVoice)
+}
+
+/// Disconnect the account's other devices without invalidating their
+/// tokens. They can reconnect without re-entering credentials.
+pub fn log_out_other_devices(session_id: u32) -> Result<(), String> {
+    send_command(session_id, Command::LogOutOtherDevices)
 }
 
 /// Send a chat message (echo confirmation: "chat" event).
@@ -2764,6 +2884,7 @@ mod disconnect_tests {
                 username: "bob".into(),
                 password: "pass_b".into(),
                 session_token: String::new(),
+                ..Default::default()
             },
         )
         .await

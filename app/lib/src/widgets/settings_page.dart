@@ -213,6 +213,31 @@ class _SettingsPageState extends State<SettingsPage> {
             value: s.echoCancel,
             onChanged: (v) => _update(_copy(echoCancel: v)),
           ),
+          if (s.echoCancel)
+            _levelSlider(
+              label: 'Echo reduction strength',
+              caption:
+                  'Light is the mobile canceller; Balanced and Strong use '
+                  'AEC3. A phone on speaker usually needs Strong. Applies '
+                  'to the next channel you join.',
+              value: s.echoLevel.clamp(1, 3),
+              min: 1,
+              names: const ['Light', 'Balanced', 'Strong'],
+              onChanged: (v) => setState(() => _settings = _copy(echoLevel: v)),
+              onChangeEnd: (v) => _update(_copy(echoLevel: v)),
+            ),
+          _levelSlider(
+            label: 'Noise reduction',
+            caption:
+                'How hard the speech processor removes steady background '
+                'noise. High still keeps consonants; use Off for music or a '
+                'clean interface. Applies to the next channel you join.',
+            value: s.noiseLevel.clamp(0, 3),
+            min: 0,
+            names: const ['Off', 'Low', 'Medium', 'High'],
+            onChanged: (v) => setState(() => _settings = _copy(noiseLevel: v)),
+            onChangeEnd: (v) => _update(_copy(noiseLevel: v)),
+          ),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Microphone auto gain'),
@@ -322,6 +347,8 @@ class _SettingsPageState extends State<SettingsPage> {
     int? shareHeight,
     int? shareFps,
     bool? echoCancel,
+    int? echoLevel,
+    int? noiseLevel,
     String? inputDevice,
     String? outputDevice,
     bool? micAutogain,
@@ -334,10 +361,58 @@ class _SettingsPageState extends State<SettingsPage> {
       shareHeight: shareHeight ?? s.shareHeight,
       shareFps: shareFps ?? s.shareFps,
       echoCancel: echoCancel ?? s.echoCancel,
+      echoLevel: echoLevel ?? s.echoLevel,
+      noiseLevel: noiseLevel ?? s.noiseLevel,
       inputDevice: inputDevice ?? s.inputDevice,
       outputDevice: outputDevice ?? s.outputDevice,
       micAutogain: micAutogain ?? s.micAutogain,
       micAutogainTargetDb: micAutogainTargetDb ?? s.micAutogainTargetDb,
+    );
+  }
+
+  /// A discrete slider: the labels are what the user picks, the integer is
+  /// what crosses the bridge. `onChanged` previews locally while dragging;
+  /// `onChangeEnd` persists once, so a drag does not write the file per pixel.
+  Widget _levelSlider({
+    required String label,
+    required String caption,
+    required int value,
+    required int min,
+    required List<String> names,
+    required ValueChanged<int> onChanged,
+    required ValueChanged<int> onChangeEnd,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(label, style: const TextStyle(fontSize: 14)),
+              ),
+              Text(
+                names[value - min],
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ],
+          ),
+          Slider(
+            value: value.toDouble(),
+            min: min.toDouble(),
+            max: (min + names.length - 1).toDouble(),
+            divisions: names.length - 1,
+            label: names[value - min],
+            onChanged: (v) => onChanged(v.round()),
+            onChangeEnd: (v) => onChangeEnd(v.round()),
+          ),
+          Text(
+            caption,
+            style: const TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+        ],
+      ),
     );
   }
 

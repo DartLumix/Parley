@@ -1,7 +1,7 @@
 name: parley
 description: "Parley — self-hosted voice, chat and screen share (Linux desktop client)."
 publish_to: 'none'
-version: 0.4.9+21
+version: 0.5.0+22
 
 environment:
   sdk: ^3.13.5
@@ -15,6 +15,12 @@ dependencies:
   # 7f: exports the engine handle the Rust texture bridge needs (its
   # native plugin registers the symbols irondash dlsym-resolves).
   irondash_engine_context: ^0.5.4
+
+# Cargokit's published 0.5.5 script still calls Project.exec, which Gradle 9
+# removed. The local copy is identical except for the ExecOperations fix.
+dependency_overrides:
+  irondash_engine_context:
+    path: third_party/irondash_engine_context
 
 dev_dependencies:
   flutter_test:

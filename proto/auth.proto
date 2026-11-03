@@ -4,10 +4,29 @@ package parley;
 
 import "role.proto";
 
+// What kind of client owns a session. Account identity stays the user;
+// this only describes the device beside the name and lets a phone and a
+// desktop be signed in at once.
+enum DeviceKind {
+  DEVICE_UNKNOWN = 0;
+  DEVICE_DESKTOP = 1;
+  DEVICE_MOBILE = 2;
+}
+
+message DeviceSession {
+  uint64 session_id = 1;
+  DeviceKind kind = 2;
+  string name = 3;
+}
+
 message AuthRequest {
   string username = 1;
   string password = 2;
   string session_token = 3;
+  // Additive. An older client leaves UNKNOWN; the server treats that as
+  // one legacy desktop session.
+  DeviceKind device_kind = 4;
+  string device_name = 5;
 }
 
 message AuthOk {
@@ -19,6 +38,14 @@ message AuthOk {
   // Additive: an older server leaves this USER, which is the safe
   // default (no management page). An older client ignores it.
   Role role = 4;
+  // This connection's server-side session/media identities. Both are
+  // stable for the life of the connection; media_id is what voice and
+  // video datagrams carry so two devices on one account cannot collide.
+  uint64 session_id = 5;
+  uint32 media_id = 6;
+  // Other live sessions on this account at auth time. Drives the
+  // keep-both / log-out-other-devices prompt.
+  repeated DeviceSession other_sessions = 7;
 }
 
 message AuthDenied {

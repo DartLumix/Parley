@@ -127,6 +127,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ChatEntry dco_decode_chat_entry(dynamic raw);
 
   @protected
+  DeviceSessionInfo dco_decode_device_session_info(dynamic raw);
+
+  @protected
   double dco_decode_f_64(dynamic raw);
 
   @protected
@@ -143,6 +146,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<ChatEntry> dco_decode_list_chat_entry(dynamic raw);
+
+  @protected
+  List<DeviceSessionInfo> dco_decode_list_device_session_info(dynamic raw);
 
   @protected
   List<ManagedChannelInfo> dco_decode_list_managed_channel_info(dynamic raw);
@@ -337,6 +343,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ChatEntry sse_decode_chat_entry(SseDeserializer deserializer);
 
   @protected
+  DeviceSessionInfo sse_decode_device_session_info(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   double sse_decode_f_64(SseDeserializer deserializer);
 
   @protected
@@ -353,6 +364,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<ChatEntry> sse_decode_list_chat_entry(SseDeserializer deserializer);
+
+  @protected
+  List<DeviceSessionInfo> sse_decode_list_device_session_info(
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<ManagedChannelInfo> sse_decode_list_managed_channel_info(
@@ -587,6 +603,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_chat_entry(ChatEntry self, SseSerializer serializer);
 
   @protected
+  void sse_encode_device_session_info(
+    DeviceSessionInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_f_64(double self, SseSerializer serializer);
 
   @protected
@@ -607,6 +629,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_chat_entry(
     List<ChatEntry> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_device_session_info(
+    List<DeviceSessionInfo> self,
     SseSerializer serializer,
   );
 

@@ -276,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             username: args.user.clone(),
             password: args.password.clone(),
             session_token: args.token.clone().unwrap_or_default(),
+            ..Default::default()
         },
     )
     .await?;
@@ -705,15 +706,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(ServerBody::ReceiverReport(rep)) => {
                         // 4d: a peer's loss report steers our send profile
                         // (speech channels only — music ignores reports).
-                        // Skip our own echo and unstamped reports.
-                        if rep.reporter_id != 0 && rep.reporter_id != ok.user_id {
+                        // Skip our own echo and unstamped reports. Echo is
+                        // the reporter's media id: another device on this
+                        // account is a different receiver.
+                        if rep.reporter_id != 0 && rep.reporter_media_id != ok.media_id {
                             ctrl_loss_state.store(rep.gap_rate_permille, Ordering::Relaxed);
                         }
                     }
                     Some(ServerBody::VideoReport(rep)) => {
                         // 6e: a viewer's video loss report steers our
-                        // share bitrate. Skip own echo and unstamped.
-                        if rep.reporter_id != 0 && rep.reporter_id != ok.user_id {
+                        // share bitrate. Skip own echo and unstamped;
+                        // echo is per device, not per account.
+                        if rep.reporter_id != 0 && rep.reporter_media_id != ok.media_id {
                             if rep.keyframe_request {
                                 // A viewer's assembler is stalled; the
                                 // handle latches an IDR for the next frame.
@@ -983,7 +987,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = rep_outbound.send(ClientMessage {
                         body: Some(ClientBody::ReceiverReport(ReceiverReport {
                             gap_rate_permille: worst,
-                            reporter_id: 0, // server stamps the authenticated id
+                            reporter_id: 0,       // server stamps the authenticated id
+                            reporter_media_id: 0, // server stamps this too
                         })),
                     });
                 }

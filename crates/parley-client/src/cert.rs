@@ -19,6 +19,12 @@ fn fingerprint(cert: &CertificateDer<'_>) -> String {
 }
 
 fn known_hosts_path() -> PathBuf {
+    // Android's MainActivity points this at the app's private files dir;
+    // there is no useful HOME inside an app sandbox. Keep the pins beside
+    // the remembered login and settings, both of which already use it.
+    if let Some(dir) = std::env::var_os("PARLEY_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir).join("parley").join("known_hosts");
+    }
     // Windows sets neither of the XDG variables below; %APPDATA% is the
     // per-user root there (%APPDATA%\parley\known_hosts). Falling through
     // would put the pins in the current directory, which is not a place
@@ -254,6 +260,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("parley-cert-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("known_hosts")
+    }
+
+    #[test]
+    fn data_dir_override_holds_the_pins() {
+        let dir = std::env::temp_dir().join(format!("parley-cert-data-{}", std::process::id()));
+        let previous = std::env::var_os("PARLEY_DATA_DIR");
+        // SAFETY: this test owns the variable for its duration; no other
+        // test in this binary reads or writes it.
+        unsafe { std::env::set_var("PARLEY_DATA_DIR", &dir) };
+        let path = known_hosts_path();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PARLEY_DATA_DIR", value) },
+            None => unsafe { std::env::remove_var("PARLEY_DATA_DIR") },
+        }
+        assert_eq!(path, dir.join("parley").join("known_hosts"));
     }
 
     #[test]

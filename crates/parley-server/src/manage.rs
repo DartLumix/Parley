@@ -29,6 +29,7 @@ use parley_proto::{
 pub async fn handle(
     req: ManageRequest,
     actor: &UserInfo,
+    session_gen: u64,
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
@@ -64,7 +65,7 @@ pub async fn handle(
             if let Err(e) = db.create_user_with_role(&username, &a.password, role).await {
                 return fail(db_error(e));
             }
-            publish(actor.id, db, registry, voice).await
+            publish(session_gen, db, registry, voice).await
         }
 
         Action::UpdateUser(u) => {
@@ -111,7 +112,7 @@ pub async fn handle(
             if username.is_some() || role.is_some() {
                 registry.disconnect_user(target.id);
             }
-            publish(actor.id, db, registry, voice).await
+            publish(session_gen, db, registry, voice).await
         }
 
         Action::RemoveUser(r) => {
@@ -129,9 +130,16 @@ pub async fn handle(
             if let Err(e) = db.delete_user(target.id).await {
                 return fail(db_error(e));
             }
-            force_leave(target.id, registry, voice, transcode);
+            // Membership is per device: the account may be in voice from
+            // a phone and a desktop at once, and each media id has to
+            // leave on its own. Passing the user id here (as this did)
+            // removed nothing, leaving both devices in the room until
+            // their connections died.
+            for media_id in voice.media_ids_of_user(target.id) {
+                force_leave(media_id, registry, voice, transcode);
+            }
             registry.disconnect_user(target.id);
-            publish(actor.id, db, registry, voice).await
+            publish(session_gen, db, registry, voice).await
         }
 
         Action::CreateChannel(c) => {
@@ -149,7 +157,7 @@ pub async fn handle(
                 return fail(db_error(e));
             }
             broadcast_channel_list(db, registry).await;
-            publish(actor.id, db, registry, voice).await
+            publish(session_gen, db, registry, voice).await
         }
 
         Action::UpdateChannel(u) => {
@@ -170,7 +178,7 @@ pub async fn handle(
                 return fail(db_error(e));
             }
             broadcast_channel_list(db, registry).await;
-            publish(actor.id, db, registry, voice).await
+            publish(session_gen, db, registry, voice).await
         }
 
         Action::DeleteChannel(d) => {
@@ -180,11 +188,11 @@ pub async fn handle(
             if let Err(e) = db.delete_channel(d.channel_id).await {
                 return fail(db_error(e));
             }
-            for user_id in members {
-                force_leave(user_id, registry, voice, transcode);
+            for member in members {
+                force_leave(member.media_id, registry, voice, transcode);
             }
             broadcast_channel_list(db, registry).await;
-            publish(actor.id, db, registry, voice).await
+            publish(session_gen, db, registry, voice).await
         }
 
         Action::KickUser(k) => {
@@ -199,14 +207,18 @@ pub async fn handle(
             if !actor.role.is_admin() && target.role.is_admin() {
                 return fail("only an admin can kick an admin");
             }
-            if voice.channel_of(target.id) != Some(k.channel_id) {
+            let media_id = voice
+                .media_ids_of_user(target.id)
+                .into_iter()
+                .find(|media| voice.channel_of(*media) == Some(k.channel_id));
+            let Some(media_id) = media_id else {
                 return fail("that user is not in the channel");
-            }
+            };
             // The ordinary leave path, and nothing else: no ban, no
             // announcement beyond the membership change. They may rejoin
-            // immediately.
-            force_leave(target.id, registry, voice, transcode);
-            publish(actor.id, db, registry, voice).await
+            // immediately. Only the device in that channel is kicked.
+            force_leave(media_id, registry, voice, transcode);
+            publish(session_gen, db, registry, voice).await
         }
     }
 }
@@ -237,7 +249,7 @@ async fn state(
     let online: HashSet<u32> = registry
         .online_users()
         .into_iter()
-        .map(|(id, ..)| id)
+        .map(|user| user.id)
         .collect();
     let mut state = ManageState {
         users: users
@@ -247,7 +259,16 @@ async fn state(
                 username: u.username,
                 role: pb_role(u.role),
                 online: online.contains(&u.id),
-                channel_id: voice.channel_of(u.id).unwrap_or(0),
+                // Several devices may be in different rooms. Report the
+                // lowest channel so two identical polls cannot disagree
+                // (HashMap order is not stable), and pair it with what a
+                // kick will actually act on.
+                channel_id: voice
+                    .media_ids_of_user(u.id)
+                    .into_iter()
+                    .filter_map(|media| voice.channel_of(media))
+                    .min()
+                    .unwrap_or(0),
             })
             .collect(),
         channels: Vec::new(),
@@ -272,7 +293,7 @@ async fn state(
 /// manager. The requester's copy is written by the session loop (its
 /// control stream stays ordered), so it is excluded here.
 async fn publish(
-    actor_id: u32,
+    actor_session: u64,
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
@@ -280,7 +301,7 @@ async fn publish(
     match state(db, registry, voice).await {
         Ok(state) => {
             registry.broadcast_managers_except(
-                actor_id,
+                actor_session,
                 ServerMessage {
                     body: Some(ServerBody::ManageResult(ManageResult {
                         ok: true,
@@ -321,20 +342,20 @@ async fn broadcast_channel_list(db: &DbHandle, registry: &Arc<SessionRegistry>) 
 /// and channel deletion: membership, share route and transcode seat all
 /// die together, and the room hears one ordinary leave.
 fn force_leave(
-    user_id: u32,
+    media_id: u32,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
     transcode: &Arc<TranscodeManager>,
 ) {
-    let Some(channel_id) = voice.leave(user_id) else {
+    let Some(member) = voice.leave(media_id) else {
         return;
     };
-    if voice.stop_sharing(user_id) {
-        crate::server::notify_share_stopped(user_id, channel_id, registry, voice);
+    if voice.stop_sharing(media_id) {
+        crate::server::notify_share_stopped(member, member.channel_id, registry, voice);
     }
-    transcode.remove_share(user_id);
-    transcode.remove_viewer(user_id);
-    registry.broadcast(crate::server::voice_state_message(voice, user_id, 0, false));
+    transcode.remove_share(media_id);
+    transcode.remove_viewer(media_id);
+    registry.broadcast(crate::server::voice_state_message(voice, &member, 0, false));
 }
 
 fn pb_role(role: UserRole) -> i32 {

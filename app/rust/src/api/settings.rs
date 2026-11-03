@@ -39,6 +39,14 @@ pub struct AppSettings {
     /// Run echo cancellation on speech channels. Music channels never
     /// use it (transparency wins there), whatever this says.
     pub echo_cancel: bool,
+    /// Echo-canceller strength, 1..3 (light, balanced, strong). Only
+    /// consulted when `echo_cancel` is on; a value written by hand is
+    /// clamped at voice start.
+    pub echo_level: u8,
+    /// Noise-suppression strength, 0..3 (off, low, moderate, strong).
+    /// `Strong` maps to WebRTC's `High`, not `VeryHigh`: the latter is the
+    /// setting that starts eating consonants on a phone speaker.
+    pub noise_level: u8,
     /// Capture device name, or empty for the system default. A saved
     /// device that has since disappeared falls back to the default.
     pub input_device: String,
@@ -64,6 +72,18 @@ impl Default for AppSettings {
             share_height: 0,
             share_fps: 0,
             echo_cancel: true,
+            // Android is the speaker + built-in-mic case: default to the
+            // strongest pair that does not distort speech. Desktop keeps
+            // the balanced defaults; the sliders are one tap away either
+            // way, and the file is per-machine.
+            #[cfg(target_os = "android")]
+            echo_level: 3,
+            #[cfg(not(target_os = "android"))]
+            echo_level: 2,
+            #[cfg(target_os = "android")]
+            noise_level: 3,
+            #[cfg(not(target_os = "android"))]
+            noise_level: 2,
             input_device: String::new(),
             output_device: String::new(),
             mic_autogain: false,
@@ -124,6 +144,11 @@ pub(crate) fn audio_prefs() -> AudioPrefs {
 }
 
 fn config_dir() -> PathBuf {
+    // Android sets this to the app's private files dir (same rule as
+    // login.rs); XDG/HOME are not useful inside an app sandbox.
+    if let Some(dir) = std::env::var_os("PARLEY_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
     // Windows has neither XDG_CONFIG_HOME nor HOME; %APPDATA% is the
     // per-user root there (same rule as login.rs).
     #[cfg(windows)]
@@ -199,6 +224,16 @@ pub(crate) fn echo_cancel() -> bool {
     CURRENT.read().unwrap().echo_cancel
 }
 
+#[cfg(feature = "audio-device")]
+pub(crate) fn echo_level() -> u8 {
+    CURRENT.read().unwrap().echo_level.clamp(1, 3)
+}
+
+#[cfg(feature = "audio-device")]
+pub(crate) fn noise_level() -> u8 {
+    CURRENT.read().unwrap().noise_level.min(3)
+}
+
 fn read() -> Result<AppSettings, String> {
     read_at(&settings_path())
 }
@@ -235,6 +270,8 @@ mod tests {
         assert!(parsed.show_share_preview, "default keeps the preview on");
         assert!(!parsed.mic_autogain, "autogain stays opt-in");
         assert_eq!(parsed.mic_autogain_target_db, -18);
+        assert_eq!(parsed.echo_level, AppSettings::default().echo_level);
+        assert_eq!(parsed.noise_level, AppSettings::default().noise_level);
     }
 
     #[test]
@@ -247,6 +284,8 @@ mod tests {
             share_height: 720,
             share_fps: 30,
             echo_cancel: false,
+            echo_level: 1,
+            noise_level: 3,
             input_device: "Studio Mic".to_string(),
             output_device: "Headphones".to_string(),
             mic_autogain: true,
@@ -280,6 +319,8 @@ mod tests {
             share_height: 1080,
             share_fps: 60,
             echo_cancel: false,
+            echo_level: 3,
+            noise_level: 1,
             input_device: String::new(),
             output_device: String::new(),
             mic_autogain: true,
@@ -291,6 +332,10 @@ mod tests {
         assert!(!show_share_preview());
         #[cfg(feature = "audio-device")]
         assert!(!echo_cancel());
+        #[cfg(feature = "audio-device")]
+        assert_eq!(echo_level(), 3);
+        #[cfg(feature = "audio-device")]
+        assert_eq!(noise_level(), 1);
         #[cfg(feature = "audio-device")]
         {
             let audio = audio_prefs();

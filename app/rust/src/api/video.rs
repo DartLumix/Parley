@@ -720,6 +720,11 @@ pub mod imp {
         let mut dead: HashMap<u32, std::time::Instant> = HashMap::new();
         // Per-sender arrival cadence (see `Cadence`).
         let mut rate: HashMap<u32, Cadence> = HashMap::new();
+        // When the surface was last announced. `video_started` is the only
+        // event that creates a tile, and event delivery is best-effort; a
+        // periodic re-announcement repairs a missed notice without asking
+        // the sender to stop and start again.
+        let mut announced: HashMap<u32, std::time::Instant> = HashMap::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -793,7 +798,11 @@ pub mod imp {
                 frames: 0,
                 shown: provisional_fps,
             });
-            if reannounce || first_view {
+            let now = std::time::Instant::now();
+            let refresh = announced
+                .get(&sender)
+                .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(5));
+            if reannounce || first_view || refresh {
                 let _ = events.send(surface_event(
                     session_id,
                     "video_started",
@@ -802,6 +811,7 @@ pub mod imp {
                     rate.shown,
                     texture_id,
                 ));
+                announced.insert(sender, now);
             }
             if (frame.width, frame.height) != dims {
                 println!(

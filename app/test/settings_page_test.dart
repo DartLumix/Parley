@@ -15,6 +15,8 @@ void main() {
     shareHeight: 0,
     shareFps: 0,
     echoCancel: true,
+    echoLevel: 2,
+    noiseLevel: 2,
     inputDevice: '',
     outputDevice: '',
     micAutogain: false,
@@ -108,6 +110,7 @@ void main() {
 
     await tester.scrollUntilVisible(find.text('chat.example:4443'), 200);
     expect(find.text('chat.example:4443'), findsOneWidget);
+    await tester.scrollUntilVisible(find.text('Signed in as'), 200);
     expect(find.text('elliot'), findsOneWidget);
     // No hardware switch when the build has no VAAPI backend.
     expect(find.text('Hardware encoding (VAAPI)'), findsNothing);
@@ -147,16 +150,35 @@ void main() {
     await tester.pumpWidget(host(saved));
     await tester.pumpAndSettle();
 
-    expect(find.byType(Slider), findsNothing);
     await tester.scrollUntilVisible(find.text('Microphone auto gain'), 200);
     await tester.tap(find.text('Microphone auto gain'));
     await tester.pumpAndSettle();
     expect(saved.last.micAutogain, isTrue);
-    expect(find.byType(Slider), findsOneWidget);
+    await tester.scrollUntilVisible(find.text('Target level'), 200);
+    expect(find.text('Target level'), findsOneWidget);
 
-    await tester.drag(find.byType(Slider), const Offset(-80, 0));
+    await tester.drag(find.byType(Slider).last, const Offset(-80, 0));
     await tester.pumpAndSettle();
     expect(saved.last.micAutogainTargetDb, lessThan(-18));
     expect(saved.last.micAutogainTargetDb, greaterThanOrEqualTo(-36));
+  });
+
+  testWidgets('echo and noise strength are separate persisted levels', (
+    tester,
+  ) async {
+    final saved = <AppSettings>[];
+    await tester.pumpWidget(host(saved));
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(find.text('Noise reduction'), 200);
+    expect(find.text('Noise reduction'), findsOneWidget);
+    await tester.drag(find.byType(Slider).last, const Offset(-120, 0));
+    await tester.pumpAndSettle();
+    expect(saved.last.noiseLevel, lessThan(initial.noiseLevel));
+    expect(
+      saved.last.echoLevel,
+      initial.echoLevel,
+      reason: 'changing noise must not change echo strength',
+    );
   });
 }

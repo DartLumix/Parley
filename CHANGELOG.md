@@ -3,6 +3,50 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.5.0] — 2026-11-03
+
+Parley on Android, and one account live on several devices without the
+devices stepping on each other.
+
+### Added
+
+- **Android app.** A release APK for arm64 phones and tablets
+  (`parley-0.5.0-android.apk`): sign in, voice channels with echo
+  cancellation, chat with attachments, presence and personal cues, and
+  watching screen shares. Settings → Updates downloads the next APK
+  from the release page and hands it to Android's installer. The
+  launcher icon, adaptive icon and splash use the Parley mark.
+- **One account, several live devices.** Logging in on a phone no
+  longer replaces the desktop. Each connection has its own session and
+  media id, and both appear as badges on the single presence row. A
+  voice join, mute or leave belongs to that device only, so joining
+  from the phone cannot move the desktop's microphone. *Log out other
+  devices* disconnects them without revoking their tokens.
+
+### Changed
+
+- **The wire protocol is version 1.** Media datagrams carry a
+  per-device media id instead of the account id, which is what makes
+  two devices on one account distinguishable. The server and every
+  client must come from this release: an older client is refused at
+  the handshake (ALPN includes the version) instead of mislabelling a
+  sender. Upgrade the server first, then every client.
+
+### Fixed
+
+- Account removal now removes every device from voice; it passed an
+  account id where a media id was expected, so nothing left the room.
+- Voice and video control (share stopped, loss reports, keyframe
+  requests) is addressed to the device it describes instead of every
+  device on that account.
+- The presence dashboard reports a user as muted when **any** of their
+  devices is muted, and picks a stable channel when devices are in
+  different rooms. Management state picks a stable channel too.
+- Chat sent to a channel deleted mid-session is ignored instead of
+  ending the sender's session on a failed insert.
+- An attachment whose bytes could not be moved into place no longer
+  leaves a chat row that can never be downloaded.
+
 ## [0.4.9] — 2026-11-01
 
 Cues of your own and files in chat; the bundled notes now carry the

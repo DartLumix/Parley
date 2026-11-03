@@ -13,6 +13,7 @@ import 'rust/api/session.dart';
 import 'rust/api/settings.dart' as settings_api;
 import 'rust/api/soundboard.dart' as soundboard_api;
 import 'rust/api/video.dart' as video_api;
+import 'platform/android_platform.dart';
 import 'theme.dart';
 import 'update/notes.dart' as notes;
 import 'widgets/fullscreen_share.dart';
@@ -227,6 +228,8 @@ class _HomePageState extends State<HomePage> {
     shareHeight: 0,
     shareFps: 0,
     echoCancel: true,
+    echoLevel: 2,
+    noiseLevel: 2,
     inputDevice: '',
     outputDevice: '',
     micAutogain: false,
@@ -243,6 +246,16 @@ class _HomePageState extends State<HomePage> {
   // callback sends nothing at all. Session-scoped; a new login starts
   // unmuted.
   bool _micMuted = false;
+
+  // Phone-only layout state. The chat is a heading by default so the
+  // channel list gets the height; tapping the heading opens it in place.
+  bool _mobileChatExpanded = false;
+
+  // Phone-only: identity + fingerprint are hidden by default. A long
+  // pull down at the top reveals them, a long push up hides them again
+  // (the pull-to-refresh gesture, repurposed without a refresh action).
+  bool _mobileDetailsVisible = false;
+  double _mobileDetailsPull = 0;
 
   late final Timer _liveness;
 
@@ -603,12 +616,18 @@ class _HomePageState extends State<HomePage> {
       _statuses.clear();
       _afkStatus = null;
       _outputMuted = false;
+      _mobileChatExpanded = false;
+      _mobileDetailsVisible = false;
+      _mobileDetailsPull = 0;
       _shareStats = null;
       _avatars.clear();
       _avatarVersions.clear();
       _profileSave = null;
     });
     setWindowFullscreen(false);
+    if (AndroidPlatform.supported) {
+      unawaited(AndroidPlatform.stopVoiceService());
+    }
     _muteAllShares();
     _syncScreenWatch();
     // Clean the dead registry entry (a manual Disconnect may have
@@ -666,6 +685,11 @@ class _HomePageState extends State<HomePage> {
       // Who was already sitting in a channel before we connected —
       // no broadcast replays that, only the snapshot has it.
       requestVoiceStates(sessionId: s.sessionId);
+      // Every successful login asks what to do with any other live
+      // devices on this account. Keeping both is the default; logging
+      // the others out closes their connections but leaves their saved
+      // tokens valid, so they can reconnect without a password.
+      await _offerDeviceChoice(s);
     } catch (e) {
       if (mounted) setState(() => _status = 'connect failed: $e');
       // A saved token the server no longer accepts is not an error the
@@ -683,6 +707,45 @@ class _HomePageState extends State<HomePage> {
       }
     } finally {
       if (mounted) setState(() => _connecting = false);
+    }
+  }
+
+  Future<void> _offerDeviceChoice(SessionInfo s) async {
+    if (!mounted || s.otherSessions.isEmpty) return;
+    final devices = s.otherSessions
+        .map((d) => '${d.name} (${d.kind})')
+        .join('\n');
+    final logOutOthers = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Already signed in'),
+        content: Text(
+          'This account is also connected on:\n\n$devices\n\n'
+          'Keep both signed in, or disconnect the other devices. Logging '
+          'them out does not cancel their saved login: they can reconnect '
+          'without entering the password again.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Keep both'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Log out other devices'),
+          ),
+        ],
+      ),
+    );
+    if (logOutOthers != true || !mounted) return;
+    try {
+      await logOutOtherDevices(sessionId: s.sessionId);
+      if (mounted) setState(() => _status = 'other devices disconnected');
+    } catch (e) {
+      if (mounted) {
+        setState(() => _status = 'could not log out other devices: $e');
+      }
     }
   }
 
@@ -844,6 +907,9 @@ class _HomePageState extends State<HomePage> {
       _outputMuted = false;
       _volume.clear();
       _shareVolume.clear();
+      _mobileChatExpanded = false;
+      _mobileDetailsVisible = false;
+      _mobileDetailsPull = 0;
       _shareStats = null;
       _avatars.clear();
       _avatarVersions.clear();
@@ -1299,6 +1365,8 @@ class _HomePageState extends State<HomePage> {
         shareHeight: _settings.shareHeight,
         shareFps: _settings.shareFps,
         echoCancel: _settings.echoCancel,
+        echoLevel: _settings.echoLevel,
+        noiseLevel: _settings.noiseLevel,
         inputDevice: _settings.inputDevice,
         outputDevice: _settings.outputDevice,
         micAutogain: _settings.micAutogain,
@@ -1347,6 +1415,8 @@ class _HomePageState extends State<HomePage> {
             shareHeight: options.height,
             shareFps: options.fps,
             echoCancel: _settings.echoCancel,
+            echoLevel: _settings.echoLevel,
+            noiseLevel: _settings.noiseLevel,
             inputDevice: _settings.inputDevice,
             outputDevice: _settings.outputDevice,
             micAutogain: _settings.micAutogain,
@@ -1675,15 +1745,18 @@ class _HomePageState extends State<HomePage> {
         }
       case 'video_stats':
         // Same surface, new dimensions and/or a measured cadence. The
-        // texture id is stable, so the card simply keeps rendering.
+        // texture id is stable, so the card simply keeps rendering. A
+        // stats event can also be the first thing that arrives after a
+        // dropped start notice: upsert instead of requiring an existing
+        // tile, or the share stays invisible until the sender re-shares.
         final s2 = ev.surface;
         if (s2 != null) {
           final old = _videos[s2.userId];
-          if (old != null) {
-            final fps = s2.fps.toInt() > 0 ? s2.fps.toInt() : old.$4;
+          if (old != null || s2.textureId != 0) {
+            final fps = s2.fps.toInt() > 0 ? s2.fps.toInt() : (old?.$4 ?? 0);
             setState(() {
               _videos[s2.userId] = (
-                old.$1,
+                old?.$1 ?? s2.textureId,
                 s2.width.toInt(),
                 s2.height.toInt(),
                 fps,
@@ -1771,7 +1844,25 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _joinChannel(ChannelInfo c) async {
     if (_session == null || _joinedChannelId == c.id) return;
+    if (AndroidPlatform.supported) {
+      final granted = await AndroidPlatform.requestPermissions(const [
+        'android.permission.RECORD_AUDIO',
+      ]);
+      if (!granted) {
+        if (mounted) {
+          setState(
+            () => _status = 'microphone permission is required for voice',
+          );
+        }
+        return;
+      }
+    }
     await joinVoice(sessionId: _session!.sessionId, channelId: c.id);
+    if (AndroidPlatform.supported) {
+      // Voice starts on our own voice_state event, but the foreground
+      // service must exist before Android can suspend the process.
+      await AndroidPlatform.startVoiceService();
+    }
     // History preload for the joined channel (chat context).
     await fetchHistory(
       sessionId: _session!.sessionId,
@@ -1787,6 +1878,7 @@ class _HomePageState extends State<HomePage> {
     // on the roster with a note for a channel that is gone.
     if (_afkStatus != null) await _exitAfk();
     await leaveVoice(sessionId: _session!.sessionId);
+    if (AndroidPlatform.supported) await AndroidPlatform.stopVoiceService();
     setState(() => _chat.clear());
   }
 
@@ -1984,6 +2076,7 @@ class _HomePageState extends State<HomePage> {
         ),
       );
     }
+    final narrow = MediaQuery.sizeOf(context).width < 700;
     return Stack(
       children: [
         Scaffold(
@@ -2011,10 +2104,11 @@ class _HomePageState extends State<HomePage> {
                 onPressed: _openSettings,
               ),
               if (_session != null) ...[
-                Text(
-                  '$_ownName · id ${_session!.userId}',
-                  style: const TextStyle(color: Colors.white70, fontSize: 13),
-                ),
+                if (!narrow)
+                  Text(
+                    '$_ownName · id ${_session!.userId}',
+                    style: const TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
                 IconButton(
                   tooltip: 'Disconnect',
                   icon: const Icon(Icons.logout, size: 20),
@@ -2061,17 +2155,66 @@ class _HomePageState extends State<HomePage> {
   // [_channelPanelWidth]) so the rest of the window is screens and chat.
 
   Widget _sessionView(ThemeData theme) {
-    return Padding(
+    final mobile = MediaQuery.sizeOf(context).width < 760;
+    final content = Padding(
       // Bottom room for the floating share/mute bar.
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 80),
+      padding: EdgeInsets.fromLTRB(16, 12, 16, mobile ? 72 : 80),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _connectionStrip(theme),
-          const SizedBox(height: 12),
+          if (!mobile || _mobileDetailsVisible) ...[
+            _connectionStrip(theme),
+            const SizedBox(height: 12),
+          ],
           Expanded(
             child: LayoutBuilder(
               builder: (context, c) {
+                if (c.maxWidth < 760) {
+                  // Phone layout: channels own the height while the
+                  // chat is collapsed. An open chat shares the height
+                  // with the channels, and the share picture yields to
+                  // the keyboard so the composer can never overflow.
+                  final keyboardOpen =
+                      MediaQuery.viewInsetsOf(context).bottom > 0;
+                  final tiles = keyboardOpen
+                      ? const <ScreenTile>[]
+                      : _screenTiles();
+                  final screenHeight = tiles.isEmpty
+                      ? 0.0
+                      : math.min(180.0, c.maxHeight * 0.28);
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Expanded(
+                        flex: _mobileChatExpanded ? 6 : 1,
+                        child: _channelsPanel(theme, pullToReveal: true),
+                      ),
+                      if (tiles.isNotEmpty) ...[
+                        const SizedBox(height: 10),
+                        _screensPanel(theme, c.maxWidth, screenHeight),
+                      ],
+                      const SizedBox(height: 10),
+                      if (_mobileChatExpanded)
+                        Expanded(
+                          flex: 5,
+                          child: _chatPanel(
+                            theme,
+                            collapsible: true,
+                            collapsed: false,
+                          ),
+                        )
+                      else
+                        SizedBox(
+                          height: _mobileChatDockHeight,
+                          child: _chatPanel(
+                            theme,
+                            collapsible: true,
+                            collapsed: true,
+                          ),
+                        ),
+                    ],
+                  );
+                }
                 final channels = _channelPanelWidth(theme, c.maxWidth);
                 return Row(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2089,6 +2232,103 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
         ],
+      ),
+    );
+    if (!mobile) return content;
+    return NotificationListener<ScrollNotification>(
+      onNotification: _onMobileOverscroll,
+      child: content,
+    );
+  }
+
+  static const double _mobileChatDockHeight = 54;
+
+  /// Pull down deliberately far at the top to reveal the connection line.
+  /// Hiding is the opposite: the first upward movement folds it away, so
+  /// putting the strip back is never a second long gesture. The sign of the
+  /// drag comes from the pointer, so this does not depend on the platform's
+  /// overscroll sign convention.
+  static const double _mobileDetailsRevealPull = 420;
+
+  bool _onMobileOverscroll(ScrollNotification n) {
+    if (n is ScrollEndNotification) {
+      _mobileDetailsPull = 0;
+      return false;
+    }
+    if (n.metrics.axis != Axis.vertical) return false;
+    // Once the strip is open, the first upward movement hides it even if
+    // the channel list is not at the top. Requiring a second overscroll
+    // would make the gesture feel stuck after the layout shift that
+    // revealed the strip.
+    if (_mobileDetailsVisible && n is ScrollUpdateNotification) {
+      final delta = n.dragDetails?.delta.dy;
+      if (delta == null || delta == 0) return false;
+      if (delta < 0) {
+        _mobileDetailsPull = 0;
+        setState(() => _mobileDetailsVisible = false);
+      } else {
+        _mobileDetailsPull = 0;
+      }
+      return false;
+    }
+    if (n is! OverscrollNotification) return false;
+    if (n.metrics.extentBefore > 0) {
+      _mobileDetailsPull = 0;
+      return false;
+    }
+    final delta = n.dragDetails?.delta.dy;
+    if (delta == null || delta == 0) return false;
+    // Down is +, up is -. The reveal threshold is deliberately long: the
+    // strip is a diagnostic, not something that should flash while
+    // browsing. Hiding is immediate, not thresholded.
+    if (_mobileDetailsVisible) {
+      if (delta < 0) {
+        _mobileDetailsPull = 0;
+        setState(() => _mobileDetailsVisible = false);
+      } else {
+        _mobileDetailsPull = 0;
+      }
+    } else {
+      if (delta > 0) {
+        _mobileDetailsPull += delta;
+        if (_mobileDetailsPull >= _mobileDetailsRevealPull) {
+          setState(() {
+            _mobileDetailsVisible = true;
+            _mobileDetailsPull = 0;
+          });
+        }
+      } else {
+        _mobileDetailsPull = 0;
+      }
+    }
+    return false;
+  }
+
+  /// A share section sized for the phone's fixed strip above the chat.
+  Widget _screensPanel(ThemeData theme, double width, double availableHeight) {
+    final tiles = _screenTiles();
+    if (tiles.isEmpty) return const SizedBox.shrink();
+    final ids = {for (final t in tiles) t.userId};
+    final open = [
+      for (final id in _watched)
+        if (ids.contains(id)) id,
+    ];
+    final height = ScreensPanel.heightFor(
+      tileCount: tiles.length,
+      openCount: open.length,
+      width: width,
+      availableHeight: availableHeight,
+    );
+    return SizedBox(
+      height: height,
+      child: ScreensPanel(
+        tiles: tiles,
+        open: open,
+        onWatch: _watch,
+        onClose: _unwatch,
+        onFullscreen: _enterFullscreen,
+        onPreviewEnabled: _setPreviewEnabled,
+        onVolume: _applyShareVolume,
       ),
     );
   }
@@ -2226,7 +2466,7 @@ class _HomePageState extends State<HomePage> {
   // --- channels: one card per channel, with its live roster. The
   // column fills the left pane and scrolls on its own.
 
-  Widget _channelsPanel(ThemeData theme) {
+  Widget _channelsPanel(ThemeData theme, {bool pullToReveal = false}) {
     final idle = [
       for (final u in _presence)
         if (!_voiceChannel.containsKey(u.userId)) u.userId,
@@ -2247,6 +2487,12 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 8),
         Expanded(
           child: ListView(
+            // Keep the pull gesture available even when the list is
+            // shorter than the pane: it is how the connection strip is
+            // revealed on a phone. Desktop keeps its normal physics.
+            physics: pullToReveal
+                ? const AlwaysScrollableScrollPhysics()
+                : null,
             children: [
               for (final c in _channels) _channelCard(theme, c),
               if (idle.isNotEmpty) _idleCard(theme, idle),
@@ -2395,6 +2641,32 @@ class _HomePageState extends State<HomePage> {
   /// One roster row. It lights up while that person is actually making
   /// sound (local peak meter, not a flag), shows a muted mic when they say
   /// they are muted, and opens the volume dialog on click.
+  /// A compact phone/desktop hint beside a roster name. Presence is one
+  /// row per account; these are the live devices behind it.
+  Widget _deviceBadges(int userId) {
+    final entry = _presence.where((u) => u.userId == userId).firstOrNull;
+    if (entry == null || entry.devices.isEmpty) return const SizedBox.shrink();
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final kind in entry.devices.take(3))
+          Padding(
+            padding: const EdgeInsets.only(left: 4),
+            child: Tooltip(
+              message: kind == 'mobile' ? 'phone' : 'desktop',
+              child: Icon(
+                kind == 'mobile'
+                    ? Icons.phone_android
+                    : Icons.desktop_windows_outlined,
+                size: 13,
+                color: Colors.white38,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
   Widget _memberRow(int userId, {bool idle = false}) {
     final self = userId == _session?.userId;
     final level = self ? _selfLevel : (_levels[userId] ?? 0.0);
@@ -2471,11 +2743,18 @@ class _HomePageState extends State<HomePage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 13),
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                        ),
+                        _deviceBadges(userId),
+                      ],
                     ),
                     if (away != null)
                       Text(
@@ -2545,165 +2824,207 @@ class _HomePageState extends State<HomePage> {
 
   // --- chat
 
-  Widget _chatPanel(ThemeData theme) {
+  Widget _chatPanel(
+    ThemeData theme, {
+    bool collapsible = false,
+    bool collapsed = false,
+  }) {
     final joinedName = _joinedChannelId == null
         ? null
         : _channels
               .where((c) => c.id == _joinedChannelId)
               .map((c) => c.name)
               .firstOrNull;
+    final title = joinedName == null ? 'Chat' : 'Chat · $joinedName';
+    final header = collapsible
+        ? InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: () =>
+                setState(() => _mobileChatExpanded = !_mobileChatExpanded),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleSmall,
+                    ),
+                  ),
+                  Tooltip(
+                    message: collapsed ? 'Show chat' : 'Hide chat',
+                    child: Icon(
+                      collapsed ? Icons.expand_less : Icons.expand_more,
+                      size: 20,
+                      color: Colors.white54,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          )
+        : Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+            child: Text(title, style: theme.textTheme.titleSmall),
+          );
     return Container(
       decoration: BoxDecoration(
         border: Border.all(color: Colors.white24),
         borderRadius: BorderRadius.circular(10),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
-            child: Text(
-              joinedName == null ? 'Chat' : 'Chat · $joinedName',
-              style: theme.textTheme.titleSmall,
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: _joinedChannelId == null
-                ? const Center(
-                    child: Text(
-                      'Join a channel to chat.',
-                      style: TextStyle(color: Colors.white38),
-                    ),
-                  )
-                : SelectionArea(
-                    child: ListView.builder(
-                      controller: _chatScroll,
-                      padding: const EdgeInsets.all(10),
-                      itemCount: _chat.length,
-                      itemBuilder: (_, i) {
-                        final m = _chat[i];
-                        final own = m.userId == _session!.userId;
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 2),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Padding(
-                                padding: const EdgeInsets.only(top: 1),
-                                child: _avatar(m.userId, size: 20),
-                              ),
-                              const SizedBox(width: 6),
-                              if (m.pinned)
-                                const Padding(
-                                  padding: EdgeInsets.only(top: 3, right: 4),
-                                  child: Tooltip(
-                                    message: 'Pinned — kept after 24 h',
-                                    child: Icon(
-                                      Icons.push_pin,
-                                      size: 13,
-                                      color: accentSoft,
-                                    ),
-                                  ),
+      child: collapsed
+          ? header
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                header,
+                const Divider(height: 1),
+                Expanded(
+                  child: _joinedChannelId == null
+                      ? const Center(
+                          child: Text(
+                            'Join a channel to chat.',
+                            style: TextStyle(color: Colors.white38),
+                          ),
+                        )
+                      : SelectionArea(
+                          child: ListView.builder(
+                            controller: _chatScroll,
+                            padding: const EdgeInsets.all(10),
+                            itemCount: _chat.length,
+                            itemBuilder: (_, i) {
+                              final m = _chat[i];
+                              final own = m.userId == _session!.userId;
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 2,
                                 ),
-                              Expanded(
-                                child: Column(
+                                child: Row(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text.rich(
-                                      TextSpan(
-                                        style: const TextStyle(fontSize: 13),
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 1),
+                                      child: _avatar(m.userId, size: 20),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    if (m.pinned)
+                                      const Padding(
+                                        padding: EdgeInsets.only(
+                                          top: 3,
+                                          right: 4,
+                                        ),
+                                        child: Tooltip(
+                                          message: 'Pinned — kept after 24 h',
+                                          child: Icon(
+                                            Icons.push_pin,
+                                            size: 13,
+                                            color: accentSoft,
+                                          ),
+                                        ),
+                                      ),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
                                         children: [
-                                          TextSpan(
-                                            text: '${m.username} ',
-                                            style: TextStyle(
-                                              color: own
-                                                  ? accentSoft
-                                                  : Colors.white70,
-                                              fontWeight: FontWeight.bold,
+                                          Text.rich(
+                                            TextSpan(
+                                              style: const TextStyle(
+                                                fontSize: 13,
+                                              ),
+                                              children: [
+                                                TextSpan(
+                                                  text: '${m.username} ',
+                                                  style: TextStyle(
+                                                    color: own
+                                                        ? accentSoft
+                                                        : Colors.white70,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                                TextSpan(
+                                                  text:
+                                                      '${chatStamp(DateTime.fromMillisecondsSinceEpoch(m.timestampMs.toInt()))}  ',
+                                                  style: const TextStyle(
+                                                    color: Colors.white38,
+                                                    fontSize: 11,
+                                                  ),
+                                                ),
+                                                TextSpan(
+                                                  text: m.text,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                  ),
+                                                ),
+                                              ],
                                             ),
                                           ),
-                                          TextSpan(
-                                            text:
-                                                '${chatStamp(DateTime.fromMillisecondsSinceEpoch(m.timestampMs.toInt()))}  ',
-                                            style: const TextStyle(
-                                              color: Colors.white38,
-                                              fontSize: 11,
-                                            ),
-                                          ),
-                                          TextSpan(
-                                            text: m.text,
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                            ),
-                                          ),
+                                          if (m.attachmentId != BigInt.zero)
+                                            _attachmentChip(m),
                                         ],
                                       ),
                                     ),
-                                    if (m.attachmentId != BigInt.zero)
-                                      _attachmentChip(m),
+                                    IconButton(
+                                      onPressed: () => _togglePin(m),
+                                      tooltip: m.pinned
+                                          ? 'Unpin (it will expire again)'
+                                          : 'Pin — keep after 24 h',
+                                      visualDensity: VisualDensity.compact,
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 26,
+                                        minHeight: 26,
+                                      ),
+                                      icon: Icon(
+                                        m.pinned
+                                            ? Icons.push_pin
+                                            : Icons.push_pin_outlined,
+                                        size: 14,
+                                        color: Colors.white38,
+                                      ),
+                                    ),
                                   ],
                                 ),
-                              ),
-                              IconButton(
-                                onPressed: () => _togglePin(m),
-                                tooltip: m.pinned
-                                    ? 'Unpin (it will expire again)'
-                                    : 'Pin — keep after 24 h',
-                                visualDensity: VisualDensity.compact,
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(
-                                  minWidth: 26,
-                                  minHeight: 26,
-                                ),
-                                icon: Icon(
-                                  m.pinned
-                                      ? Icons.push_pin
-                                      : Icons.push_pin_outlined,
-                                  size: 14,
-                                  color: Colors.white38,
-                                ),
-                              ),
-                            ],
+                              );
+                            },
                           ),
-                        );
-                      },
+                        ),
+                ),
+                if (_joinedChannelId != null) ...[
+                  const Divider(height: 1),
+                  Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _chatInput,
+                            onSubmitted: (_) => _sendChat(),
+                            decoration: const InputDecoration(
+                              labelText: 'Message',
+                              isDense: true,
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: _attachFile,
+                          tooltip: 'Attach a file',
+                          icon: const Icon(Icons.attach_file, size: 20),
+                        ),
+                        const SizedBox(width: 4),
+                        ElevatedButton(
+                          onPressed: _sendChat,
+                          child: const Text('Send'),
+                        ),
+                      ],
                     ),
-                  ),
-          ),
-          if (_joinedChannelId != null) ...[
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.all(8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _chatInput,
-                      onSubmitted: (_) => _sendChat(),
-                      decoration: const InputDecoration(
-                        labelText: 'Message',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: _attachFile,
-                    tooltip: 'Attach a file',
-                    icon: const Icon(Icons.attach_file, size: 20),
-                  ),
-                  const SizedBox(width: 4),
-                  ElevatedButton(
-                    onPressed: _sendChat,
-                    child: const Text('Send'),
                   ),
                 ],
-              ),
+              ],
             ),
-          ],
-        ],
-      ),
     );
   }
 

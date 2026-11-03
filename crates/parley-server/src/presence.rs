@@ -391,12 +391,27 @@ pub(crate) async fn snapshot(
     voice: &VoiceManager,
 ) -> Result<String, Error> {
     let channels = db.list_channels().await?;
-    let mut live: HashMap<u32, (u64, bool, String)> = voice
-        .snapshot()
-        .into_iter()
-        .map(|(id, channel, muted, status)| (id, (channel, muted, status)))
-        .collect();
-    let sharing: HashSet<u32> = voice.sharing_snapshot();
+    let sharing_media: HashSet<u32> = voice.sharing_snapshot();
+    // The dashboard contract is one row per account. Collapse multiple
+    // devices onto one row: the lowest channel id (stable across polls),
+    // "muted" true if ANY device is muted, and "sharing" true if any
+    // device is sharing. The old `or_insert_with` kept whichever device
+    // HashMap iteration produced first, so a muted phone could read as
+    // unmuted because the desktop happened to be visited first.
+    let mut live: HashMap<u32, (u64, bool, String)> = HashMap::new();
+    let mut sharing_users: HashSet<u32> = HashSet::new();
+    for member in voice.snapshot() {
+        if sharing_media.contains(&member.media_id) {
+            sharing_users.insert(member.user_id);
+        }
+        let entry = live.entry(member.user_id).or_insert((
+            member.channel_id,
+            false,
+            voice.status_of(member.user_id),
+        ));
+        entry.0 = entry.0.min(member.channel_id);
+        entry.1 |= voice.is_muted(member.media_id);
+    }
     let roster = registry
         .roster()
         .into_iter()
@@ -413,7 +428,7 @@ pub(crate) async fn snapshot(
                 channel_id,
                 muted,
                 status,
-                sharing: sharing.contains(&user.id),
+                sharing: sharing_users.contains(&user.id),
             }
         })
         .collect();

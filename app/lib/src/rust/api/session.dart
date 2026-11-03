@@ -7,9 +7,9 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `connection`, `disable_voice`, `enable_voice`, `in_voice`, `into_client_body`, `mode_code`, `now_ms`, `output_muted`, `own_user_id`, `probe`, `read_frame`, `role_code`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
+// These functions are ignored because they are not marked as `pub`: `channel_is_music`, `closed_event`, `connect_async`, `connection`, `device_kind`, `device_label`, `device_name`, `disable_voice`, `enable_voice`, `in_voice`, `into_client_body`, `mode_code`, `now_ms`, `output_muted`, `own_server_session_id`, `own_user_id`, `probe`, `read_frame`, `role_code`, `rt`, `send_command`, `share_audio_audible`, `share_event`, `share_failed_event`, `share_mic_mux_channel`, `share_mic_route`, `start_share_watchdog`, `start_video_reporter`, `start_video_task`, `teardown_voice`, `to_event`, `volume_or_err`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Auth`, `Command`, `LiveSession`, `Probe`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// The certificate a server presents right now, beside the pin we hold.
 /// Read-only: nothing is trusted or written here.
@@ -158,6 +158,13 @@ Future<void> joinVoice({required int sessionId, required BigInt channelId}) =>
 /// event — which then disables the local voice devices; 7e).
 Future<void> leaveVoice({required int sessionId}) =>
     RustLib.instance.api.crateApiSessionLeaveVoice(sessionId: sessionId);
+
+/// Disconnect the account's other devices without invalidating their
+/// tokens. They can reconnect without re-entering credentials.
+Future<void> logOutOtherDevices({required int sessionId}) => RustLib
+    .instance
+    .api
+    .crateApiSessionLogOutOtherDevices(sessionId: sessionId);
 
 /// Send a chat message (echo confirmation: "chat" event).
 Future<void> sendChat({
@@ -540,6 +547,31 @@ class ChatEntry {
           attachmentMime == other.attachmentMime;
 }
 
+/// One other live device on the account, as the login prompt names it.
+class DeviceSessionInfo {
+  final BigInt sessionId;
+  final String kind;
+  final String name;
+
+  const DeviceSessionInfo({
+    required this.sessionId,
+    required this.kind,
+    required this.name,
+  });
+
+  @override
+  int get hashCode => sessionId.hashCode ^ kind.hashCode ^ name.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DeviceSessionInfo &&
+          runtimeType == other.runtimeType &&
+          sessionId == other.sessionId &&
+          kind == other.kind &&
+          name == other.name;
+}
+
 /// A full management snapshot. The page replaces its tables with this on
 /// every response; there are no partial-update races.
 class ManageStateInfo {
@@ -650,15 +682,23 @@ class PresenceEntry {
   /// bytes are requested separately and cached by version.
   final BigInt avatarVersion;
 
+  /// "desktop" / "mobile", one entry per live device. One account still
+  /// has one presence row; the UI draws the badges beside the name.
+  final List<String> devices;
+
   const PresenceEntry({
     required this.userId,
     required this.username,
     required this.avatarVersion,
+    required this.devices,
   });
 
   @override
   int get hashCode =>
-      userId.hashCode ^ username.hashCode ^ avatarVersion.hashCode;
+      userId.hashCode ^
+      username.hashCode ^
+      avatarVersion.hashCode ^
+      devices.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -667,7 +707,8 @@ class PresenceEntry {
           runtimeType == other.runtimeType &&
           userId == other.userId &&
           username == other.username &&
-          avatarVersion == other.avatarVersion;
+          avatarVersion == other.avatarVersion &&
+          devices == other.devices;
 }
 
 /// What a server presents on the wire, beside what this machine has
@@ -835,6 +876,14 @@ class SessionEvent {
 /// Connected-session snapshot returned at connect time.
 class SessionInfo {
   final int sessionId;
+
+  /// The server-side connection generation. Distinct from the bridge's
+  /// local `session_id`; used to tell this device's voice events from
+  /// another device on the same account.
+  final BigInt serverSessionId;
+
+  /// The compact per-device identity stamped into media datagrams.
+  final int mediaId;
   final int userId;
   final String sessionToken;
   final String server;
@@ -843,23 +892,32 @@ class SessionInfo {
   /// "user" | "mod" | "admin" — gates the management page.
   final String role;
 
+  /// Other devices already signed in when this one authenticated.
+  final List<DeviceSessionInfo> otherSessions;
+
   const SessionInfo({
     required this.sessionId,
+    required this.serverSessionId,
+    required this.mediaId,
     required this.userId,
     required this.sessionToken,
     required this.server,
     required this.fingerprint,
     required this.role,
+    required this.otherSessions,
   });
 
   @override
   int get hashCode =>
       sessionId.hashCode ^
+      serverSessionId.hashCode ^
+      mediaId.hashCode ^
       userId.hashCode ^
       sessionToken.hashCode ^
       server.hashCode ^
       fingerprint.hashCode ^
-      role.hashCode;
+      role.hashCode ^
+      otherSessions.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -867,11 +925,14 @@ class SessionInfo {
       other is SessionInfo &&
           runtimeType == other.runtimeType &&
           sessionId == other.sessionId &&
+          serverSessionId == other.serverSessionId &&
+          mediaId == other.mediaId &&
           userId == other.userId &&
           sessionToken == other.sessionToken &&
           server == other.server &&
           fingerprint == other.fingerprint &&
-          role == other.role;
+          role == other.role &&
+          otherSessions == other.otherSessions;
 }
 
 /// 7f: one remote share's display surface. `texture_id` feeds a plain

@@ -23,6 +23,11 @@ pub struct SavedLogin {
 }
 
 fn config_dir() -> PathBuf {
+    // Android's MainActivity points this at the app's private files dir;
+    // there is no useful HOME in an Android app process.
+    if let Some(dir) = std::env::var_os("PARLEY_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
     // Windows has neither XDG_CONFIG_HOME nor HOME: %APPDATA% is the
     // per-user root there. Without this the token file would land in the
     // process's working directory.

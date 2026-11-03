@@ -21,7 +21,7 @@ use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, AvatarData, Channel as PbChannel, ChannelList, ChannelMode,
-    ClientBody, ClientMessage, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked,
+    ClientBody, ClientMessage, DeviceKind, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked,
     PresenceList, PresenceUser, ProfileResult, ReceiverReport, ServerBody, ServerMessage,
     ShareStopped, VideoReport, VoiceState as PbVoiceState, VoiceStateList,
 };
@@ -291,14 +291,22 @@ async fn serve(
 
     info!(username = %info.username, user_id = info.id, "session started");
 
-    // Register with the broadcast registry before acking. Keyed by
-    // user_id: a second login by the same user replaces the first —
-    // the old event channel closes and that session ends. The returned
-    // generation guards the OLD session's cleanup against tearing down
-    // its successor (6c).
+    // A second login no longer replaces the first. Each connection gets
+    // its own session + media identity; the phone and desktop can stay
+    // online together and both can transmit. The session generation still
+    // guards cleanup against a closed connection racing a newer one.
+    let device = match DeviceKind::try_from(auth.device_kind) {
+        Ok(DeviceKind::DeviceMobile) => DeviceKind::DeviceMobile as i32,
+        _ => DeviceKind::DeviceDesktop as i32,
+    };
+    let device_name = if auth.device_name.trim().is_empty() {
+        "desktop".to_string()
+    } else {
+        auth.device_name.trim().chars().take(64).collect()
+    };
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let sound_versions = db.sound_versions(info.id).await?;
-    let session_gen = registry.register(ClientHandle {
+    let registered = registry.register(ClientHandle {
         user_id: info.id,
         username: info.username.clone(),
         avatar_version: info.avatar_version,
@@ -306,8 +314,14 @@ async fn serve(
         role: info.role,
         conn: conn.clone(),
         tx: event_tx,
-        session: 0, // assigned by register()
+        session: 0,  // assigned by register()
+        media_id: 0, // assigned by register()
+        device,
+        device_name,
     });
+    let session_gen = registered.session;
+    let media_id = registered.media;
+    let other_sessions = registry.other_sessions(info.id, session_gen);
 
     // Presence push on join. The new client's own copy queues in
     // event_rx and is only written by the session loop below — which
@@ -328,6 +342,9 @@ async fn serve(
                 crate::db::UserRole::Mod => parley_proto::Role::Mod as i32,
                 crate::db::UserRole::User => parley_proto::Role::User as i32,
             },
+            session_id: session_gen,
+            media_id,
+            other_sessions,
         },
     )
     .await?;
@@ -374,7 +391,7 @@ async fn serve(
             biased;
 
             dg = dg_rx.recv() => match dg {
-                Some(d) => route_datagram(&d, &info, registry, voice, transcode),
+                Some(d) => route_datagram(&d, &info, media_id, registry, voice, transcode),
                 None => break Ok(()),
             },
 
@@ -393,6 +410,8 @@ async fn serve(
                         m,
                         &mut info,
                         session_gen,
+                        media_id,
+                        device,
                         &mut tx,
                         db,
                         registry,
@@ -418,42 +437,39 @@ async fn serve(
     // and voice.leave would be booted from voice; coupling the two
     // locks isn't worth it.)
     let still_current = registry.unregister_if(info.id, session_gen);
-    // 7k: the channel a dying session was in, captured before the leave
-    // below forgets it — the ShareStopped notice goes to the room.
-    let died_in_channel = if still_current {
-        voice.channel_of(info.id)
+    // Capture the device membership before dropping it: the ShareStopped
+    // notice needs the media/session identity, and a leave needs the
+    // old channel.
+    let died_member = if still_current {
+        voice.member(media_id)
     } else {
         None
     };
     if still_current {
-        // Presence push on leave: the fresh list (dying user already
-        // unregistered) reaches the survivors. Generation-guarded — a
-        // replaced session's death must not un-list its successor.
+        // Presence still shows the account while another device remains;
+        // the device badge list changes either way.
         registry.broadcast(presence_message(registry));
-        // Mute is a SESSION preference (the client resets it at startup):
-        // forgetting it here keeps the server's roster in step with a
-        // client that signs back in unmuted.
-        voice.clear_muted(info.id);
-        // Same for the away status: it described that client's session.
-        voice.clear_status(info.id);
+        voice.clear_muted(media_id);
+        if registry.session_count(info.id) == 0 {
+            voice.clear_status(info.id);
+        }
     }
-    if still_current && voice.leave(info.id).is_some() {
-        registry.broadcast(voice_state_message(voice, info.id, 0, false));
+    if still_current && let Some(member) = died_member {
+        voice.leave(media_id);
+        registry.broadcast_voice(
+            info.id,
+            session_gen,
+            voice_state_message(voice, &member, 0, false),
+        );
     }
-    // 7k: the session (and with it any share) is over — the channel it
-    // was routed to must hear that, or a crash/disconnect strands a
-    // frozen card on every viewer. `voice.leave` above already dropped
-    // the membership, so the surviving members are all that remain.
-    if let Some(channel_id) = died_in_channel
-        && voice.stop_sharing(info.id)
+    if let Some(member) = died_member
+        && voice.stop_sharing(media_id)
     {
-        notify_share_stopped(info.id, channel_id, registry, voice);
+        notify_share_stopped(member, member.channel_id, registry, voice);
     }
     if still_current {
-        // A dead session cannot keep owning a transcode job or a seat
-        // in someone else's job.
-        transcode.remove_share(info.id);
-        transcode.remove_viewer(info.id);
+        transcode.remove_share(media_id);
+        transcode.remove_viewer(media_id);
     }
     info!(user_id = info.id, "session ended");
     let _ = tx.finish();
@@ -472,6 +488,8 @@ async fn handle_client_message(
     msg: ClientMessage,
     info: &mut crate::db::UserInfo,
     session_gen: u64,
+    media_id: u32,
+    device: i32,
     tx: &mut quinn::SendStream,
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
@@ -525,6 +543,18 @@ async fn handle_client_message(
             let text = chat.text.trim().to_string();
             if text.is_empty() || text.len() > 2000 {
                 return Ok(true); // ignore empty/oversized silently
+            }
+            // A stale client can send into a channel deleted while it was
+            // connected. Answer with silence, exactly like an unknown
+            // JoinVoice: the INSERT would otherwise fail on the foreign
+            // key and end the whole session.
+            if !db.channel_exists(chat.channel_id).await? {
+                warn!(
+                    user_id = info.id,
+                    channel_id = chat.channel_id,
+                    "chat for a channel that does not exist"
+                );
+                return Ok(true);
             }
             let (msg_id, ts, _) = db.insert_message(chat.channel_id, info.id, &text).await?;
             registry.broadcast(ServerMessage {
@@ -598,58 +628,74 @@ async fn handle_client_message(
 
         Some(ClientBody::JoinVoice(j)) => {
             let exists = db.channel_exists(j.channel_id).await?;
-            // is_current: a replaced session's stray messages must not
-            // touch the successor's voice membership (6c).
-            if exists && registry.is_current(info.id, session_gen) {
-                // A switch is leave + join: peers in the OLD channel
-                // must see a departure or their viewers/mixers freeze
-                // (6b).
-                if let Some(old) = voice.join(info.id, j.channel_id)
-                    && old != j.channel_id
+            // This connection must still be registered; its own media id
+            // is the voice identity, so another device on the account is
+            // unaffected.
+            if exists && registry.is_registered(info.id, session_gen) {
+                let next = crate::voice::VoiceMember {
+                    media_id,
+                    user_id: info.id,
+                    session_id: session_gen,
+                    channel_id: j.channel_id,
+                    device,
+                };
+                if let Some(old) = voice.join(next)
+                    && old.channel_id != j.channel_id
                 {
-                    // A channel switch is leave + join: the share died
-                    // with the old membership.
-                    if voice.stop_sharing(info.id) {
-                        notify_share_stopped(info.id, old, registry, voice);
+                    // A switch is leave + join for THIS device only. The
+                    // leave carries the channel it is leaving, so clients
+                    // can clear the right roster entry.
+                    if voice.stop_sharing(media_id) {
+                        notify_share_stopped(old, old.channel_id, registry, voice);
                     }
-                    transcode.remove_share(info.id);
-                    transcode.remove_viewer(info.id);
-                    registry.broadcast(voice_state_message(voice, info.id, old, false));
+                    transcode.remove_share(media_id);
+                    transcode.remove_viewer(media_id);
+                    registry.broadcast_voice(
+                        info.id,
+                        session_gen,
+                        voice_state_message(voice, &old, old.channel_id, false),
+                    );
                 }
-                registry.broadcast(voice_state_message(voice, info.id, j.channel_id, true));
+                if let Some(member) = voice.member(media_id) {
+                    registry.broadcast_voice(
+                        info.id,
+                        session_gen,
+                        voice_state_message(voice, &member, j.channel_id, true),
+                    );
+                }
             }
             // joining a nonexistent channel is ignored
         }
 
         Some(ClientBody::LeaveVoice(_)) => {
-            if registry.is_current(info.id, session_gen)
-                && let Some(old_channel) = voice.leave(info.id)
+            if registry.is_registered(info.id, session_gen)
+                && let Some(member) = voice.leave(media_id)
             {
-                // 7k: a share cannot outlive channel membership — the
-                // media route it rides is gone. Tell the room, or its
-                // viewers hold a card whose Watch button shows a frozen
-                // last frame forever (the reported 7j bug).
-                if voice.stop_sharing(info.id) {
-                    notify_share_stopped(info.id, old_channel, registry, voice);
+                if voice.stop_sharing(media_id) {
+                    notify_share_stopped(member, member.channel_id, registry, voice);
                 }
-                transcode.remove_share(info.id);
-                transcode.remove_viewer(info.id);
-                registry.broadcast(voice_state_message(voice, info.id, 0, false));
+                transcode.remove_share(media_id);
+                transcode.remove_viewer(media_id);
+                registry.broadcast_voice(
+                    info.id,
+                    session_gen,
+                    voice_state_message(voice, &member, 0, false),
+                );
             }
         }
 
         Some(ClientBody::SetMute(m)) => {
-            // A mute is roster news, not channel-scoped: the whole session
-            // sees it, so "muted" is right on the first join broadcast and
-            // a state poll can never disagree with the last SetMute.
-            if voice.set_muted(info.id, m.muted) {
-                let channel = voice.channel_of(info.id);
-                registry.broadcast(voice_state_message(
-                    voice,
+            // Mute is per device: muting the phone must not silence the
+            // desktop's microphone. It is still roster news, broadcast to
+            // every connected client.
+            if voice.set_muted(media_id, m.muted)
+                && let Some(member) = voice.member(media_id)
+            {
+                registry.broadcast_voice(
                     info.id,
-                    channel.unwrap_or(0),
-                    channel.is_some(),
-                ));
+                    session_gen,
+                    voice_state_message(voice, &member, member.channel_id, true),
+                );
             }
         }
 
@@ -665,7 +711,7 @@ async fn handle_client_message(
                         body: Some(ServerBody::Poked(Poked {
                             from_user_id: info.id,
                             from_username: info.username.clone(),
-                            channel_id: voice.channel_of(info.id).unwrap_or(0),
+                            channel_id: voice.channel_of(media_id).unwrap_or(0),
                         })),
                     },
                 );
@@ -680,16 +726,18 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::SetStatus(s)) => {
-            // Away text is roster news exactly like mute: whole session,
-            // unchanged text is not re-broadcast.
+            // Away text belongs to the ACCOUNT, so changing it updates
+            // every device's voice row. Unchanged text is not re-broadcast.
             if voice.set_status(info.id, &s.text) {
-                let channel = voice.channel_of(info.id);
-                registry.broadcast(voice_state_message(
-                    voice,
-                    info.id,
-                    channel.unwrap_or(0),
-                    channel.is_some(),
-                ));
+                for id in voice.media_ids_of_user(info.id) {
+                    if let Some(member) = voice.member(id) {
+                        registry.broadcast_voice(
+                            info.id,
+                            session_gen,
+                            voice_state_message(voice, &member, member.channel_id, true),
+                        );
+                    }
+                }
             }
         }
 
@@ -804,12 +852,15 @@ async fn handle_client_message(
                     body: Some(ServerBody::VoiceStateList(VoiceStateList {
                         states: states
                             .into_iter()
-                            .map(|(user_id, channel_id, muted, status)| PbVoiceState {
-                                user_id,
-                                channel_id,
+                            .map(|member| PbVoiceState {
+                                user_id: member.user_id,
+                                channel_id: member.channel_id,
                                 joined: true,
-                                muted,
-                                status,
+                                muted: voice.is_muted(member.media_id),
+                                status: voice.status_of(member.user_id),
+                                session_id: member.session_id,
+                                media_id: member.media_id,
+                                device_kind: member.device,
                             })
                             .collect(),
                     })),
@@ -819,48 +870,54 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::ReceiverReport(rep)) => {
-            // 4d/6b: loss feedback routed like media — to the reporter's
-            // voice-channel members only, reporter excluded.
-            if let Some(channel_id) = voice.channel_of(info.id) {
+            // Loss feedback is routed like media: to the reporter's
+            // voice-channel devices, reporter device excluded.
+            if let Some(channel_id) = voice.channel_of(media_id) {
                 let msg = ServerMessage {
                     body: Some(ServerBody::ReceiverReport(ReceiverReport {
                         reporter_id: info.id,
+                        reporter_media_id: media_id,
                         gap_rate_permille: rep.gap_rate_permille,
                     })),
                 };
                 for member in voice.members_of(channel_id) {
-                    if member != info.id {
-                        registry.send_to_user(member, msg.clone());
+                    if member.media_id != media_id {
+                        registry.send_to_media(member.media_id, msg.clone());
                     }
                 }
             }
         }
 
         Some(ClientBody::StopShare(_)) => {
-            // 6a/6b: scoped exactly like the video datagrams it
-            // terminates — members of the sharer's channel, sharer
-            // excluded (their own state machine drove the stop).
-            // An explicit stop always notifies: the client only sends
-            // it after teardown, and a duplicate is a no-op downstream.
-            voice.stop_sharing(info.id);
-            transcode.remove_share(info.id);
-            match voice.channel_of(info.id) {
-                Some(channel_id) => notify_share_stopped(info.id, channel_id, registry, voice),
-                // 7k: the sharer already left voice (or the leave and
-                // the stop raced). Nobody is in the old channel by our
-                // books, but a viewer may still hold the card — a
-                // broadcast is harmless (a second stop is a no-op).
+            // Scoped to THIS device's share. A desktop share must not be
+            // stopped by the phone's state machine ending its own share.
+            let member = voice.member(media_id);
+            voice.stop_sharing(media_id);
+            transcode.remove_share(media_id);
+            match member {
+                Some(member) => notify_share_stopped(member, member.channel_id, registry, voice),
                 None => registry.broadcast(ServerMessage {
-                    body: Some(ServerBody::ShareStopped(ShareStopped { user_id: info.id })),
+                    body: Some(ServerBody::ShareStopped(ShareStopped {
+                        user_id: info.id,
+                        session_id: session_gen,
+                        media_id,
+                    })),
                 }),
             }
+        }
+
+        Some(ClientBody::LogOutOtherDevices(_)) => {
+            // The token stays valid on the other devices by design: this
+            // is a live-session disconnect, not a credential revocation.
+            registry.log_out_other_sessions(info.id, session_gen);
         }
 
         Some(ClientBody::Manage(req)) => {
             // Management is a request/response on the same control stream.
             // Permission failures are ordinary results, not session
             // errors: a regular client that asks still gets an answer.
-            let result = manage::handle(req, info, db, registry, voice, transcode).await;
+            let result =
+                manage::handle(req, info, session_gen, db, registry, voice, transcode).await;
             session::write_message(
                 tx,
                 &ServerMessage {
@@ -877,13 +934,11 @@ async fn handle_client_message(
             // the server's tier instead: forwarding it would also make
             // the sharer lower its own stream, and the viewer would get
             // a double-degraded picture.
-            if let Some(channel_id) = voice.channel_of(info.id) {
+            if let Some(channel_id) = voice.channel_of(media_id) {
                 // A request-only report is not a decode-capability
-                // sample: forwarding it must not create a transcode job
-                // (viewer_fps is 0 because the assembler is stalled, not
-                // because the machine is slow).
+                // sample: forwarding it must not create a transcode job.
                 if !rep.keyframe_request
-                    && transcode.on_report(info.id, channel_id, rep.viewer_fps)
+                    && transcode.on_report(media_id, channel_id, rep.viewer_fps)
                         == ReportAction::Suppress
                 {
                     return Ok(true);
@@ -891,14 +946,15 @@ async fn handle_client_message(
                 let msg = ServerMessage {
                     body: Some(ServerBody::VideoReport(VideoReport {
                         reporter_id: info.id,
+                        reporter_media_id: media_id,
                         gap_rate_permille: rep.gap_rate_permille,
                         viewer_fps: rep.viewer_fps,
                         keyframe_request: rep.keyframe_request,
                     })),
                 };
                 for member in voice.members_of(channel_id) {
-                    if member != info.id {
-                        registry.send_to_user(member, msg.clone());
+                    if member.media_id != media_id {
+                        registry.send_to_media(member.media_id, msg.clone());
                     }
                 }
             }
@@ -923,26 +979,32 @@ async fn handle_client_message(
 /// anyone, so a sharer who closed their app (or hopped channels) left
 /// viewers with a card that never went away.
 pub(crate) fn notify_share_stopped(
-    user_id: u32,
+    sharer: crate::voice::VoiceMember,
     channel_id: u64,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
 ) {
     let msg = ServerMessage {
-        body: Some(ServerBody::ShareStopped(ShareStopped { user_id })),
+        body: Some(ServerBody::ShareStopped(ShareStopped {
+            user_id: sharer.user_id,
+            session_id: sharer.session_id,
+            media_id: sharer.media_id,
+        })),
     };
     for member in voice.members_of(channel_id) {
-        if member != user_id {
-            registry.send_to_user(member, msg.clone());
+        if member.media_id != sharer.media_id {
+            registry.send_to_media(member.media_id, msg.clone());
         }
     }
 }
 
 /// Forward a media datagram from `sender` to their voice channel.
-/// The sender id in the header is overwritten with the authenticated id.
+/// The sender field in the header is overwritten with this connection's
+/// media id, so a receiver can tell the phone from the desktop.
 fn route_datagram(
     data: &Bytes,
     sender: &crate::db::UserInfo,
+    media_id: u32,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
     transcode: &Arc<TranscodeManager>,
@@ -950,37 +1012,43 @@ fn route_datagram(
     let decoded = match parley_proto::media::decode(data) {
         Ok(d) => d,
         Err(e) => {
-            warn!(user_id = sender.id, error = e, "malformed media datagram");
+            warn!(
+                user_id = sender.id,
+                media_id,
+                error = e,
+                "malformed media datagram"
+            );
             return;
         }
     };
 
-    let Some(channel_id) = voice.channel_of(sender.id) else {
-        return; // sender is not in a voice channel: drop
+    let Some(channel_id) = voice.channel_of(media_id) else {
+        return; // this device is not in a voice channel: drop
     };
-    // 7k: a video datagram means a share is live for this user. The
-    // teardown paths consult this flag so they only announce a stop
-    // for someone who had something to stop.
     let is_video = decoded.flags & parley_proto::media::FLAG_VIDEO != 0;
     if is_video {
-        voice.mark_sharing(sender.id);
-        // Feed the transcode job (if one is active) and meter the
-        // sharer's own rate. Audio never takes this path.
-        transcode.note_video(sender.id, channel_id, decoded.payload);
+        voice.mark_sharing(media_id);
+        transcode.note_video(media_id, channel_id, decoded.payload);
     }
 
     let forwarded = Bytes::from(parley_proto::media::encode(
         decoded.flags,
         decoded.seq,
         decoded.timestamp,
-        sender.id,
+        media_id,
         decoded.payload,
     ));
 
-    let mut targets = voice.members_of(channel_id);
-    targets.retain(|member| {
-        *member != sender.id && (!is_video || transcode.should_forward(sender.id, *member))
-    });
+    // Same-account devices do not receive each other's media. On a phone
+    // and a desktop sitting in the same room that is the echo loop; on
+    // different channels the routing already keeps them apart.
+    let targets: Vec<u32> = voice
+        .members_of(channel_id)
+        .into_iter()
+        .filter(|member| member.media_id != media_id && member.user_id != sender.id)
+        .filter(|member| !is_video || transcode.should_forward(media_id, member.media_id))
+        .map(|member| member.media_id)
+        .collect();
     registry.send_datagram_many(&targets, &forwarded);
 }
 
@@ -993,17 +1061,20 @@ fn route_datagram(
 /// per-user field cannot be forgotten at one of the construction sites.
 pub(crate) fn voice_state_message(
     voice: &VoiceManager,
-    user_id: u32,
+    member: &crate::voice::VoiceMember,
     channel_id: u64,
     joined: bool,
 ) -> ServerMessage {
     ServerMessage {
         body: Some(ServerBody::VoiceState(PbVoiceState {
-            user_id,
+            user_id: member.user_id,
             channel_id,
             joined,
-            muted: voice.is_muted(user_id),
-            status: voice.status_of(user_id),
+            muted: voice.is_muted(member.media_id),
+            status: voice.status_of(member.user_id),
+            session_id: member.session_id,
+            media_id: member.media_id,
+            device_kind: member.device,
         })),
     }
 }
@@ -1014,16 +1085,15 @@ pub(crate) fn presence_message(registry: &SessionRegistry) -> ServerMessage {
         body: Some(ServerBody::PresenceList(PresenceList {
             users: users
                 .into_iter()
-                .map(
-                    |(id, name, avatar_version, (join, leave, afk))| PresenceUser {
-                        user_id: id,
-                        username: name,
-                        avatar_version,
-                        sound_join_version: join,
-                        sound_leave_version: leave,
-                        sound_afk_version: afk,
-                    },
-                )
+                .map(|user| PresenceUser {
+                    user_id: user.id,
+                    username: user.username,
+                    avatar_version: user.avatar_version,
+                    sound_join_version: user.sound_versions.0,
+                    sound_leave_version: user.sound_versions.1,
+                    sound_afk_version: user.sound_versions.2,
+                    devices: user.devices,
+                })
                 .collect(),
         })),
     }

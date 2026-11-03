@@ -15,11 +15,11 @@ pub use pb::server_message::Body as ServerBody;
 pub use pb::{
     AddUser, AuthDenied, AuthOk, AuthRequest, AvatarData, BlobDownload, BlobKind, BlobReply,
     BlobRequest, BlobUpload, Channel, ChannelList, ChannelMode, ChatMessage, ClientMessage,
-    CreateChannel, DeleteChannel, FetchHistory, Heartbeat, HeartbeatAck, Hello, HelloAck,
-    HistoryResult, JoinVoice, KickUser, LeaveVoice, ListChannels, ManageRequest, ManageResult,
-    ManageState, ManageStateRequest, ManagedChannel, ManagedUser, PinMessage, Poke, Poked,
-    PresenceList, PresenceRequest, PresenceUser, ProfileResult, ReceiverReport, RemoveUser,
-    RequestAvatar, Role, SendChat, ServerMessage, SetMute, SetStatus, ShareStopped, SoundRef,
-    StopShare, UpdateChannel, UpdateProfile, UpdateUser, VideoReport, VoiceState, VoiceStateList,
-    VoiceStatesRequest,
+    CreateChannel, DeleteChannel, DeviceKind, DeviceSession, FetchHistory, Heartbeat, HeartbeatAck,
+    Hello, HelloAck, HistoryResult, JoinVoice, KickUser, LeaveVoice, ListChannels,
+    LogOutOtherDevices, ManageRequest, ManageResult, ManageState, ManageStateRequest,
+    ManagedChannel, ManagedUser, PinMessage, Poke, Poked, PresenceList, PresenceRequest,
+    PresenceUser, ProfileResult, ReceiverReport, RemoveUser, RequestAvatar, Role, SendChat,
+    ServerMessage, SetMute, SetStatus, ShareStopped, SoundRef, StopShare, UpdateChannel,
+    UpdateProfile, UpdateUser, VideoReport, VoiceState, VoiceStateList, VoiceStatesRequest,
 };

@@ -168,6 +168,7 @@ async fn connect_and_auth(
             username: username.to_string(),
             password: password.to_string(),
             session_token: String::new(),
+            ..Default::default()
         },
     )
     .await

@@ -31,6 +31,50 @@ cargo build --release -p parley-client && tools/e2e-container.sh
 tools/package-client.sh 0.2.0 dist   # needs Flutter on PATH
 ```
 
+### Android signing secrets
+
+The Android job builds a **release** APK; it never falls back to the
+debug key. Set these repository secrets before tagging:
+
+| secret | value |
+|:--|:--|
+| `PARLEY_ANDROID_KEYSTORE_BASE64` | `base64 -w0 parley-release.jks` |
+| `PARLEY_ANDROID_KEYSTORE_PASSWORD` | the keystore password |
+| `PARLEY_ANDROID_KEY_ALIAS` | the release key alias |
+| `PARLEY_ANDROID_KEY_PASSWORD` | that key's password |
+| `PARLEY_ANDROID_CERT_SHA256` | optional: the signer's SHA-256, checked against `apksigner` |
+
+Create the key once, then keep it offline (never in this repository —
+`.gitignore` covers `*.jks` and `*.keystore`):
+
+```sh
+keytool -genkeypair -v -keystore parley-release.jks \
+  -alias parley -keyalg RSA -keysize 4096 -validity 10000
+base64 -w0 parley-release.jks > parley-release.jks.b64
+```
+
+Put the contents of `parley-release.jks.b64` in
+`PARLEY_ANDROID_KEYSTORE_BASE64`; the other three secrets are the
+passwords and alias chosen above. Android refuses an update signed with
+a different key, so losing this keystore strands every installed copy.
+
+To build a signed APK locally, point the same four environment
+variables at your keystore and run:
+
+```sh
+cd app
+PARLEY_ANDROID_KEYSTORE=/path/to/parley-release.jks \
+PARLEY_ANDROID_KEYSTORE_PASSWORD=... \
+PARLEY_ANDROID_KEY_ALIAS=... \
+PARLEY_ANDROID_KEY_PASSWORD=... \
+flutter build apk --release \
+  --dart-define=PARLEY_VERSION=0.5.0 \
+  --dart-define=PARLEY_BUILD=$(git rev-parse HEAD)
+```
+
+Without them the Gradle build stops at `assembleRelease` with a message
+naming the missing variables, rather than producing a debug-signed APK.
+
 ## Tag and push
 
 ```sh
@@ -58,13 +102,18 @@ git push origin v0.2.0
    WASAPI loopback), and zips the bundle. The archive layout is checked by
    extracting it: a `parley.exe` without `parley_flutter.dll` next to it
    would start and then fail on the first bridge call.
-6. **smoke** — extracts the kit, loads its image, boots it, adds a user through
+6. **android** — decodes the keystore secret, builds the NDK bridge for
+   `arm64-v8a` and `x86_64`, runs `flutter build apk --release`, then
+   checks the archive is aligned, signed by a non-debug certificate,
+   labelled Parley, packaged with the brand icon, and not debuggable.
+   The job fails before building when the secrets are absent.
+7. **smoke** — extracts the kit, loads its image, boots it, adds a user through
    `/parley-server adduser`, logs in as two accounts and proves a wrong
    password is refused (`tools/e2e-container.sh`).
-7. **publish** — writes `SHA256SUMS`, extracts the changelog section
+8. **publish** — writes `SHA256SUMS`, extracts the changelog section
    and creates the GitHub release with every asset attached.
 
-Only after all seven jobs pass does anything become public. Re-running a
+Only after all eight jobs pass does anything become public. Re-running a
 tag (workflow dispatch) uploads assets with `--clobber` and updates the
 notes.
 
@@ -74,6 +123,7 @@ notes.
 |:--|:--|
 | `parley-<v>-linux-x86_64.tar.gz` | desktop client; `./install.sh` |
 | `parley-<v>-windows-x86_64.zip` | Windows desktop client; extract, run `parley.exe` |
+| `parley-<v>-android.apk` | Android client; open the file and allow installs from this source |
 | `parley-cli-<v>-linux-x86_64.tar.gz` | terminal client, `--check` smoke test |
 | `parley-server-<v>-x86_64-linux-musl` | static server without Docker |
 | `parley-deploy-<v>.tar.gz` | deploy kit: compose file, env template, runbook **and** `parley-image-<v>.tar.gz` |
@@ -88,16 +138,18 @@ it by hand.
 Settings → *Updates* in the desktop client reads `releases/latest` from this
 repository and installs the asset named `parley-<v>-linux-x86_64.tar.gz`
 (Linux) or `parley-<v>-windows-x86_64.zip` (Windows), after checking it
-against the release's `SHA256SUMS`. All three come out of the publish job, so
-**a tagged release needs no extra step** for the updater to see it. Override
+against the release's `SHA256SUMS`. The Android build reads the same
+channel and downloads `parley-<v>-android.apk`, then hands it to the
+system installer. All of them come out of the publish job, so **a
+tagged release needs no extra step** for the updater to see it. Override
 the channel for a fork or a test build with
 `--dart-define=PARLEY_UPDATE_REPO=owner/repo`.
 
 What the updater depends on, and what to check after publishing:
 
-- **Both assets and `SHA256SUMS`** must be attached, and the checksums must
-  cover the exact uploaded bytes. The app verifies the download against them
-  and installs nothing when they disagree.
+- **Every platform asset and `SHA256SUMS`** must be attached, and the
+  checksums must cover the exact uploaded bytes. The app verifies the
+  download against them and installs nothing when they disagree.
 - `/releases/latest` **skips prereleases and drafts**: an `-rc` tag is never
   offered, and the last stable release stays the one clients see.
 - A release with **no asset for the platform** is reported in the Settings
@@ -107,6 +159,9 @@ What the updater depends on, and what to check after publishing:
   own. It never installs an older build.
 - A copy the app cannot write to — `/opt/parley` for a pacman install — is
   refused with a pointer to the package manager instead of being modified.
+- Android installs an APK **over** the current one only when both are
+  signed with the same key, which is why the release key must never be
+  replaced between updates.
 
 ## AUR
 
@@ -136,4 +191,7 @@ Or against the running server, with the shipped CLI:
 The Windows zip is unsigned, so SmartScreen warns on first run
 ("More info" → "Run anyway"). It carries voice with echo cancellation
 but cannot start a screen share — both stated in the release notes
-rather than left for the user to discover.
+rather than left for the user to discover. The Android APK is signed
+with the release key; Android may still warn about installing outside a
+store, and the first install has to allow installs from the app that
+opened it.

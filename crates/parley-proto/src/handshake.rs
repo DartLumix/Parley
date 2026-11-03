@@ -2,7 +2,12 @@
 //! Hello/HelloAck messages are prost-generated (see `pb` module).
 
 /// Wire-protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 0;
+///
+/// 1: media datagrams carry the sender's per-device `media_id` instead
+///    of the account id. An old client cannot tell two devices apart and
+///    would decode the new value as a different account, so server and
+///    every client must move together (ALPN carries this number).
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// A channel's identity. Newtype — never a bare u64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

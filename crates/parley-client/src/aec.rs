@@ -49,6 +49,73 @@ pub enum Kind {
     EchoOnly,
 }
 
+/// How hard the echo canceller works. `Light` is WebRTC's mobile AEC (less
+/// aggressive, cheaper); `Balanced` and `Strong` both use AEC3 — AEC3 has no
+/// suppression knob of its own, so the two differ only on backends that can
+/// expose one. The UI still shows three stops: a user should not have to
+/// learn that the C++ and Rust backends have different internals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchoStrength {
+    Off,
+    Light,
+    Balanced,
+    Strong,
+}
+
+impl EchoStrength {
+    /// The persisted level is an integer because it crosses the Flutter
+    /// bridge. Clamp rather than error: a hand-edited settings file must not
+    /// stop a voice join.
+    pub fn from_level(level: u8) -> Self {
+        match level {
+            0 => Self::Light,
+            1 => Self::Light,
+            2 => Self::Balanced,
+            _ => Self::Strong,
+        }
+    }
+}
+
+/// Noise-suppression aggressiveness. `Strong` deliberately stops at the
+/// WebRTC `High` preset (about 18 dB): `VeryHigh` is the one that starts
+/// chewing on speech consonants, which is exactly what the phone speaker +
+/// built-in mic setup cannot afford.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoiseLevel {
+    Off,
+    Low,
+    Moderate,
+    Strong,
+}
+
+impl NoiseLevel {
+    pub fn from_level(level: u8) -> Self {
+        match level {
+            0 => Self::Off,
+            1 => Self::Low,
+            2 => Self::Moderate,
+            _ => Self::Strong,
+        }
+    }
+}
+
+/// One voice connection's processing profile, read from settings at join
+/// time. A running connection keeps the profile it started with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Levels {
+    pub echo: EchoStrength,
+    pub noise: NoiseLevel,
+}
+
+impl Default for Levels {
+    fn default() -> Self {
+        Self {
+            echo: EchoStrength::Balanced,
+            noise: NoiseLevel::Moderate,
+        }
+    }
+}
+
 // ---------------------------------------------------------------- backend
 
 #[cfg(feature = "aec")]
@@ -56,22 +123,54 @@ mod backend {
     pub use webrtc_audio_processing::Processor;
     use webrtc_audio_processing::{Config, config};
 
-    use super::Kind;
+    use super::{EchoStrength, Kind, Levels, NoiseLevel};
 
     pub type Error = webrtc_audio_processing::Error;
 
     /// AEC3 (adaptive delay) + noise suppression + high-pass. AGC off.
-    pub fn new(kind: Kind) -> Result<Processor, Error> {
+    pub fn new(kind: Kind, levels: Levels) -> Result<Processor, Error> {
         let processor = Processor::new(48_000)?;
+        let echo = match kind {
+            Kind::EchoOnly => None,
+            Kind::Voice => match levels.echo {
+                EchoStrength::Off => None,
+                EchoStrength::Light => Some(config::EchoCanceller::Mobile { stream_delay_ms: 0 }),
+                EchoStrength::Balanced | EchoStrength::Strong => {
+                    Some(config::EchoCanceller::Full {
+                        stream_delay_ms: None,
+                    })
+                }
+            },
+        };
+        let noise = match kind {
+            Kind::EchoOnly => None,
+            Kind::Voice => match levels.noise {
+                NoiseLevel::Off => None,
+                NoiseLevel::Low => Some(config::NoiseSuppression {
+                    level: config::NoiseSuppressionLevel::Low,
+                    ..Default::default()
+                }),
+                NoiseLevel::Moderate => Some(config::NoiseSuppression {
+                    level: config::NoiseSuppressionLevel::Moderate,
+                    ..Default::default()
+                }),
+                NoiseLevel::Strong => Some(config::NoiseSuppression {
+                    level: config::NoiseSuppressionLevel::High,
+                    ..Default::default()
+                }),
+            },
+        };
         let config = match kind {
             Kind::Voice => Config {
-                echo_canceller: Some(config::EchoCanceller::default()),
+                echo_canceller: echo,
                 high_pass_filter: Some(Default::default()),
-                noise_suppression: Some(Default::default()),
+                noise_suppression: noise,
                 ..Default::default()
             },
             Kind::EchoOnly => Config {
-                echo_canceller: Some(config::EchoCanceller::default()),
+                echo_canceller: Some(config::EchoCanceller::Full {
+                    stream_delay_ms: None,
+                }),
                 ..Default::default()
             },
         };
@@ -104,7 +203,7 @@ mod backend {
     use sonora::config::{EchoCanceller, HighPassFilter, NoiseSuppression};
     use sonora::{AudioProcessing, Config, StreamConfig};
 
-    use super::{FRAME_SAMPLES, Kind};
+    use super::{EchoStrength, FRAME_SAMPLES, Kind, Levels, NoiseLevel};
 
     pub type Error = sonora::Error;
 
@@ -117,16 +216,43 @@ mod backend {
         ap: Mutex<AudioProcessing>,
     }
 
-    pub fn new(kind: Kind) -> Result<Processor, Error> {
+    pub fn new(kind: Kind, levels: Levels) -> Result<Processor, Error> {
+        let echo = match kind {
+            Kind::EchoOnly => Some(EchoCanceller::default()),
+            Kind::Voice => match levels.echo {
+                EchoStrength::Off => None,
+                EchoStrength::Light | EchoStrength::Balanced | EchoStrength::Strong => {
+                    Some(EchoCanceller::default())
+                }
+            },
+        };
+        let noise = match kind {
+            Kind::EchoOnly => None,
+            Kind::Voice => match levels.noise {
+                NoiseLevel::Off => None,
+                NoiseLevel::Low => Some(NoiseSuppression {
+                    level: sonora::config::NoiseSuppressionLevel::Low,
+                    ..Default::default()
+                }),
+                NoiseLevel::Moderate => Some(NoiseSuppression {
+                    level: sonora::config::NoiseSuppressionLevel::Moderate,
+                    ..Default::default()
+                }),
+                NoiseLevel::Strong => Some(NoiseSuppression {
+                    level: sonora::config::NoiseSuppressionLevel::High,
+                    ..Default::default()
+                }),
+            },
+        };
         let config = match kind {
             Kind::Voice => Config {
-                echo_canceller: Some(EchoCanceller::default()),
+                echo_canceller: echo,
                 high_pass_filter: Some(HighPassFilter::default()),
-                noise_suppression: Some(NoiseSuppression::default()),
+                noise_suppression: noise,
                 ..Default::default()
             },
             Kind::EchoOnly => Config {
-                echo_canceller: Some(EchoCanceller::default()),
+                echo_canceller: echo,
                 ..Default::default()
             },
         };
@@ -177,14 +303,14 @@ mod backend {
 /// filter with. Call sites keep their `Option<Arc<Processor>>` shape.
 #[cfg(not(any(feature = "aec", feature = "aec-rust")))]
 mod backend {
-    use super::Kind;
+    use super::{Kind, Levels};
 
     pub struct Processor(());
 
     pub type Error = std::convert::Infallible;
 
     /// Cannot fail — there is no APM to fail.
-    pub fn new(_kind: Kind) -> Result<Processor, Error> {
+    pub fn new(_kind: Kind, _levels: Levels) -> Result<Processor, Error> {
         Ok(Processor(()))
     }
 
@@ -198,12 +324,24 @@ pub use backend::{Error, Processor};
 
 /// Speech profile: AEC3 (adaptive delay) + noise suppression + high-pass.
 pub fn new_processor() -> Result<Arc<Processor>, Error> {
-    Ok(Arc::new(backend::new(Kind::Voice)?))
+    new_processor_with(Levels::default())
+}
+
+/// Speech profile with the levels the settings page chose. `Off` on either
+/// axis simply leaves that stage out; the other stage keeps working.
+pub fn new_processor_with(levels: Levels) -> Result<Arc<Processor>, Error> {
+    Ok(Arc::new(backend::new(Kind::Voice, levels)?))
 }
 
 /// Echo cancellation only — the share-audio path's smaller toolset.
 pub fn new_echo_canceller() -> Result<Arc<Processor>, Error> {
-    Ok(Arc::new(backend::new(Kind::EchoOnly)?))
+    Ok(Arc::new(backend::new(
+        Kind::EchoOnly,
+        Levels {
+            echo: EchoStrength::Strong,
+            noise: NoiseLevel::Off,
+        },
+    )?))
 }
 
 /// Buffers arbitrary-length chunks; pops exact 10 ms frames.

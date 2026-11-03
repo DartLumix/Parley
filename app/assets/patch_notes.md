@@ -12,51 +12,38 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
-# Five releases, one update.
+# Parley, now in your pocket.
 
-0.4.4 to 0.4.9 in a single jump. Everything that changed on the way.
+0.5.0 brings the Android app, and lets a phone and a desktop stay
+signed in together. Same rooms, same chat, same voice.
 
-## 0.4.4 · Updates from inside the app
+## Android
 
-- Settings → Updates looks for the newest build, downloads the one for your platform, checks it against the release checksums, installs it and restarts straight into it.
-- The handover is boring on purpose: the running install is replaced only after the new one unpacks, and a bad swap puts the old one back. The log is update.log next to the download.
-- These notes. They open by themselves on the first launch of a version, and live forever behind What's new.
-- A copy you cannot write to (a pacman install in /opt) is refused with a pointer to the package manager instead of being half-updated.
+- The release page carries an APK for arm64 phones and tablets. Open it
+  on the device and allow installs from this source the first time.
+- Voice channels with echo cancellation, chat with files, presence and
+  personal join/leave cues.
+- Watch a friend's screen share from the phone.
+- Settings → Updates downloads the next APK and hands it to Android's
+  installer. The release key stays the same, so updates install over the
+  current copy.
+- The Parley mark is the launcher icon, the adaptive icon and the
+  splash, instead of Flutter's default.
 
-## 0.4.5 · Windows grows up
+## One account, several devices
 
-- Screen sharing on Windows: pick a monitor or a single window.
-- Share audio too, either the whole output or only the apps you choose.
-- Fullscreen shares really are fullscreen, and the previous window placement comes back on exit.
-- An idle desktop stays live instead of freezing on the last frame.
+- Signing in on the phone no longer signs the desktop out. Both show up
+  as badges on one presence row.
+- Joining voice, muting or leaving happens on the device you did it on.
+  The phone joining a channel does not move the desktop's microphone,
+  and the phone leaving does not tear it down.
+- Settings → Log out other devices disconnects the rest without making
+  you sign in again later.
 
-## 0.4.6 · Pokes, wheel, camera
+## Before you update
 
-- Poke: click an online participant — in a channel or in the idle list — hit Poke, and they get a notification and a sound. Poke back from the notification.
-- Volume without dialogs: hover a user in the channel and scroll the wheel, 5% per notch.
-- Webcam sharing on Linux.
-- Minor fixes. Porcoddio.
-
-## 0.4.7 · Streams survive motion, camera on Windows
-
-- High motion fix: frames now leave at the stream's bitrate instead of in a burst, the ladder steps down gently and the view-rate floor is 15 fps. (Vediamo se Dario Cucci riesce a streammare più del fotolibro di Rocket League.)
-- Windows camera share, BETA. A capitu @AleOcerg? BETAA. L'eventuale combustione spontanea dell'utilizzatore non ha try/catch, ragazzi.
-- Camera overlay: your webcam in the corner of any screen share. One stream, one tile, both views.
-
-## 0.4.8 · Profile settings, avatars, quieter failures
-
-- Profile page next to Settings: change username and password. Ta ricordare la vecchia, cuiune.
-- Profile picture, picked straight from your files, shown on the roster and next to your chat rows.
-- Pokes now ring even with headphones muted, while AFK or deafened. That is the whole point of a poke.
-- Server transcoding is opt-in, and a tier that cannot keep up hands the viewer back instead of showing a slideshow.
-- Windows camera failsafe: a camera that refuses no longer leaves the share half-started. Microsoft, pijatela nculu plz.
-
-## 0.4.9 · Your sounds, your files
-
-- Personal event sounds: drop join.mp3, leave.mp3 or afk.mp3 in the sounds folder next to the app, then switch them on in Profile → Soundboard. Everyone in the channel hears yours.
-- The folder survives updates and reinstalls, 1 MB per file, MP3 only. No file, no problem: the default chime stays.
-- Mute everything silences personal sounds. Pokes still get through, because that is the point of a poke.
-- Chat file sharing: the paperclip next to the composer sends a file into the channel, up to 100 MB. Click the card to download, the message text becomes the caption. (100 MB di cap — per testare un po', caso mai Fladio Gelo carica l'intramfs come file jpeg.)
-- Files live on the server and disappear together with their message in a disappearing channel.
-
-Server first, then clients: files and personal sounds need both sides on 0.4.9. Voice and chat against an older build still work.
+- This is protocol 1. Upgrade the server first, then every client;
+  an older client is refused at the handshake instead of showing the
+  wrong name on a voice bar.
+- Android and desktop can talk to each other as soon as both are on
+  0.5.0.

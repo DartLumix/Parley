@@ -393,6 +393,7 @@ async fn connect_and_auth_full(
             username: username.to_string(),
             password: password.to_string(),
             session_token: String::new(),
+            ..Default::default()
         },
     )
     .await
@@ -560,6 +561,7 @@ async fn auth_success() {
             username: "testuser".to_string(),
             password: "testpass".to_string(),
             session_token: String::new(),
+            ..Default::default()
         },
     )
     .await
@@ -605,6 +607,7 @@ async fn auth_failure_wrong_password() {
             username: "testuser".to_string(),
             password: "wrongpass".to_string(),
             session_token: String::new(),
+            ..Default::default()
         },
     )
     .await
@@ -1502,6 +1505,7 @@ async fn a_slow_viewer_gets_a_transcoded_tier() {
                     reporter_id: 0,
                     viewer_fps: 5,
                     keyframe_request: false,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1670,6 +1674,7 @@ async fn receiver_report_routed_to_channel_members_only() {
         ClientBody::ReceiverReport(ReceiverReport {
             gap_rate_permille: 42,
             reporter_id: 0, // server stamps
+            ..Default::default()
         }),
     )
     .await;
@@ -1952,6 +1957,7 @@ async fn token_relogin_end_to_end() {
             username: String::new(),
             password: String::new(),
             session_token: ok_a.session_token.clone(),
+            ..Default::default()
         },
     )
     .await
@@ -1993,6 +1999,7 @@ async fn token_relogin_end_to_end() {
             username: String::new(),
             password: String::new(),
             session_token: "not-a-real-token".to_string(),
+            ..Default::default()
         },
     )
     .await
@@ -2007,7 +2014,7 @@ async fn token_relogin_end_to_end() {
 }
 
 #[tokio::test]
-async fn second_login_replaces_session() {
+async fn second_login_keeps_both_sessions() {
     init_logs();
 
     let (config, server) = setup_server_with_user("replace");
@@ -2020,8 +2027,8 @@ async fn second_login_replaces_session() {
     let (conn_b, mut tx_b, mut rx_b) =
         connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
     // First session of user 1, in voice.
-    let (conn_a, mut tx_a, mut rx_a) =
-        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_a, mut tx_a, mut rx_a, ok_a) =
+        connect_and_auth_full(&endpoint, addr, "testuser", "testpass").await;
     send_client_msg(
         &mut tx_a,
         ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
@@ -2030,39 +2037,27 @@ async fn second_login_replaces_session() {
     expect_voice_state(&mut rx_a, 1, 1, true).await;
     expect_voice_state(&mut rx_b, 1, 1, true).await;
 
-    // Same user logs in again — replaces the registry entry.
-    let (conn_a2, mut tx_a2, mut rx_a2) =
-        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
-    // First connection dies. Its cleanup is generation-guarded: it
-    // must NOT unregister the successor, NOT leave voice, NOT
-    // broadcast a departure.
-    conn_a.close(0u32.into(), b"replaced");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Same account logs in again: the old connection is NOT replaced.
+    let (conn_a2, mut tx_a2, mut rx_a2, ok_a2) =
+        connect_and_auth_full(&endpoint, addr, "testuser", "testpass").await;
+    assert_eq!(ok_a2.other_sessions.len(), 1);
+    assert_eq!(ok_a2.other_sessions[0].session_id, ok_a.session_id);
+    assert_ne!(
+        ok_a.media_id, ok_a2.media_id,
+        "each device has its own media id"
+    );
 
-    // B saw no leave for user 1. expect_silence, not a bare timeout:
-    // a2's registration legitimately pushed a PresenceList to B —
-    // ambient, tolerated — but nothing else may arrive (no departure,
-    // no voice state: the replaced session's cleanup is
-    // generation-guarded).
-    expect_silence(&mut rx_b, Duration::from_millis(500)).await;
-
-    // User 1 is still in voice — membership outlived the swap.
+    // Both connections are fully served.
     send_client_msg(
-        &mut tx_b,
-        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+        &mut tx_a,
+        ClientBody::Heartbeat(Heartbeat { client_time_ms: 8 }),
     )
     .await;
-    let msg = read_server_msg(&mut rx_b).await;
+    let msg = read_server_msg(&mut rx_a).await;
     match msg.body {
-        Some(ServerBody::VoiceStateList(list)) => {
-            assert_eq!(list.states.len(), 1);
-            assert_eq!(list.states[0].user_id, 1);
-            assert_eq!(list.states[0].channel_id, 1);
-        }
-        other => panic!("expected voice state list, got {other:?}"),
+        Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 8),
+        other => panic!("expected first session heartbeat ack, got {other:?}"),
     }
-
-    // The successor is fully served.
     send_client_msg(
         &mut tx_a2,
         ClientBody::Heartbeat(Heartbeat { client_time_ms: 9 }),
@@ -2071,7 +2066,59 @@ async fn second_login_replaces_session() {
     let msg = read_server_msg(&mut rx_a2).await;
     match msg.body {
         Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 9),
-        other => panic!("expected heartbeat ack, got {other:?}"),
+        other => panic!("expected second session heartbeat ack, got {other:?}"),
+    }
+
+    // Both devices may transmit in the same channel.
+    send_client_msg(
+        &mut tx_a2,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a2, 1, 1, true).await;
+    expect_voice_state(&mut rx_b, 1, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::VoiceStatesRequest(VoiceStatesRequest {}),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_b).await;
+    match msg.body {
+        Some(ServerBody::VoiceStateList(list)) => {
+            assert_eq!(list.states.len(), 2, "both devices are in voice");
+            let sessions: Vec<u64> = list.states.iter().map(|s| s.session_id).collect();
+            assert!(sessions.contains(&ok_a.session_id));
+            assert!(sessions.contains(&ok_a2.session_id));
+            assert!(list.states.iter().all(|s| s.user_id == 1));
+            assert!(list.states.iter().all(|s| s.channel_id == 1));
+        }
+        other => panic!("expected voice state list, got {other:?}"),
+    }
+
+    // Closing ONE device leaves only that device; the other stays in
+    // voice and is still served.
+    conn_a.close(0u32.into(), b"closed one device");
+    let msg = timeout(Duration::from_secs(5), read_server_msg(&mut rx_b))
+        .await
+        .expect("the leave of the closed device should arrive");
+    match msg.body {
+        Some(ServerBody::VoiceState(v)) => {
+            assert_eq!(v.user_id, 1);
+            assert_eq!(v.session_id, ok_a.session_id);
+            assert_eq!(v.channel_id, 0, "explicit leave carries no channel");
+            assert!(!v.joined);
+        }
+        other => panic!("expected the closed device's leave, got {other:?}"),
+    }
+    send_client_msg(
+        &mut tx_a2,
+        ClientBody::Heartbeat(Heartbeat { client_time_ms: 10 }),
+    )
+    .await;
+    let msg = read_server_msg(&mut rx_a2).await;
+    match msg.body {
+        Some(ServerBody::HeartbeatAck(ack)) => assert_eq!(ack.client_time_ms, 10),
+        other => panic!("the surviving device must stay served, got {other:?}"),
     }
 
     conn_b.close(0u32.into(), b"done");
@@ -2276,6 +2323,7 @@ async fn video_report_routed_to_channel_members_only() {
             reporter_id: 0, // server stamps
             viewer_fps: 42, // must survive the server's rebuild
             keyframe_request: false,
+            ..Default::default()
         }),
     )
     .await;

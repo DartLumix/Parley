@@ -1,6 +1,6 @@
 [package]
 name = "parley_flutter"
-version = "0.4.9"
+version = "0.5.0"
 edition = "2021"
 
 [lib]
@@ -66,6 +66,13 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # Remembered login (api/login.rs): the session token in a TOML file.
 serde = { workspace = true }
 toml = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Oboe (through cpal) resolves the Android AudioManager through
+# ndk-context. The Dart VM's dynamic-library load does not run JNI
+# initialization, so MainActivity hands us the application context.
+jni = "0.21"
+ndk-context = "0.1"
 
 [dev-dependencies]
 # The disconnect regression test runs a real server in-process.

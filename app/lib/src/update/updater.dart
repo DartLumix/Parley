@@ -25,6 +25,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart' show sha256;
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
+import '../platform/android_platform.dart';
 import '../version.dart';
 import '../window.dart' show closeWindow;
 
@@ -107,13 +108,20 @@ class Version implements Comparable<Version> {
 
 /// The asset names the release workflow publishes, for the platform this
 /// build runs on. The mirror must carry the same names.
-String assetNameFor(String version, {required bool windows}) => windows
+String assetNameFor(
+  String version, {
+  required bool windows,
+  bool android = false,
+}) => android
+    ? 'parley-$version-android.apk'
+    : windows
     ? 'parley-$version-windows-x86_64.zip'
     : 'parley-$version-linux-x86_64.tar.gz';
 
 /// Which platform's build a file describes — and with it, whether the
 /// platform can unpack it itself (see the swap scripts).
 bool get _windows => Platform.isWindows;
+bool get _android => Platform.isAndroid;
 
 enum UpdateStatus {
   /// Nothing newer is published.
@@ -218,6 +226,7 @@ UpdateCheck evaluateRelease(
   Map<String, dynamic> release, {
   required String current,
   required bool windows,
+  bool android = false,
   String repo = '',
   String? blocker,
   String currentBuild = '',
@@ -240,7 +249,7 @@ UpdateCheck evaluateRelease(
   if (!newer && !rebuilt) return UpdateCheck.upToDate(current);
 
   final version = latest.toString();
-  final name = assetNameFor(version, windows: windows);
+  final name = assetNameFor(version, windows: windows, android: android);
 
   if (blocker != null) {
     return UpdateCheck.blocked(
@@ -350,20 +359,25 @@ Future<UpdateCheck> checkForUpdate({
         }
       }
     }
-    // A build that predates PARLEY_BUILD cannot compare commits. Its
-    // install directory's mtime is when its files were written, so a
-    // re-uploaded asset timestamped after that is a rebuilt release.
-    // (This is the fallback the user asked for: artifact date, but only
-    // when there is no build id to do the job exactly.)
+    // A build that predates PARLEY_BUILD — or a release without
+    // RELEASE.json — cannot compare commits. The running executable's mtime
+    // is when this build was written, so a re-uploaded asset timestamped
+    // after that is a rebuilt release. Do not use the install directory:
+    // Windows creates/updates logs, caches and the extracted tree after
+    // installation, which makes the directory look newer than the asset and
+    // suppresses a real update.
     var artifactNewerThanInstall = false;
-    if (parleyBuild.isEmpty && sameVersion) {
+    if ((parleyBuild.isEmpty || remoteBuild.isEmpty) && sameVersion) {
       final updatedAt = DateTime.tryParse(
-        (_asset(release, assetNameFor(now, windows: _windows))?['updated_at']
+        (_asset(
+                  release,
+                  assetNameFor(now, windows: _windows, android: _android),
+                )?['updated_at']
                 as String?) ??
             '',
       );
       try {
-        final installed = installDir().statSync().modified;
+        final installed = File(Platform.resolvedExecutable).statSync().modified;
         artifactNewerThanInstall =
             updatedAt != null &&
             updatedAt.isAfter(installed.add(const Duration(seconds: 60)));
@@ -375,6 +389,7 @@ Future<UpdateCheck> checkForUpdate({
       release,
       current: now,
       windows: _windows,
+      android: _android,
       repo: repo,
       blocker: await installBlocker(),
       currentBuild: parleyBuild,
@@ -394,11 +409,15 @@ Future<UpdateCheck> checkForUpdate({
 /// The install directory: where the running binary actually lives — the
 /// unpacked tarball for a run-in-place copy, `~/.local/opt/parley` for
 /// `install.sh`, `/opt/parley` for the AUR package.
-Directory installDir() => File(Platform.resolvedExecutable).parent;
+Directory installDir() =>
+    _android ? Directory.systemTemp : File(Platform.resolvedExecutable).parent;
 
 /// Why this copy cannot replace itself, or null when it can. A package
 /// manager owns `/opt/parley`: pacman updates that one, not the app.
 Future<String?> installBlocker() async {
+  // Android's package installer owns the replacement; there is no
+  // install directory this process could rewrite.
+  if (_android) return null;
   final dir = installDir();
   if (!dir.existsSync()) {
     return 'cannot find the install directory (${dir.path})';
@@ -423,6 +442,9 @@ Directory updateRoot() {
     return (value == null || value.isEmpty) ? null : value;
   }
 
+  if (_android) {
+    return Directory('${Directory.systemTemp.path}${_sep}parley');
+  }
   final base = _windows
       ? (env('LOCALAPPDATA') ?? Directory.systemTemp.path)
       : (env('XDG_CACHE_HOME') ??
@@ -476,6 +498,18 @@ Future<void> installAndRestart(
         'the download does not match SHA256SUMS (expected $expected, got '
         '$actual); nothing was installed',
       );
+    }
+
+    if (_android) {
+      final opened = await AndroidPlatform.installApk(archive.path);
+      if (!opened) {
+        throw const UpdateException(
+          'Android needs permission to install this update. Allow installs '
+          'from Parley in the settings screen that just opened, then try '
+          'again.',
+        );
+      }
+      return;
     }
 
     final root = updateRoot()..createSync(recursive: true);

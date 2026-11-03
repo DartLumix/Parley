@@ -1,0 +1,18 @@
+# The wrapper belongs to the build: CI must reproduce the same Gradle
+# version instead of depending on whatever is installed on the runner.
+/.gradle
+/build/
+/.kotlin/
+/.idea/
+*.iml
+/captures/
+/local.properties
+/app/src/main/jniLibs/
+GeneratedPluginRegistrant.java
+.cxx/
+
+# Remember to never publicly share your keystore.
+# See https://flutter.dev/to/reference-keystore
+key.properties
+**/*.keystore
+**/*.jks

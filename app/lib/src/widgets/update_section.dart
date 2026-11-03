@@ -2,6 +2,8 @@
 //! asks the release channel, the install-and-restart path, and *What's new*
 //! for the notes bundled with this build.
 
+import 'dart:io' show Platform;
+
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
@@ -63,14 +65,24 @@ class _UpdateSectionState extends State<UpdateSection> {
   Future<void> _install() async {
     final check = _check;
     if (check == null || check.latest == null) return;
+    final android = Platform.isAndroid;
     final go = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text('Install ${check.latest} and restart?'),
-        content: const Text(
-          'Parley downloads the new build, checks it against the release '
-          'checksums and restarts on it. A call or a screen share in '
-          'progress ends with the restart.',
+        title: Text(
+          android
+              ? 'Download and install ${check.latest}?'
+              : 'Install ${check.latest} and restart?',
+        ),
+        content: Text(
+          android
+              ? 'Parley downloads the APK and checks it against the '
+                    'release checksums, then Android asks you to confirm the '
+                    'install. Your current session stays open until you '
+                    'confirm.'
+              : 'Parley downloads the new build, checks it against the '
+                    'release checksums and restarts on it. A call or a screen '
+                    'share in progress ends with the restart.',
         ),
         actions: [
           TextButton(
@@ -79,7 +91,9 @@ class _UpdateSectionState extends State<UpdateSection> {
           ),
           FilledButton(
             onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Install and restart'),
+            child: Text(
+              android ? 'Download and install' : 'Install and restart',
+            ),
           ),
         ],
       ),
@@ -102,8 +116,15 @@ class _UpdateSectionState extends State<UpdateSection> {
               : 'Downloading…';
         });
       });
-      // The real install ends this process; only an injected one returns.
-      if (mounted) setState(() => _phase = 'Restarting…');
+      // The desktop install ends this process; Android hands off to the
+      // package installer and returns here.
+      if (mounted) {
+        setState(
+          () => _phase = Platform.isAndroid
+              ? 'Waiting for the Android installer…'
+              : 'Restarting…',
+        );
+      }
     } on Object catch (e) {
       if (mounted) {
         setState(() {
@@ -144,7 +165,9 @@ class _UpdateSectionState extends State<UpdateSection> {
           subtitle: Text(
             parleyVersion == 'dev'
                 ? 'dev — a source build, not a release'
-                : parleyVersion,
+                : parleyBuild.isEmpty
+                ? parleyVersion
+                : '$parleyVersion · ${parleyBuild.length > 12 ? parleyBuild.substring(0, 12) : parleyBuild}',
           ),
         ),
         const SizedBox(height: 4),
@@ -198,7 +221,11 @@ class _UpdateSectionState extends State<UpdateSection> {
           FilledButton.icon(
             onPressed: _install,
             icon: const Icon(Icons.download, size: 18),
-            label: Text('Install ${_check!.latest} and restart'),
+            label: Text(
+              Platform.isAndroid
+                  ? 'Download and install ${_check!.latest}'
+                  : 'Install ${_check!.latest} and restart',
+            ),
           ),
         ],
       ],

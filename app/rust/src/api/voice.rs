@@ -438,6 +438,8 @@ pub(crate) fn start_voice(
     // share feature is off (no tee → mic rides the normal encoder).
     #[cfg(feature = "screen-capture")] mic_mux_tx: Option<tokio::sync::mpsc::Sender<Vec<f32>>>,
 ) -> Result<VoiceControl, String> {
+    crate::android_log::install_panic_hook();
+    crate::android_log::info("voice: start requested");
     let stop = Arc::new(AtomicBool::new(false));
     let (reader_stop_tx, mut reader_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
@@ -537,7 +539,15 @@ pub(crate) fn start_voice(
         println!("voice: aec off (settings)");
         None
     } else {
-        match parley_client::aec::new_processor() {
+        let levels = parley_client::aec::Levels {
+            echo: parley_client::aec::EchoStrength::from_level(crate::api::settings::echo_level()),
+            noise: parley_client::aec::NoiseLevel::from_level(crate::api::settings::noise_level()),
+        };
+        println!(
+            "voice: aec levels: echo {:?}, noise {:?}",
+            levels.echo, levels.noise
+        );
+        match parley_client::aec::new_processor_with(levels) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("voice: aec init failed ({e}); continuing without echo cancellation");
@@ -759,12 +769,14 @@ pub(crate) fn start_voice(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let stop_for_thread = stop.clone();
     let device_thread = std::thread::spawn(move || {
+        crate::android_log::info("voice: device thread started");
         match build_streams(&mixer, aec, pcm_tx, muted, mic_level) {
             Ok(streams) => {
                 let AudioStreams { input, output } = streams;
                 let played = input.play().and_then(|_| output.play());
                 match played {
                     Ok(()) => {
+                        crate::android_log::info("voice: both streams playing");
                         let _ = ready_tx.send(Ok(()));
                         while !stop_for_thread.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(100));
@@ -773,11 +785,13 @@ pub(crate) fn start_voice(
                     }
                     Err(e) => {
                         // Dropping both streams at scope exit; report.
+                        crate::android_log::error(&format!("voice: start streams failed: {e}"));
                         let _ = ready_tx.send(Err(format!("start streams: {e}")));
                     }
                 }
             }
             Err(e) => {
+                crate::android_log::error(&format!("voice: build streams failed: {e}"));
                 let _ = ready_tx.send(Err(e));
             }
         }
@@ -824,6 +838,7 @@ fn build_streams(
     muted: Arc<AtomicBool>,
     mic_level: Arc<AtomicU32>,
 ) -> Result<AudioStreams, String> {
+    crate::android_log::info("voice: build_streams entered");
     let audio = crate::api::settings::audio_prefs();
     let in_dev =
         input_device(audio.input_device.as_deref()).map_err(|e| format!("input device: {e}"))?;
@@ -834,11 +849,22 @@ fn build_streams(
 
     let in_cfg = preferred_input_config(&in_dev).map_err(|e| format!("input config: {e}"))?;
     let out_cfg = preferred_output_config(&out_dev).map_err(|e| format!("output config: {e}"))?;
+    crate::android_log::info(&format!(
+        "voice: devices capture=\"{in_name}\" render=\"{out_name}\" \
+         capture={}Hz/{}ch render={}Hz/{}ch",
+        in_cfg.sample_rate().0,
+        in_cfg.channels(),
+        out_cfg.sample_rate().0,
+        out_cfg.channels(),
+    ));
     for (what, name, rate) in [
         ("capture", in_name.as_str(), in_cfg.sample_rate().0),
         ("render", out_name.as_str(), out_cfg.sample_rate().0),
     ] {
         if rate != PREFERRED_RATE {
+            crate::android_log::error(&format!(
+                "voice: {what} device \"{name}\" is {rate} Hz, need {PREFERRED_RATE} Hz"
+            ));
             return Err(format!(
                 "{what} device \"{name}\" opened at {rate} Hz, need {PREFERRED_RATE} Hz — refusing to run"
             ));
@@ -872,6 +898,10 @@ fn build_streams(
                 if first {
                     first = false;
                     let frames = data.len() / in_channels.max(1);
+                    crate::android_log::info(&format!(
+                        "voice: first capture callback: {frames} frames ({:.1} ms)",
+                        frames as f64 / 48.0
+                    ));
                     eprintln!(
                         "voice: capture period: {frames} frames ({:.1} ms)",
                         frames as f64 / 48.0
@@ -913,8 +943,14 @@ fn build_streams(
         )
     };
     let input = match build_input(&fixed_in) {
-        Ok(s) => s,
+        Ok(s) => {
+            crate::android_log::info("voice: capture stream opened (fixed period)");
+            s
+        }
         Err(_) => {
+            crate::android_log::info(
+                "voice: capture fixed period rejected; retrying with default buffer",
+            );
             eprintln!(
                 "voice: capture device rejected a {PERIOD_FRAMES}-frame buffer; using default (higher latency)"
             );
@@ -951,6 +987,10 @@ fn build_streams(
                 let frames = data.len() / out_channels.max(1);
                 if first {
                     first = false;
+                    crate::android_log::info(&format!(
+                        "voice: first render callback: {frames} frames ({:.1} ms)",
+                        frames as f64 / 48.0
+                    ));
                     eprintln!(
                         "voice: render period: {frames} frames ({:.1} ms)",
                         frames as f64 / 48.0
@@ -1041,8 +1081,14 @@ fn build_streams(
         )
     };
     let output = match build_output(&fixed_out) {
-        Ok(s) => s,
+        Ok(s) => {
+            crate::android_log::info("voice: render stream opened (fixed period)");
+            s
+        }
         Err(_) => {
+            crate::android_log::info(
+                "voice: render fixed period rejected; retrying with default buffer",
+            );
             eprintln!(
                 "voice: render device rejected a {PERIOD_FRAMES}-frame buffer; using default (higher latency)"
             );
@@ -1055,6 +1101,10 @@ fn build_streams(
         if aec.is_some() { " (AEC+NS on)" } else { "" }
     );
     println!("voice: render \"{out_name}\" 48 kHz {out_channels}ch (stereo mix)");
+
+    crate::android_log::info(&format!(
+        "voice: both streams open: capture \"{in_name}\" {in_channels}ch, render \"{out_name}\" {out_channels}ch"
+    ));
 
     Ok(AudioStreams { input, output })
 }

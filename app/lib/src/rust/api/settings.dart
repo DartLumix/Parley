@@ -7,7 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `audio_prefs`, `config_dir`, `echo_cancel`, `install`, `read_at`, `read`, `settings_path`, `show_share_preview`, `write`
+// These functions are ignored because they are not marked as `pub`: `audio_prefs`, `config_dir`, `echo_cancel`, `echo_level`, `install`, `noise_level`, `read_at`, `read`, `settings_path`, `show_share_preview`, `write`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AudioPrefs`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `eq`, `fmt`, `fmt`, `fmt`
 
@@ -46,6 +46,16 @@ class AppSettings {
   /// use it (transparency wins there), whatever this says.
   final bool echoCancel;
 
+  /// Echo-canceller strength, 1..3 (light, balanced, strong). Only
+  /// consulted when `echo_cancel` is on; a value written by hand is
+  /// clamped at voice start.
+  final int echoLevel;
+
+  /// Noise-suppression strength, 0..3 (off, low, moderate, strong).
+  /// `Strong` maps to WebRTC's `High`, not `VeryHigh`: the latter is the
+  /// setting that starts eating consonants on a phone speaker.
+  final int noiseLevel;
+
   /// Capture device name, or empty for the system default. A saved
   /// device that has since disappeared falls back to the default.
   final String inputDevice;
@@ -67,6 +77,8 @@ class AppSettings {
     required this.shareHeight,
     required this.shareFps,
     required this.echoCancel,
+    required this.echoLevel,
+    required this.noiseLevel,
     required this.inputDevice,
     required this.outputDevice,
     required this.micAutogain,
@@ -83,6 +95,8 @@ class AppSettings {
       shareHeight.hashCode ^
       shareFps.hashCode ^
       echoCancel.hashCode ^
+      echoLevel.hashCode ^
+      noiseLevel.hashCode ^
       inputDevice.hashCode ^
       outputDevice.hashCode ^
       micAutogain.hashCode ^
@@ -98,6 +112,8 @@ class AppSettings {
           shareHeight == other.shareHeight &&
           shareFps == other.shareFps &&
           echoCancel == other.echoCancel &&
+          echoLevel == other.echoLevel &&
+          noiseLevel == other.noiseLevel &&
           inputDevice == other.inputDevice &&
           outputDevice == other.outputDevice &&
           micAutogain == other.micAutogain &&

@@ -150,6 +150,12 @@ async fn upload_blob(
             if let Err(e) = tokio::fs::rename(&tmp, &final_path).await {
                 warn!(error = %e, "attachment rename");
                 let _ = tokio::fs::remove_file(&tmp).await;
+                // The row is already committed. Remove it rather than
+                // leave a chat message whose attachment can never be
+                // downloaded; the file row is swept as an orphan.
+                if let Err(e) = db.delete_message(message_id).await {
+                    warn!(message_id, error = %e, "attachment rollback");
+                }
                 return Ok(reply_err("could not store the file"));
             }
 
@@ -391,10 +397,63 @@ fn is_mp3(bytes: &[u8]) -> bool {
     if bytes.len() < 4 {
         return false;
     }
-    // ID3v2 tag, or a bare MPEG audio frame sync (0xFFEx).
-    bytes.starts_with(b"ID3") || (bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0)
+    // A leading ID3v2 tag is conclusive. (The old check stopped here, which
+    // is why a bare stream with padding, an APE tag or another leading
+    // container could look like "not an MP3" even though every decoder
+    // played it.)
+    if bytes.starts_with(b"ID3") {
+        return true;
+    }
+    // Otherwise find a real MPEG audio frame in the opening bytes. This is
+    // deliberately a scan, not a first-two-bytes check: tag writers and
+    // encoders leave all sorts of small prefixes in front of the first
+    // frame. 64 KiB is far past any legitimate leading metadata and cheap
+    // for a 1 MiB cue.
+    bytes.windows(4).take(64 * 1024).any(is_mpeg_frame_header)
+}
+
+/// Validate the four-byte MPEG audio frame header, not just the sync word.
+/// The sync alone also matches AAC/ADTS and random bytes; the version,
+/// layer, bitrate and sample-rate fields are what make it an MP3 frame.
+fn is_mpeg_frame_header(h: &[u8]) -> bool {
+    if h.len() < 4 || h[0] != 0xFF || h[1] & 0xE0 != 0xE0 {
+        return false;
+    }
+    // Version 01 is reserved; layer 00 is reserved.
+    if (h[1] >> 3) & 0x03 == 0x01 || (h[1] >> 1) & 0x03 == 0 {
+        return false;
+    }
+    let bitrate = h[2] >> 4;
+    let sample_rate = (h[2] >> 2) & 0x03;
+    bitrate != 0 && bitrate != 0x0F && sample_rate != 0x03
 }
 
 fn presence(registry: &Arc<SessionRegistry>) -> ServerMessage {
     crate::server::presence_message(registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_mp3;
+
+    #[test]
+    fn accepts_id3_and_bare_frames() {
+        assert!(is_mp3(b"ID3\x04\x00\x00\x00\x00\x00\x00"));
+        assert!(is_mp3(&[0xFF, 0xFB, 0x90, 0x64]));
+    }
+
+    #[test]
+    fn accepts_a_frame_after_small_leading_junk() {
+        // Some taggers leave a short pad before the first frame. The old
+        // first-byte check rejected this even though a decoder plays it.
+        let mut bytes = b"\0\0junk".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        assert!(is_mp3(&bytes));
+    }
+
+    #[test]
+    fn rejects_non_mpeg_data() {
+        assert!(!is_mp3(b"not audio at all"));
+        assert!(!is_mp3(b"fLaC\0\0\0\x22"));
+    }
 }

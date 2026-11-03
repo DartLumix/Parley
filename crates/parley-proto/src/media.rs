@@ -5,7 +5,8 @@
 //!   [0]       version:3 | flags:5
 //!   [1..3]    seq: u16
 //!   [3..7]    timestamp: u32 (codec clock, e.g. Opus sample count)
-//!   [7..11]   sender_id: u32 (stamped by the server)
+//!   [7..11]   sender: u32 (per-device media id, stamped by the server;
+//!             protocol 1 — it was the account id before)
 //!   [11..]    payload (Opus frame)
 
 pub const MEDIA_VERSION: u8 = 0;
