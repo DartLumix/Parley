@@ -3,6 +3,19 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.5.1] — 2026-11-03
+
+A release-build fix; the wire protocol and client features are unchanged.
+
+### Fixed
+
+- The terminal client now sends the server-stamped `reporter_media_id`
+  field in video loss reports, so the all-feature CLI package builds
+  again.
+- The Android APK check pins the release certificate in the release
+  workflow instead of a separately stored fingerprint that could drift
+  from the keystore.
+
 ## [0.5.0] — 2026-11-03
 
 Parley on Android, and one account live on several devices without the

@@ -75,7 +75,7 @@ PARLEY_ANDROID_KEYSTORE_PASSWORD=... \
 PARLEY_ANDROID_KEY_ALIAS=... \
 PARLEY_ANDROID_KEY_PASSWORD=... \
 flutter build apk --release \
-  --dart-define=PARLEY_VERSION=0.5.0 \
+  --dart-define=PARLEY_VERSION=0.5.1 \
   --dart-define=PARLEY_BUILD=$(git rev-parse HEAD)
 ```
 

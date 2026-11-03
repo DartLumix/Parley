@@ -12,6 +12,12 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.5.1
+
+This release fixes the release build itself. The Android APK is signed by
+the release key, and the terminal client builds with the 0.5.0
+multi-device protocol. The 0.5.0 features below are included.
+
 # Parley, now in your pocket.
 
 0.5.0 brings the Android app, and lets a phone and a desktop stay
@@ -46,4 +52,4 @@ signed in together. Same rooms, same chat, same voice.
   an older client is refused at the handshake instead of showing the
   wrong name on a voice bar.
 - Android and desktop can talk to each other as soon as both are on
-  0.5.0.
+  0.5.0 or newer.
