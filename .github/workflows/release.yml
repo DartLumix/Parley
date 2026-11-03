@@ -378,7 +378,12 @@ jobs:
       - name: verify the APK is a signed release build with our icon
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          EXPECTED_CERT_SHA: ${{ secrets.PARLEY_ANDROID_CERT_SHA256 }}
+          # Public certificate digest, pinned in-tree. The keystore stays in
+          # secrets; this only proves the build used that keystore. Keeping
+          # the expected value here avoids a second secret drifting out of
+          # sync with the keystore and failing an otherwise valid release.
+          # Rotating the key means updating this line deliberately.
+          EXPECTED_CERT_SHA: c2dc5849159d4b75e7361faf97bc018962744a9be2b22b4e26a55799490a8b68
         run: |
           set -euo pipefail
           apk="app/build/app/outputs/flutter-apk/app-release.apk"
@@ -398,16 +403,14 @@ jobs:
             echo "::error::the release APK has no signer certificate"
             exit 1
           fi
-          if [ -n "$EXPECTED_CERT_SHA" ]; then
-            # keytool prints "SHA256: AA:BB:..."; apksigner prints a plain
-            # lowercase digest. Accept either, with or without the label.
-            expected=$(printf '%s' "$EXPECTED_CERT_SHA" \
-              | sed -E 's/^[[:space:]]*SHA-?256:[[:space:]]*//I' \
-              | tr 'A-Z' 'a-z' | tr -d ': ')
-            if [ "$cert_sha" != "$expected" ]; then
-              echo "::error::the APK signer is not PARLEY_ANDROID_CERT_SHA256"
-              exit 1
-            fi
+          expected=$(printf '%s' "$EXPECTED_CERT_SHA" \
+            | sed -E 's/^[[:space:]]*SHA-?256:[[:space:]]*//I' \
+            | tr 'A-Z' 'a-z' | tr -d ': ')
+          if [ "$cert_sha" != "$expected" ]; then
+            echo "::error::the APK signer does not match the pinned release certificate"
+            echo "actual:   $cert_sha"
+            echo "expected: $expected"
+            exit 1
           fi
           badging=$("$build_tools/aapt2" dump badging "$apk")
           echo "$badging" | grep -q "package: name='dev.parley.app' versionName='$VERSION'"

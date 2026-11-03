@@ -42,7 +42,14 @@ debug key. Set these repository secrets before tagging:
 | `PARLEY_ANDROID_KEYSTORE_PASSWORD` | the keystore password |
 | `PARLEY_ANDROID_KEY_ALIAS` | the release key alias |
 | `PARLEY_ANDROID_KEY_PASSWORD` | that key's password |
-| `PARLEY_ANDROID_CERT_SHA256` | optional: the signer's SHA-256, checked against `apksigner` |
+
+The signer certificate's SHA-256 is pinned in
+`.github/workflows/release.yml` (`EXPECTED_CERT_SHA`), not in a secret.
+The certificate is public; the keystore is not. The check makes a wrong
+keystore upload fail after the APK is built. Current pin:
+`c2dc5849159d4b75e7361faf97bc018962744a9be2b22b4e26a55799490a8b68`.
+When rotating the release key, update the pin and the keystore secret
+together.
 
 Create the key once, then keep it offline (never in this repository —
 `.gitignore` covers `*.jks` and `*.keystore`):

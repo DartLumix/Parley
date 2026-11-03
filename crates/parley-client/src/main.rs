@@ -567,7 +567,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     body: Some(ClientBody::VideoReport(VideoReport {
                         gap_rate_permille: worst,
                         keyframe_request: false,
-                        reporter_id: 0, // server stamps the authenticated id
+                        reporter_id: 0,       // server stamps the authenticated id
+                        reporter_media_id: 0, // server stamps the media/session id
                         // The terminal viewer's mpv pipe declares one fixed
                         // raw-video rate; it cannot follow a cadence that
                         // changes mid-share, so it does not steer one. The
