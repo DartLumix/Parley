@@ -320,11 +320,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.meta.outputs.tag }}
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: Android SDK packages
         run: |
           yes | sdkmanager --licenses >/dev/null || true
@@ -391,7 +391,10 @@ jobs:
             exit 1
           fi
           if [ -n "$EXPECTED_CERT_SHA" ]; then
-            expected=$(printf '%s' "$EXPECTED_CERT_SHA" | tr 'A-F' 'a-f' | tr -d ': ')
+            # keytool prints "SHA256: AA:BB:..."; apksigner prints a plain
+            # lowercase digest. Accept either, with or without the label.
+            expected=$(printf '%s' "$EXPECTED_CERT_SHA" \
+              | tr 'A-F' 'a-f' | tr -d ': ' | sed 's/^sha256//')
             if [ "$cert_sha" != "$expected" ]; then
               echo "::error::the APK signer is not PARLEY_ANDROID_CERT_SHA256"
               exit 1
