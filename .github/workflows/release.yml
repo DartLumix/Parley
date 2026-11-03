@@ -328,10 +328,18 @@ jobs:
       - name: Android SDK packages
         run: |
           yes | sdkmanager --licenses >/dev/null || true
+          # API 37 is published as android-37.0; there is no
+          # platforms;android-37 package in the SDK repository.
           sdkmanager --install \
-            "platforms;android-37" \
+            "platforms;android-37.0" \
             "build-tools;37.0.0" \
             "ndk;28.2.13676358"
+          # Some AGP versions look for android-37 even though the package
+          # installs as android-37.0; expose the compatibility path.
+          if [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
+            ln -s "$ANDROID_HOME/platforms/android-37.0" \
+              "$ANDROID_HOME/platforms/android-37"
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -394,7 +402,8 @@ jobs:
             # keytool prints "SHA256: AA:BB:..."; apksigner prints a plain
             # lowercase digest. Accept either, with or without the label.
             expected=$(printf '%s' "$EXPECTED_CERT_SHA" \
-              | tr 'A-F' 'a-f' | tr -d ': ' | sed 's/^sha256//')
+              | sed -E 's/^[[:space:]]*SHA-?256:[[:space:]]*//I' \
+              | tr 'A-Z' 'a-z' | tr -d ': ')
             if [ "$cert_sha" != "$expected" ]; then
               echo "::error::the APK signer is not PARLEY_ANDROID_CERT_SHA256"
               exit 1
