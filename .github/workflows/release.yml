@@ -373,6 +373,8 @@ jobs:
         run: |
           flutter pub get
           flutter build apk --release \
+            --build-name="$VERSION" \
+            --build-number="$GITHUB_RUN_NUMBER" \
             "--dart-define=PARLEY_VERSION=$VERSION" \
             "--dart-define=PARLEY_BUILD=$(git -C .. rev-parse HEAD)"
       - name: verify the APK is a signed release build with our icon
@@ -413,10 +415,16 @@ jobs:
             exit 1
           fi
           badging=$("$build_tools/aapt2" dump badging "$apk")
-          echo "$badging" | grep -q "package: name='dev.parley.app' versionName='$VERSION'"
-          echo "$badging" | grep -q "application-label:'Parley'"
-          echo "$badging" | grep -q "application-icon"
-          if echo "$badging" | grep -q "application-debuggable"; then
+          echo "$badging" | grep -E "^(package|application-label):" || true
+
+          need() {
+            grep -q "$1" <<<"$badging" || { echo "::error::APK badging is missing: $1"; exit 1; }
+          }
+          need "^package: name='dev.parley.app' "
+          need "versionName='$VERSION'"
+          need "application-label:'Parley'"
+          need "application-icon"
+          if grep -q "application-debuggable" <<<"$badging"; then
             echo "::error::the release APK is debuggable"
             exit 1
           fi
