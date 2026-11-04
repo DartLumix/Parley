@@ -3,6 +3,30 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.5.2] — 2026-11-04
+
+A client bug-fix release; the wire protocol is unchanged.
+
+### Fixed
+
+- Receiving a screen share on Android no longer crashes. R8 was renaming
+  `io.flutter.view.TextureRegistry` inside the irondash plugin's JNI
+  descriptor, so the first remote texture lookup failed with
+  `NoSuchMethodError`. Release builds now keep the plugin entry points and
+  their Flutter descriptor types stable.
+- A transient full encoder queue no longer stops a client's microphone
+  capture tee for the rest of the session. The stale chunk is dropped and
+  capture continues, so a user no longer has to leave and rejoin to be
+  heard again.
+- The five-second video refresh is sent as `video_stats`, not a fresh
+  `video_started`. A healthy stream no longer makes its tile disappear
+  and return on the periodic repair.
+- Kicking a device or deleting its channel no longer tears down the same
+  account's other device: the leave is routed to the affected device and
+  other accounts, not broadcast to every device on the account.
+- Chat length is counted in characters instead of UTF-8 bytes, so long
+  non-Latin messages are no longer silently discarded.
+
 ## [0.5.1] — 2026-11-03
 
 A release-build fix; the wire protocol and client features are unchanged.

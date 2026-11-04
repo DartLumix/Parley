@@ -600,9 +600,13 @@ pub(crate) fn start_voice(
                     let _ = mux_tx.try_send(chunk);
                     continue;
                 }
-                if tee_enc_tx.try_send(chunk).is_err() {
-                    break;
-                }
+                // A full encoder queue is backpressure, not teardown.
+                // Breaking here permanently stopped the capture tee (and
+                // with it the encoder task) after one transient stall;
+                // the user then needed a leave/rejoin to get a mic again.
+                // Drop this stale chunk and keep the tee alive, exactly
+                // like the mux side above and the raw capture callback.
+                let _ = tee_enc_tx.try_send(chunk);
             }
         });
         tee_enc_rx

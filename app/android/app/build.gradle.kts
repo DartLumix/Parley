@@ -61,6 +61,13 @@ android {
         release {
             signingConfig =
                 if (releaseSigningReady) signingConfigs.getByName("release") else null
+            // Flutter's release pipeline runs R8. The irondash plugin is
+            // reached by JNI method name, so its entry points and the
+            // Flutter types in their descriptors must survive shrinking.
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }

@@ -12,6 +12,31 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.5.2
+
+A bug-fix release for the 0.5 line. The wire protocol is unchanged.
+
+## Android
+
+- Receiving a screen share no longer crashes. Release builds were
+  renaming a Flutter type used by the video plugin's native interface;
+  that interface is now kept stable.
+
+## Voice and streams
+
+- A brief encoder stall no longer permanently silences your microphone
+  until you leave and rejoin the channel.
+- The stream tile no longer disappears and returns every five seconds;
+  the periodic refresh updates the existing tile instead of announcing a
+  new share.
+
+## Server
+
+- Kicking a device or deleting its channel no longer tears down the same
+  account's other device.
+- Chat length is counted in characters, so long non-Latin messages are no
+  longer silently dropped.
+
 # Parley 0.5.1
 
 This release fixes the release build itself. The Android APK is signed by

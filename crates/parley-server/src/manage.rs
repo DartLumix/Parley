@@ -355,7 +355,15 @@ fn force_leave(
     }
     transcode.remove_share(media_id);
     transcode.remove_viewer(media_id);
-    registry.broadcast(crate::server::voice_state_message(voice, &member, 0, false));
+    // Voice membership is per DEVICE. A global broadcast would make the
+    // same account's other device process this as its own leave and tear
+    // down its microphone. Route it like every ordinary leave: the
+    // affected device plus other accounts, never its sibling devices.
+    registry.broadcast_voice(
+        member.user_id,
+        member.session_id,
+        crate::server::voice_state_message(voice, &member, 0, false),
+    );
 }
 
 fn pb_role(role: UserRole) -> i32 {

@@ -802,10 +802,27 @@ pub mod imp {
             let refresh = announced
                 .get(&sender)
                 .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(5));
-            if reannounce || first_view || refresh {
+            // `video_started` means "a new tile appeared"; the periodic
+            // repair must not re-send it. The Flutter side treats a start
+            // as a fresh surface (and re-applies share-audio state), so
+            // repeating it every five seconds made a healthy stream look
+            // like it stopped and started again. After the first
+            // announcement, refresh with `video_stats`, which upserts the
+            // same texture and cannot churn the tile.
+            if reannounce || first_view {
                 let _ = events.send(surface_event(
                     session_id,
                     "video_started",
+                    sender,
+                    &frame,
+                    rate.shown,
+                    texture_id,
+                ));
+                announced.insert(sender, now);
+            } else if refresh {
+                let _ = events.send(surface_event(
+                    session_id,
+                    "video_stats",
                     sender,
                     &frame,
                     rate.shown,

@@ -541,7 +541,11 @@ async fn handle_client_message(
 
         Some(ClientBody::SendChat(chat)) => {
             let text = chat.text.trim().to_string();
-            if text.is_empty() || text.len() > 2000 {
+            // The client counts characters, not UTF-8 bytes. A 2000-char
+            // message in a non-Latin script can be several kilobytes; the
+            // old byte check silently dropped it while accepting 2000
+            // ASCII characters.
+            if text.is_empty() || text.chars().count() > 2000 {
                 return Ok(true); // ignore empty/oversized silently
             }
             // A stale client can send into a channel deleted while it was
