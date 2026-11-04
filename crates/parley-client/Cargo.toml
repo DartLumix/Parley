@@ -23,10 +23,10 @@ video = ["parley-core/video"]
 # 7g: opt-in hardware encode (--hw-encode). NOT part of any default
 # build — the server/CI configs must never link libva. §8 containment.
 vaapi = ["parley-core/vaapi", "video"]
-# Screen capture + share audio, one feature for both desktop targets:
-# Linux is the portal + PipeWire path, Windows is WGC + WASAPI loopback.
-# The platform deps are target-scoped so enabling this on either OS only
-# pulls that OS's backend.
+# Screen capture + share audio. Linux is the portal + PipeWire path,
+# Windows is WGC + WASAPI loopback, and Android is MediaProjection /
+# Camera2 feeding the same encoder. The desktop deps are target-scoped so
+# an Android build never resolves ashpd, PipeWire, WGC or WASAPI.
 screen-capture = [
     "dep:ashpd",
     "dep:pipewire",
@@ -52,7 +52,8 @@ webrtc-audio-processing = { workspace = true, optional = true }
 sonora = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
 
-[target.'cfg(unix)'.dependencies]
+# Linux-only: Android is cfg(unix), but it has neither the portal nor V4L2.
+[target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { workspace = true, optional = true, features = ["screencast"] }
 pipewire = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }

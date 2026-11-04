@@ -56,6 +56,9 @@ pub async fn handle(
             if a.password.is_empty() {
                 return fail("password cannot be empty");
             }
+            if a.password.len() > 256 {
+                return fail("password is too long");
+            }
             let Some(role) = parse_role(a.role) else {
                 return fail("invalid role");
             };
@@ -207,17 +210,22 @@ pub async fn handle(
             if !actor.role.is_admin() && target.role.is_admin() {
                 return fail("only an admin can kick an admin");
             }
-            let media_id = voice
+            let media_ids: Vec<u32> = voice
                 .media_ids_of_user(target.id)
                 .into_iter()
-                .find(|media| voice.channel_of(*media) == Some(k.channel_id));
-            let Some(media_id) = media_id else {
+                .filter(|media| voice.channel_of(*media) == Some(k.channel_id))
+                .collect();
+            if media_ids.is_empty() {
                 return fail("that user is not in the channel");
-            };
+            }
             // The ordinary leave path, and nothing else: no ban, no
             // announcement beyond the membership change. They may rejoin
-            // immediately. Only the device in that channel is kicked.
-            force_leave(media_id, registry, voice, transcode);
+            // immediately. Every device of the account in this channel
+            // leaves: picking one (HashMap order) told the manager the
+            // kick succeeded while the second device stayed in the room.
+            for media_id in media_ids {
+                force_leave(media_id, registry, voice, transcode);
+            }
             publish(session_gen, db, registry, voice).await
         }
     }
@@ -393,6 +401,9 @@ fn clean_name(raw: &str, max: usize) -> Result<String, String> {
     let name = raw.trim();
     if name.is_empty() {
         return Err("name cannot be empty".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("name cannot contain control characters".into());
     }
     if name.chars().count() > max {
         return Err(format!("name is longer than {max} characters"));

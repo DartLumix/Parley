@@ -197,6 +197,17 @@ message ShareStopped {
   uint32 media_id = 3;
 }
 
+// A share became visible in the receiver's voice channel. Video datagrams
+// carry only the per-device media id; this maps that id to the account and
+// name the UI shows. Sent on the first video datagram of a share and to a
+// device that joins a channel where shares are already running.
+message ShareStarted {
+  uint32 user_id = 1;
+  string username = 2;
+  uint32 media_id = 3;
+  uint64 channel_id = 4;
+}
+
 // --- Video loss feedback (6e) ---
 
 message VideoReport {
@@ -399,5 +410,6 @@ message ServerMessage {
     Poked poked = 12;
     AvatarData avatar_data = 13;
     ProfileResult profile_result = 14;
+    ShareStarted share_started = 15;
   }
 }

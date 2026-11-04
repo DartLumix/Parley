@@ -961,23 +961,28 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             // texture on their next frame). Emits video_stopped BEFORE
             // voice_state (the Vec return carries both).
             if !v.joined {
+                // Mixer voices, display surfaces and video datagrams are
+                // all keyed by the DEVICE media id, never the account id:
+                // one account may have a phone and a desktop in the same
+                // call. Using user_id here removed the wrong decoder and
+                // left the surface painted.
                 #[cfg(feature = "video")]
                 if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
-                    s.mixer.lock().unwrap().remove(v.user_id);
+                    s.mixer.lock().unwrap().remove(v.media_id);
                     if let Some(d) = s.display.as_ref() {
-                        d.sender_stopped(v.user_id, true);
+                        d.sender_stopped(v.media_id, true);
                     }
                 }
                 #[cfg(not(feature = "video"))]
                 if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
-                    s.mixer.lock().unwrap().remove(v.user_id);
+                    s.mixer.lock().unwrap().remove(v.media_id);
                 }
                 #[cfg(feature = "video")]
                 {
                     let mut e = ev("video_stopped");
                     e.user_id = v.user_id;
                     e.surface = Some(VideoSurfaceInfo {
-                        user_id: v.user_id,
+                        user_id: v.media_id,
                         width: 0,
                         height: 0,
                         fps: 0,
@@ -1132,6 +1137,22 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 .collect();
             vec![e]
         }
+        ServerBody::ShareStarted(s) => {
+            // Video datagrams carry the per-device media id. This is the
+            // server-stamped owner, so the card can show a name instead
+            // of "user 5" and can be pruned against the account roster.
+            let mut e = ev("share_identity");
+            e.user_id = s.user_id;
+            e.username = s.username.clone();
+            e.surface = Some(VideoSurfaceInfo {
+                user_id: s.media_id,
+                width: 0,
+                height: 0,
+                fps: 0,
+                texture_id: 0,
+            });
+            vec![e]
+        }
         ServerBody::ShareStopped(s) => {
             // 7f: a sharer stopped (own echo filtered — the server
             // excludes the reporter from routing, but be defensive,
@@ -1152,10 +1173,12 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                         // share. Flush what is still buffered (and stop
                         // the decoder's PLC extrapolation) so no tail
                         // plays on after the card is gone — the stream
-                        // itself keeps existing for their voice.
-                        sess.mixer.lock().unwrap().remove(s.user_id);
+                        // itself keeps existing for their voice. Keyed
+                        // by media id: the account id is not a mixer or
+                        // display key.
+                        sess.mixer.lock().unwrap().remove(s.media_id);
                         if let Some(d) = sess.display.as_ref() {
-                            d.sender_stopped(s.user_id, false);
+                            d.sender_stopped(s.media_id, false);
                         }
                     }
                 } else {
@@ -1170,7 +1193,7 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 let mut e = ev("video_stopped");
                 e.user_id = s.user_id;
                 e.surface = Some(VideoSurfaceInfo {
-                    user_id: s.user_id,
+                    user_id: s.media_id,
                     width: 0,
                     height: 0,
                     fps: 0,
@@ -2355,6 +2378,10 @@ pub fn start_screen_share(
     camera: bool,
     camera_overlay: bool,
 ) -> Result<(), String> {
+    // Android takes the video-only branch below; the desktop audio tap is
+    // compiled out there, so keep these parameters explicitly used.
+    #[cfg(target_os = "android")]
+    let _ = (share_audio, audio_players);
     // The own-share card reads the NEW share's shape, not the last one's
     // while the source picker is still open.
     crate::api::video::clear_share_stats();
@@ -2378,6 +2405,8 @@ pub fn start_screen_share(
     // Spawned (not awaited): the source picker blocks for seconds and FRB
     // calls must return fast. The owner task forwards lifecycle events
     // into the session's stream and clears the slots on Ended.
+    // `true` means the share failed and a share_failed event was already
+    // sent; the outer task must not overwrite it with share_ended.
     let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
     let ended_event_tx = event_tx.clone();
     rt().spawn(async move {
@@ -2392,7 +2421,11 @@ pub fn start_screen_share(
             // and the mic mux rides the media conn on its own music
             // stream — mic tee routes to it via SHARE_MIC_ROUTE while
             // the mux lives.
-            #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
+            #[cfg(all(
+                feature = "audio-device",
+                feature = "screen-capture",
+                not(target_os = "android")
+            ))]
             let (audio, sys_rx) = if !share_audio {
                 (None, None)
             } else if audio_players.is_empty() {
@@ -2433,6 +2466,13 @@ pub fn start_screen_share(
             // with the same predicate, so the receiver is never read.
             #[cfg(not(all(feature = "audio-device", feature = "screen-capture")))]
             let (audio, _sys_rx): (
+                Option<parley_client::screen::ShareAudioTap>,
+                Option<std::sync::mpsc::Receiver<Vec<f32>>>,
+            ) = (None, None);
+            // Android screen audio is not implemented yet. Keep the
+            // video-only shape without starting a mux with no source.
+            #[cfg(all(target_os = "android", feature = "screen-capture"))]
+            let (audio, sys_rx): (
                 Option<parley_client::screen::ShareAudioTap>,
                 Option<std::sync::mpsc::Receiver<Vec<f32>>>,
             ) = (None, None);
@@ -2514,6 +2554,8 @@ pub fn start_screen_share(
                 }
                 Err(e) => {
                     let _ = event_tx.send(share_failed_event(session_id, e));
+                    let _ = ended_tx.send(true);
+                    return;
                 }
             }
             // Forward the supervisor's Ended (external stop) and exit.
@@ -2521,11 +2563,31 @@ pub fn start_screen_share(
             // Ended channel by dropping the ctrl; the supervisor still
             // sends Ended on the shared `events`... which we own, so
             // we just drain until it closes.
+            let mut terminal = false;
             while let Some(ev) = share_event_rx.recv().await {
-                if let parley_client::ShareEvent::Ended { external } = ev {
-                    let _ = ended_tx.send(external);
-                    break;
+                match ev {
+                    parley_client::ShareEvent::Ended { .. } => {
+                        let _ = ended_tx.send(false);
+                        terminal = true;
+                        break;
+                    }
+                    parley_client::ShareEvent::Failed(reason) => {
+                        let _ = event_tx.send(share_failed_event(session_id, reason));
+                        let _ = ended_tx.send(true);
+                        terminal = true;
+                        break;
+                    }
+                    parley_client::ShareEvent::StartFailed(reason) => {
+                        let _ = event_tx.send(share_failed_event(session_id, reason));
+                        let _ = ended_tx.send(true);
+                        terminal = true;
+                        break;
+                    }
+                    parley_client::ShareEvent::Started => {}
                 }
+            }
+            if !terminal {
+                let _ = ended_tx.send(true);
             }
         });
         // Hand the keyframe handle to the session slot when it lands.
@@ -2534,7 +2596,7 @@ pub fn start_screen_share(
         }
         // Wait for Ended (external OR our own stop), then signal the
         // server and clean the slots.
-        let _ = ended_rx.recv().await;
+        let failed = ended_rx.recv().await.unwrap_or(true);
         let _ = send_command(session_id, Command::StopShare);
         crate::api::video::clear_share_stats();
         {
@@ -2544,7 +2606,9 @@ pub fn start_screen_share(
                 *s.share_poke.lock().unwrap() = None;
             }
         }
-        let _ = ended_event_tx.send(share_event(session_id, "share_ended"));
+        if !failed {
+            let _ = ended_event_tx.send(share_event(session_id, "share_ended"));
+        }
         let _ = owner.await;
     });
     Ok(())

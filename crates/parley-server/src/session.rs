@@ -12,6 +12,12 @@ use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 
+/// How many control messages may wait for one client's writer before the
+/// client is considered stuck. Broadcasts never block; a client that will
+/// not drain its control stream is disconnected instead of growing the
+/// queue without bound.
+pub const CONTROL_QUEUE_DEPTH: usize = 1024;
+
 /// (join, leave, afk) revisions for one account's personal sounds.
 pub type SoundVersions = (u64, u64, u64);
 
@@ -27,7 +33,7 @@ pub struct ClientHandle {
     /// For media datagram forwarding.
     pub conn: quinn::Connection,
     /// Control-plane messages for this client (broadcasts).
-    pub tx: mpsc::UnboundedSender<parley_proto::ServerMessage>,
+    pub tx: mpsc::Sender<parley_proto::ServerMessage>,
     /// Stable connection generation.
     pub session: u64,
     /// Compact identity used in media datagrams and voice reports.
@@ -144,10 +150,26 @@ impl SessionRegistry {
             .is_some_and(|h| h.user_id == user_id)
     }
 
+    /// Queue one control message for a client. A full queue means the
+    /// client is not reading its control stream: close it rather than let
+    /// broadcasts accumulate without bound.
+    fn deliver(handle: &ClientHandle, msg: parley_proto::ServerMessage) -> bool {
+        match handle.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                handle
+                    .conn
+                    .close(5u32.into(), b"control stream not drained");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     /// Send a control-plane message to every connected device.
     pub fn broadcast(&self, msg: parley_proto::ServerMessage) {
         for handle in self.state.lock().unwrap().clients.values() {
-            let _ = handle.tx.send(msg.clone());
+            Self::deliver(handle, msg.clone());
         }
     }
 
@@ -165,7 +187,7 @@ impl SessionRegistry {
     ) {
         for handle in self.state.lock().unwrap().clients.values() {
             if handle.user_id != user_id || handle.session == from_session {
-                let _ = handle.tx.send(msg.clone());
+                Self::deliver(handle, msg.clone());
             }
         }
     }
@@ -175,7 +197,7 @@ impl SessionRegistry {
     pub fn broadcast_managers_except(&self, except_session: u64, msg: parley_proto::ServerMessage) {
         for handle in self.state.lock().unwrap().clients.values() {
             if handle.session != except_session && handle.role.can_manage() {
-                let _ = handle.tx.send(msg.clone());
+                Self::deliver(handle, msg.clone());
             }
         }
     }
@@ -224,7 +246,7 @@ impl SessionRegistry {
         let mut sent = false;
         for session in sessions {
             if let Some(handle) = state.clients.get(session) {
-                sent |= handle.tx.send(msg.clone()).is_ok();
+                sent |= Self::deliver(handle, msg.clone());
             }
         }
         sent
@@ -241,7 +263,7 @@ impl SessionRegistry {
             .by_media
             .get(&media_id)
             .and_then(|session| state.clients.get(session))
-            .map(|handle| handle.tx.send(msg).is_ok())
+            .map(|handle| Self::deliver(handle, msg))
             .unwrap_or(false)
     }
 

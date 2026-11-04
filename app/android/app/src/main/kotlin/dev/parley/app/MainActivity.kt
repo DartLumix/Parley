@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -25,7 +26,9 @@ import java.io.File
 class MainActivity : FlutterActivity() {
     private val channelName = "parley/platform"
     private val permissionRequestCode = 4701
+    private val screenCaptureRequestCode = 4702
     private var pendingPermissions: MethodChannel.Result? = null
+    private var pendingScreenCapture: MethodChannel.Result? = null
     private var requestedPermissions: Array<String> = emptyArray()
 
     // Loading the Rust library from the JVM (rather than only from the
@@ -91,6 +94,47 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                "requestScreenCapture" -> requestScreenCapture(result)
+
+                "hasCamera" -> result.success(
+                    packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY),
+                )
+
+                "startShareService" -> {
+                    val camera = call.argument<Boolean>("camera") ?: false
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, ShareService::class.java).apply {
+                            action = ShareService.ACTION_START
+                            putExtra(ShareService.EXTRA_CAMERA, camera)
+                        },
+                    )
+                    result.success(true)
+                }
+
+                "stopShareService" -> {
+                    stopService(Intent(this, ShareService::class.java))
+                    result.success(true)
+                }
+
+                "switchCamera" -> {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, ShareService::class.java).apply {
+                            action = ShareService.ACTION_SWITCH_CAMERA
+                        },
+                    )
+                    result.success(true)
+                }
+
+                "moveTaskToBack" -> {
+                    // Back is a MINIMIZE while a call/share is running:
+                    // finishing the activity would tear down the
+                    // foreground service with it.
+                    moveTaskToBack(true)
+                    result.success(true)
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -130,6 +174,43 @@ class MainActivity : FlutterActivity() {
         requestedPermissions = emptyArray()
     }
 
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != screenCaptureRequestCode) return
+        val result = pendingScreenCapture
+        pendingScreenCapture = null
+        if (resultCode == RESULT_OK) {
+            // The service consumes this once it is in the foreground. The
+            // Activity cannot start MediaProjection itself on Android 14+.
+            ShareService.setScreenCapturePermission(resultCode, data)
+            result?.success(true)
+        } else {
+            result?.success(false)
+        }
+    }
+
+    private fun requestScreenCapture(result: MethodChannel.Result) {
+        if (pendingScreenCapture != null) {
+            result.error("busy", "another screen capture request is already open", null)
+            return
+        }
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        pendingScreenCapture = result
+        try {
+            startActivityForResult(
+                manager.createScreenCaptureIntent(),
+                screenCaptureRequestCode,
+            )
+        } catch (e: Exception) {
+            pendingScreenCapture = null
+            result.error(
+                "screen-capture",
+                e.message ?: "could not open the system screen-capture prompt",
+                null,
+            )
+        }
+    }
+
     private fun installApk(apk: File, result: MethodChannel.Result) {
         if (!apk.isFile) {
             result.error("missing", "the downloaded APK no longer exists", null)
@@ -143,10 +224,17 @@ class MainActivity : FlutterActivity() {
             return
         }
         try {
+            // Downloads live under code_cache, which FileProvider does
+            // not expose. Its roots are files-path and cache-path, so
+            // stage the APK under cacheDir first; the old direct URI
+            // threw "Failed to find configured root" on every install.
+            val staging = File(cacheDir, "updates").apply { mkdirs() }
+            val staged = File(staging, "parley-update.apk")
+            apk.copyTo(staged, overwrite = true)
             val uri: Uri = FileProvider.getUriForFile(
                 this,
                 "$packageName.fileprovider",
-                apk,
+                staged,
             )
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "application/vnd.android.package-archive")

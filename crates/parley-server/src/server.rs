@@ -23,7 +23,7 @@ use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, AvatarData, Channel as PbChannel, ChannelList, ChannelMode,
     ClientBody, ClientMessage, DeviceKind, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked,
     PresenceList, PresenceUser, ProfileResult, ReceiverReport, ServerBody, ServerMessage,
-    ShareStopped, VideoReport, VoiceState as PbVoiceState, VoiceStateList,
+    ShareStarted, ShareStopped, VideoReport, VoiceState as PbVoiceState, VoiceStateList,
 };
 
 pub struct Server {
@@ -47,6 +47,7 @@ impl Server {
         db.bootstrap_admin()?;
         let files_dir = config.files_dir();
         std::fs::create_dir_all(&files_dir)?;
+        crate::blob::sweep_temp_files(&files_dir);
         db.purge_stale_sessions()?;
         // Expired ephemeral chat is also filtered on read; sweeping at
         // boot keeps the file from carrying yesterday's rows until the
@@ -183,6 +184,12 @@ impl Server {
                         }
                         Err(e) => warn!(error = %e, "attachment cleanup failed"),
                     }
+                    // Tokens were only swept at boot, so a long-running
+                    // server kept every expired session forever. The sweep
+                    // is one indexed DELETE on a small table.
+                    if let Err(e) = purge_db.purge_stale_sessions().await {
+                        warn!(error = %e, "stale token purge failed");
+                    }
                 }
             });
         }
@@ -304,7 +311,7 @@ async fn serve(
     } else {
         auth.device_name.trim().chars().take(64).collect()
     };
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(crate::session::CONTROL_QUEUE_DEPTH);
     let sound_versions = db.sound_versions(info.id).await?;
     let registered = registry.register(ClientHandle {
         user_id: info.id,
@@ -364,22 +371,28 @@ async fn serve(
     // cancelled by select — partial reads can never be lost.
     // (A cancelled read_exact drops already-read bytes; that would
     // desynchronize the framed stream.)
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let (msg_tx, mut msg_rx) = mpsc::channel(64);
     tokio::spawn(async move {
         while let Ok(m) = session::read_message::<ClientMessage>(&mut rx).await {
-            if msg_tx.send(m).is_err() {
+            // Backpressure, not an unbounded queue: a client that floods
+            // control messages waits for the session loop to catch up.
+            if msg_tx.send(m).await.is_err() {
                 break;
             }
         }
         // stream closed or malformed: reader ends, msg_rx closes below
     });
 
-    let (dg_tx, mut dg_rx) = mpsc::unbounded_channel();
+    let (dg_tx, mut dg_rx) = mpsc::channel(256);
     let dg_conn = conn.clone();
     tokio::spawn(async move {
         while let Ok(d) = dg_conn.read_datagram().await {
-            if dg_tx.send(d).is_err() {
-                break;
+            match dg_tx.try_send(d) {
+                Ok(()) => {}
+                // Media is real-time: under overload the newest datagram
+                // is dropped, never queued into stale latency.
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
         // connection dead: reader ends, dg_rx closes below
@@ -667,6 +680,35 @@ async fn handle_client_message(
                         voice_state_message(voice, &member, j.channel_id, true),
                     );
                 }
+                // A device joining a channel where shares are already
+                // running missed the first-frame announcements. Send
+                // them now, so late joiners see names instead of the
+                // bare media ids on the wire.
+                for sharer_media in voice.sharing_snapshot() {
+                    if sharer_media == media_id {
+                        continue;
+                    }
+                    let Some(sharer) = voice.member(sharer_media) else {
+                        continue;
+                    };
+                    if sharer.channel_id != j.channel_id || sharer.user_id == info.id {
+                        continue;
+                    }
+                    let Some(username) = registry.username_of(sharer.user_id) else {
+                        continue;
+                    };
+                    registry.send_to_media(
+                        media_id,
+                        ServerMessage {
+                            body: Some(ServerBody::ShareStarted(ShareStarted {
+                                user_id: sharer.user_id,
+                                username,
+                                media_id: sharer.media_id,
+                                channel_id: sharer.channel_id,
+                            })),
+                        },
+                    );
+                }
             }
             // joining a nonexistent channel is ignored
         }
@@ -690,8 +732,10 @@ async fn handle_client_message(
 
         Some(ClientBody::SetMute(m)) => {
             // Mute is per device: muting the phone must not silence the
-            // desktop's microphone. It is still roster news, broadcast to
-            // every connected client.
+            // desktop's microphone. The requester and every other account
+            // hear it; the account's other devices do not, because their
+            // own row would otherwise show the account muted while their
+            // microphone is live.
             if voice.set_muted(media_id, m.muted)
                 && let Some(member) = voice.member(media_id)
             {
@@ -1031,7 +1075,26 @@ fn route_datagram(
     };
     let is_video = decoded.flags & parley_proto::media::FLAG_VIDEO != 0;
     if is_video {
-        voice.mark_sharing(media_id);
+        // First frame of a new share: tell every other device in the
+        // channel who is behind this media id. Video itself carries no
+        // account, so without this mapping a viewer can only say
+        // "user <media id>". Same-account devices are excluded exactly
+        // like their video is.
+        if voice.mark_sharing(media_id) {
+            let announcement = ServerMessage {
+                body: Some(ServerBody::ShareStarted(ShareStarted {
+                    user_id: sender.id,
+                    username: sender.username.clone(),
+                    media_id,
+                    channel_id,
+                })),
+            };
+            for member in voice.members_of(channel_id) {
+                if member.media_id != media_id && member.user_id != sender.id {
+                    registry.send_to_media(member.media_id, announcement.clone());
+                }
+            }
+        }
         transcode.note_video(media_id, channel_id, decoded.payload);
     }
 

@@ -190,6 +190,12 @@ class _HomePageState extends State<HomePage> {
   // Voice membership (who is in which channel): the snapshot at connect
   // plus every join/leave broadcast since.
   final Map<int, BigInt> _voiceChannel = {}; // user_id → channel_id
+
+  /// media id → account id for a received share. Video datagrams carry
+  /// only the per-device media id; the server announces the owner on the
+  /// first frame (and on a late channel join), so a card can show a real
+  /// name and be pruned against the account roster.
+  final Map<int, int> _shareAccount = {};
   // 7e: join = listen + transmit (TeamSpeak shape) — the Rust side
   // opens/closes the devices on the own join/leave events. The UI only
   // reflects membership; there is no listen toggle.
@@ -620,6 +626,7 @@ class _HomePageState extends State<HomePage> {
       _mobileDetailsVisible = false;
       _mobileDetailsPull = 0;
       _shareStats = null;
+      _shareAccount.clear();
       _avatars.clear();
       _avatarVersions.clear();
       _profileSave = null;
@@ -627,6 +634,7 @@ class _HomePageState extends State<HomePage> {
     setWindowFullscreen(false);
     if (AndroidPlatform.supported) {
       unawaited(AndroidPlatform.stopVoiceService());
+      unawaited(AndroidPlatform.stopShareService());
     }
     _muteAllShares();
     _syncScreenWatch();
@@ -911,6 +919,7 @@ class _HomePageState extends State<HomePage> {
       _mobileDetailsVisible = false;
       _mobileDetailsPull = 0;
       _shareStats = null;
+      _shareAccount.clear();
       _avatars.clear();
       _avatarVersions.clear();
       _profileSave = null;
@@ -937,7 +946,7 @@ class _HomePageState extends State<HomePage> {
   /// texture and no watch state, but the capture preview it draws is a
   /// picture like any other, so it gets the same page.
   void _enterFullscreen(int userId) {
-    if (userId == _session?.userId) {
+    if (userId == _session?.mediaId) {
       unawaited(_enterOwnFullscreen());
       return;
     }
@@ -952,15 +961,15 @@ class _HomePageState extends State<HomePage> {
   /// so expanding turns the preview on (it is what the page shows) and
   /// the viewer opens on its first frame.
   Future<void> _enterOwnFullscreen() async {
-    final me = _session?.userId;
-    if (me == null || !_sharing) return;
+    final own = _session?.mediaId;
+    if (own == null || !_sharing) return;
     if (!_settings.showSharePreview) {
       await _setPreviewEnabled(true);
     } else if (_preview == null) {
       await _loadPreview();
     }
     if (!mounted || _preview == null) return;
-    setState(() => _fullscreen = me);
+    setState(() => _fullscreen = own);
     setWindowFullscreen(true);
   }
 
@@ -981,8 +990,9 @@ class _HomePageState extends State<HomePage> {
   _fullscreenView() {
     final id = _fullscreen;
     final me = _session?.userId;
+    final own = _session?.mediaId;
     if (id == null || me == null) return null;
-    if (id == me) {
+    if (id == own) {
       final preview = _preview;
       if (!_sharing || preview == null) return null;
       // The preview canvas follows the stream (it is the capture at the
@@ -992,7 +1002,7 @@ class _HomePageState extends State<HomePage> {
       final h = _shareStats?.height.toInt() ?? preview.height.toInt();
       return (
         userId: id,
-        title: '${_nameOf(id)} (you)',
+        title: '${_nameOf(me)} (you)',
         textureId: preview.textureId,
         width: w,
         height: h,
@@ -1004,7 +1014,7 @@ class _HomePageState extends State<HomePage> {
     if (v == null) return null;
     return (
       userId: id,
-      title: _nameOf(id),
+      title: _shareName(id),
       textureId: v.$1,
       width: v.$2,
       height: v.$3,
@@ -1019,7 +1029,7 @@ class _HomePageState extends State<HomePage> {
     if (_watched.contains(userId)) return;
     setState(() => _watched.add(userId));
     _syncScreenWatch();
-    if (userId != _session?.userId) _setShareAudio(userId, true);
+    if (userId != _session?.mediaId) _setShareAudio(userId, true);
   }
 
   /// Open (or close) one share in the big area. A screen share's system
@@ -1040,7 +1050,7 @@ class _HomePageState extends State<HomePage> {
     if (!_watched.remove(userId)) return;
     setState(() {});
     _syncScreenWatch();
-    if (userId != _session?.userId) _setShareAudio(userId, false);
+    if (userId != _session?.mediaId) _setShareAudio(userId, false);
     if (_fullscreen == userId) {
       _fullscreen = null;
       setWindowFullscreen(false);
@@ -1066,10 +1076,10 @@ class _HomePageState extends State<HomePage> {
       _rustWatched.clear();
       return;
     }
-    final me = _session?.userId;
+    final own = _session?.mediaId;
     final want = {
       for (final id in _watched)
-        if (id != me) id,
+        if (id != own) id,
     };
     for (final id in _rustWatched.difference(want).toList()) {
       _rustWatched.remove(id);
@@ -1137,23 +1147,27 @@ class _HomePageState extends State<HomePage> {
   /// backstop for a notice that never arrived — the "card that stays
   /// there forever, Watch shows the last frame" bug.
   void _pruneShares() {
-    final me = _session?.userId;
+    final own = _session?.mediaId;
     if (_videos.isEmpty && !_sharing) return;
     final myChannel = _joinedChannelId;
     final online = {for (final u in _presence) u.userId};
     _videos.removeWhere((id, _) {
-      if (id == me) return true; // our own share is not a remote pane
-      if (online.isNotEmpty && !online.contains(id)) return true;
-      if (myChannel == null) return true; // not in voice: nothing routed
-      if (_voiceChannel.isNotEmpty) {
-        final theirs = _voiceChannel[id];
-        if (theirs == null || theirs != myChannel) return true;
+      if (id == own) return true; // our own share is not a remote pane
+      // Card keys are MEDIA ids, never account ids: one account can have
+      // a phone and a desktop sharing at once. Match through the
+      // announced identity; until it arrives, keep the card rather than
+      // guess (the old account-id guess deleted every live card on each
+      // roster poll, which is the flicker this fixes).
+      final account = _shareAccount[id];
+      if (account != null && online.isNotEmpty && !online.contains(account)) {
+        return true;
       }
+      if (myChannel == null) return true; // not in voice: nothing routed
       return false;
     });
     // Own share: it lives in `_sharing`, not `_videos`, so "still on
     // screen" is a different question for it.
-    bool visible(int id) => id == me ? _sharing : _videos.containsKey(id);
+    bool visible(int id) => id == own ? _sharing : _videos.containsKey(id);
     _watched.removeWhere((id) => !visible(id));
     _syncScreenWatch();
     for (final id in _audibleShares.toList()) {
@@ -1170,7 +1184,8 @@ class _HomePageState extends State<HomePage> {
       final loaded = await settings_api.load();
       final supported = await hwEncodeSupported();
       final canShare = await screenShareSupported();
-      final canCamera = await cameraShareSupported();
+      final canCamera = await cameraShareSupported() &&
+          (!AndroidPlatform.supported || await AndroidPlatform.hasCamera());
       if (!mounted) return;
       setState(() {
         _settings = loaded;
@@ -1396,11 +1411,32 @@ class _HomePageState extends State<HomePage> {
       fps: _settings.shareFps,
       players: players,
       cameraSupported: _cameraShareSupported,
+      // Android screen audio and screen+camera overlay are not built yet.
+      audioSupported: !AndroidPlatform.supported,
+      cameraOverlaySupported: !AndroidPlatform.supported,
     );
     if (options == null ||
         !mounted ||
         _session?.sessionId != session.sessionId) {
       return;
+    }
+    if (AndroidPlatform.supported) {
+      final granted = options.camera
+          ? await AndroidPlatform.requestPermissions(const [
+              'android.permission.CAMERA',
+            ])
+          : await AndroidPlatform.requestScreenCapture();
+      if (!granted) {
+        if (mounted) {
+          setState(
+            () => _status = options.camera
+                ? 'camera permission is required to share'
+                : 'screen capture permission is required to share',
+          );
+        }
+        return;
+      }
+      if (!mounted || _session?.sessionId != session.sessionId) return;
     }
     // The dialog is the same cap Settings → Video edits, so remember what
     // was actually picked: next time it should not snap back to a stale
@@ -1436,8 +1472,20 @@ class _HomePageState extends State<HomePage> {
         camera: options.camera,
         cameraOverlay: options.cameraOverlay,
       );
+      if (AndroidPlatform.supported) {
+        await AndroidPlatform.startShareService(camera: options.camera);
+      }
       // share_started arrives as an event; the button flips there.
     } catch (e) {
+      if (AndroidPlatform.supported) {
+        unawaited(AndroidPlatform.stopShareService());
+        // The Rust encoder may already be live even though the platform
+        // service failed to start; tear it down rather than leaving a
+        // share with no frame source.
+        try {
+          stopScreenShare(sessionId: session.sessionId);
+        } catch (_) {}
+      }
       setState(() => _status = 'share failed: $e');
     }
   }
@@ -1450,6 +1498,26 @@ class _HomePageState extends State<HomePage> {
       stopScreenShare(sessionId: _session!.sessionId);
     } catch (e) {
       setState(() => _status = 'share stop failed: $e');
+    } finally {
+      // The service is the frame source. It must stop even when the Rust
+      // share slot was already cleared (a failed start, or an event race),
+      // otherwise Android keeps the camera/projection alive with no
+      // encoder consuming its frames.
+      if (AndroidPlatform.supported) {
+        await AndroidPlatform.stopShareService();
+      }
+    }
+  }
+
+  /// Flip a running Android camera share. The service swaps the Capture
+  /// device in place, so this does not restart the share or the encoder.
+  Future<void> _switchCamera() async {
+    if (!AndroidPlatform.supported || !_sharing || !_shareIsCamera) return;
+    try {
+      await AndroidPlatform.switchCamera();
+      if (mounted) setState(() => _status = 'camera flipped');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'camera switch failed: $e');
     }
   }
 
@@ -1724,6 +1792,19 @@ class _HomePageState extends State<HomePage> {
           }
           _pruneShares();
         });
+      case 'share_identity':
+        // Server-stamped owner of a media id. Kept even if the video
+        // start arrives after it; the card then paints a real name.
+        final sid = ev.surface;
+        if (sid != null && sid.userId != 0) {
+          setState(() {
+            _shareAccount[sid.userId] = ev.userId;
+            if (ev.username.isNotEmpty) _usernames[ev.userId] = ev.username;
+            if (_videos.containsKey(sid.userId) && ev.username.isNotEmpty) {
+              _status = '${ev.username} is sharing';
+            }
+          });
+        }
       case 'video_started':
         final s0 = ev.surface;
         if (s0 != null) {
@@ -1739,7 +1820,7 @@ class _HomePageState extends State<HomePage> {
               s0.height.toInt(),
               s0.fps.toInt(),
             );
-            final name = _nameOf(s0.userId);
+            final name = _shareName(s0.userId);
             _status = '$name is sharing ${s0.width}×${s0.height}';
           });
         }
@@ -1749,6 +1830,7 @@ class _HomePageState extends State<HomePage> {
         // stats event can also be the first thing that arrives after a
         // dropped start notice: upsert instead of requiring an existing
         // tile, or the share stays invisible until the sender re-shares.
+        // The periodic 5 s refresh is this event, never a second start.
         final s2 = ev.surface;
         if (s2 != null) {
           final old = _videos[s2.userId];
@@ -1771,6 +1853,7 @@ class _HomePageState extends State<HomePage> {
           setState(() {
             _videos.remove(s1.userId);
             _watched.remove(s1.userId);
+            _shareAccount.remove(s1.userId);
             if (_fullscreen == s1.userId) {
               _fullscreen = null;
               setWindowFullscreen(false);
@@ -1797,31 +1880,37 @@ class _HomePageState extends State<HomePage> {
         }
       case 'share_ended':
         if (mounted) {
-          final ownFullscreen = _fullscreen == _session?.userId;
+          final ownFullscreen = _fullscreen == _session?.mediaId;
           setState(() {
             _sharing = false;
             _shareIsCamera = false;
             _shareStats = null;
-            _watched.remove(_session?.userId);
+            _watched.remove(_session?.mediaId);
             if (ownFullscreen) _fullscreen = null;
           });
           // The page that was showing the preview has nothing left to
           // paint: put the window back before the picture disappears.
           if (ownFullscreen) setWindowFullscreen(false);
           _status = 'share ended';
+          if (AndroidPlatform.supported) {
+            unawaited(AndroidPlatform.stopShareService());
+          }
         }
       case 'share_failed':
         if (mounted) {
-          final ownFullscreen = _fullscreen == _session?.userId;
+          final ownFullscreen = _fullscreen == _session?.mediaId;
           setState(() {
             _sharing = false;
             _shareIsCamera = false;
             _shareStats = null;
-            _watched.remove(_session?.userId);
+            _watched.remove(_session?.mediaId);
             if (ownFullscreen) _fullscreen = null;
           });
           if (ownFullscreen) setWindowFullscreen(false);
           _status = 'share failed: ${ev.username}';
+          if (AndroidPlatform.supported) {
+            unawaited(AndroidPlatform.stopShareService());
+          }
         }
       case 'session_closed':
         if (mounted) _handleClosed();
@@ -2025,6 +2114,14 @@ class _HomePageState extends State<HomePage> {
 
   String _nameOf(int userId) => _usernames[userId] ?? 'user $userId';
 
+  /// A share card's label: the announced account name, never the raw
+  /// media id that happens to be the map key.
+  String _shareName(int mediaId) {
+    final account = _shareAccount[mediaId];
+    if (account == null) return 'user $mediaId';
+    return _nameOf(account);
+  }
+
   /// Display name for the connected account: presence is the authority
   /// once it arrives, the login field before that.
   String get _ownName {
@@ -2050,6 +2147,27 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        // Back leaves fullscreen first. Anywhere else it MINIMIZES the
+        // app instead of killing the call/share: Android would otherwise
+        // finish the activity and tear down a running capture.
+        final fs = _fullscreenView();
+        if (fs != null) {
+          _exitFullscreen();
+          return;
+        }
+        if (AndroidPlatform.supported) {
+          unawaited(AndroidPlatform.moveTaskToBack());
+        }
+      },
+      child: _buildPage(context),
+    );
+  }
+
+  Widget _buildPage(BuildContext context) {
     final theme = Theme.of(context);
     // Fullscreen is its own page, not a layer over the session view: no
     // app bar, no floating share/HW bar, no padding, no window toolbar.
@@ -2073,6 +2191,7 @@ class _HomePageState extends State<HomePage> {
                   _exitFullscreen();
                   _unwatch(fs.userId);
                 },
+          onStopSharing: fs.own ? _stopShare : null,
         ),
       );
     }
@@ -3036,15 +3155,17 @@ class _HomePageState extends State<HomePage> {
   /// the other sharers alphabetically (a stable order — cards must not
   /// jump around on refresh).
   List<int> _screenIds() {
+    final own = _session?.mediaId;
+    final me = _session?.userId;
     final ids = [
       for (final id in _videos.keys)
-        if (id != _session?.userId) id,
+        if (id != own && _shareAccount[id] != me) id,
     ];
     ids.sort(
-      (a, b) => _nameOf(a).toLowerCase().compareTo(_nameOf(b).toLowerCase()),
+      (a, b) =>
+          _shareName(a).toLowerCase().compareTo(_shareName(b).toLowerCase()),
     );
-    final me = _session?.userId;
-    if (_sharing && me != null) ids.insert(0, me);
+    if (_sharing && own != null) ids.insert(0, own);
     return ids;
   }
 
@@ -3054,8 +3175,9 @@ class _HomePageState extends State<HomePage> {
   /// own dimensions before the first frame.
   List<ScreenTile> _screenTiles() {
     final tiles = <ScreenTile>[];
+    final me = _session?.userId;
     for (final id in _screenIds()) {
-      final own = id == _session?.userId;
+      final own = id == _session?.mediaId;
       final v = own ? null : _videos[id];
       final stats = own ? _shareStats : null;
       final preview = own ? _preview : null;
@@ -3063,7 +3185,7 @@ class _HomePageState extends State<HomePage> {
       tiles.add(
         ScreenTile(
           userId: id,
-          name: own ? '${_nameOf(id)} (you)' : _nameOf(id),
+          name: own ? '${_nameOf(me ?? 0)} (you)' : _shareName(id),
           own: own,
           textureId: showing ? (own ? preview?.textureId : v?.$1) : null,
           width: own
@@ -3320,6 +3442,15 @@ class _HomePageState extends State<HomePage> {
                 ),
                 label: Text(_sharing ? 'Stop sharing' : 'Share screen'),
               ),
+              if (AndroidPlatform.supported && _sharing && _shareIsCamera)
+                Tooltip(
+                  message: 'Switch front/back camera',
+                  child: IconButton(
+                    onPressed: _switchCamera,
+                    iconSize: 20,
+                    icon: const Icon(Icons.cameraswitch),
+                  ),
+                ),
             ],
             // The hardware-encode switch moved to Settings → Video: one
             // source of truth for a preference that is already persisted

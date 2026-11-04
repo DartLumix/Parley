@@ -13,6 +13,11 @@
 -keep class io.flutter.embedding.engine.FlutterEngine { *; }
 -keep class io.flutter.embedding.android.FlutterView { *; }
 
+# The capture service's native methods are resolved by their Java names
+# from Rust (`Java_dev_parley_app_ShareService_*`). Keep the class and
+# the method names even if a future R8 version changes its defaults.
+-keep class dev.parley.app.ShareService { *; }
+
 # Standard JNI safety net for any other plugin that uses a native
 # method's declaring class or signature.
 -keepclasseswithmembernames class * {

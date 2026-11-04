@@ -3,6 +3,8 @@
 //! minimal (the generator may append its wiring here — verify with cat
 //! after generate, before building).
 
+#[cfg(target_os = "android")]
+mod android_share;
 mod api;
 mod frb_generated;
 

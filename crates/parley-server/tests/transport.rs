@@ -1745,6 +1745,81 @@ async fn stop_share_scoped_to_channel_members() {
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 
+/// A share's first video frame announces which account is behind the
+/// per-device media id, and a device that joins later gets the same
+/// announcement. Without it viewers can only render "user <media id>".
+#[tokio::test]
+async fn share_started_names_the_sharer_and_reaches_late_joiners() {
+    let (mut a, mut b, mut c, _ch2, config) = setup_two_channels("share-identity").await;
+
+    let dg = parley_proto::media::encode(parley_proto::media::FLAG_VIDEO, 0, 0, 0, &[0u8; 16]);
+    a.0.send_datagram(dg.into()).unwrap();
+
+    let announced = read_server_msg(&mut b.2).await;
+    let started = match announced.body {
+        Some(ServerBody::ShareStarted(s)) => s,
+        other => panic!("expected share started, got {other:?}"),
+    };
+    assert_eq!(started.user_id, 1);
+    assert_eq!(started.username, "testuser");
+    assert_ne!(started.media_id, 0, "media id is the per-device key");
+    assert_eq!(started.channel_id, 1);
+
+    // The forwarded frame carries that same media id.
+    let frame = timeout(Duration::from_secs(2), b.0.read_datagram())
+        .await
+        .expect("share frame must arrive")
+        .unwrap();
+    assert_eq!(
+        parley_proto::media::decode(&frame).unwrap().sender_id,
+        started.media_id
+    );
+
+    // The sharer is not told about its own share, and the other channel
+    // learns nothing about it.
+    expect_silence(&mut a.2, Duration::from_millis(200)).await;
+    expect_silence(&mut c.2, Duration::from_millis(200)).await;
+
+    // C moves into the channel after the share started: the server
+    // replays the identity announcement to it.
+    send_client_msg(&mut c.1, ClientBody::JoinVoice(JoinVoice { channel_id: 1 })).await;
+    let mut saw_started = false;
+    let mut saw_voice = false;
+    while !(saw_started && saw_voice) {
+        let msg = timeout(Duration::from_secs(2), read_server_msg(&mut c.2))
+            .await
+            .expect("late joiner must receive its join state and the share");
+        match msg.body {
+            Some(ServerBody::ShareStarted(s)) => {
+                assert_eq!(s.media_id, started.media_id);
+                assert_eq!(s.username, "testuser");
+                saw_started = true;
+            }
+            Some(ServerBody::VoiceState(v)) if v.user_id == 3 && v.joined && v.channel_id == 1 => {
+                saw_voice = true;
+            }
+            _ => {}
+        }
+    }
+
+    // Live frames now reach the late joiner too.
+    let dg = parley_proto::media::encode(parley_proto::media::FLAG_VIDEO, 1, 0, 0, &[1u8; 16]);
+    a.0.send_datagram(dg.into()).unwrap();
+    let frame = timeout(Duration::from_secs(2), c.0.read_datagram())
+        .await
+        .expect("late joiner must receive the live frames")
+        .unwrap();
+    assert_eq!(
+        parley_proto::media::decode(&frame).unwrap().sender_id,
+        started.media_id
+    );
+
+    a.0.close(0u32.into(), b"done");
+    b.0.close(0u32.into(), b"done");
+    c.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
 /// 7k: a share cannot outlive channel membership. Leaving voice while
 /// sharing used to notify nobody — viewers kept the card (and its Watch
 /// button showed the last decoded frame) indefinitely.
@@ -1867,6 +1942,80 @@ async fn voice_states_snapshot_two_channels() {
     }
 
     a.0.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// A kick removes the account from the channel, not one arbitrary device
+/// of it: leaving a second device behind reported success while the user
+/// stayed in the room.
+#[tokio::test]
+async fn kick_removes_every_device_of_the_account_in_the_channel() {
+    init_logs();
+
+    let (config, server) = setup_server_with_roles("manage-kick-multi");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+
+    let endpoint = client_endpoint(pinned);
+    let (conn_admin, mut tx_admin, mut rx_admin, _) =
+        connect_and_auth_full(&endpoint, addr, "admin", "adminpass").await;
+    let (conn_bob1, mut tx_bob1, mut rx_bob1, bob1) =
+        connect_and_auth_full(&endpoint, addr, "bob", "bobpass").await;
+    let (conn_bob2, mut tx_bob2, mut rx_bob2, bob2) =
+        connect_and_auth_full(&endpoint, addr, "bob", "bobpass").await;
+    assert_eq!(bob1.user_id, bob2.user_id, "one account");
+    assert_ne!(bob1.media_id, bob2.media_id, "two devices");
+
+    for (tx, rx) in [(&mut tx_bob1, &mut rx_bob1), (&mut tx_bob2, &mut rx_bob2)] {
+        send_client_msg(tx, ClientBody::JoinVoice(JoinVoice { channel_id: 1 })).await;
+        expect_voice_state(rx, bob1.user_id, 1, true).await;
+    }
+    // The admin sees both memberships (different devices, same account).
+    expect_voice_state(&mut rx_admin, bob1.user_id, 1, true).await;
+    expect_voice_state(&mut rx_admin, bob1.user_id, 1, true).await;
+
+    send_manage(
+        &mut tx_admin,
+        ManageAction::KickUser(KickUser {
+            user_id: bob1.user_id,
+            channel_id: 1,
+        }),
+    )
+    .await;
+    // Each device hears its own leave; the admin hears both and then the
+    // result (streams are independent, so accept either interleaving).
+    expect_voice_state(&mut rx_bob1, bob1.user_id, 0, false).await;
+    expect_voice_state(&mut rx_bob2, bob1.user_id, 0, false).await;
+    let mut leaves = 0;
+    let mut result = None;
+    while result.is_none() || leaves < 2 {
+        match read_server_msg(&mut rx_admin).await.body {
+            Some(ServerBody::VoiceState(v)) if v.user_id == bob1.user_id && !v.joined => {
+                leaves += 1;
+            }
+            Some(ServerBody::ManageResult(r)) => result = Some(r),
+            other => panic!("unexpected kick outcome: {other:?}"),
+        }
+    }
+    let result = result.expect("one manage result");
+    assert!(result.ok, "kick failed: {}", result.error);
+    assert_eq!(leaves, 2, "both devices must leave the room");
+    let state = result.state.unwrap();
+    assert_eq!(
+        state
+            .users
+            .iter()
+            .find(|u| u.user_id == bob1.user_id)
+            .unwrap()
+            .channel_id,
+        0,
+        "the account is no longer in a channel"
+    );
+
+    conn_admin.close(0u32.into(), b"done");
+    conn_bob1.close(0u32.into(), b"done");
+    conn_bob2.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 

@@ -20,6 +20,7 @@ pub use pb::{
     LogOutOtherDevices, ManageRequest, ManageResult, ManageState, ManageStateRequest,
     ManagedChannel, ManagedUser, PinMessage, Poke, Poked, PresenceList, PresenceRequest,
     PresenceUser, ProfileResult, ReceiverReport, RemoveUser, RequestAvatar, Role, SendChat,
-    ServerMessage, SetMute, SetStatus, ShareStopped, SoundRef, StopShare, UpdateChannel,
-    UpdateProfile, UpdateUser, VideoReport, VoiceState, VoiceStateList, VoiceStatesRequest,
+    ServerMessage, SetMute, SetStatus, ShareStarted, ShareStopped, SoundRef, StopShare,
+    UpdateChannel, UpdateProfile, UpdateUser, VideoReport, VoiceState, VoiceStateList,
+    VoiceStatesRequest,
 };

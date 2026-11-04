@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use quinn::{RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +29,12 @@ use parley_proto::{
 pub const MAX_CHAT_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// Personal cues are short MP3s. 1 MiB is over three minutes at 40 kbps.
 pub const MAX_SOUND_BYTES: u64 = 1024 * 1024;
+
+/// Distinguishes uploads that begin in the same clock tick. The temp name
+/// used to carry only the user id and a nanosecond timestamp, so two
+/// simultaneous streams from one account could pick the same path and one
+/// could delete the other's file.
+static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Spawn the per-connection accept loop. Every accepted stream is its
 /// own task; the loop ends when the connection does.
@@ -50,6 +57,33 @@ pub fn spawn_acceptor(
             });
         }
     });
+}
+
+/// Remove upload temp files a crash left behind. Called at startup,
+/// before any transfer can be in flight, so only the private prefix is
+/// touched.
+pub fn sweep_temp_files(files_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(files_dir) else {
+        return;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".incoming-")
+        {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!(removed, "removed interrupted uploads");
+    }
 }
 
 async fn handle(
@@ -112,8 +146,10 @@ async fn upload_blob(
             // Write to a private temp name first: an aborted transfer must
             // never leave a half file where a download can see it.
             tokio::fs::create_dir_all(files_dir).await?;
+            let unique = UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
             let tmp = files_dir.join(format!(
-                ".incoming-{user_id}-{}",
+                ".incoming-{user_id}-{}-{unique}-{}",
+                std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
@@ -434,7 +470,7 @@ fn presence(registry: &Arc<SessionRegistry>) -> ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::is_mp3;
+    use super::{is_mp3, sweep_temp_files};
 
     #[test]
     fn accepts_id3_and_bare_frames() {
@@ -455,5 +491,20 @@ mod tests {
     fn rejects_non_mpeg_data() {
         assert!(!is_mp3(b"not audio at all"));
         assert!(!is_mp3(b"fLaC\0\0\0\x22"));
+    }
+
+    #[test]
+    fn sweeps_only_interrupted_upload_temps() {
+        let dir = std::env::temp_dir().join(format!("parley-blob-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".incoming-1-2-3-4"), b"partial").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"final").unwrap();
+
+        sweep_temp_files(&dir);
+
+        assert!(!dir.join(".incoming-1-2-3-4").exists());
+        assert!(dir.join("keep.txt").exists(), "only temp files are swept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

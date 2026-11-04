@@ -94,33 +94,40 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::video::VideoLadder;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use futures_util::StreamExt;
 use parley_core::audio::pipeline::SendPipeline;
 use parley_core::video::{VideoEncoder, bitrate_for, create_encoder_auto, target_fps};
 use parley_proto::video::fragment_frame_with_max;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use pipewire as pw;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use pw::properties::properties;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use pw::spa;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
 pub use win::{list_audio_players, start, start_camera, start_overlay};
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod camera;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub use camera::{start_camera, start_overlay};
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+pub use android::{
+    android_capture_ended, android_capture_failed, android_push_frame, android_push_yuv_frame,
+    list_audio_players, start, start_camera,
+};
 
 /// Whether this build has a camera source. Linux captures V4L2 directly;
 /// Windows uses Media Foundation (beta: it can fail on a device whose
@@ -147,6 +154,7 @@ struct OverlayFrame {
     at: std::time::Instant,
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 impl CameraOverlay {
     pub fn new() -> Self {
         Self {
@@ -183,7 +191,7 @@ impl Default for CameraOverlay {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use crate::ShareEvent;
 
 /// Messages from the capture thread to the encoder thread. One channel
@@ -399,7 +407,7 @@ impl ShareController {
 }
 
 /// Listener user data, owned by the pw loop thread.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
@@ -990,7 +998,7 @@ struct ShareSenderArgs {
 /// set, then disconnects and returns (scope exit drops stream, core,
 /// context, mainloop — in reverse declaration order, which is the
 /// required C teardown order).
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn pw_thread(
     node_id: u32,
@@ -2514,7 +2522,7 @@ fn encoder_thread(
 // WASAPI with the same contract.
 
 /// Listener user data for the audio capture stream.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 struct AudioState {
     stop: Arc<AtomicBool>,
     accepted: bool,
@@ -2528,7 +2536,7 @@ struct AudioState {
 /// channel + try_send: never block the pw thread (the 6f discipline); a
 /// slow consumer drops stale audio — correct for live content. Failures
 /// surface on stderr; the video share proceeds regardless.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn start_audio_capture(stop: Arc<AtomicBool>, tap: ShareAudioTap) {
     std::thread::spawn(move || {
         let ShareAudioTap { source, tx } = tap;
@@ -2545,7 +2553,7 @@ fn start_audio_capture(stop: Arc<AtomicBool>, tap: ShareAudioTap) {
 /// The whole-output tap: capture the DEFAULT OUTPUT (PipeWire
 /// `stream.capture.sink`). Everything the machine plays is in there,
 /// this app included — the caller pairs it with the echo guard.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn output_capture_thread(
     stop: Arc<AtomicBool>,
     sys_tx: SyncSender<Vec<f32>>,
@@ -2718,7 +2726,7 @@ fn output_capture_thread(
 /// Parley's own playback nodes are excluded HERE, at the source: a picker
 /// that offered them would re-create exactly the echo this path exists
 /// to remove.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn list_audio_players() -> Result<Vec<AudioPlayer>, String> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2820,7 +2828,7 @@ pub fn list_audio_players() -> Result<Vec<AudioPlayer>, String> {
     Ok(out)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn is_parley(value: &str) -> bool {
     value.to_lowercase().contains("parley")
 }
@@ -2828,7 +2836,7 @@ fn is_parley(value: &str) -> bool {
 /// Backlog for one selected application. Written by its capture callback,
 /// drained by the collector — both on the capture thread, so a plain
 /// `VecDeque` needs no lock.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 struct PlayerSource {
     /// Interleaved stereo f32 at 48 kHz, oldest first.
     buf: std::collections::VecDeque<f32>,
@@ -2837,18 +2845,18 @@ struct PlayerSource {
     primed: bool,
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const STEREO_SAMPLES_PER_MS: usize = 48 * 2;
 /// Playout backlog before a source is mixed in (30 ms absorbs quantum
 /// jitter without adding audible delay).
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const PLAYER_PREBUFFER_SAMPLES: usize = 30 * STEREO_SAMPLES_PER_MS;
 /// Hard cap per source (240 ms): a sustained surplus means the clocks
 /// disagree — drop OLDEST, never grow latency.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const PLAYER_CAP_SAMPLES: usize = 240 * STEREO_SAMPLES_PER_MS;
 /// One collector step: 10 ms of stereo.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const MIX_STEP_SAMPLES: usize = 10 * STEREO_SAMPLES_PER_MS;
 
 /// Capture specific application nodes — the echo-free path.
@@ -2858,7 +2866,7 @@ const MIX_STEP_SAMPLES: usize = 10 * STEREO_SAMPLES_PER_MS;
 /// each accumulates into its own ring and a 10 ms collector sums whatever
 /// is ready: the mux always receives the same steady stereo shape. Parley's
 /// own playback is not among the sources — structural, not a subtraction.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn players_capture_thread(
     stop: Arc<AtomicBool>,
     tx: SyncSender<Vec<f32>>,
@@ -3006,7 +3014,7 @@ fn players_capture_thread(
 /// the next `step` samples of its backlog; a source short of data
 /// contributes silence for the missing tail — the mux's clock must never
 /// depend on one app.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn collect_mix(
     sources: &std::rc::Rc<std::cell::RefCell<Vec<PlayerSource>>>,
     step: usize,
@@ -3035,7 +3043,7 @@ fn collect_mix(
 /// The one format every share-audio tap asks for: F32LE, 48 kHz, stereo.
 /// Share audio rides the music profile, so nothing downstream converts or
 /// resamples.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn f32_stereo_format_pod() -> Vec<u8> {
     use spa::pod::{ChoiceValue, Object, Property, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
@@ -3271,7 +3279,7 @@ pub fn spawn_share_audio_mux(
 // share audio, the DMA-BUF switch, the dialog's caps, and the preview
 // tap. They are deliberately separate — folding them into a struct at
 // the one call site that has all of them (the bridge) buys nothing.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
     conn: quinn::Connection,
@@ -3539,7 +3547,7 @@ pub async fn start(
     Ok((handle, ShareController { stop_tx }))
 }
 
-#[cfg(all(test, feature = "vaapi", not(windows)))]
+#[cfg(all(test, feature = "vaapi", target_os = "linux"))]
 mod dmabuf_negotiation_tests {
     use super::{buffers_data_type_property, modifier_property};
     use pipewire::spa::pod::{ChoiceValue, PropertyFlags, Value};

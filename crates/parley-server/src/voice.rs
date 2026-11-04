@@ -49,8 +49,11 @@ impl VoiceManager {
         self.members.lock().unwrap().remove(&media_id)
     }
 
-    pub fn mark_sharing(&self, media_id: u32) {
-        self.sharing.lock().unwrap().insert(media_id);
+    /// Remember that this device is sharing. True when this is the
+    /// first video datagram of the share, so the caller can announce it
+    /// exactly once.
+    pub fn mark_sharing(&self, media_id: u32) -> bool {
+        self.sharing.lock().unwrap().insert(media_id)
     }
 
     /// Forget the share. True when there was one to forget.

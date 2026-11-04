@@ -3,6 +3,39 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.5.3] — 2026-11-04
+
+A stream-identity and Android-control release. The wire protocol gains one
+additive message; older peers ignore it.
+
+### Fixed
+
+- Share cards no longer disappear and return on every presence/roster
+  poll. Video datagrams carry a per-device media id, but the client was
+  pruning and naming the cards with account ids, so each refresh deleted
+  every live card until the next stats frame. Shares are now keyed by
+  media id end to end, and the server announces the owning account and
+  username when a share starts (and to late channel joiners).
+- Stream cards show the sharer's real username instead of `user 1`,
+  `user 5` and so on.
+- A clean `ShareStopped`/voice-leave now clears the right decoder and
+  surface, so a stopped share disappears immediately instead of lingering
+  until the watchdog.
+- The Android updater can hand the downloaded APK to the installer.
+  Downloads live under `code_cache`, which FileProvider does not expose;
+  the APK is now staged under `cacheDir/updates` before the content URI
+  is built.
+
+### Added
+
+- Android camera share has a front/back switch, both on the floating
+  action bar and as a notification action. The capture device is swapped
+  in place; the stream and encoder keep running.
+- Android back now leaves fullscreen first and otherwise sends the app to
+  the background instead of finishing the activity, so a call or capture
+  survives. The fullscreen viewer also has an explicit Stop sharing
+  button for your own share.
+
 ## [0.5.2] — 2026-11-04
 
 A client bug-fix release; the wire protocol is unchanged.

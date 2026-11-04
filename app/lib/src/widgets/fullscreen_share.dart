@@ -22,6 +22,7 @@ class FullscreenShare extends StatefulWidget {
     required this.aspectRatio,
     required this.onExit,
     this.onStopWatching,
+    this.onStopSharing,
   });
 
   final String title;
@@ -38,6 +39,9 @@ class FullscreenShare extends StatefulWidget {
 
   final VoidCallback onExit;
   final VoidCallback? onStopWatching;
+
+  /// Only for your own share: ends the capture, not just the viewer.
+  final VoidCallback? onStopSharing;
 
   @override
   State<FullscreenShare> createState() => _FullscreenShareState();
@@ -113,14 +117,23 @@ class _FullscreenShareState extends State<FullscreenShare> {
                   duration: const Duration(milliseconds: 180),
                   child: IgnorePointer(
                     ignoring: !_controls,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
+                    child: Wrap(
+                      alignment: WrapAlignment.end,
+                      runSpacing: 8,
                       children: [
                         if (widget.onStopWatching != null) ...[
                           _button(
                             Icons.visibility_off,
                             'Stop watching',
                             widget.onStopWatching!,
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        if (widget.onStopSharing != null) ...[
+                          _button(
+                            Icons.stop_circle_outlined,
+                            'Stop sharing',
+                            widget.onStopSharing!,
                           ),
                           const SizedBox(width: 8),
                         ],

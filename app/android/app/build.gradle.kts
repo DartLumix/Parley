@@ -58,6 +58,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Side-by-side with the release-signed app: a debug build must
+            // never replace the user's real install (or its data).
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             signingConfig =
                 if (releaseSigningReady) signingConfigs.getByName("release") else null
@@ -95,7 +101,7 @@ kotlin {
 // Build the Rust bridge for the two ABIs the Android app ships. Keeping
 // this in Gradle means `flutter build apk` and `flutter run` cannot
 // silently package an old or missing libparley_flutter.so.
-val rustFeatures = "audio-device,aec-rust,video"
+val rustFeatures = "audio-device,aec-rust,video,screen-capture"
 val buildRustAndroid by tasks.registering(Exec::class) {
     workingDir = file("../../rust")
     val ndk = android.ndkDirectory.absolutePath

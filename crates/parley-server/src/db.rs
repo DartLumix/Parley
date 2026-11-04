@@ -136,6 +136,35 @@ pub type AvatarRow = (Vec<u8>, String, u64);
 /// How long an unpinned message lives in an ephemeral channel.
 pub const EPHEMERAL_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// The database holds password hashes and session tokens. SQLite creates
+/// it with the process umask (commonly 0644), which leaves both readable
+/// by every local account; the WAL sidecars inherit the database's mode.
+fn restrict_database_files(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let sidecar = |suffix: &str| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        };
+        for candidate in [path.to_path_buf(), sidecar("-wal"), sidecar("-shm")] {
+            if candidate.exists()
+                && let Err(e) =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    error = %e,
+                    "could not restrict database permissions"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,6 +179,7 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        restrict_database_files(path);
         // Seed the default channel only when the schema is created. The
         // management page can delete `general`; re-running the seed on
         // every open would resurrect it at the next restart.
@@ -1032,6 +1062,9 @@ impl Db {
             DbCmd::PurgeExpiredMessages { reply } => {
                 let _ = reply.send(self.purge_expired_messages());
             }
+            DbCmd::PurgeStaleSessions { reply } => {
+                let _ = reply.send(self.purge_stale_sessions());
+            }
             DbCmd::OrphanFiles { reply } => {
                 let _ = reply.send(self.orphan_files());
             }
@@ -1158,6 +1191,9 @@ pub enum DbCmd {
     },
     PurgeExpiredMessages {
         reply: oneshot::Sender<Result<u64, Error>>,
+    },
+    PurgeStaleSessions {
+        reply: oneshot::Sender<Result<(), Error>>,
     },
     OrphanFiles {
         reply: oneshot::Sender<Result<Vec<u64>, Error>>,
@@ -1512,6 +1548,14 @@ impl DbHandle {
         rx.await.map_err(|_| gone())?
     }
 
+    pub async fn purge_stale_sessions(&self) -> Result<(), Error> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(DbCmd::PurgeStaleSessions { reply })
+            .map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
     pub async fn orphan_files(&self) -> Result<Vec<u64>, Error> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -1637,6 +1681,25 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("parley-db-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("parley.db");
+        let db = Db::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "password hashes and tokens must not be group/world readable"
+        );
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

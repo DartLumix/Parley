@@ -12,6 +12,30 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.5.3
+
+Streams stay on screen, show real names, and Android gets its camera flip
+and a back button that no longer ends the call.
+
+## Streams
+
+- A share no longer disappears and comes back every few seconds. The
+  client was checking a per-device stream id against account ids, so every
+  roster refresh removed the live cards.
+- Share cards show the sharer's username instead of `user 1` or `user 5`.
+- A stopped share closes immediately instead of waiting for the watchdog.
+
+## Android
+
+- Camera shares have a front/back switch on the share bar and in the
+  notification.
+- Back leaves fullscreen first; anywhere else it minimizes the app, so a
+  call or screen share keeps running. Your own fullscreen share has a
+  Stop sharing button.
+- The updater now hands the downloaded APK to Android's installer
+  correctly. The download directory was outside the installer's shared
+  roots, which caused `Failed to find configured root`.
+
 # Parley 0.5.2
 
 A bug-fix release for the 0.5 line. The wire protocol is unchanged.

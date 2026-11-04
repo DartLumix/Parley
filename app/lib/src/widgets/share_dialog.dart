@@ -37,6 +37,8 @@ Future<ShareOptions?> showShareOptionsDialog(
   required int fps,
   List<ShareAudioPlayer> players = const [],
   bool cameraSupported = true,
+  bool audioSupported = true,
+  bool cameraOverlaySupported = true,
 }) {
   var chosenHeight = height;
   var chosenFps = fps;
@@ -46,7 +48,7 @@ Future<ShareOptions?> showShareOptionsDialog(
   var cameraOverlay = false;
   // Everything playing is checked by default: the old whole-output
   // behaviour, minus this app itself.
-  var audioOn = players.isNotEmpty;
+  var audioOn = audioSupported && players.isNotEmpty;
   final selected = <int>{for (final p in players) p.id};
   return showDialog<ShareOptions>(
     context: context,
@@ -72,7 +74,7 @@ Future<ShareOptions?> showShareOptionsDialog(
                       if (v) cameraOverlay = false;
                     }),
                   ),
-                  if (!camera)
+                  if (!camera && cameraOverlaySupported)
                     Row(
                       children: [
                         const Expanded(
@@ -130,7 +132,7 @@ Future<ShareOptions?> showShareOptionsDialog(
                   ],
                   onChanged: (v) => setDialog(() => chosenFps = v),
                 ),
-                if (!camera) ...[
+                if (!camera && audioSupported) ...[
                   const Divider(height: 24),
                   Row(
                     children: [
@@ -211,8 +213,8 @@ Future<ShareOptions?> showShareOptionsDialog(
             onPressed: () => Navigator.pop<ShareOptions>(context, (
               height: chosenHeight,
               fps: chosenFps,
-              audio: !camera && audioOn && selected.isNotEmpty,
-              audioPlayers: !camera && audioOn
+              audio: !camera && audioSupported && audioOn && selected.isNotEmpty,
+              audioPlayers: !camera && audioSupported && audioOn
                   ? selected.toList(growable: false)
                   : const <int>[],
               camera: camera,

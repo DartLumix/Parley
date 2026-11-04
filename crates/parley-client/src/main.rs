@@ -1351,6 +1351,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 eprintln!("share: {e}");
                             }
+                            ShareEvent::Failed(e) => {
+                                #[cfg(feature = "screen-capture")]
+                                {
+                                    share_starting = false;
+                                }
+                                eprintln!("share failed: {e}");
+                            }
                             ShareEvent::Ended { external } => {
                                 #[cfg(feature = "screen-capture")]
                                 {

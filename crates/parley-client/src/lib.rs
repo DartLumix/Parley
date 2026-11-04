@@ -30,6 +30,9 @@ pub enum ShareEvent {
     Started,
     /// Start failed (portal denied/cancelled, pipewire error).
     StartFailed(String),
+    /// The platform capture died after the share started (camera
+    /// disconnected, projection revoked, Android service error).
+    Failed(String),
     /// Share fully torn down; the client may now signal StopShare.
     /// `external` = the desktop closed it from its sharing indicator.
     Ended { external: bool },

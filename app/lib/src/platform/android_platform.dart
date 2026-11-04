@@ -56,6 +56,45 @@ class AndroidPlatform {
     if (!supported) return;
     await _channel.invokeMethod<void>('stopVoiceService');
   }
+
+  /// Ask Android for MediaProjection consent. The result is parked in
+  /// ShareService and consumed when the capture service starts.
+  static Future<bool> requestScreenCapture() async {
+    if (!supported) return false;
+    return await _channel.invokeMethod<bool>('requestScreenCapture') ?? false;
+  }
+
+  /// Start the MediaProjection or Camera2 capture foreground service.
+  /// Rust must have installed its frame sink before this is called.
+  static Future<void> startShareService({required bool camera}) async {
+    if (!supported) return;
+    await _channel.invokeMethod<void>('startShareService', {'camera': camera});
+  }
+
+  static Future<void> stopShareService() async {
+    if (!supported) return;
+    await _channel.invokeMethod<void>('stopShareService');
+  }
+
+  /// Flip a running camera share between the front and back lens.
+  static Future<void> switchCamera() async {
+    if (!supported) return;
+    await _channel.invokeMethod<void>('switchCamera');
+  }
+
+  /// Send the activity to the background without finishing it, so a
+  /// running call or capture keeps its service alive.
+  static Future<void> moveTaskToBack() async {
+    if (!supported) return;
+    await _channel.invokeMethod<void>('moveTaskToBack');
+  }
+
+  /// Whether this device has a camera at all. The Rust build flag says
+  /// the backend exists; only Android knows whether there is a lens.
+  static Future<bool> hasCamera() async {
+    if (!supported) return false;
+    return await _channel.invokeMethod<bool>('hasCamera') ?? false;
+  }
 }
 
 class AndroidPaths {
