@@ -242,6 +242,13 @@ pub fn build_endpoint(pinned: Option<String>) -> (quinn::Endpoint, Arc<Mutex<Opt
     // inbound datagrams, and bursty small audio packets suffer most
     // (observed: 26% gap rate on loopback → PLC distortion).
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    // One unidirectional stream per video frame, in both directions
+    // (sharer→server and server→viewer). Quinn's default of 100 is far
+    // below what a 60 fps share has in flight: once the cap is reached
+    // `open_uni` waits, and every frame behind it waits too. The server
+    // sets the same ceiling; 1024 keeps the stream-per-frame model from
+    // turning a burst into head-of-line blocking.
+    transport.max_concurrent_uni_streams(1024_u32.into());
     let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("valid client config"),
     ));

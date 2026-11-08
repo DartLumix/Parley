@@ -815,7 +815,9 @@ fn pace_micros(bytes: usize, bps: u32) -> u64 {
 struct ShareEncoder {
     conn: quinn::Connection,
     /// Reliable stream transport; `None` keeps the datagram path for an
-    /// older server or a transcode-enabled one.
+    /// older server. A transcode-enabled server serves streams too: the
+    /// workers read whole frames and write their tiers back in this same
+    /// framing.
     video_stream: Option<VideoSender>,
     encoder: Option<Box<dyn VideoEncoder>>,
     ladder: VideoLadder,
@@ -1963,13 +1965,16 @@ impl ShareEncoder {
         let loss = self.video_loss.load(Ordering::Relaxed);
         // Stream backpressure is real congestion: the writer queue or the
         // server's per-viewer queue filled, so the network is not keeping
-        // up. This is deliberately different from frame loss on datagrams
-        // (which used to mean "drop resolution" even when the source was
-        // simply a high-motion keyframe).
-        let pressure = self
+        // up. The server's own reset feedback rides `video_loss` (its
+        // debounced IDR reports carry the viewer's gap rate), so the worse
+        // of the two wins. Taking only the sender's atomic would make a
+        // share look healthy in stream mode exactly while the server is
+        // shedding its frames.
+        let stream_pressure = self
             .video_stream
             .as_ref()
-            .map_or(loss, VideoSender::take_pressure);
+            .map_or(0, VideoSender::take_pressure);
+        let pressure = stream_pressure.max(loss);
         self.governor.sent_fps = self.sent_fps;
         // A viewer can only report what was actually sent. If the
         // encoder is delivering below the pace while capture frames are
@@ -2267,6 +2272,13 @@ impl ShareEncoder {
             // and the stream's own flow-control window is the backpressure.
             let eff_fps = self.paced_fps();
             let timestamp = (self.frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
+            // Streams and audio datagrams share one QUIC congestion
+            // controller. Pacing the frame here keeps an IDR burst from
+            // filling the window and delaying the audio that follows it —
+            // the same 4x keyframe credit the datagram path uses. Without
+            // this, a 2 s intra period became a periodic audio stutter.
+            self.pacer
+                .wait_burst(frame.len(), if keyframe { 4 } else { 1 });
             let outcome = stream.send(self.frame_id, timestamp, keyframe, eff_fps > 45.0, frame);
             self.frame_id = self.frame_id.wrapping_add(1);
             if keyframe {

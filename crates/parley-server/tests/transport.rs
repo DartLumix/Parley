@@ -373,6 +373,41 @@ async fn connect_and_auth_full(
     quinn::RecvStream,
     AuthOk,
 ) {
+    connect_and_auth_caps(
+        endpoint,
+        addr,
+        username,
+        password,
+        parley_proto::Capabilities::VIDEO_STREAMS.0,
+    )
+    .await
+}
+
+/// A datagram-era client: it advertises no capabilities, so a
+/// transcode-enabled server must keep its fragment output even though
+/// the server itself can serve streams to everyone else.
+async fn connect_and_auth_datagram(
+    endpoint: &quinn::Endpoint,
+    addr: std::net::SocketAddr,
+    username: &str,
+    password: &str,
+) -> (quinn::Connection, quinn::SendStream, quinn::RecvStream) {
+    let (conn, tx, rx, _ok) = connect_and_auth_caps(endpoint, addr, username, password, 0).await;
+    (conn, tx, rx)
+}
+
+async fn connect_and_auth_caps(
+    endpoint: &quinn::Endpoint,
+    addr: std::net::SocketAddr,
+    username: &str,
+    password: &str,
+    caps: u32,
+) -> (
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+    AuthOk,
+) {
     let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
 
@@ -380,7 +415,7 @@ async fn connect_and_auth_full(
         &mut tx,
         &Hello {
             protocol_version: PROTOCOL_VERSION,
-            caps: parley_proto::Capabilities::VIDEO_STREAMS.0,
+            caps,
         },
     )
     .await
@@ -538,6 +573,420 @@ async fn video_stream_frames_fan_out_with_sender_exclusion() {
             .await
             .is_err(),
         "a sender must not be fanned out to itself"
+    );
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// A stalled viewer must not (a) silence audio or (b) flood the sharer
+/// with IDR requests. The server's per-viewer queue sheds video, the
+/// datagram path keeps running on the same connection, and the one
+/// request that goes out carries the real gap rate so the sharer's
+/// ladder reacts even though its uplink to the server is healthy.
+#[tokio::test]
+async fn a_stalled_viewer_keeps_audio_and_debounces_idr_requests() {
+    init_logs();
+    let (config, server) = setup_server_with_user("video-stream-loss");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+    let endpoint = client_endpoint(pinned.clone());
+    // 16 KB of stream credit per stream: the fan-out stalls on the first
+    // 300 KB picture, which is exactly the "viewer stopped reading"
+    // condition the shedding path exists for.
+    let mut stalled_transport = quinn::TransportConfig::default();
+    stalled_transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024));
+    stalled_transport.receive_window(quinn::VarInt::from_u32(64 * 1024));
+    let stalled = client_endpoint_with(pinned, Some(stalled_transport));
+
+    let (conn_a, mut tx_a, mut rx_a, ok_a) =
+        connect_and_auth_full(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b, ok_b) =
+        connect_and_auth_full(&stalled, addr, "seconduser", "secondpass").await;
+    let (conn_c, mut tx_c, mut rx_c, ok_c) =
+        connect_and_auth_full(&stalled, addr, "thirduser", "thirdpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, ok_a.user_id, 1, true).await;
+    expect_voice_state(&mut rx_b, ok_a.user_id, 1, true).await;
+    expect_voice_state(&mut rx_c, ok_a.user_id, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, ok_b.user_id, 1, true).await;
+    expect_voice_state(&mut rx_b, ok_b.user_id, 1, true).await;
+    expect_voice_state(&mut rx_c, ok_b.user_id, 1, true).await;
+    send_client_msg(
+        &mut tx_c,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, ok_c.user_id, 1, true).await;
+    expect_voice_state(&mut rx_b, ok_c.user_id, 1, true).await;
+    expect_voice_state(&mut rx_c, ok_c.user_id, 1, true).await;
+
+    // B and C never accept a unidirectional stream: their transport
+    // windows fill, the server's per-viewer queues back up, and the
+    // fan-out must shed frames rather than block A's share. A keeps
+    // sending audio on the datagram path throughout.
+    let stalled_payload = vec![0x5au8; 300 * 1024];
+    for frame in 0..12u32 {
+        let encoded =
+            parley_proto::video_stream::encode_frame(&parley_proto::video_stream::StreamFrame {
+                sender_id: 0,
+                frame_id: frame,
+                timestamp: frame * 960,
+                keyframe: frame == 0,
+                high_rate: true,
+                codec: parley_proto::media::VIDEO_CODEC_H264,
+                data: &stalled_payload,
+            });
+        let mut outgoing = conn_a.open_uni().await.unwrap();
+        outgoing.write_all(&encoded).await.unwrap();
+        outgoing.finish().unwrap();
+        if frame.is_multiple_of(2) {
+            let dg = parley_proto::media::encode(0, frame as u16, frame * 960, 0, &[7u8; 200]);
+            conn_a.send_datagram(dg.into()).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Audio still reaches the viewer whose video streams are blocked.
+    let mut audio = 0;
+    while audio < 3 {
+        let Ok(Ok(dg)) = timeout(Duration::from_secs(1), conn_b.read_datagram()).await else {
+            break;
+        };
+        let decoded = parley_proto::media::decode(&dg).unwrap();
+        assert_eq!(decoded.sender_id, ok_a.media_id, "server stamps the sharer");
+        audio += 1;
+    }
+    assert!(
+        audio > 0,
+        "audio datagrams must survive a blocked video fan-out"
+    );
+
+    // The sharer is told why its stream is being shed: a debounced IDR
+    // request with a nonzero gap rate (one request, not one per viewer).
+    let report = timeout(Duration::from_secs(8), async {
+        loop {
+            match read_server_msg(&mut rx_a).await.body {
+                Some(ServerBody::VideoReport(rep)) if rep.keyframe_request => break rep,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("server must ask the sharer for an IDR");
+    assert!(
+        report.gap_rate_permille > 0,
+        "a request caused by shedding must carry the loss rate, got {report:?}"
+    );
+    assert!(
+        report.reporter_media_id == ok_b.media_id || report.reporter_media_id == ok_c.media_id,
+        "the report names the stalled viewing device"
+    );
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    conn_c.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// A UDP relay with a per-direction byte budget. QUIC sees a real
+/// bottleneck — queueing, then kernel drops once the socket buffer fills
+/// — without netem or root. Used to prove audio datagrams are not
+/// starved while reliable video occupies the congestion window.
+async fn spawn_throttled_proxy(
+    server: std::net::SocketAddr,
+    bps: u64,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut client: Option<std::net::SocketAddr> = None;
+        let mut to_server = tokio::time::Instant::now();
+        let mut to_client = tokio::time::Instant::now();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                break;
+            };
+            let (to, next) = if from == server {
+                let Some(client_addr) = client else {
+                    continue;
+                };
+                (client_addr, &mut to_client)
+            } else {
+                client = Some(from);
+                (server, &mut to_server)
+            };
+            let now = tokio::time::Instant::now();
+            if *next < now {
+                *next = now;
+            }
+            tokio::time::sleep_until(*next).await;
+            *next += Duration::from_secs_f64(n as f64 * 8.0 / bps as f64);
+            let _ = socket.send_to(&buf[..n], to).await;
+        }
+    });
+    (addr, task)
+}
+
+/// The coupling the review called out: video streams and audio datagrams
+/// share one QUIC congestion controller. With the share paced below a
+/// constrained link's rate — what the sender's ladder does — audio must
+/// still arrive while video occupies most of the window.
+#[tokio::test]
+async fn audio_survives_a_congested_link_during_a_video_stream() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    init_logs();
+    let (config, server) = setup_server_with_user("video-stream-throttle");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+    // 2 Mbit/s each way; the share below paces ~1.4 Mbit/s.
+    let (proxy, _proxy_task) = spawn_throttled_proxy(addr, 2_000_000).await;
+    let endpoint = client_endpoint(pinned);
+
+    let (conn_a, mut tx_a, mut rx_a, ok_a) =
+        connect_and_auth_full(&endpoint, proxy, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b, _ok_b) =
+        connect_and_auth_full(&endpoint, proxy, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, ok_a.user_id, 1, true).await;
+    expect_voice_state(&mut rx_b, ok_a.user_id, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // The viewer accepts and drains every stream: a viewer that stopped
+    // reading would test fan-out shedding, not link congestion.
+    let frames = Arc::new(AtomicU32::new(0));
+    let reader_count = frames.clone();
+    let read_conn = conn_b.clone();
+    let stream_reader = tokio::spawn(async move {
+        loop {
+            let Ok(mut stream) = read_conn.accept_uni().await else {
+                break;
+            };
+            if stream
+                .read_to_end(parley_proto::video_stream::MAX_STREAM_BYTES)
+                .await
+                .is_ok()
+            {
+                reader_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let payload = vec![0x42u8; 25 * 1024];
+    let mut sent_audio = 0u32;
+    for frame in 0..20u32 {
+        let encoded =
+            parley_proto::video_stream::encode_frame(&parley_proto::video_stream::StreamFrame {
+                sender_id: 0,
+                frame_id: frame,
+                timestamp: frame * 960,
+                keyframe: frame == 0,
+                high_rate: false,
+                codec: parley_proto::media::VIDEO_CODEC_H264,
+                data: &payload,
+            });
+        let mut outgoing = conn_a.open_uni().await.unwrap();
+        outgoing.write_all(&encoded).await.unwrap();
+        outgoing.finish().unwrap();
+        let dg = parley_proto::media::encode(0, frame as u16, frame * 960, 0, &[9u8; 200]);
+        conn_a.send_datagram(dg.into()).unwrap();
+        sent_audio += 1;
+        tokio::time::sleep(Duration::from_millis(140)).await;
+    }
+
+    let mut received = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while received < sent_audio {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Ok(Ok(dg)) = timeout(left, conn_b.read_datagram()).await else {
+            break;
+        };
+        let decoded = parley_proto::media::decode(&dg).unwrap();
+        assert_eq!(decoded.sender_id, ok_a.media_id);
+        received += 1;
+    }
+    assert!(
+        received * 2 >= sent_audio,
+        "audio under a congested video stream: {received}/{sent_audio}"
+    );
+    assert!(
+        frames.load(Ordering::Relaxed) > 5,
+        "the viewer must also be receiving the video streams"
+    );
+
+    stream_reader.abort();
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// Server transcode must work on BOTH transports: a stream-capable
+/// sharer feeds the worker whole pictures, and the tier goes to the
+/// viewer through the same one-frame-per-stream framing. The proof is a
+/// decodable picture at the tier's dimensions.
+#[tokio::test]
+async fn transcoded_tier_reaches_a_stream_viewer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    init_logs();
+    let (config, server) = setup_server_with_video(
+        "transcode-streams",
+        VideoConfig {
+            transcode: true,
+            max_transcodes: 1,
+            min_viewer_fps: 24,
+            first_height: 90,
+            second_height: 60,
+            threads: 1,
+        },
+    );
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+    let endpoint = client_endpoint(pinned);
+
+    let (conn_a, mut tx_a, mut rx_a, ok_a) =
+        connect_and_auth_full(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b, _ok_b) =
+        connect_and_auth_full(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, ok_a.user_id, 1, true).await;
+    expect_voice_state(&mut rx_b, ok_a.user_id, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    // B drains every stream the server sends (raw, then the tier) and
+    // decodes from each keyframe. One picture at 160x90 is the tier.
+    let tier_hit = Arc::new(AtomicBool::new(false));
+    let reader_flag = tier_hit.clone();
+    let read_conn = conn_b.clone();
+    let reader = tokio::spawn(async move {
+        let mut decoder: Option<VideoDecoder> = None;
+        loop {
+            let Ok(mut stream) = read_conn.accept_uni().await else {
+                break;
+            };
+            let Ok(bytes) = stream
+                .read_to_end(parley_proto::video_stream::MAX_STREAM_BYTES)
+                .await
+            else {
+                continue;
+            };
+            let Ok(frame) = parley_proto::video_stream::decode_frame(&bytes) else {
+                continue;
+            };
+            if frame.keyframe {
+                decoder = VideoDecoder::new().ok();
+            }
+            if let Some(decoder) = decoder.as_mut()
+                && let Ok(Some((_, w, h))) = decoder.decode_rgba_with_dims(frame.data)
+                && (w, h) == (160, 90)
+            {
+                reader_flag.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let (w, h) = (320usize, 180usize);
+    let mut bgra = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            bgra[i] = (x % 256) as u8;
+            bgra[i + 1] = (y % 256) as u8;
+            bgra[i + 2] = 128;
+            bgra[i + 3] = 255;
+        }
+    }
+    let mut encoder = SoftwareEncoder::new(w, h).expect("source encoder");
+    for frame_id in 0..16u32 {
+        if frame_id == 4 {
+            // A severe decode slump starts the job on this report. The
+            // job needs a fresh IDR: the frames already sent are behind
+            // its assembler and a P-frame chain has no anchor for it.
+            send_client_msg(
+                &mut tx_b,
+                ClientBody::VideoReport(VideoReport {
+                    reporter_id: 0,
+                    reporter_media_id: 0,
+                    gap_rate_permille: 0,
+                    viewer_fps: 5,
+                    keyframe_request: false,
+                }),
+            )
+            .await;
+        }
+        if frame_id == 4 || frame_id == 8 {
+            // The report and the next stream race through two different
+            // server tasks; an IDR at frame 4 may arrive before the job
+            // exists. A second anchor after the job is live guarantees
+            // the worker has one to decode from.
+            encoder.force_keyframe();
+        }
+        let (data, keyframe) = encoder.encode_bgra(&bgra).expect("source encode");
+        let encoded =
+            parley_proto::video_stream::encode_frame(&parley_proto::video_stream::StreamFrame {
+                sender_id: 0,
+                frame_id,
+                timestamp: frame_id * 960,
+                keyframe,
+                high_rate: false,
+                codec: parley_proto::media::VIDEO_CODEC_H264,
+                data: &data,
+            });
+        let mut outgoing = conn_a.open_uni().await.unwrap();
+        outgoing.write_all(&encoded).await.unwrap();
+        outgoing.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !tier_hit.load(Ordering::Relaxed) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    reader.abort();
+    assert!(
+        tier_hit.load(Ordering::Relaxed),
+        "the viewer must receive a decodable transcoded picture over its stream"
     );
 
     conn_a.close(0u32.into(), b"done");
@@ -1170,15 +1619,28 @@ fn init_logs() {
 
 /// A client endpoint that verifies the server by pinned fingerprint.
 fn client_endpoint(pinned_fingerprint: String) -> quinn::Endpoint {
+    client_endpoint_with(pinned_fingerprint, None)
+}
+
+/// The transport is a test hook: the backpressure test gives the viewer
+/// almost no stream credit, so the server's fan-out blocks on the first
+/// picture instead of after megabytes of local send buffering.
+fn client_endpoint_with(
+    pinned_fingerprint: String,
+    transport: Option<quinn::TransportConfig>,
+) -> quinn::Endpoint {
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedFingerprint(pinned_fingerprint)))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![tls::alpn()];
 
-    let config = quinn::ClientConfig::new(Arc::new(
+    let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("valid client config"),
     ));
+    if let Some(transport) = transport {
+        config.transport_config(Arc::new(transport));
+    }
 
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(config);
@@ -1538,9 +2000,9 @@ async fn a_slow_viewer_gets_a_transcoded_tier() {
 
     let endpoint = client_endpoint(pinned);
     let (conn_a, mut tx_a, mut rx_a) =
-        connect_and_auth(&endpoint, addr, "testuser", "testpass").await;
+        connect_and_auth_datagram(&endpoint, addr, "testuser", "testpass").await;
     let (conn_b, mut tx_b, mut rx_b) =
-        connect_and_auth(&endpoint, addr, "seconduser", "secondpass").await;
+        connect_and_auth_datagram(&endpoint, addr, "seconduser", "secondpass").await;
 
     send_client_msg(
         &mut tx_a,

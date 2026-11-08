@@ -1063,6 +1063,16 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
                 && rep.reporter_media_id != own_media_id(session_id)
             {
                 let _ = poke_share_keyframe(session_id);
+                // The server debounces IDR requests globally, but the
+                // report that carries one still has the viewer's real
+                // gap rate. Discarding it made a congested share look
+                // healthy to the ladder on exactly that report.
+                #[cfg(feature = "screen-capture")]
+                if rep.gap_rate_permille > 0 {
+                    if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                        s.share_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
+                    }
+                }
                 return Vec::new();
             }
             #[cfg(feature = "screen-capture")]

@@ -11,6 +11,12 @@
 //! on its way to the sharer, so the sharer's own resolution ladder does
 //! not fight the server's tier.
 //!
+//! Transcoding is transport-agnostic at both ends. Input arrives either
+//! as datagram fragments (an older sharer) or as whole frames from a
+//! reliable stream; output goes to each viewer as datagram fragments or,
+//! when that viewer negotiated VIDEO_STREAMS, through the identical
+//! one-frame-per-stream framing the sharer itself uses.
+//!
 //! The worker is deliberately small (the encoder's slice parallelism is
 //! configurable, default two threads): a share that needs help must not
 //! cost the host several cores. The cap and tiers live in
@@ -29,6 +35,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::VideoConfig;
 use crate::session::SessionRegistry;
+use crate::video_stream::{Frame, StreamOut};
 use crate::voice::VoiceManager;
 use parley_core::error::Error;
 use parley_core::video::{SoftwareEncoder, VideoDecoder, VideoEncoder, bitrate_for};
@@ -90,6 +97,10 @@ pub struct TranscodeManager {
     config: VideoConfig,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
+    /// Runtime for per-viewer stream writers. Captured at construction
+    /// (the server binds inside its runtime); `None` keeps the datagram
+    /// output, which every client still reads.
+    stream_runtime: Option<tokio::runtime::Handle>,
     inner: Mutex<Inner>,
 }
 
@@ -190,10 +201,18 @@ fn watch_step(watch: &mut Watch, viewer_fps: u32, min_fps: u32, now: Instant) ->
     }
 }
 
+/// One unit of work for a transcoder. The two input transports produce
+/// assembled pictures by different routes: datagrams need the fragment
+/// assembler, a reliable stream already carries a whole frame.
+enum Input {
+    Fragment(Vec<u8>),
+    Frame(AssembledFrame),
+}
+
 struct Job {
     sender_id: u32,
     channel_id: u64,
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<Input>,
     viewers: Mutex<HashMap<u32, ViewerJob>>,
     stop: AtomicBool,
     force_idr: AtomicBool,
@@ -224,6 +243,7 @@ impl TranscodeManager {
             config: config.normalized(),
             registry,
             voice,
+            stream_runtime: tokio::runtime::Handle::try_current().ok(),
             inner: Mutex::new(Inner::default()),
         }
     }
@@ -256,10 +276,51 @@ impl TranscodeManager {
         if let Some(job) = inner.jobs.get(&sender_id)
             && job.channel_id == channel_id
         {
-            match job.tx.try_send(payload.to_vec()) {
+            match job.tx.try_send(Input::Fragment(payload.to_vec())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     debug!(sender_id, "transcode input behind: dropping a fragment");
+                }
+                Err(TrySendError::Disconnected(_)) => {}
+            }
+        }
+    }
+
+    /// Feed one complete frame from the sharer's reliable stream path.
+    ///
+    /// Transcode is transport-agnostic on input: a whole frame skips the
+    /// fragmenter/assembler pair entirely, so a stream-capable sharer gets
+    /// the same server-side tier as a datagram one.
+    pub(crate) fn note_stream_frame(&self, sender_id: u32, channel_id: u64, frame: &Frame) {
+        if !self.config.transcode || self.config.max_transcodes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        self.prune(&mut inner, now);
+        inner
+            .shares
+            .entry(channel_id)
+            .or_default()
+            .insert(sender_id);
+        inner
+            .meters
+            .entry(sender_id)
+            .or_insert_with(Meter::new)
+            .observe(frame.frame_id, now);
+        if let Some(job) = inner.jobs.get(&sender_id)
+            && job.channel_id == channel_id
+        {
+            let input = Input::Frame(AssembledFrame {
+                frame_id: frame.frame_id,
+                keyframe: frame.keyframe,
+                high_rate: frame.high_rate,
+                data: frame.data.to_vec(),
+            });
+            match job.tx.try_send(input) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    debug!(sender_id, "transcode input behind: dropping a frame");
                 }
                 Err(TrySendError::Disconnected(_)) => {}
             }
@@ -537,9 +598,10 @@ impl TranscodeManager {
         let registry = self.registry.clone();
         let voice = self.voice.clone();
         let config = self.config.clone();
+        let stream_runtime = self.stream_runtime.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("transcode-{sender_id}"))
-            .spawn(move || run_worker(worker_job, rx, registry, voice, config));
+            .spawn(move || run_worker(worker_job, rx, registry, voice, config, stream_runtime));
         if let Err(e) = spawned {
             warn!(sender_id, error = %e, "transcode: could not start worker");
             return false;
@@ -610,10 +672,11 @@ fn drop_to_original(job: &Job) {
 
 fn run_worker(
     job: Arc<Job>,
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<Input>,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
     config: VideoConfig,
+    stream_runtime: Option<tokio::runtime::Handle>,
 ) {
     let mut assembler = VideoAssembler::new();
     let mut pipeline = match Pipeline::new(config.threads) {
@@ -636,6 +699,11 @@ fn run_worker(
     // let the sharer's ladder get the reports again.
     let mut output_rate: HashMap<u32, (Instant, u32)> = HashMap::new();
     let mut errors: u64 = 0;
+    // Per-viewer stream output for tier pictures, and the id each viewer's
+    // own sequence is at. A viewer starts (or restarts) at 0 with an IDR:
+    // the receiver's epoch rule for a new keyframe chain.
+    let mut stream_out: HashMap<u32, StreamOut> = HashMap::new();
+    let mut stream_ids: HashMap<u32, u32> = HashMap::new();
 
     'worker: while !job.stop.load(Ordering::Relaxed) {
         // A worker that stopped producing pictures must hand the viewer
@@ -645,8 +713,8 @@ fn run_worker(
         if last_output.elapsed() > Duration::from_secs(2) {
             drop_to_original(&job);
         }
-        let payload = match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(payload) => payload,
+        let input = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(input) => input,
             Err(RecvTimeoutError::Timeout) => {
                 if last_input.elapsed() >= WORKER_IDLE {
                     break;
@@ -656,12 +724,19 @@ fn run_worker(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         last_input = Instant::now();
-        let Ok(frag) = decode_fragment(&payload) else {
-            continue;
-        };
-        assembler.push_fragment(frag);
-        while let Some(frame) = assembler.pop_frame() {
-            let viewers = job.viewers.lock().unwrap().clone();
+        let mut complete: Vec<AssembledFrame> = Vec::new();
+        match input {
+            Input::Fragment(payload) => {
+                if let Ok(frag) = decode_fragment(&payload) {
+                    assembler.push_fragment(frag);
+                }
+            }
+            // A whole frame needs no assembly: pushing it through the
+            // fragment path would only copy it.
+            Input::Frame(frame) => complete.push(frame),
+        }
+        while let Some(frame) = complete.pop().or_else(|| assembler.pop_frame()) {
+            let mut viewers = job.viewers.lock().unwrap().clone();
             if viewers.is_empty() {
                 job.stop.store(true, Ordering::Relaxed);
                 break;
@@ -695,10 +770,80 @@ fn run_worker(
                 let next = frame_ids.entry(tier).or_insert(0);
                 let frame_id = *next;
                 *next = next.wrapping_add(1);
+                // One payload allocation per tier picture, shared by the
+                // datagram fragments and every stream viewer.
+                let picture: Arc<[u8]> = Arc::from(encoded.data);
+                if encoded.keyframe {
+                    last_keyframe = Instant::now();
+                    let mut live = job.viewers.lock().unwrap();
+                    for (viewer_id, v) in &mut viewers {
+                        if v.tier == tier {
+                            // This picture IS the anchor. Updating only
+                            // the job map would leave the local snapshot
+                            // saying "not live", and the loop below would
+                            // skip the one IDR the viewer needs to start.
+                            v.live = true;
+                            if let Some(current) = live.get_mut(viewer_id) {
+                                current.live = true;
+                            }
+                        }
+                    }
+                }
+                // Stream-capable viewers get the tier through the sharer's
+                // own framing, one picture per unidirectional stream. A
+                // viewer becomes eligible only at the IDR that flips
+                // `live`, so its per-viewer counter starts at 0 exactly
+                // where the receiver resets its reference epoch.
+                for (viewer_id, v) in &viewers {
+                    if v.tier != tier {
+                        continue;
+                    }
+                    if !v.live {
+                        // A tier switch re-enters through a keyframe and a
+                        // fresh 0, not a stale high id the hub would drop.
+                        stream_ids.remove(viewer_id);
+                        continue;
+                    }
+                    if voice.channel_of(*viewer_id) != Some(job.channel_id)
+                        || !registry.video_streams_of(*viewer_id)
+                    {
+                        continue;
+                    }
+                    let Some(handle) = stream_runtime.as_ref() else {
+                        continue;
+                    };
+                    if !stream_out.contains_key(viewer_id) {
+                        let Some(conn) = registry.connection_of_media(*viewer_id) else {
+                            continue;
+                        };
+                        stream_out
+                            .insert(*viewer_id, StreamOut::spawn(handle, conn, job.sender_id));
+                    }
+                    let out = stream_out.get(viewer_id).expect("inserted above");
+                    let id = stream_ids.entry(*viewer_id).or_insert(0);
+                    let frame = Arc::new(Frame {
+                        frame_id: *id,
+                        timestamp: encoded.timestamp,
+                        keyframe: encoded.keyframe,
+                        // The tier runs at TIER_FPS, not a high-refresh
+                        // source cadence.
+                        high_rate: false,
+                        data: picture.clone(),
+                    });
+                    *id = id.wrapping_add(1);
+                    if !out.offer(frame) {
+                        job.force_idr.store(true, Ordering::Relaxed);
+                    }
+                }
+                for out in stream_out.values() {
+                    if out.take_failed() {
+                        job.force_idr.store(true, Ordering::Relaxed);
+                    }
+                }
                 let dgs = fragment_frame_with_max(
                     frame_id,
                     encoded.keyframe,
-                    &encoded.data,
+                    &picture,
                     seq,
                     encoded.timestamp,
                     job.sender_id,
@@ -706,17 +851,6 @@ fn run_worker(
                     false,
                 );
                 seq = seq.wrapping_add(dgs.len() as u16);
-                if encoded.keyframe {
-                    last_keyframe = Instant::now();
-                    let mut live = job.viewers.lock().unwrap();
-                    for (viewer_id, v) in &viewers {
-                        if v.tier == tier
-                            && let Some(current) = live.get_mut(viewer_id)
-                        {
-                            current.live = true;
-                        }
-                    }
-                }
                 // The worker used to hand every fragment of a tier to
                 // quinn in one tight loop. A 720p keyframe is ~40 KB, i.e.
                 // ~35 datagrams back-to-back — the same burst that made
@@ -747,7 +881,10 @@ fn run_worker(
                         // Re-check membership, not just the job's viewer
                         // set: a viewer who switched channels must not
                         // receive this share through a stale job entry.
-                        if v.tier == tier && voice.channel_of(*viewer_id) == Some(job.channel_id) {
+                        if v.tier == tier
+                            && voice.channel_of(*viewer_id) == Some(job.channel_id)
+                            && !stream_out.contains_key(viewer_id)
+                        {
                             let _ = registry.send_datagram(*viewer_id, Bytes::from(dg.clone()));
                         }
                     }
@@ -769,6 +906,12 @@ fn run_worker(
                     *rate = (Instant::now(), 0);
                 }
             }
+            // A viewer that left the job must not keep a writer task,
+            // queue, or frame counter alive in this worker.
+            stream_out.retain(|viewer, _| {
+                viewers.contains_key(viewer) && registry.connection_of_media(*viewer).is_some()
+            });
+            stream_ids.retain(|viewer, _| stream_out.contains_key(viewer));
         }
     }
     drop_to_original(&job);

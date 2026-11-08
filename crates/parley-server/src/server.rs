@@ -38,10 +38,6 @@ pub struct Server {
     files_dir: PathBuf,
     /// Read-only HTTP snapshot for a dashboard; `None` when disabled.
     presence: Option<PresenceServer>,
-    /// Reliable video streams are available. Off with server transcode:
-    /// that tier is datagram-based, and the two cannot describe the same
-    /// viewer stream without a second negotiation.
-    video_streams: bool,
 }
 
 impl Server {
@@ -102,6 +98,12 @@ impl Server {
         // the sharer's firehose and forwards it; default overflows
         // under load.
         transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+        // One unidirectional stream per video frame, in both directions
+        // (sharer→server and server→viewer). Quinn's default of 100 is
+        // below what a 60 fps share has in flight; at the cap `open_uni`
+        // waits and every frame behind it waits too. Mirrors the client's
+        // endpoint config.
+        transport.max_concurrent_uni_streams(1024_u32.into());
         quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
@@ -134,7 +136,6 @@ impl Server {
             transcode,
             files_dir,
             presence,
-            video_streams: !config.video.transcode,
         })
     }
 
@@ -212,7 +213,6 @@ impl Server {
                 }
             });
         }
-        let video_streams = self.video_streams;
         while let Some(incoming) = self.endpoint.accept().await {
             match incoming.await {
                 Ok(conn) => {
@@ -222,13 +222,7 @@ impl Server {
                     let transcode = self.transcode.clone();
                     let files_dir = self.files_dir.clone();
                     tokio::spawn(handle_connection(
-                        conn,
-                        db,
-                        registry,
-                        voice,
-                        transcode,
-                        files_dir,
-                        video_streams,
+                        conn, db, registry, voice, transcode, files_dir,
                     ));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
@@ -245,20 +239,9 @@ async fn handle_connection(
     voice: Arc<VoiceManager>,
     transcode: Arc<TranscodeManager>,
     files_dir: PathBuf,
-    video_streams: bool,
 ) {
     let peer = conn.remote_address();
-    match serve(
-        conn.clone(),
-        &db,
-        &registry,
-        &voice,
-        &transcode,
-        &files_dir,
-        video_streams,
-    )
-    .await
-    {
+    match serve(conn.clone(), &db, &registry, &voice, &transcode, &files_dir).await {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -272,7 +255,6 @@ async fn serve(
     voice: &Arc<VoiceManager>,
     transcode: &Arc<TranscodeManager>,
     files_dir: &std::path::Path,
-    video_streams: bool,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
 
@@ -287,11 +269,9 @@ async fn serve(
         &mut tx,
         &HelloAck {
             protocol_version: PROTOCOL_VERSION,
-            server_caps: if video_streams {
-                Capabilities::VIDEO_STREAMS.0
-            } else {
-                0
-            },
+            // Reliable per-frame streams, always. A client that did not
+            // advertise VIDEO_STREAMS keeps the datagram path regardless.
+            server_caps: Capabilities::VIDEO_STREAMS.0,
             heartbeat_ms: 5_000,
         },
     )
@@ -354,6 +334,7 @@ async fn serve(
         media_id: 0, // assigned by register()
         device,
         device_name,
+        video_streams: hello.caps & Capabilities::VIDEO_STREAMS.0 != 0,
     });
     let session_gen = registered.session;
     let media_id = registered.media;
@@ -395,11 +376,12 @@ async fn serve(
         files_dir.to_path_buf(),
     );
 
-    // Video frames ride reliable unidirectional streams when both sides
-    // understand them. The client must have advertised the capability too;
-    // a peer that already sent a datagram-era Hello must not suddenly be
-    // fed streams it will never read.
-    if video_streams && hello.caps & Capabilities::VIDEO_STREAMS.0 != 0 {
+    // Video frames ride reliable unidirectional streams when the client
+    // understands them. Transcode no longer disables this path: the
+    // workers read whole stream frames and write their tiers back through
+    // the same framing. A datagram-era client never advertised the
+    // capability and keeps the fragment path.
+    if hello.caps & Capabilities::VIDEO_STREAMS.0 != 0 {
         crate::video_stream::spawn_acceptor(
             conn.clone(),
             info.id,
@@ -407,6 +389,7 @@ async fn serve(
             media_id,
             registry.clone(),
             voice.clone(),
+            transcode.clone(),
         );
     }
 

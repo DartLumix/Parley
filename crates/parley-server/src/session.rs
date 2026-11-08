@@ -41,6 +41,10 @@ pub struct ClientHandle {
     /// DeviceKind wire value (Desktop / Mobile).
     pub device: i32,
     pub device_name: String,
+    /// `Hello.caps` carried VIDEO_STREAMS: this connection reads
+    /// per-frame unidirectional streams, including server-transcoded
+    /// tiers. Fixed at registration; a mid-session change is not a thing.
+    pub video_streams: bool,
 }
 
 /// One account's live facts, without any one connection's handles.
@@ -347,6 +351,19 @@ impl SessionRegistry {
             .get(&media_id)
             .and_then(|session| state.clients.get(session))
             .map(|handle| handle.conn.clone())
+    }
+
+    /// Whether this connection negotiated reliable video streams. The
+    /// transcode worker picks its output transport per viewer from here:
+    /// a stream-capable viewer gets the tier in the same framing as the
+    /// sharer's own frames, everyone else keeps fragments.
+    pub fn video_streams_of(&self, media_id: u32) -> bool {
+        let state = self.state.lock().unwrap();
+        state
+            .by_media
+            .get(&media_id)
+            .and_then(|session| state.clients.get(session))
+            .is_some_and(|handle| handle.video_streams)
     }
 
     pub fn user_of_media(&self, media_id: u32) -> Option<u32> {

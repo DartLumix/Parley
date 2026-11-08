@@ -726,6 +726,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // share bitrate. Skip own echo and unstamped;
                         // echo is per device, not per account.
                         if rep.reporter_id != 0 && rep.reporter_media_id != ok.media_id {
+                            // The server debounces IDR requests across all
+                            // viewers, but the report it sends with one
+                            // still carries the viewer's real gap rate.
+                            // Dropping that value here made a congested
+                            // share look healthy on exactly the report
+                            // that proved it was not.
+                            if rep.gap_rate_permille > 0 {
+                                ctrl_video_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
+                            }
                             if rep.keyframe_request {
                                 // A viewer's assembler is stalled; the
                                 // handle latches an IDR for the next frame.
@@ -735,8 +744,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(h) = ctrl_poke.lock().unwrap().as_ref() {
                                     h.force_keyframe();
                                 }
-                            } else {
-                                ctrl_video_loss.store(rep.gap_rate_permille, Ordering::Relaxed);
                             }
                         }
                     }
