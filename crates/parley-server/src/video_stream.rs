@@ -44,8 +44,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Global per-sender IDR debounce. One IDR anchors every viewer, so this
 /// is the interval a whole share may be asked for an intra frame, not the
-/// interval one viewer may ask.
-const KEYFRAME_REQUEST_EVERY: Duration = Duration::from_secs(2);
+/// interval one viewer may ask. One second is the compromise: long enough
+/// that ten stalled viewers still collapse into one request, short enough
+/// that a viewer joining or recovering just after an anchor waits at most
+/// a second for the next one.
+const KEYFRAME_REQUEST_EVERY: Duration = Duration::from_secs(1);
 
 /// One encoded picture, shared by every viewer of the share. The payload
 /// is behind an `Arc` so a fan-out to twenty viewers copies a handle, not

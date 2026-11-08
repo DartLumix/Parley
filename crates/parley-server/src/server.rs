@@ -102,7 +102,9 @@ impl Server {
         // (sharer→server and server→viewer). Quinn's default of 100 is
         // below what a 60 fps share has in flight; at the cap `open_uni`
         // waits and every frame behind it waits too. Mirrors the client's
-        // endpoint config.
+        // endpoint config. QUIC transport parameters are negotiated PER
+        // CONNECTION, so this is each peer's budget, not a server-wide
+        // pool: ten sharers cannot consume one another's stream slots.
         transport.max_concurrent_uni_streams(1024_u32.into());
         quinn_config.transport_config(Arc::new(transport));
 

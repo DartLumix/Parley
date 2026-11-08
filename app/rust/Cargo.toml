@@ -33,10 +33,21 @@ aec = ["audio-device", "parley-client/aec"]
 # aec.rs refuses a build that enables both.
 aec-rust = ["audio-device", "parley-client/aec-rust"]
 # 7f: video receive (openh264 decode via parley-core/video) + the
-# Flutter texture display bridge (irondash_texture). Default off: CI
-# and the musl server build never touch openh264 or the texture glue.
-# The app builds with --features audio-device,video.
-video = ["dep:irondash_texture", "dep:irondash_engine_context", "parley-core/video"]
+# Flutter texture display bridge (irondash_texture) + the reliable
+# stream receiver (parley-client/video). Default off: CI and the musl
+# server build never touch openh264 or the texture glue. The app builds
+# with --features audio-device,video.
+#
+# parley-client/video is required, not implied by parley-core/video:
+# `video_stream::spawn_reader` is gated on the CLIENT's feature, so a
+# bridge built with video but without screen-capture used to fail to
+# compile exactly where it starts the viewer-side stream reader.
+video = [
+    "dep:irondash_texture",
+    "dep:irondash_engine_context",
+    "parley-core/video",
+    "parley-client/video",
+]
 # 7g: in-app screen SHARE (capture + encode via parley-client's screen
 # module). Linux builds ashpd/pipewire into the bridge; Windows builds
 # windows-capture/wasapi (WGC + WASAPI loopback). Same feature name, the
