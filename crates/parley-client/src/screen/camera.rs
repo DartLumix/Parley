@@ -308,6 +308,9 @@ pub async fn start_camera(
     let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    let video_stream = options
+        .video_streams
+        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
     let enc_handle = std::thread::Builder::new()
         .name("parley-camera-encode".into())
         .spawn(move || {
@@ -323,6 +326,7 @@ pub async fn start_camera(
                 options,
                 None,
                 preview,
+                video_stream,
             )
         })
         .map_err(|e| format!("camera encoder thread: {e}"))?;

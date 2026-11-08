@@ -264,11 +264,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut tx,
         &Hello {
             protocol_version: PROTOCOL_VERSION,
-            caps: 0,
+            caps: parley_proto::Capabilities::VIDEO_STREAMS.0,
         },
     )
     .await?;
     let ack: HelloAck = session::read_message(&mut rx).await?;
+    let video_streams = ack.server_caps & parley_proto::Capabilities::VIDEO_STREAMS.0 != 0;
+    #[cfg(not(feature = "video"))]
+    let _ = video_streams;
 
     session::write_message(
         &mut tx,
@@ -460,6 +463,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // control reader (cleanup), and the stats ticker.
     #[cfg(feature = "video")]
     let video_viewers = parley_client::video::new_viewers();
+    #[cfg(feature = "video")]
+    if video_streams {
+        parley_client::video::spawn_stream_reader(&video_viewers, conn.clone());
+    }
 
     // Feature-mismatch warnings, split per feature so every Args field
     // stays read in every feature combination (dead_code is per-build).
@@ -1220,6 +1227,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         } else {
                                             (None, None)
                                         };
+                                        let share_options = screen::ShareOptions {
+                                            video_streams,
+                                            ..Default::default()
+                                        };
                                         match screen::start(
                                             conn,
                                             vloss,
@@ -1231,7 +1242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             events.clone(),
                                             audio,
                                             args.dmabuf,
-                                            screen::ShareOptions::default(),
+                                            share_options,
                                             None,
                                         )
                                         .await

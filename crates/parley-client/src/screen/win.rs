@@ -544,6 +544,9 @@ pub async fn start_camera(
 
     let encoder_pending = pending.clone();
     let encoder_drops = capture_drops.clone();
+    let video_stream = options
+        .video_streams
+        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
     let enc_handle = std::thread::Builder::new()
         .name("parley-camera-encode".into())
         .spawn(move || {
@@ -559,6 +562,7 @@ pub async fn start_camera(
                 options,
                 None,
                 preview,
+                video_stream,
             )
         })
         .map_err(|e| format!("camera encoder thread: {e}"))?;
@@ -817,6 +821,9 @@ pub async fn start(
         Err(_) => return Err("capture thread died before starting".to_string()),
     }
 
+    let video_stream = options
+        .video_streams
+        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
     let encoder = std::thread::Builder::new()
         .name("parley-share-encoder".into())
         .spawn(move || {
@@ -832,6 +839,7 @@ pub async fn start(
                 options,
                 overlay_for_encoder,
                 preview,
+                video_stream,
             )
         })
         .map_err(|e| format!("encoder thread: {e}"))?;

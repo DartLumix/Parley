@@ -4,11 +4,13 @@ pub mod frame;
 pub mod handshake;
 pub mod media;
 pub mod video;
+pub mod video_stream;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/parley.rs"));
 }
 
+pub use handshake::Capabilities;
 pub use handshake::PROTOCOL_VERSION;
 pub use pb::client_message::Body as ClientBody;
 pub use pb::server_message::Body as ServerBody;

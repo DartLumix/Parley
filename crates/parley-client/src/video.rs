@@ -441,6 +441,13 @@ pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, codec: u8, paylo
         .push_datagram_with_codec(sender_id, codec, payload);
 }
 
+/// Start the reliable-stream reader for this connection. The stream
+/// transport and the datagram transport share the same hub, so display,
+/// stopped-state and stats need no second code path.
+pub fn spawn_stream_reader(viewers: &Viewers, conn: quinn::Connection) {
+    crate::video_stream::spawn_reader(conn, viewers.hub.clone());
+}
+
 /// A sender stopped sharing: the hub suppresses stragglers, the
 /// consumer kills their mpv. A later keyframe (new share) spawns a
 /// fresh window — so `dead` clears here too.

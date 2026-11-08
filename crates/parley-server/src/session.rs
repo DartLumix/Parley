@@ -339,6 +339,16 @@ impl SessionRegistry {
         self.state.lock().unwrap().by_media.get(&media_id).copied()
     }
 
+    /// The viewer's QUIC connection, for opening per-viewer video streams.
+    pub fn connection_of_media(&self, media_id: u32) -> Option<quinn::Connection> {
+        let state = self.state.lock().unwrap();
+        state
+            .by_media
+            .get(&media_id)
+            .and_then(|session| state.clients.get(session))
+            .map(|handle| handle.conn.clone())
+    }
+
     pub fn user_of_media(&self, media_id: u32) -> Option<u32> {
         let state = self.state.lock().unwrap();
         state

@@ -285,6 +285,7 @@ fn start_internal(
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
     options: ShareOptions,
     preview: Option<PreviewSink>,
+    video_stream: Option<crate::video_stream::VideoSender>,
 ) -> Result<(ShareHandle, ShareController), String> {
     let (frame_tx, frame_rx) = sync_channel::<ToEncoder>(4);
     let force_idr = Arc::new(AtomicBool::new(false));
@@ -325,6 +326,7 @@ fn start_internal(
                 options,
                 None,
                 preview,
+                video_stream,
             )
         }) {
         Ok(handle) => handle,
@@ -382,7 +384,18 @@ pub async fn start(
     if audio.is_some() {
         eprintln!("android share: system audio is not implemented; sharing video only");
     }
-    start_internal(conn, video_loss, viewer_fps, events, options, preview)
+    let video_stream = options
+        .video_streams
+        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
+    start_internal(
+        conn,
+        video_loss,
+        viewer_fps,
+        events,
+        options,
+        preview,
+        video_stream,
+    )
 }
 
 /// Camera-share entry point. Kotlin opens Camera2 only after this slot is
@@ -395,7 +408,18 @@ pub async fn start_camera(
     options: ShareOptions,
     preview: Option<PreviewSink>,
 ) -> Result<(ShareHandle, ShareController), String> {
-    start_internal(conn, video_loss, viewer_fps, events, options, preview)
+    let video_stream = options
+        .video_streams
+        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
+    start_internal(
+        conn,
+        video_loss,
+        viewer_fps,
+        events,
+        options,
+        preview,
+        video_stream,
+    )
 }
 
 /// Android has no application-audio picker in this first cut. Returning an

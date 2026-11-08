@@ -94,6 +94,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::video::VideoLadder;
+use crate::video_stream::{SendOutcome, VideoSender};
 #[cfg(target_os = "linux")]
 use ashpd::desktop::{
     PersistMode,
@@ -246,6 +247,10 @@ pub struct ShareOptions {
     /// standalone camera share ignores this. The camera runs on its own
     /// thread; if it cannot open, the screen share still starts.
     pub camera_overlay: bool,
+    /// The server advertised reliable video streams in its HelloAck.
+    /// Leave false for an older server: sending streams it never reads
+    /// would fill its receive windows and stall the share.
+    pub video_streams: bool,
 }
 
 /// One application's playback, as the platform's audio graph exposes
@@ -809,6 +814,9 @@ fn pace_micros(bytes: usize, bps: u32) -> u64 {
 /// fragmentation reaches both.
 struct ShareEncoder {
     conn: quinn::Connection,
+    /// Reliable stream transport; `None` keeps the datagram path for an
+    /// older server or a transcode-enabled one.
+    video_stream: Option<VideoSender>,
     encoder: Option<Box<dyn VideoEncoder>>,
     ladder: VideoLadder,
     /// Byte-level fragment pacing at the ladder's current target.
@@ -967,6 +975,7 @@ fn spawn_preview_thread(tap: PreviewSink) -> SyncSender<PreviewJob> {
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 struct ShareSenderArgs {
     conn: quinn::Connection,
+    video_stream: Option<VideoSender>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
     video_loss: Arc<AtomicU32>,
@@ -1762,6 +1771,7 @@ impl ShareEncoder {
         let max_payload = fragment_budget_for(&sender.conn);
         Self {
             conn: sender.conn,
+            video_stream: sender.video_stream,
             encoder: None,
             pacer: SendPacer::new(VideoLadder::new().current_bps()),
             ladder: VideoLadder::new(),
@@ -1951,6 +1961,15 @@ impl ShareEncoder {
         let base = self.base_fps();
         let reported = self.viewer_fps.load(Ordering::Relaxed);
         let loss = self.video_loss.load(Ordering::Relaxed);
+        // Stream backpressure is real congestion: the writer queue or the
+        // server's per-viewer queue filled, so the network is not keeping
+        // up. This is deliberately different from frame loss on datagrams
+        // (which used to mean "drop resolution" even when the source was
+        // simply a high-motion keyframe).
+        let pressure = self
+            .video_stream
+            .as_ref()
+            .map_or(loss, VideoSender::take_pressure);
         self.governor.sent_fps = self.sent_fps;
         // A viewer can only report what was actually sent. If the
         // encoder is delivering below the pace while capture frames are
@@ -1967,7 +1986,7 @@ impl ShareEncoder {
             reported,
             self.stream.1,
             self.base_height,
-            loss,
+            pressure,
             self.ladder.on_robust_rung(),
         );
         self.fps_cap = fps_cap;
@@ -1993,7 +2012,7 @@ impl ShareEncoder {
             self.negotiate(self.source.0 as u32, self.source.1 as u32, self.fps);
         }
         let enc = self.encoder.as_mut()?;
-        if let Some(bps) = self.ladder.step(self.video_loss.load(Ordering::Relaxed)) {
+        if let Some(bps) = self.ladder.step(pressure) {
             enc.set_bitrate(bps);
             self.pacer.set_bps(bps);
             println!("share: bitrate → {bps} bps (video loss ladder)");
@@ -2009,6 +2028,14 @@ impl ShareEncoder {
         if self.force_idr.swap(false, Ordering::Relaxed) {
             enc.force_keyframe();
             println!("share: forced keyframe (viewer joined)");
+        }
+        if self
+            .video_stream
+            .as_ref()
+            .is_some_and(VideoSender::take_keyframe_request)
+        {
+            enc.force_keyframe();
+            println!("share: forced keyframe (stream backpressure)");
         }
         Some(enc)
     }
@@ -2234,6 +2261,24 @@ impl ShareEncoder {
     }
 
     fn send_inner(&mut self, frame: &[u8], keyframe: bool) -> bool {
+        if let Some(stream) = self.video_stream.as_ref() {
+            // One frame per reliable QUIC stream. No fragmenter, no send
+            // pacer, no duplicate keyframe copies: QUIC owns reliability
+            // and the stream's own flow-control window is the backpressure.
+            let eff_fps = self.paced_fps();
+            let timestamp = (self.frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
+            let outcome = stream.send(self.frame_id, timestamp, keyframe, eff_fps > 45.0, frame);
+            self.frame_id = self.frame_id.wrapping_add(1);
+            if keyframe {
+                self.last_keyframe = std::time::Instant::now();
+            }
+            match outcome {
+                SendOutcome::Queued => self.record_send(),
+                SendOutcome::Dropped => {}
+                SendOutcome::Closed => return false,
+            }
+            return true;
+        }
         let first_seq = self.seq;
         // The seq advance must match the fragmenter's own count — it is
         // computed from the same budget, or the two drift apart the moment
@@ -2309,6 +2354,13 @@ impl ShareEncoder {
                 }
             }
         }
+        self.record_send();
+        true
+    }
+
+    /// Account for one frame that actually left: the sharer's card, the
+    /// governor's sent-rate input, and the 10 s diagnostic line.
+    fn record_send(&mut self) {
         self.encoded += 1;
         // What this share actually delivers, reported to the sharer's own
         // card once a second. The negotiated rate is an upper bound; the
@@ -2356,7 +2408,6 @@ impl ShareEncoder {
             self.stale_skipped = 0;
             self.window = std::time::Instant::now();
         }
-        true
     }
 }
 
@@ -2405,6 +2456,7 @@ fn encoder_thread(
     options: ShareOptions,
     overlay: Option<CameraOverlay>,
     tap: Option<PreviewSink>,
+    video_stream: Option<VideoSender>,
 ) {
     // A panic here must end the share, not leave it looking active.
     let _death = EncoderDeathGuard(Some(die.clone()));
@@ -2413,6 +2465,7 @@ fn encoder_thread(
     let preview_tx = tap.as_ref().map(|t| spawn_preview_thread(t.clone()));
     let mut share = ShareEncoder::new(ShareSenderArgs {
         conn,
+        video_stream,
         die,
         force_idr,
         video_loss,
@@ -3374,8 +3427,15 @@ pub async fn start(
     // portal/PipeWire setup has succeeded. A camera that cannot open is
     // therefore a normal, screen-only share — no half-started thread.
     let overlay = options.camera_overlay.then(CameraOverlay::new);
+    // Only negotiate streams with a server that said it reads them. The
+    // snapshot is taken once at startup and shared by the inline (DMA-BUF)
+    // encoder and the encoder thread.
+    let video_stream = options
+        .video_streams
+        .then(|| VideoSender::spawn(conn.clone()));
     let sender = ShareSenderArgs {
         conn: conn.clone(),
+        video_stream: video_stream.clone(),
         die: die_tx.clone(),
         force_idr: force_idr.clone(),
         video_loss: video_loss.clone(),
@@ -3425,6 +3485,7 @@ pub async fn start(
                 options,
                 overlay_for_encoder,
                 preview,
+                video_stream,
             )
         }))
     };

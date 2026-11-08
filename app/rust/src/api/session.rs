@@ -430,6 +430,11 @@ struct LiveSession {
     /// the voice startup path; a default-feature build has no voice.
     #[cfg_attr(not(feature = "audio-device"), allow(dead_code))]
     media_id: u32,
+    /// The server advertised reliable video streams in its HelloAck.
+    /// Share startup passes this to the encoder; an older server keeps
+    /// the datagram path.
+    #[cfg_attr(not(feature = "screen-capture"), allow(dead_code))]
+    video_streams: bool,
     /// Mic mute: the capture callback drops chunks while this is set
     /// (no packets at all, rather than silence packets). Session-scoped
     /// and deliberately not cleared by leave/join — muting is a user
@@ -1515,7 +1520,7 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
         &mut tx,
         &Hello {
             protocol_version: PROTOCOL_VERSION,
-            caps: 0,
+            caps: parley_proto::Capabilities::VIDEO_STREAMS.0,
         },
     )
     .await
@@ -1523,6 +1528,7 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     let ack: HelloAck = session::read_message(&mut rx)
         .await
         .map_err(|e| format!("hello ack: {e}"))?;
+    let video_streams = ack.server_caps & parley_proto::Capabilities::VIDEO_STREAMS.0 != 0;
 
     let (password, session_token) = match auth {
         Auth::Password(p) => (p, String::new()),
@@ -1672,6 +1678,10 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     start_video_task(session_id, session_hub.clone());
     #[cfg(feature = "video")]
     start_video_reporter(session_id, session_hub.clone(), cmd_tx.clone());
+    #[cfg(feature = "video")]
+    if video_streams {
+        parley_client::video_stream::spawn_reader(conn.clone(), session_hub.clone());
+    }
 
     SESSIONS.lock().unwrap().insert(
         session_id,
@@ -1685,6 +1695,7 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
             user_id: ok.user_id,
             server_session_id: ok.session_id,
             media_id: ok.media_id,
+            video_streams,
             mic_muted: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "audio-device")]
             mic_level: Arc::new(AtomicU32::new(0)),
@@ -2385,7 +2396,7 @@ pub fn start_screen_share(
     // The own-share card reads the NEW share's shape, not the last one's
     // while the source picker is still open.
     crate::api::video::clear_share_stats();
-    let (event_tx, share_loss, share_viewer_fps, conn, poke_slot, ctrl_slot) = {
+    let (event_tx, share_loss, share_viewer_fps, conn, poke_slot, ctrl_slot, video_streams) = {
         let sessions = SESSIONS.lock().unwrap();
         let s = sessions
             .get(&session_id)
@@ -2400,6 +2411,7 @@ pub fn start_screen_share(
             s.conn.clone(),
             s.share_poke.clone(),
             s.share_ctrl.clone(),
+            s.video_streams,
         )
     };
     // Spawned (not awaited): the source picker blocks for seconds and FRB
@@ -2484,6 +2496,7 @@ pub fn start_screen_share(
                 max_fps: (max_fps > 0).then(|| f64::from(max_fps)),
                 // A standalone camera share has no screen to overlay on.
                 camera_overlay: camera_overlay && !camera,
+                video_streams,
             };
             // The sharer's own preview: the tap is always installed and
             // checks the settings switch per frame, so toggling it mid-

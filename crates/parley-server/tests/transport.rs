@@ -380,7 +380,7 @@ async fn connect_and_auth_full(
         &mut tx,
         &Hello {
             protocol_version: PROTOCOL_VERSION,
-            caps: 0,
+            caps: parley_proto::Capabilities::VIDEO_STREAMS.0,
         },
     )
     .await
@@ -452,6 +452,96 @@ async fn heartbeat_roundtrip() {
     }
 
     conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+/// The reliable path is negotiated, not assumed: the client advertises
+/// the capability, the server accepts a stream, and a channel member
+/// receives a frame with the sender's media id stamped by the server.
+#[tokio::test]
+async fn video_stream_frames_fan_out_with_sender_exclusion() {
+    init_logs();
+    let (config, server) = setup_server_with_user("video-streams");
+    let addr = server.local_addr();
+    let pinned = server.fingerprint().to_string();
+    tokio::spawn(server.run());
+    let endpoint = client_endpoint(pinned);
+
+    let (conn_a, mut tx_a, mut rx_a, ok_a) =
+        connect_and_auth_full(&endpoint, addr, "testuser", "testpass").await;
+    let (conn_b, mut tx_b, mut rx_b, _ok_b) =
+        connect_and_auth_full(&endpoint, addr, "seconduser", "secondpass").await;
+
+    send_client_msg(
+        &mut tx_a,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, ok_a.user_id, 1, true).await;
+    expect_voice_state(&mut rx_b, ok_a.user_id, 1, true).await;
+    send_client_msg(
+        &mut tx_b,
+        ClientBody::JoinVoice(JoinVoice { channel_id: 1 }),
+    )
+    .await;
+    expect_voice_state(&mut rx_a, 2, 1, true).await;
+    expect_voice_state(&mut rx_b, 2, 1, true).await;
+
+    let payload = vec![0x5au8; 32 * 1024];
+    let encoded =
+        parley_proto::video_stream::encode_frame(&parley_proto::video_stream::StreamFrame {
+            sender_id: 0,
+            frame_id: 0,
+            timestamp: 0,
+            keyframe: true,
+            high_rate: true,
+            codec: parley_proto::media::VIDEO_CODEC_H264,
+            data: &payload,
+        });
+    let mut outgoing = conn_a.open_uni().await.unwrap();
+    outgoing.write_all(&encoded).await.unwrap();
+    outgoing.finish().unwrap();
+
+    // The server announces the share on the control stream before the
+    // first frame reaches the viewer.
+    let announced = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match read_server_msg(&mut rx_b).await.body {
+                Some(ServerBody::ShareStarted(s)) => break s,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("share announcement");
+    assert_eq!(announced.media_id, ok_a.media_id);
+
+    let mut incoming = tokio::time::timeout(Duration::from_secs(2), conn_b.accept_uni())
+        .await
+        .expect("viewer stream")
+        .unwrap();
+    let bytes = incoming
+        .read_to_end(parley_proto::video_stream::MAX_STREAM_BYTES)
+        .await
+        .unwrap();
+    let received = parley_proto::video_stream::decode_frame(&bytes).unwrap();
+    assert_eq!(
+        received.sender_id, ok_a.media_id,
+        "server must stamp identity"
+    );
+    assert_eq!(received.data, payload);
+    assert!(received.keyframe);
+
+    // The sharer never receives its own stream.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), conn_a.accept_uni())
+            .await
+            .is_err(),
+        "a sender must not be fanned out to itself"
+    );
+
+    conn_a.close(0u32.into(), b"done");
+    conn_b.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 

@@ -219,6 +219,13 @@ struct RecvStream {
     /// notice (crash, killed capture) never sends again; a viewer that
     /// only trusts events would keep the card forever.
     last_packet: std::time::Instant,
+    /// Reliable stream state: the last complete frame id, whether a gap
+    /// has put us into drop-until-IDR mode, and the gap/completion
+    /// counters that feed the sender's ladder.
+    stream_last_frame: Option<u32>,
+    stream_waiting_for_keyframe: bool,
+    stream_dropped: u64,
+    stream_completed: u64,
 }
 
 #[derive(Default)]
@@ -351,6 +358,10 @@ impl VideoReceiveHub {
                             fps_window: std::time::Instant::now(),
                             decoded_fps: 0,
                             last_packet: std::time::Instant::now(),
+                            stream_last_frame: None,
+                            stream_waiting_for_keyframe: false,
+                            stream_dropped: 0,
+                            stream_completed: 0,
                         });
                     }
                     Err(e) => {
@@ -368,6 +379,171 @@ impl VideoReceiveHub {
         if pushed {
             self.frame_ready.notify_one();
         }
+    }
+
+    /// Feed one complete frame from a reliable QUIC stream.
+    ///
+    /// Unlike the datagram path there is no assembly or fragment loss to
+    /// wait for: QUIC delivers the bytes or resets the stream. A missing
+    /// frame still matters for H.264 references, so an id gap puts the
+    /// stream into drop-until-IDR mode exactly as the datagram path does.
+    /// Returns true when a picture was queued for display.
+    pub fn push_stream_frame(
+        &self,
+        sender_id: u32,
+        codec: u8,
+        keyframe: bool,
+        high_rate: bool,
+        frame_id: u32,
+        data: &[u8],
+    ) -> bool {
+        if codec != parley_proto::media::VIDEO_CODEC_H264 {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.refused_codec.insert(sender_id) {
+                eprintln!(
+                    "video: user {sender_id} is sending codec id {codec}, which this build \
+                     cannot decode (H.264 only) — stream refused"
+                );
+            }
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let pushed = {
+            let HubInner {
+                streams,
+                stopped,
+                queue,
+                format,
+                ..
+            } = &mut *inner;
+            if stopped.contains(&sender_id) {
+                if !keyframe || frame_id != 0 {
+                    return false;
+                }
+                stopped.remove(&sender_id);
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(sender_id) {
+                match VideoDecoder::new() {
+                    Ok(decoder) => {
+                        e.insert(RecvStream {
+                            assembler: VideoAssembler::new(),
+                            decoder,
+                            predecode_skipped: 0,
+                            decoded: 0,
+                            no_picture: 0,
+                            decode_errors: 0,
+                            fed_since_picture: 0,
+                            last_reset: None,
+                            decoded_window: 0,
+                            fps_window: std::time::Instant::now(),
+                            decoded_fps: 0,
+                            last_packet: std::time::Instant::now(),
+                            stream_last_frame: None,
+                            stream_waiting_for_keyframe: false,
+                            stream_dropped: 0,
+                            stream_completed: 0,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("video: decoder init failed for user {sender_id}: {e}");
+                        return false;
+                    }
+                }
+            }
+            let stream = streams.get_mut(&sender_id).expect("just inserted");
+            let now = std::time::Instant::now();
+            stream.last_packet = now;
+
+            // A new share starts at frame 0 with an IDR. A stream that
+            // restarts therefore clears the old epoch even when the
+            // previous share never sent ShareStopped.
+            if keyframe && frame_id == 0 && stream.stream_last_frame.is_some() {
+                stream.stream_last_frame = None;
+                stream.stream_waiting_for_keyframe = false;
+            }
+            let gap = match stream.stream_last_frame {
+                Some(last) if frame_id <= last => return false, // duplicate or late
+                Some(last) if frame_id != last.wrapping_add(1) => {
+                    frame_id.wrapping_sub(last).saturating_sub(1) as u64
+                }
+                _ => 0,
+            };
+            if gap > 0 {
+                stream.stream_dropped = stream.stream_dropped.saturating_add(gap);
+                stream.stream_waiting_for_keyframe = true;
+            }
+            if stream.stream_waiting_for_keyframe {
+                if !keyframe {
+                    return false;
+                }
+                stream.stream_waiting_for_keyframe = false;
+            } else if stream.stream_last_frame.is_none() && !keyframe {
+                // Start on an IDR: a P-frame with no reference is not a
+                // picture, it is decoder noise.
+                stream.stream_waiting_for_keyframe = true;
+                return false;
+            }
+            stream.stream_last_frame = Some(frame_id);
+
+            if keyframe {
+                keyframe_dump::keyframe(sender_id, frame_id, data);
+            }
+            let decoded = match *format {
+                VideoPixelFormat::Rgb24 => stream.decoder.decode_with_dims(data),
+                VideoPixelFormat::Rgba => stream.decoder.decode_rgba_with_dims(data),
+            };
+            match decoded {
+                Ok(Some((rgb, w, h))) => {
+                    stream.decoded += 1;
+                    stream.stream_completed += 1;
+                    stream.fed_since_picture = 0;
+                    stream.decoded_window += 1;
+                    let elapsed = stream.fps_window.elapsed();
+                    if elapsed >= Duration::from_secs(5) {
+                        stream.decoded_fps =
+                            (stream.decoded_window as f64 / elapsed.as_secs_f64()).round() as u32;
+                        stream.decoded_window = 0;
+                        stream.fps_window = std::time::Instant::now();
+                    }
+                    queue.push_back(VideoFrame {
+                        sender_id,
+                        rgb,
+                        channels: format.bytes_per_pixel(),
+                        width: w,
+                        height: h,
+                        high_rate,
+                    });
+                    while queue.len() > FRAME_QUEUE_CAP {
+                        queue.pop_front();
+                    }
+                    true
+                }
+                Ok(None) => {
+                    stream.no_picture += 1;
+                    stream.fed_since_picture += 1;
+                    Self::check_stall(sender_id, stream);
+                    false
+                }
+                Err(e) => {
+                    stream.decode_errors += 1;
+                    stream.fed_since_picture += 1;
+                    if stream.decode_errors == 1 || stream.decode_errors.is_multiple_of(100) {
+                        eprintln!(
+                            "video: user {sender_id}: decoder rejected a stream frame ({e}) — \
+                             decoded {}, no-picture {}, errors {}",
+                            stream.decoded, stream.no_picture, stream.decode_errors
+                        );
+                    }
+                    Self::reset_decoder(sender_id, stream);
+                    false
+                }
+            }
+        };
+        drop(inner);
+        if pushed {
+            self.frame_ready.notify_one();
+        }
+        pushed
     }
 
     /// Decode drain (3b): pull assembled frames through the decoders
@@ -657,8 +833,15 @@ impl VideoReceiveHub {
             .streams
             .iter()
             .filter(|(_, s)| {
-                s.assembler.needs_keyframe()
-                    && now.duration_since(s.last_packet) < Duration::from_secs(5)
+                // A stream has its own reference state. The assembler starts
+                // "needs keyframe" on a fresh hub; consulting it for a
+                // successful stream would report a stall forever.
+                let waiting = if s.stream_last_frame.is_some() {
+                    s.stream_waiting_for_keyframe
+                } else {
+                    s.assembler.needs_keyframe() || s.stream_waiting_for_keyframe
+                };
+                waiting && now.duration_since(s.last_packet) < Duration::from_secs(5)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -677,7 +860,18 @@ impl VideoReceiveHub {
         inner
             .streams
             .values_mut()
-            .map(|s| s.assembler.gap_rate_permille())
+            .map(|s| {
+                let datagram = s.assembler.gap_rate_permille();
+                let total = s.stream_completed.saturating_add(s.stream_dropped);
+                let stream = s
+                    .stream_dropped
+                    .saturating_mul(1000)
+                    .checked_div(total)
+                    .unwrap_or(0) as u32;
+                s.stream_completed = 0;
+                s.stream_dropped = 0;
+                datagram.max(stream)
+            })
             .max()
     }
 
@@ -1090,5 +1284,58 @@ mod tests {
     #[test]
     fn decoded_fps_is_none_without_streams() {
         assert_eq!(VideoReceiveHub::new().decoded_fps(), None);
+    }
+
+    /// Stream frames must start on an IDR. A gap (a reset/dropped stream)
+    /// poisons the reference chain until the next keyframe, and the next
+    /// complete frame must be accepted without waiting for another one.
+    #[test]
+    fn stream_frames_require_idr_and_recover_after_a_gap() {
+        let (w, h) = (320, 240);
+        let mut enc = crate::video::create_encoder(w, h).unwrap();
+        enc.force_keyframe();
+        let (key, _) = enc.encode_bgra(&noisy_bgra(w, h, 0)).unwrap();
+        let (delta, _) = enc.encode_bgra(&noisy_bgra(w, h, 1)).unwrap();
+        let hub = VideoReceiveHub::new();
+
+        assert!(hub.push_stream_frame(
+            11,
+            parley_proto::media::VIDEO_CODEC_H264,
+            true,
+            false,
+            0,
+            &key
+        ));
+        assert!(
+            hub.pop_frame(Duration::from_millis(500)).is_some(),
+            "the first IDR must decode"
+        );
+
+        // Frame 1 is missing: a delta for frame 2 cannot be referenced.
+        assert!(!hub.push_stream_frame(
+            11,
+            parley_proto::media::VIDEO_CODEC_H264,
+            false,
+            false,
+            2,
+            &delta
+        ));
+        assert_eq!(hub.keyframe_waiting(), vec![11]);
+
+        enc.force_keyframe();
+        let (recovery, _) = enc.encode_bgra(&noisy_bgra(w, h, 2)).unwrap();
+        assert!(hub.push_stream_frame(
+            11,
+            parley_proto::media::VIDEO_CODEC_H264,
+            true,
+            false,
+            3,
+            &recovery
+        ));
+        assert!(
+            hub.pop_frame(Duration::from_millis(500)).is_some(),
+            "the recovery IDR must decode"
+        );
+        assert!(hub.keyframe_waiting().is_empty());
     }
 }

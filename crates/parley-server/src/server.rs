@@ -19,6 +19,7 @@ use crate::tls;
 use crate::transcode::{ReportAction, TranscodeManager};
 use crate::voice::VoiceManager;
 use parley_core::session;
+use parley_proto::Capabilities;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, AvatarData, Channel as PbChannel, ChannelList, ChannelMode,
     ClientBody, ClientMessage, DeviceKind, HeartbeatAck, Hello, HelloAck, PROTOCOL_VERSION, Poked,
@@ -37,6 +38,10 @@ pub struct Server {
     files_dir: PathBuf,
     /// Read-only HTTP snapshot for a dashboard; `None` when disabled.
     presence: Option<PresenceServer>,
+    /// Reliable video streams are available. Off with server transcode:
+    /// that tier is datagram-based, and the two cannot describe the same
+    /// viewer stream without a second negotiation.
+    video_streams: bool,
 }
 
 impl Server {
@@ -129,6 +134,7 @@ impl Server {
             transcode,
             files_dir,
             presence,
+            video_streams: !config.video.transcode,
         })
     }
 
@@ -206,6 +212,7 @@ impl Server {
                 }
             });
         }
+        let video_streams = self.video_streams;
         while let Some(incoming) = self.endpoint.accept().await {
             match incoming.await {
                 Ok(conn) => {
@@ -215,7 +222,13 @@ impl Server {
                     let transcode = self.transcode.clone();
                     let files_dir = self.files_dir.clone();
                     tokio::spawn(handle_connection(
-                        conn, db, registry, voice, transcode, files_dir,
+                        conn,
+                        db,
+                        registry,
+                        voice,
+                        transcode,
+                        files_dir,
+                        video_streams,
                     ));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
@@ -232,9 +245,20 @@ async fn handle_connection(
     voice: Arc<VoiceManager>,
     transcode: Arc<TranscodeManager>,
     files_dir: PathBuf,
+    video_streams: bool,
 ) {
     let peer = conn.remote_address();
-    match serve(conn.clone(), &db, &registry, &voice, &transcode, &files_dir).await {
+    match serve(
+        conn.clone(),
+        &db,
+        &registry,
+        &voice,
+        &transcode,
+        &files_dir,
+        video_streams,
+    )
+    .await
+    {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -248,6 +272,7 @@ async fn serve(
     voice: &Arc<VoiceManager>,
     transcode: &Arc<TranscodeManager>,
     files_dir: &std::path::Path,
+    video_streams: bool,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
 
@@ -262,7 +287,11 @@ async fn serve(
         &mut tx,
         &HelloAck {
             protocol_version: PROTOCOL_VERSION,
-            server_caps: 0,
+            server_caps: if video_streams {
+                Capabilities::VIDEO_STREAMS.0
+            } else {
+                0
+            },
             heartbeat_ms: 5_000,
         },
     )
@@ -365,6 +394,21 @@ async fn serve(
         registry.clone(),
         files_dir.to_path_buf(),
     );
+
+    // Video frames ride reliable unidirectional streams when both sides
+    // understand them. The client must have advertised the capability too;
+    // a peer that already sent a datagram-era Hello must not suddenly be
+    // fed streams it will never read.
+    if video_streams && hello.caps & Capabilities::VIDEO_STREAMS.0 != 0 {
+        crate::video_stream::spawn_acceptor(
+            conn.clone(),
+            info.id,
+            info.username.clone(),
+            media_id,
+            registry.clone(),
+            voice.clone(),
+        );
+    }
 
     // --- Dedicated reader tasks ---
     // Each reader owns its source, so an in-flight read is never
@@ -1046,6 +1090,35 @@ pub(crate) fn notify_share_stopped(
     }
 }
 
+/// Mark a share live and announce it to the channel exactly once. Both
+/// the datagram relay and the stream acceptor call this, so the two
+/// transports cannot drift in who they notify.
+pub(crate) fn announce_share(
+    user_id: u32,
+    username: &str,
+    media_id: u32,
+    channel_id: u64,
+    registry: &Arc<SessionRegistry>,
+    voice: &Arc<VoiceManager>,
+) {
+    if !voice.mark_sharing(media_id) {
+        return;
+    }
+    let announcement = ServerMessage {
+        body: Some(ServerBody::ShareStarted(ShareStarted {
+            user_id,
+            username: username.to_string(),
+            media_id,
+            channel_id,
+        })),
+    };
+    for member in voice.members_of(channel_id) {
+        if member.media_id != media_id && member.user_id != user_id {
+            registry.send_to_media(member.media_id, announcement.clone());
+        }
+    }
+}
+
 /// Forward a media datagram from `sender` to their voice channel.
 /// The sender field in the header is overwritten with this connection's
 /// media id, so a receiver can tell the phone from the desktop.
@@ -1080,21 +1153,14 @@ fn route_datagram(
         // account, so without this mapping a viewer can only say
         // "user <media id>". Same-account devices are excluded exactly
         // like their video is.
-        if voice.mark_sharing(media_id) {
-            let announcement = ServerMessage {
-                body: Some(ServerBody::ShareStarted(ShareStarted {
-                    user_id: sender.id,
-                    username: sender.username.clone(),
-                    media_id,
-                    channel_id,
-                })),
-            };
-            for member in voice.members_of(channel_id) {
-                if member.media_id != media_id && member.user_id != sender.id {
-                    registry.send_to_media(member.media_id, announcement.clone());
-                }
-            }
-        }
+        announce_share(
+            sender.id,
+            &sender.username,
+            media_id,
+            channel_id,
+            registry,
+            voice,
+        );
         transcode.note_video(media_id, channel_id, decoded.payload);
     }
 

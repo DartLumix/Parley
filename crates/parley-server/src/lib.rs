@@ -11,6 +11,7 @@ pub mod server;
 pub mod session;
 pub mod tls;
 pub mod transcode;
+pub mod video_stream;
 pub mod voice;
 
 pub use config::Config;

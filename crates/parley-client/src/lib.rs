@@ -4,6 +4,7 @@
 
 pub mod cert;
 pub mod endpoint;
+pub mod video_stream;
 
 /// The share-audio echo guard: subtract this app's playback from the
 /// default-output monitor. Pure DSP, no device dependency — both the

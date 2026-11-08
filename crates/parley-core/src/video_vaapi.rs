@@ -178,6 +178,12 @@ pub struct VaapiEncoder {
     /// force_keyframe latched here; the next encode passes it to
     /// moq-vaapi (its `keyframe` argument drives the IDR).
     pending_idr: bool,
+    /// GOP position tracked here because the crate does not report the
+    /// encoded slice type. Without this, periodic IDRs were sent with
+    /// `keyframe = false`, so a receiver that lost a delta never knew a
+    /// fresh reference point had arrived.
+    gop: u32,
+    frames_since_keyframe: u32,
 }
 
 // SAFETY: VaEncoder is !Send because libva context Rcs are not
@@ -230,6 +236,8 @@ impl VaapiEncoder {
             height,
             current_bitrate: bitrate,
             pending_idr: false,
+            gop: keyframe_interval_frames(fps),
+            frames_since_keyframe: 0,
         })
     }
 
@@ -244,6 +252,24 @@ impl VaapiEncoder {
         self.inner
             .as_mut()
             .expect("encoder present for its lifetime")
+    }
+
+    /// Decide whether this picture is an IDR. The first picture is one,
+    /// a forced request is one, and the wall-clock GOP boundary is one.
+    /// Passing a periodic IDR as `keyframe` to the crate keeps its own
+    /// counter aligned with this one, so it never emits an unreported
+    /// IDR between our two boundaries.
+    fn take_idr(&mut self) -> bool {
+        let idr = self.pending_idr
+            || self.frames_since_keyframe == 0
+            || self.frames_since_keyframe >= self.gop;
+        self.pending_idr = false;
+        self.frames_since_keyframe = if idr {
+            0
+        } else {
+            self.frames_since_keyframe.saturating_add(1)
+        };
+        idr
     }
 }
 
@@ -269,19 +295,15 @@ impl VideoEncoder for VaapiEncoder {
         // 7i: no CPU conversion and no repack — the crate uploads packed
         // BGRA rows straight into a BGRX surface (honoring the pitch) and
         // the video processor produces the NV12 the encoder consumes.
-        let idr = self.pending_idr;
-        self.pending_idr = false;
+        let idr = self.take_idr();
         let (width, height) = (self.width, self.height);
         let annexb = self
             .enc()
             .encode_bgra(bgra, width as u32, height as u32, width * 4, idr)
             .map_err(|e| Error::Codec(format!("vaapi encode: {e:#}")))?;
-        // moq-vaapi doesn't report the frame type back; the ladder's
-        // IDR bookkeeping only needs "was this one forced". The first
-        // frame of a fresh encoder is an IDR by construction; report
-        // keyframe only for forced IDRs so the wire flag matches what
-        // the software path emits (periodic GOP IDRs are NOT flagged —
-        // the assembler only needs the forced/first-frame signal).
+        // `take_idr` models the crate's own GOP boundary as well, so a
+        // periodic IDR is flagged on the wire and a receiver can resume
+        // from it rather than waiting for the next forced one.
         Ok((annexb, idr))
     }
 
@@ -320,8 +342,7 @@ impl VideoEncoder for VaapiEncoder {
             // self.width/height and never mismatches.
             return crate::video::strided_fallback(self, bgra, width, height, stride, out);
         }
-        let idr = self.pending_idr;
-        self.pending_idr = false;
+        let idr = self.take_idr();
         let bytes = self
             .enc()
             .encode_bgra(bgra, width as u32, height as u32, stride, idr)
@@ -345,8 +366,7 @@ impl VideoEncoder for VaapiEncoder {
     /// packed BGRX a screencast produces), so a renegotiated size still
     /// encodes — scaled — instead of failing.
     fn encode_dmabuf(&mut self, frame: DmaBufFrame, out: &mut Vec<u8>) -> Result<bool, Error> {
-        let idr = self.pending_idr;
-        self.pending_idr = false;
+        let idr = self.take_idr();
         let buffer = moq_vaapi::dmabuf::DmaBuf {
             drm_format: frame.drm_format,
             modifier: frame.modifier,
