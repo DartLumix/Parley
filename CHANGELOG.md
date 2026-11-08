@@ -3,6 +3,43 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.6.0] — 2026-11-08
+
+Reliable video streams for screen and camera shares. The wire protocol
+gains one additive capability: peers that do not advertise it keep using
+the datagram path, so mixed-version calls still work.
+
+### Added
+
+- Video frames now travel one per QUIC stream instead of being split
+  across datagrams. A single lost packet no longer destroys a keyframe,
+  and a keyframe burst no longer competes with voice for the same
+  congestion window. High-motion shares hold their resolution instead of
+  collapsing to a slideshow.
+- Camera shares use the same reliable transport, pacing, keyframe-on-join
+  and backpressure handling as screen shares on Linux, Windows and
+  Android.
+- Server-side transcoding writes each tier back over the same stream
+  framing. A viewer on a slow link receives its tier instead of the
+  full-resolution stream, while the sharer keeps sending full quality.
+- Viewer loss and queue pressure steer the sharer's bitrate ladder, and
+  a viewer that disconnects is removed from the fan-out immediately.
+
+### Fixed
+
+- Keyframe requests are debounced per sender, so ten stalled viewers ask
+  for one keyframe instead of ten; suppressed requests still carry their
+  gap rate to the ladder.
+- A keyframe burst can no longer starve audio on a congested link.
+- The QUIC unidirectional-stream ceiling is raised from Quinn's default
+  of 100, so a 60 fps share cannot exhaust its stream slots and stall.
+
+### Build
+
+- The Flutter bridge now enables `parley-client/video` from its own
+  `video` feature, so a build with `--features video` alone compiles the
+  viewer-side stream reader.
+
 ## [0.5.3] — 2026-11-04
 
 A stream-identity and Android-control release. The wire protocol gains one

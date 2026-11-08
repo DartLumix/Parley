@@ -12,6 +12,27 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.6.0
+
+High-motion screen and camera shares stay sharp, and voice keeps its
+share of the connection.
+
+## Sharper sharing
+
+- Each video frame now travels on its own reliable stream. One lost
+  packet no longer wipes out a keyframe, so fast-moving screens and
+  cameras hold their resolution instead of turning into a slideshow.
+- Camera shares use the same transport, pacing and recovery as screen
+  shares.
+- A slow viewer gets a server-encoded lower tier while the sharer keeps
+  sending full quality.
+
+## Smoother calls
+
+- Keyframes no longer crowd out voice audio on a busy link.
+- A stalled viewer no longer delays everyone else, and keyframe requests
+  are coalesced so the encoder is not forced into a keyframe loop.
+
 # Parley 0.5.3
 
 Streams stay on screen, show real names, and Android gets its camera flip
