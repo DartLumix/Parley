@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use crate::db::{DbHandle, UserInfo, UserRole};
 use crate::session::SessionRegistry;
-use crate::transcode::TranscodeManager;
 use crate::voice::VoiceManager;
 use parley_proto::pb::manage_request::Action;
 use parley_proto::{
@@ -33,7 +32,6 @@ pub async fn handle(
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
-    transcode: &Arc<TranscodeManager>,
 ) -> ManageResult {
     if !actor.role.can_manage() {
         return fail("not permitted");
@@ -139,7 +137,7 @@ pub async fn handle(
             // removed nothing, leaving both devices in the room until
             // their connections died.
             for media_id in voice.media_ids_of_user(target.id) {
-                force_leave(media_id, registry, voice, transcode);
+                force_leave(media_id, registry, voice);
             }
             registry.disconnect_user(target.id);
             publish(session_gen, db, registry, voice).await
@@ -192,7 +190,7 @@ pub async fn handle(
                 return fail(db_error(e));
             }
             for member in members {
-                force_leave(member.media_id, registry, voice, transcode);
+                force_leave(member.media_id, registry, voice);
             }
             broadcast_channel_list(db, registry).await;
             publish(session_gen, db, registry, voice).await
@@ -224,7 +222,7 @@ pub async fn handle(
             // leaves: picking one (HashMap order) told the manager the
             // kick succeeded while the second device stayed in the room.
             for media_id in media_ids {
-                force_leave(media_id, registry, voice, transcode);
+                force_leave(media_id, registry, voice);
             }
             publish(session_gen, db, registry, voice).await
         }
@@ -347,22 +345,15 @@ async fn broadcast_channel_list(db: &DbHandle, registry: &Arc<SessionRegistry>) 
 }
 
 /// The same teardown a LeaveVoice performs. Used by kick, account removal
-/// and channel deletion: membership, share route and transcode seat all
+/// and channel deletion: membership and the share route all
 /// die together, and the room hears one ordinary leave.
-fn force_leave(
-    media_id: u32,
-    registry: &Arc<SessionRegistry>,
-    voice: &Arc<VoiceManager>,
-    transcode: &Arc<TranscodeManager>,
-) {
+fn force_leave(media_id: u32, registry: &Arc<SessionRegistry>, voice: &Arc<VoiceManager>) {
     let Some(member) = voice.leave(media_id) else {
         return;
     };
     if voice.stop_sharing(media_id) {
         crate::server::notify_share_stopped(member, member.channel_id, registry, voice);
     }
-    transcode.remove_share(media_id);
-    transcode.remove_viewer(media_id);
     // Voice membership is per DEVICE. A global broadcast would make the
     // same account's other device process this as its own leave and tear
     // down its microphone. Route it like every ordinary leave: the

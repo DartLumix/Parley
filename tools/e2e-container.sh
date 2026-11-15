@@ -17,6 +17,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # and the client would try to connect to :0.
 IMAGE=${IMAGE:-parley:e2e}
 E2E_PORT=${E2E_PORT:-44430}
+E2E_MOQ_PORT=${E2E_MOQ_PORT:-44450}
 CONTAINER="parley-e2e-$$"
 CLIENT=${CLIENT:-"$ROOT/target/release/parley-client"}
 ADMIN_PASS="e2e-admin-$$"
@@ -45,6 +46,7 @@ fi
 echo "==> boot"
 docker run -d --name "$CONTAINER" \
     -p "127.0.0.1:${E2E_PORT}:4443/udp" \
+    -p "127.0.0.1:${E2E_MOQ_PORT}:4445/udp" \
     -e PARLEY_ADMIN_PASSWORD="$ADMIN_PASS" \
     "$IMAGE" >/dev/null
 
@@ -66,7 +68,12 @@ docker logs "$CONTAINER" 2>&1 | grep -q "admin account created" || {
     docker logs "$CONTAINER" >&2
     exit 1
 }
-echo "    listening, admin bootstrapped"
+docker logs "$CONTAINER" 2>&1 | grep -q "moq media listener bound" || {
+    echo "FAIL: the MoQ media listener did not bind" >&2
+    docker logs "$CONTAINER" >&2
+    exit 1
+}
+echo "    listening on 4443 and 4445, admin bootstrapped"
 
 echo "==> adduser inside the container"
 created=0

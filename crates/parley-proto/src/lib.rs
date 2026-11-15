@@ -4,7 +4,6 @@ pub mod frame;
 pub mod handshake;
 pub mod media;
 pub mod video;
-pub mod video_stream;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/parley.rs"));

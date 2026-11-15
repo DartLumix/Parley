@@ -417,7 +417,12 @@ impl VideoReceiveHub {
                 ..
             } = &mut *inner;
             if stopped.contains(&sender_id) {
-                if !keyframe || frame_id != 0 {
+                // A fresh MoQ share resets the frame counter to zero. The
+                // first access unit can be non-key while a hardware encoder
+                // primes; removing the stop mark now lets the normal
+                // wait-for-IDR rule below reject it without also rejecting
+                // the keyframe that follows at frame_id 1.
+                if frame_id != 0 {
                     return false;
                 }
                 stopped.remove(&sender_id);
@@ -454,12 +459,15 @@ impl VideoReceiveHub {
             let now = std::time::Instant::now();
             stream.last_packet = now;
 
-            // A new share starts at frame 0 with an IDR. A stream that
-            // restarts therefore clears the old epoch even when the
-            // previous share never sent ShareStopped.
-            if keyframe && frame_id == 0 && stream.stream_last_frame.is_some() {
+            // A new share starts at frame 0. Clear the old epoch on the
+            // counter reset itself, not only when the first access unit is
+            // already flagged as an IDR: a hardware encoder can prime its
+            // pipeline and return a non-key access unit first. Keeping the
+            // previous share's last id would then reject the whole new
+            // share as duplicate/out-of-order until its counter caught up.
+            if frame_id == 0 && stream.stream_last_frame.is_some() {
                 stream.stream_last_frame = None;
-                stream.stream_waiting_for_keyframe = false;
+                stream.stream_waiting_for_keyframe = true;
             }
             let gap = match stream.stream_last_frame {
                 Some(last) if frame_id <= last => return false, // duplicate or late
@@ -736,6 +744,19 @@ impl VideoReceiveHub {
         inner.streams.remove(&sender_id);
         inner.stopped.insert(sender_id);
         inner.queue.retain(|f| f.sender_id != sender_id);
+    }
+
+    /// Drop every stream, queued picture and suppression mark.
+    ///
+    /// Room subscriptions call this when their watch stops: aborting the
+    /// reader tasks stops NEW media, but frames already decoded from the
+    /// old room would otherwise be displayed after the switch.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.streams.clear();
+        inner.queue.clear();
+        inner.stopped.clear();
+        inner.refused_codec.clear();
     }
 
     /// Sender left voice entirely: drop state, forget stopped-state —
@@ -1059,6 +1080,38 @@ mod tests {
         for p in payloads(&fragment_frame(0, true, &c, 20, 1920, 42)) {
             hub.push_datagram(5, &p);
         }
+        assert!(hub.pop_frame(Duration::from_millis(500)).is_some());
+    }
+
+    #[test]
+    fn stopped_stream_unsticks_on_frame_zero_when_hardware_primes() {
+        // MediaCodec/Media Foundation can emit a non-key access unit while
+        // priming. It must not leave the viewer permanently stopped just
+        // because its keyframe arrives as frame 1.
+        let mut enc = crate::video::create_encoder(320, 240).unwrap();
+        enc.force_keyframe();
+        let (first, _) = enc.encode_bgra(&noisy_bgra(320, 240, 0)).unwrap();
+        enc.force_keyframe();
+        let (second, _) = enc.encode_bgra(&noisy_bgra(320, 240, 1)).unwrap();
+
+        let hub = VideoReceiveHub::new();
+        hub.mark_stopped(7);
+        assert!(!hub.push_stream_frame(
+            7,
+            parley_proto::media::VIDEO_CODEC_H264,
+            false,
+            false,
+            0,
+            &first,
+        ));
+        assert!(hub.push_stream_frame(
+            7,
+            parley_proto::media::VIDEO_CODEC_H264,
+            true,
+            false,
+            1,
+            &second,
+        ));
         assert!(hub.pop_frame(Duration::from_millis(500)).is_some());
     }
 

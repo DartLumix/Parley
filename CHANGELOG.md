@@ -3,6 +3,111 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.6.1] — 2026-11-15
+
+The MoQ media-plane release. Screen video, camera video and share audio
+move from the custom QUIC streams/datagrams to an authenticated MoQ relay;
+the server becomes a zero-transcode fan-out. This is a breaking wire
+change: `PROTOCOL_VERSION` is 2, `HelloAck` advertises the MoQ port and its
+certificate fingerprint, and the server and every client must be upgraded
+together. Room voice stays on the low-latency QUIC datagrams.
+
+### Added
+
+- An authenticated MoQ relay on a second UDP port (default 4445). SETUP
+  validates the Parley session token, per-device media id, voice-room
+  membership and `MOQ_MEDIA` capability, then serves
+  `room/{channel}/user/{user}/{screen|camera}` broadcasts without decoding
+  or re-encoding a frame.
+- One broadcast per share: H.264 video plus optional Opus share audio on a
+  shared catalog clock. Screen and camera shares use the same publisher and
+  subscriber pipeline, and a viewer in the room discovers broadcasts
+  without a separate offer/answer exchange.
+- A native publisher-side `AdaptiveScreenController`: capped VBR scaled to
+  target size and FPS, a 2 s IDR group, static-scene protection, FPS-first
+  two-stage degradation (bitrate, then resolution, then cadence) and a
+  750 ms snap-back with an IDR at every step.
+- Hardware H.264 encode/decode through the platform backend: VA-API on
+  Linux, Media Foundation on Windows and MediaCodec on Android, with
+  openh264 as the universal software fallback. Hardware decoders also fall
+  back to software after a runtime failure instead of leaving a black tile.
+- A shared hardware boundary for even dimensions, BGRA→NV12/I420, Annex-B
+  normalization (including AVCC and malformed slice headers), keyframe
+  validation and sustained-rate measurement.
+- Per-device media identity is now explicit end to end: the mixer, levels,
+  share-audio gating and share teardown map roster accounts to device media
+  ids, so one account may use a phone and a desktop without crossed streams.
+
+### Changed
+
+- The server no longer links a video codec. `moq_port` is a first-class
+  config value (environment `PARLEY_MOQ_PORT`; Docker bakes 4445); the
+  deploy kit, compose files, firewall examples and docs all publish both
+  UDP ports.
+- Linux hardware encoding remains opt-in through the `hw-encode` feature
+  and Settings; Windows and Android hardware codecs are enabled by default
+  because the platform APIs are the normal path and fall back at runtime.
+- The share publisher now owns adaptation and keyframe requests. Viewer
+  reports still travel over the control stream, but they steer the sender;
+  the server only routes them.
+- Share lifecycle is epoch-scoped: a late close from an old publisher can
+  no longer retire a replacement share that reused the same media id.
+
+### Fixed
+
+- **Share audio stopped after its first moment.** The MoQ writer stamped
+  packets with writer-drain wall-clock time while assigning a fixed 20 ms
+  duration. A burst made the first group end in the future, so the next
+  keyframe rewound below the live edge, closed the track and produced the
+  server's `audio ... not found` / client `mux behind` cascade. Audio now
+  carries the encoder's 48 kHz sample timestamp and the writer anchors it
+  once; 120 packets over two group boundaries are covered by a regression
+  test.
+- **Per-user voice volume did nothing.** The roster and slider use account
+  ids; mixer streams use per-device media ids. Both the wheel and the
+  dialog set a gain that no stream ever read. The mixer now owns the
+  account/media map, applies one account gain to every device stream, and
+  reports speaking levels under the account id. Share-audio audibility and
+  its clear-on-disable path use the same mapping.
+- A hardware share could pace above the rate the encoder sustained. Pacing
+  now caps at 95% of the measured sustained rate (never above the 60 fps
+  profile ceiling), lowered further by the capture and dialog caps.
+- Vega/Raven2 VAAPI slice NALs with a zero header byte are repaired (`0x65`
+  for IDR, `0x41` for P), and the hardware self-test accepts encoders that
+  buffer their first frames instead of rejecting a usable MediaCodec or
+  Media Foundation encoder.
+- The VAAPI upload no longer reads every frame back with `vaGetImage` only
+  to overwrite it, and the DMABUF path refuses a software fallback that
+  would silently stop sending frames.
+- A capture format withdrawal or change is no longer dropped behind a full
+  frame queue; odd capture dimensions are rounded before the encoder sees
+  them, and a resolution change restarts viewers at the new shape instead
+  of feeding a fixed-size decoder.
+- The CLI and Flutter client select an explicit rustls crypto provider, so
+  feature unification by the MoQ dependency cannot panic at startup.
+- `StopShare` and the publisher retraction path no longer announce a
+  stopped share twice, and same-account devices no longer receive a
+  `ShareStopped` for a share they never received `ShareStarted` for.
+
+### Removed
+
+- Server `transcode.rs`, the custom QUIC video stream relay, per-viewer
+  frame queues, transcode seats and the stream-pressure downscale feedback
+  loop.
+- Client and protocol `video_stream` modules (the old reliable
+  one-stream-per-frame path), server `FLAG_VIDEO` datagram forwarding and
+  the old share pace governor. The legacy datagram reassembler and its
+  synthetic-test fragmenter remain compiled, but no shipping share path
+  uses them.
+
+### Compatibility
+
+- Protocol 2 is mandatory in both directions: a 0.6.0 client is refused by
+  a 0.6.1 server and a 0.6.1 client cannot use a 0.6.0 media plane. Upgrade
+  the server first, then every client. Open UDP 4445 as well as 4443.
+- Voice-only calls and chat do not use MoQ; they still require the same
+  protocol version because ALPN is versioned.
+
 ## [0.6.0] — 2026-11-08
 
 Reliable video streams for screen and camera shares. The wire protocol
@@ -564,17 +669,26 @@ nothing playing until you ask it to.
   with *Exit fullscreen* and no *Stop watching* — there is no watch
   state to stop. When the share ends, the page closes and the window
   leaves fullscreen on its own.
-- **A hardware share paced at the rate the encoder measured during
-  its own cold start.** The self-test times the encoder's first
-  frames, which pay for the video processor's context, the BGRX
-  surface and the driver's shaders — so a machine whose encoder ran
-  at ~60 fps paced its whole share at 50, and one at 1080p read as 30.
-  Worse, the 60 fps choice in the share dialog could not exceed it: a
-  60 fps request was silently a 30 fps stream. The measured rate is
-  diagnostic now; pacing uses the profile ceiling (60 fps hardware,
-  30 fps software) lowered only by the capture's own rate and the
-  dialog's cap, and the sharer's tile reports the rate actually being
-  sent rather than the one requested.
+- **A hardware share could pace above the rate the encoder sustained.**
+  The VAAPI self-test measures the same strided encode path the share
+  uses, but the share paced at the full 60 fps profile ceiling. At
+  1080p the RX 590 holds about 48 fps, so every slot the encoder could
+  not make skipped a capture frame; at sizes where the driver is slower
+  than 60 the stream stepped instead of staying smooth. Pacing now caps
+  at 95% of the measured sustained rate (never above the 60 fps
+  profile ceiling), lowered further by the capture's own rate and the
+  dialog's cap. Software stays at its 30 fps ceiling.
+- **Vega/Raven2 VAAPI emitted slice NALs with a zero header byte.**
+  The driver's H.264 encoder can write a slice NAL unit with `nal_unit_type`
+  0 instead of IDR (5) or non-IDR (1), so every decoder rejected the
+  stream even though the SPS/PPS and payload were valid. The vendored
+  encoder now repairs those headers (`0x65` for IDR, `0x41` for P),
+  with a unit test. This is what made the laptop fall back to software
+  while its encoder entrypoint was healthy.
+- **A viewer kept feeding new frame sizes into one fixed-size mpv.**
+  Adaptive resolution changes and the 60→30 high-rate transition now
+  restart the rawvideo viewer at the new shape, instead of corrupting
+  every frame the way the old fixed demuxer did.
 - **The VAAPI upload copied every frame out of the surface before
   overwriting it.** `vaGetImage` is a full-frame read-back, and the
   upload path overwrote all of it a moment later (the image format

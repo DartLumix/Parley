@@ -285,7 +285,7 @@ fn start_internal(
     events: tokio::sync::mpsc::UnboundedSender<ShareEvent>,
     options: ShareOptions,
     preview: Option<PreviewSink>,
-    video_stream: Option<crate::video_stream::VideoSender>,
+    moq: Option<parley_core::moq_media::MoqVideoPublisher>,
 ) -> Result<(ShareHandle, ShareController), String> {
     let (frame_tx, frame_rx) = sync_channel::<ToEncoder>(4);
     let force_idr = Arc::new(AtomicBool::new(false));
@@ -293,6 +293,7 @@ fn start_internal(
     let capture_drops = Arc::new(AtomicU64::new(0));
     let handle = ShareHandle {
         flag: force_idr.clone(),
+        moq: moq.clone(),
     };
     let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -326,7 +327,7 @@ fn start_internal(
                 options,
                 None,
                 preview,
-                video_stream,
+                moq,
             )
         }) {
         Ok(handle) => handle,
@@ -384,18 +385,9 @@ pub async fn start(
     if audio.is_some() {
         eprintln!("android share: system audio is not implemented; sharing video only");
     }
-    let video_stream = options
-        .video_streams
-        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
-    start_internal(
-        conn,
-        video_loss,
-        viewer_fps,
-        events,
-        options,
-        preview,
-        video_stream,
-    )
+    let moq = super::connect_publisher(&options, parley_core::moq_media::ShareKind::Screen, false)
+        .await?;
+    start_internal(conn, video_loss, viewer_fps, events, options, preview, moq)
 }
 
 /// Camera-share entry point. Kotlin opens Camera2 only after this slot is
@@ -408,18 +400,9 @@ pub async fn start_camera(
     options: ShareOptions,
     preview: Option<PreviewSink>,
 ) -> Result<(ShareHandle, ShareController), String> {
-    let video_stream = options
-        .video_streams
-        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
-    start_internal(
-        conn,
-        video_loss,
-        viewer_fps,
-        events,
-        options,
-        preview,
-        video_stream,
-    )
+    let moq = super::connect_publisher(&options, parley_core::moq_media::ShareKind::Camera, false)
+        .await?;
+    start_internal(conn, video_loss, viewer_fps, events, options, preview, moq)
 }
 
 /// Android has no application-audio picker in this first cut. Returning an

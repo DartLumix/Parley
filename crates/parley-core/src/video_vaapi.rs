@@ -26,135 +26,13 @@
 
 use moq_vaapi::encode::{Config as VaConfig, Encoder as VaEncoder};
 
-/// Frame size below which the conversion stays single-threaded: thread
-/// hand-off costs more than it saves on small pictures, and a 720p frame
-/// already converts in ~4.5 ms on one core.
-const PARALLEL_CONVERT_MIN_PIXELS: usize = 1280 * 720;
-
 use crate::error::Error;
 use crate::video::{
     CodecId, DmaBufFrame, VIDEO_FPS_SOFTWARE, VideoEncoder, bitrate_for, keyframe_interval_frames,
 };
 
-/// BGRA (0xAABBGGRR little-endian) → NV12 (4:2:0, Y then interleaved
-/// UV), BT.601 limited range — the conversion the other agent (rightly)
-/// insisted on. `width` must be even (VCE 4:2:0); callers negotiate
-/// even sizes from PipeWire in practice.
-pub fn bgra_to_nv12(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Error> {
-    let mut nv12 = Vec::new();
-    bgra_to_nv12_into(bgra, width, height, &mut nv12)?;
-    Ok(nv12)
-}
-
-/// 7h: [`bgra_to_nv12`] into a CALLER-OWNED buffer — the encoder's hot
-/// path reuses one staging buffer for the life of the encoder instead
-/// of allocating and zero-filling a fresh 3 MB Vec (1080p) on every
-/// frame at 60 fps. The buffer is resized to the exact NV12 length, so
-/// a resolution change needs no special case.
-pub fn bgra_to_nv12_into(
-    bgra: &[u8],
-    width: usize,
-    height: usize,
-    nv12: &mut Vec<u8>,
-) -> Result<(), Error> {
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(Error::Codec(format!(
-            "bgra_to_nv12: {width}x{height} — width and height must be non-zero and even \
-             (4:2:0 chroma is sampled 2x2)"
-        )));
-    }
-    let expected = width * height * 4;
-    if bgra.len() < expected {
-        return Err(Error::Codec(format!(
-            "bgra_to_nv12: {} bytes, {width}x{height} needs {expected}",
-            bgra.len()
-        )));
-    }
-    let len = width * height + (width / 2) * (height / 2) * 2;
-    if nv12.len() != len {
-        // Only when the geometry changed: every byte below is written
-        // unconditionally, so re-zeroing a correctly sized buffer would
-        // be a 3 MB memset per frame for nothing.
-        nv12.clear();
-        nv12.resize(len, 0);
-    }
-    // 7h HD: 1080p60 needs this conversion under ~8 ms and 1440p60 under
-    // ~5 — a single scalar pass costs 10 and 18 (measured), which is
-    // most of the frame budget on its own. Integer rows are disjoint and
-    // chroma is sampled 2x2 inside a band, so horizontal bands are an
-    // exact split: no cross-thread reads, no shared state, identical
-    // output regardless of thread count.
-    let threads = if width * height >= PARALLEL_CONVERT_MIN_PIXELS {
-        std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(1)
-    } else {
-        1
-    };
-    if threads > 1 {
-        // Bands are even-height so every band owns whole chroma rows.
-        let rows_per_band = (height.div_ceil(threads) + 1) & !1;
-        let (y_plane, uv_plane) = nv12.split_at_mut(width * height);
-        std::thread::scope(|scope| {
-            let mut y_rest: &mut [u8] = y_plane;
-            let mut uv_rest: &mut [u8] = uv_plane;
-            let mut y0 = 0usize;
-            while y0 < height {
-                let y1 = (y0 + rows_per_band).min(height);
-                // The two halves were split off the same buffer, so each
-                // band can take a disjoint slice of each; `split_at_mut`
-                // yields independent borrows, which is what lets the
-                // closures below run concurrently.
-                let (y_band, y_tail) = y_rest.split_at_mut((y1 - y0) * width);
-                y_rest = y_tail;
-                let uv_len = (y1 - y0) / 2 * width;
-                let (uv_band, uv_tail) = uv_rest.split_at_mut(uv_len);
-                uv_rest = uv_tail;
-                scope.spawn(move || convert_band(bgra, width, y0, y1, y_band, uv_band));
-                y0 = y1;
-            }
-        });
-        return Ok(());
-    }
-    let (y_plane, uv_plane) = nv12.split_at_mut(width * height);
-    convert_band(bgra, width, 0, height, y_plane, uv_plane);
-    Ok(())
-}
-
-/// BT.601 limited-range BGRA→NV12 for rows `[y0, y1)` of one picture:
-/// `y_band` holds exactly those luma rows, `uv_band` the matching
-/// interleaved chroma rows (`height / 2` rows of `width` bytes). Chroma
-/// is point-sampled from the top-left pixel of each 2x2 block — the
-/// same rule the single-threaded version used, so the two produce
-/// identical bytes.
-fn convert_band(
-    bgra: &[u8],
-    width: usize,
-    y0: usize,
-    y1: usize,
-    y_band: &mut [u8],
-    uv_band: &mut [u8],
-) {
-    for y in y0..y1 {
-        let row = &bgra[y * width * 4..];
-        let out = &mut y_band[(y - y0) * width..];
-        for (x, y_out) in out[..width].iter_mut().enumerate() {
-            let p = x * 4;
-            let b = row[p] as i32;
-            let g = row[p + 1] as i32;
-            let r = row[p + 2] as i32;
-            // BT.601 limited: Y = 16 + (66R + 129G + 25B) >> 8, etc.
-            *y_out = (16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)).clamp(0, 255) as u8;
-            if y % 2 == 0 && x % 2 == 0 {
-                let u = 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8);
-                let v = 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8);
-                let uv = ((y - y0) / 2) * (width / 2) + x / 2;
-                uv_band[uv * 2] = u.clamp(0, 255) as u8;
-                uv_band[uv * 2 + 1] = v.clamp(0, 255) as u8;
-            }
-        }
-    }
-}
+// Kept at this path for the encode-cost integration test.
+pub use crate::video::bgra_to_nv12;
 
 /// VAAPI H.264 encoder. Constructed only via
 /// [`crate::video::create_encoder_auto`] under the `vaapi` feature with
@@ -264,8 +142,11 @@ impl VaapiEncoder {
             || self.frames_since_keyframe == 0
             || self.frames_since_keyframe >= self.gop;
         self.pending_idr = false;
+        // The picture just emitted IS the keyframe. Counting it as frame 0
+        // of the new group would make `frames_since_keyframe == 0` true on
+        // the very next call too, turning every frame into an IDR.
         self.frames_since_keyframe = if idr {
-            0
+            1
         } else {
             self.frames_since_keyframe.saturating_add(1)
         };
@@ -419,7 +300,7 @@ impl VideoEncoder for VaapiEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::video::bgra_to_nv12;
 
     #[test]
     fn nv12_sizes_and_structure() {

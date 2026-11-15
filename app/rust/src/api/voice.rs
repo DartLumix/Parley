@@ -497,7 +497,11 @@ pub(crate) fn start_voice(
                             // should not hear someone's music just because
                             // they started sharing — the sender's VOICE
                             // rides its own stream and is never gated here.
-                            if share && !crate::api::session::share_audio_audible(m.sender_id)
+                            if share
+                                && !crate::api::session::share_audio_audible(
+                                    &mixer,
+                                    m.sender_id,
+                                )
                             {
                                 continue;
                             }

@@ -2,7 +2,7 @@
 
 | document | what it covers |
 |:--|:--|
-| [deploy.md](deploy.md) | Run the server on a VPS — one container, one UDP port, accounts, backup, upgrades |
+| [deploy.md](deploy.md) | Run the server on a VPS — one container, two UDP ports, accounts, backup, upgrades |
 | [client.md](client.md) | Install the desktop client on a machine, connect, share, troubleshoot |
 | [release.md](release.md) | Versioning and how a tagged release is built and verified |
 | [development.md](development.md) | Build from source, run tests, the bridge workflow, native dependencies |

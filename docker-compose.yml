@@ -6,6 +6,7 @@ services:
     build: .
     ports:
       - "${PARLEY_PORT:-4443}:4443/udp"  # host UDP port → container 4443
+      - "${PARLEY_MOQ_PORT:-4445}:${PARLEY_MOQ_PORT:-4445}/udp"  # MoQ screen/camera/share-audio
       # Read-only presence API for a dashboard on this machine. Loopback
       # on the host only; the container binds its own interface.
       - "127.0.0.1:${PARLEY_PRESENCE_PORT:-4444}:4444/tcp"
@@ -17,6 +18,8 @@ services:
       # First boot only: creates the admin account when the users table is
       # empty. Afterwards the variable is ignored — remove it from .env.
       - PARLEY_ADMIN_PASSWORD=${PARLEY_ADMIN_PASSWORD:-}
+      # Keep the announced/bound MoQ port identical to the published one.
+      - PARLEY_MOQ_PORT=${PARLEY_MOQ_PORT:-4445}
       - PARLEY_PRESENCE_LISTEN=0.0.0.0:4444
     restart: unless-stopped
 

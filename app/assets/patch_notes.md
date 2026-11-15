@@ -12,6 +12,42 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.6.1
+
+A new media plane, smoother sharing, and volume controls that finally do
+what they say. Server and every client must be upgraded together.
+
+## A dedicated media path
+
+- Screen video, camera video and share audio now travel over an
+  authenticated MoQ relay on UDP 4445. The server only fans out the
+  broadcast — it never decodes or re-encodes your picture.
+- The publisher adapts itself: bitrate first, then resolution, then frame
+  rate, with a two-second keyframe interval and a quick snap back when the
+  network recovers.
+- Hardware encoding and decoding use VA-API on Linux, Media Foundation on
+  Windows and MediaCodec on Android, with openh264 as the fallback.
+
+## Fixes
+
+- Share audio no longer stops after its first moment. Its Opus timestamps
+  now come from the encoder's sample clock, so a burst of packets can no
+  longer rewind the track and close it.
+- Per-user voice volume now changes what you hear, from both the slider and
+  the mouse wheel. The mixer was treating the account id in the roster as a
+  per-device stream id; it now maps between them correctly.
+- Switching a user's share audio off clears every device they are sharing
+  from, without touching their voice.
+- Hardware keyframe checks accept encoders that buffer their first frames,
+  and the VA-API path no longer schedules more frames than the encoder can
+  sustain.
+
+## Upgrade
+
+This is protocol 2. Open UDP 4445 on the server, upgrade the server first,
+then every desktop and Android client. A 0.6.0 client cannot join a 0.6.1
+server.
+
 # Parley 0.6.0
 
 High-motion screen and camera shares stay sharp, and voice keeps its

@@ -41,10 +41,10 @@ pub struct ClientHandle {
     /// DeviceKind wire value (Desktop / Mobile).
     pub device: i32,
     pub device_name: String,
-    /// `Hello.caps` carried VIDEO_STREAMS: this connection reads
-    /// per-frame unidirectional streams, including server-transcoded
-    /// tiers. Fixed at registration; a mid-session change is not a thing.
-    pub video_streams: bool,
+    /// `Hello.caps` carried `MOQ_MEDIA` and the server has a media
+    /// listener. Fixed at registration; a mid-session change is not a
+    /// thing.
+    pub moq_media: bool,
 }
 
 /// One account's live facts, without any one connection's handles.
@@ -343,27 +343,14 @@ impl SessionRegistry {
         self.state.lock().unwrap().by_media.get(&media_id).copied()
     }
 
-    /// The viewer's QUIC connection, for opening per-viewer video streams.
-    pub fn connection_of_media(&self, media_id: u32) -> Option<quinn::Connection> {
+    /// Whether this connection can use the MoQ media plane.
+    pub fn moq_media_of(&self, media_id: u32) -> bool {
         let state = self.state.lock().unwrap();
         state
             .by_media
             .get(&media_id)
             .and_then(|session| state.clients.get(session))
-            .map(|handle| handle.conn.clone())
-    }
-
-    /// Whether this connection negotiated reliable video streams. The
-    /// transcode worker picks its output transport per viewer from here:
-    /// a stream-capable viewer gets the tier in the same framing as the
-    /// sharer's own frames, everyone else keeps fragments.
-    pub fn video_streams_of(&self, media_id: u32) -> bool {
-        let state = self.state.lock().unwrap();
-        state
-            .by_media
-            .get(&media_id)
-            .and_then(|session| state.clients.get(session))
-            .is_some_and(|handle| handle.video_streams)
+            .is_some_and(|handle| handle.moq_media)
     }
 
     pub fn user_of_media(&self, media_id: u32) -> Option<u32> {

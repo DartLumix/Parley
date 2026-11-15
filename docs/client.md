@@ -31,7 +31,8 @@ matching the desktop (`xdg-desktop-portal-hyprland`, `-wlr`, `-kde`,
 **Windows.** Download `parley-<version>-windows-x86_64.zip`, extract it
 anywhere and run `parley.exe` — nothing to install. Voice with echo
 cancellation, chat, sharing (Windows Graphics Capture, with whole-output
-or per-app WASAPI audio) and watching work; the zip is unsigned, so
+or per-app WASAPI audio), hardware Media Foundation encode/decode and
+watching work; the zip is unsigned, so
 SmartScreen warns on the first run. Capturing needs Windows 10 1903 or
 newer; per-app audio uses process loopback, which needs 2004. Settings
 and the remembered login live in `%APPDATA%\parley`; the in-app updater
@@ -42,8 +43,8 @@ log of a swap is `%LOCALAPPDATA%\parley\update.log`).
 
     Server:   host or IP, port optional — the default is 4443, so
               "your-server" is enough. The deploy kit publishes 4443
-              by default; "your-server:443" only if you changed
-              PARLEY_PORT.
+              (control/voice) and 4445 (MoQ media) by default;
+              "your-server:443" only if you changed PARLEY_PORT.
     Username: created by the server owner — from Server management in
               their app, or `docker compose exec parley /parley-server
               adduser alice 'password'` for scripted setup
@@ -133,8 +134,9 @@ same trust decision.
   excluded by construction. The software encoder (openh264) is capped
   at 1080p whatever *Source* says: measured at 1440p it needs ~35 ms per
   frame against a 33 ms slot, so half the frames would be dropped. With
-  *Hardware encoding* on (Linux/VAAPI only) the cap is gone and source
-  1440p60/1080p60 is reachable. The tile's resolution line is the stream
+  *Hardware encoding* on (VA-API on Linux, Media Foundation on Windows,
+  MediaCodec on Android) the cap is gone and source 1440p60/1080p60 is
+  reachable where the encoder holds it. The tile's resolution line is the stream
   viewers get, not the capture. A still desktop still streams: the
   Windows backend repeats the newest frame about once a second while
   nothing changes.
@@ -191,10 +193,11 @@ same trust decision.
   Mod+drag on Hyprland) — the toolbar's drag area works where the
   protocol allows it. Windows keeps its native frame; the fullscreen
   viewer takes the real window fullscreen on both platforms.
-- **Hardware encoding** — the switch in Settings → Video, shown only in
-  builds with the `hw-encode` feature and usable only where VAAPI works.
-  It applies the next time an encoder is created (the next share); a
-  share in flight keeps the backend it started with.
+- **Hardware encoding** — the switch in Settings → Video, shown when the
+  build has a platform encoder. Linux uses the opt-in `hw-encode` build
+  and VA-API; Windows Media Foundation and Android MediaCodec are part of
+  every `video` build. It applies the next time an encoder is created (the
+  next share); a share in flight keeps the backend it started with.
 
 ## Chat files and personal sounds
 
@@ -226,12 +229,12 @@ folder.
 | join a channel, no sound | check the system mixer; joining opens the default devices |
 | share asks nothing / `portal` error | install the ScreenCast backend for your desktop and restart `xdg-desktop-portal` |
 | a watched share is black | sender side: the share's `encoder ready` line; receiver side: frames arriving but not decoding means keyframe/stream shape |
-| hardware encoding switch missing | the build lacks `hw-encode`, or VAAPI has no encoder (`vainfo`) |
+| hardware encoding switch missing | the build has no backend: Linux needs the `hw-encode` build feature and a VAAPI encoder (`vainfo`); Windows/Android `video` builds show it when the platform API exists |
 | share starts but looks blocky after picking a cap | the cap scales the capture down on the CPU; pick *Source* or a larger height on a slow machine |
 | *Source* on a 1440p/4K display streams 1080p | the software encoder's ceiling (see *Screen share*); enable *Hardware encoding* to send the full size |
 | a share stutters while the sender's CPU is busy | software 1080p30 is near the limit on eight cores (~19 ms per frame, p95 ~35 ms). Lower the share height/frame rate, or use hardware encoding |
 | a viewer hears their own voice in the shared stream | the sharer is on the whole-output path (`--share-audio` on the CLI), whose monitor includes our playback; the guard subtracts this client's own playback, but a **second** Parley instance playing to the same sink defeats it. In the app, open *Share screen* → *Share audio* and tick the apps to send: each is captured from its own PipeWire node, and Parley's playback is never offered |
-| a share stutters while the **viewer's** CPU is busy | the viewer reports its decode rate every 5 s. A current server re-encodes a 720p/480p tier for that viewer alone; otherwise (or at the server's cap) the sharer steps its resolution down one rung at a time and only lowers the frame rate at the 480p floor. The `video: viewer sustaining … fps` line in the viewer's log names the number. If it stays low at a small share, the machine has no decode headroom left |
+| a share stutters while the **viewer's** CPU is busy | the viewer drops stale incomplete groups and resumes at the next keyframe, and its five-second report steers the publisher's FPS-first adaptive controller. The server does not transcode. The `video: viewer sustaining … fps` line names the decode rate; if it stays low at a small share, the machine has no decode headroom left |
 | own preview stays black | frames are only produced once capture delivers its first buffer — check the `share: encoder ready` line |
 | a share's tile says "connecting…" | the first decoded frame has not reached the display yet; if it stays there, check the receiver's `video:` lines |
 | *Check for updates* reports "no releases at …" | no `v*` release is published yet, or the GitHub API is rate-limiting. The check reads `releases/latest`, which needs no token and no account |

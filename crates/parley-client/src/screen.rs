@@ -8,8 +8,8 @@
 //! loopback for share audio (the default render device, or one process
 //! loopback client per picked app). Both produce the same messages to
 //! the encoder thread and the same interleaved stereo to the mux, so
-//! pacing, fragmentation, the pace governor and the echo guard are
-//! shared and behave identically.
+//! pacing, the adaptive MoQ publisher and the echo guard are shared and
+//! behave identically.
 //!
 //! ashpd drives the portal (user picks a monitor or window in the
 //! compositor's picker) and hands back a PipeWire node id + fd. A
@@ -17,9 +17,9 @@
 //! memcpy's the frame and try_sends it into a bounded channel — if the
 //! encoder falls behind, frames are dropped, the pw graph is never
 //! stalled. A second thread owns the encoder (5e: a Box<dyn
-//! VideoEncoder> from create_encoder — software today, hardware
-//! backends later): encode → fragment → paced datagrams on the
-//! existing FLAG_VIDEO path.
+//! VideoEncoder> from create_encoder — VA-API where available, OpenH264
+//! otherwise): encode → capped-VBR H.264 access unit → the room's MoQ
+//! broadcast. The server only fans out; it never decodes the picture.
 //!
 //! 6a lifecycle: `start()` runs the portal dance, spawns both threads,
 //! hands the portal Session to a supervisor task, and returns a
@@ -29,8 +29,8 @@
 //! user hitting stop in the desktop's sharing indicator), then tears
 //! down in order — pw loop stop → thread joins → session close — and
 //! reports ShareEvent::Ended. Only after Ended does the client send
-//! StopShare on the control stream, so no video datagram can follow
-//! the stop notice.
+//! StopShare on the control stream, so no media group can follow the
+//! stop notice.
 //!
 //! The pw thread runs the loop as iterate(Finite(100 ms)) + a stop
 //! flag instead of run(): MainLoopBox is !Sync, so quit() can't be
@@ -93,8 +93,6 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::video::VideoLadder;
-use crate::video_stream::{SendOutcome, VideoSender};
 #[cfg(target_os = "linux")]
 use ashpd::desktop::{
     PersistMode,
@@ -102,9 +100,10 @@ use ashpd::desktop::{
 };
 #[cfg(target_os = "linux")]
 use futures_util::StreamExt;
+use parley_core::adaptive::{AdaptiveScreenController, EncoderDecision, FrameSample};
 use parley_core::audio::pipeline::SendPipeline;
-use parley_core::video::{VideoEncoder, bitrate_for, create_encoder_auto, target_fps};
-use parley_proto::video::fragment_frame_with_max;
+use parley_core::moq_media::{MoqEndpoint, MoqVideoPublisher, ShareKind};
+use parley_core::video::{VideoEncoder, create_encoder_auto, target_fps};
 #[cfg(target_os = "linux")]
 use pipewire as pw;
 #[cfg(target_os = "linux")]
@@ -219,6 +218,9 @@ enum ToEncoder {
 #[derive(Clone)]
 pub struct ShareHandle {
     flag: Arc<AtomicBool>,
+    /// The MoQ publisher, shared with the share-audio mux so its Opus
+    /// track lives on the same broadcast and clock as the video.
+    pub moq: Option<MoqVideoPublisher>,
 }
 
 impl ShareHandle {
@@ -236,7 +238,7 @@ impl ShareHandle {
 /// lowers it. A share that cannot honour the request still runs —
 /// unlike `--dmabuf`, nothing here changes the pixels' route, only
 /// their size and rate.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ShareOptions {
     /// Height cap for the encoded frame. The capture's aspect ratio is
     /// preserved; a capture already at or below it is untouched.
@@ -247,10 +249,13 @@ pub struct ShareOptions {
     /// standalone camera share ignores this. The camera runs on its own
     /// thread; if it cannot open, the screen share still starts.
     pub camera_overlay: bool,
-    /// The server advertised reliable video streams in its HelloAck.
-    /// Leave false for an older server: sending streams it never reads
-    /// would fill its receive windows and stall the share.
-    pub video_streams: bool,
+    /// Where the control plane said the room's MoQ listener lives.
+    /// `None` keeps this build from offering a share (a server without
+    /// the media plane has nowhere to fan out H.264).
+    pub moq: Option<MoqEndpoint>,
+    /// Broadcast room and kind (screen vs camera).
+    pub channel_id: u64,
+    pub share_kind: ShareKind,
 }
 
 /// One application's playback, as the platform's audio graph exposes
@@ -447,365 +452,6 @@ struct UserData {
     modifier: u64,
 }
 
-/// Frame-rate rungs the sender will pace at when a viewer says it cannot
-/// decode what it is being sent. The top is the encoder's own ceiling;
-/// the bottom is still recognisably live.
-const FPS_RUNGS: [f64; 7] = [60.0, 50.0, 40.0, 30.0, 24.0, 20.0, 15.0];
-
-/// The viewer-feedback rate governor.
-///
-/// The first version lowered cadence only, keeping resolution and
-/// bitrate. That is the wrong lever for almost every real slump:
-///
-/// - A path short of bandwidth loses fragment-bearing frames, so
-///   spending the same bits on fewer pictures makes each picture bigger
-///   and no easier to deliver. The loss ladder must cut the bitrate
-///   first; this governor gives it one report to do so.
-/// - A viewer short of decode time is short of pixels, not pictures.
-///   Fewer, sharper 1080p frames still cost the same per frame, so the
-///   stream settles at the floor (5 fps) looking perfect and moving like
-///   a slideshow. Resolution is the lever that actually makes a frame
-///   cheaper to decode.
-///
-/// So: lower resolution one standard rung at a time while the viewer
-/// misses 20% of the target rate, and only cut the cadence once the
-/// stream is at 480p (or the capture is already that small). Raise a
-/// rung back only after fifteen seconds at 95%, with a cooldown, so one
-/// compile or one keyframe cannot make it ping-pong.
-struct PaceGovernor {
-    /// Absolute cadence cap; 0 = the profile/dialog base.
-    fps_cap: f64,
-    /// Height cap chosen here; None = the profile/dialog base.
-    height_cap: Option<u32>,
-    /// The viewer reports every five seconds; sample at that cadence.
-    last_sample: std::time::Instant,
-    low: u32,
-    good: u32,
-    /// Frames per second the encoder actually delivered over its last
-    /// measurement second (0 = not measured yet).
-    ///
-    /// A viewer cannot decode more pictures than were sent. Comparing
-    /// its report against this as well as against the configured
-    /// ceiling is what stops a genuinely static source from reading as
-    /// a starved viewer: WGC sends nothing while the desktop does not
-    /// change (the Windows capture adds a 1 Hz keepalive), so a report
-    /// of "1 fps" after a minute of a still screen is the SOURCE's
-    /// rate, not a decode deficit — and folding the stream down to 480p
-    /// for it would be the old 5 fps bug with a new cause.
-    sent_fps: f64,
-    /// The encoder itself cannot hold the pace: sent frames are below
-    /// the target AND capture frames are piling up. Set by the share
-    /// before each step. A viewer report cannot reveal this, because a
-    /// viewer can only report what was actually sent.
-    encoder_backlog: bool,
-    /// The last cadence/resolution change was a probe upward. A low
-    /// report after it backs off for longer than a normal step down.
-    probing: bool,
-    retry_after: Option<std::time::Instant>,
-}
-
-/// The shortest frame this governor will trade down to before it starts
-/// dropping cadence. 480p is still recognisably a desktop at 60 fps.
-const MIN_HEIGHT: u32 = 480;
-
-/// Standard height rungs, tallest first. A capture between two rungs
-/// steps to the next one below it (900p -> 720p, 600p -> 480p).
-const HEIGHT_RUNGS: [u32; 5] = [2160, 1440, 1080, 720, 480];
-
-/// The viewer's report cadence; one decision per report, no faster.
-const SAMPLE_EVERY: Duration = Duration::from_secs(5);
-/// After a successful upward probe, wait this long before the next one.
-const PROBE_COOLDOWN: Duration = Duration::from_secs(30);
-/// After a probe that immediately fell back, leave it alone for longer.
-const FAILED_PROBE_COOLDOWN: Duration = Duration::from_secs(60);
-
-impl PaceGovernor {
-    fn new() -> Self {
-        Self {
-            fps_cap: 0.0,
-            height_cap: None,
-            last_sample: std::time::Instant::now(),
-            low: 0,
-            good: 0,
-            sent_fps: 0.0,
-            encoder_backlog: false,
-            probing: false,
-            retry_after: None,
-        }
-    }
-
-    fn current_fps(&self, base: f64) -> f64 {
-        if self.fps_cap > 0.0 {
-            self.fps_cap.min(base)
-        } else {
-            base
-        }
-    }
-
-    /// `reported` is 0 when no viewer has reported. `current_h` and
-    /// `base_h` are encoder heights; `loss` is the viewer's gap rate;
-    /// `robust` says the loss ladder has already cut the bitrate.
-    fn step(
-        &mut self,
-        base: f64,
-        reported: u32,
-        current_h: u32,
-        base_h: u32,
-        loss: u32,
-        robust: bool,
-    ) -> (f64, Option<u32>) {
-        self.step_at(
-            std::time::Instant::now(),
-            base,
-            reported,
-            current_h,
-            base_h,
-            loss,
-            robust,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn step_at(
-        &mut self,
-        now: std::time::Instant,
-        base: f64,
-        reported: u32,
-        current_h: u32,
-        base_h: u32,
-        loss: u32,
-        robust: bool,
-    ) -> (f64, Option<u32>) {
-        if now.duration_since(self.last_sample) < SAMPLE_EVERY {
-            return (self.fps_cap, self.height_cap);
-        }
-        self.last_sample = now;
-        // A cap above the current base is stale (the capture shrank).
-        if self.height_cap.is_some_and(|h| h >= base_h) {
-            self.height_cap = None;
-        }
-        if reported == 0 {
-            self.fps_cap = 0.0;
-            self.height_cap = None;
-            self.low = 0;
-            self.good = 0;
-            self.probing = false;
-            return (0.0, None);
-        }
-        let current = self.current_fps(base);
-        let r = f64::from(reported);
-        // Only a viewer that missed frames the sender actually SENDS is
-        // behind. Unmeasured (0) keeps the old behaviour.
-        let viewer_behind = self.sent_fps <= 0.0 || r < self.sent_fps * 0.8;
-        if (r < current * 0.8 && viewer_behind) || self.encoder_backlog {
-            self.low += 1;
-            self.good = 0;
-            if self.low < 2 {
-                return (self.fps_cap, self.height_cap);
-            }
-            // Loss? Give the bitrate ladder this report to answer. One
-            // response at a time: a bandwidth problem must not be
-            // mistaken for a decode problem and cost resolution too.
-            if !robust && loss > 50 {
-                return (self.fps_cap, self.height_cap);
-            }
-            if let Some(h) = lower_height(current_h, base_h) {
-                self.height_cap = Some(h);
-                self.low = 0;
-                if self.probing {
-                    self.retry_after = Some(now + FAILED_PROBE_COOLDOWN);
-                    self.probing = false;
-                }
-                if self.encoder_backlog {
-                    println!(
-                        "share: encoder backlog ({:.0} fps sent) at {current:.0} → {h}p (loss \
-                         {loss}‰, was {current_h}p)",
-                        self.sent_fps
-                    );
-                } else {
-                    println!(
-                        "share: viewer reports {reported} fps at {current:.0} → {h}p (loss \
-                         {loss}‰, was {current_h}p)"
-                    );
-                }
-            } else if let Some(f) = lower_fps(current) {
-                self.fps_cap = f;
-                self.low = 0;
-                if self.probing {
-                    self.retry_after = Some(now + FAILED_PROBE_COOLDOWN);
-                    self.probing = false;
-                }
-                if self.encoder_backlog {
-                    println!(
-                        "share: encoder backlog ({:.0} fps sent) at {current_h}p → pacing at \
-                         {f:.0} fps",
-                        self.sent_fps
-                    );
-                } else {
-                    println!(
-                        "share: viewer reports {reported} fps at {current_h}p → pacing at {f:.0} \
-                         fps"
-                    );
-                }
-            }
-            return (self.fps_cap, self.height_cap);
-        }
-        if r >= current * 0.95 {
-            self.good += 1;
-            self.low = 0;
-            let ready = self.retry_after.is_none_or(|t| now >= t);
-            if self.good >= 3 && ready {
-                if current_h < base_h {
-                    if let Some(cap) = raise_height(current_h, base_h) {
-                        self.height_cap = cap;
-                        self.good = 0;
-                        self.probing = true;
-                        self.retry_after = Some(now + PROBE_COOLDOWN);
-                        println!(
-                            "share: viewer recovered ({reported} fps) → probing {}p",
-                            cap.unwrap_or(base_h)
-                        );
-                    }
-                } else if current < base {
-                    if let Some(f) = raise_fps(current, base) {
-                        self.fps_cap = f;
-                        self.good = 0;
-                        self.probing = true;
-                        self.retry_after = Some(now + PROBE_COOLDOWN);
-                        println!(
-                            "share: viewer recovered ({reported} fps) → pacing at {:.0} fps",
-                            if f > 0.0 { f } else { base }
-                        );
-                    }
-                } else {
-                    self.good = 0;
-                    self.probing = false;
-                }
-            }
-        } else {
-            // Somewhere between 80% and 95%: hold, but do not let
-            // unrelated reports accumulate into a step.
-            self.low = 0;
-            self.good = 0;
-        }
-        (self.fps_cap, self.height_cap)
-    }
-}
-
-/// The next standard height below `current`, never below [`MIN_HEIGHT`]
-/// and never at or above `base` (the profile/dialog ceiling). None when
-/// the stream is already as small as this governor goes.
-fn lower_height(current: u32, base: u32) -> Option<u32> {
-    if current <= MIN_HEIGHT || base <= MIN_HEIGHT {
-        return None;
-    }
-    HEIGHT_RUNGS
-        .iter()
-        .copied()
-        .filter(|&h| h < current && h >= MIN_HEIGHT)
-        .max()
-}
-
-/// The next standard height above `current`, capped at `base`. `Some(None)`
-/// means "back to the base cap"; `None` means already at base.
-fn raise_height(current: u32, base: u32) -> Option<Option<u32>> {
-    if current >= base {
-        return None;
-    }
-    let next = HEIGHT_RUNGS
-        .iter()
-        .copied()
-        .filter(|&h| h > current && h < base)
-        .min();
-    Some(next.map(Some).unwrap_or(None))
-}
-
-/// The next rung below `current` on the cadence ladder.
-fn lower_fps(current: f64) -> Option<f64> {
-    FPS_RUNGS
-        .iter()
-        .copied()
-        .filter(|&f| f < current - 0.5)
-        .fold(None, |acc, f| Some(acc.map_or(f, |a: f64| a.max(f))))
-}
-
-/// The next rung above `current`, capped at `base`. `Some(0.0)` means
-/// "back to the base rate" (the no-cap sentinel).
-fn raise_fps(current: f64, base: f64) -> Option<f64> {
-    let next = FPS_RUNGS
-        .iter()
-        .copied()
-        .filter(|&f| f > current + 0.5 && f <= base + 0.5)
-        .fold(base, f64::min);
-    (next > current + 0.5).then_some(if (next - base).abs() < 0.5 { 0.0 } else { next })
-}
-
-/// Sends fragments at the stream's own bitrate instead of in a frame-sized
-/// burst.
-///
-/// This is the fix for the recurring "high motion → 5 fps" failure. The
-/// old send loop spread a frame over half a frame interval, which sounds
-/// like pacing but is not: a 200 KB 1080p keyframe became ~175 datagrams
-/// in 16 ms, i.e. ~87 Mbps on a link the encoder was asked to fill at 15.
-/// Quinn's congestion controller queues what it can and drops the rest;
-/// one missing fragment makes the frame undecodable, and the receiver
-/// then waits for the next IDR — which is also sent as a burst. The
-/// stream looks fine while the screen is still and collapses exactly
-/// when frames get large.
-///
-/// A byte budget makes the burst impossible: every fragment waits for its
-/// own share of the target rate before the next one leaves. A keyframe
-/// takes as long as its bits need (a few hundred milliseconds at worst)
-/// and arrives whole; the capture thread's skip-to-newest rule drops the
-/// frames that arrived during that window, so latency does not grow.
-struct SendPacer {
-    /// When the next fragment may leave. Reset to `now` whenever the
-    /// sender has been idle, so a still screen does not accumulate a
-    /// burst credit it can spend all at once.
-    next: std::time::Instant,
-    bps: u32,
-}
-
-impl SendPacer {
-    fn new(bps: u32) -> Self {
-        Self {
-            next: std::time::Instant::now(),
-            bps: bps.max(1),
-        }
-    }
-
-    fn set_bps(&mut self, bps: u32) {
-        self.bps = bps.max(1);
-    }
-
-    /// Block until `bytes` may be sent at `bps * factor`.
-    ///
-    /// Deadlines advance from the previous deadline, never from "now":
-    /// every sleep overshoots by some microseconds, and resetting the
-    /// schedule after each wakeup turns that into a permanent rate
-    /// deficit (a 15 Mbps stream that actually delivers 12). A late
-    /// wakeup is caught up by sending the next fragments immediately.
-    fn wait_burst(&mut self, bytes: usize, factor: u32) {
-        let now = std::time::Instant::now();
-        // After an idle stretch, do not let the whole gap become burst
-        // credit; one frame's worth of catch-up is plenty.
-        if self.next + Duration::from_millis(50) < now {
-            self.next = now;
-        }
-        if self.next > now {
-            std::thread::sleep(self.next - now);
-        }
-        let bps = self.bps.saturating_mul(factor.max(1));
-        self.next += Duration::from_micros(pace_micros(bytes, bps));
-    }
-}
-
-/// How long one datagram occupies the link at `bps`. At least 1 µs, so a
-/// zero-bit frame cannot make the pacer spin.
-fn pace_micros(bytes: usize, bps: u32) -> u64 {
-    ((bytes as u64).saturating_mul(8_000_000) / u64::from(bps.max(1))).max(1)
-}
-
 /// Everything the sender half needs, shared by both capture paths.
 ///
 /// The memfd path owns one on `encoder_thread`; the DMA-BUF path owns one
@@ -814,28 +460,30 @@ fn pace_micros(bytes: usize, bps: u32) -> u64 {
 /// fragmentation reaches both.
 struct ShareEncoder {
     conn: quinn::Connection,
-    /// Reliable stream transport; `None` keeps the datagram path for an
-    /// older server. A transcode-enabled server serves streams too: the
-    /// workers read whole frames and write their tiers back in this same
-    /// framing.
-    video_stream: Option<VideoSender>,
+    /// Shared MoQ publisher. Screen video and share audio live in this one
+    /// broadcast; the server only fans it out.
+    moq: Option<MoqVideoPublisher>,
+    /// FPS-first, resolution-second, bitrate-third adaptation.
+    adaptive: AdaptiveScreenController,
+    /// Decision from the previous frame, applied before this one encodes.
+    pending_decision: Option<EncoderDecision>,
+    /// A Stage-2 rebuild that failed and must be retried. Without this the
+    /// controller has already moved to the new tier while the old encoder
+    /// keeps running at the old size, and no later decision requests another
+    /// rebuild.
+    pending_resolution: Option<(u32, u32)>,
+    /// This share's capture source produces DMA-BUF frames. Every encoder
+    /// created for it must accept DMA-BUF directly; silently choosing the
+    /// software backend would make every subsequent frame fail.
+    requires_dmabuf: bool,
+    /// The previous capture buffer. The 1 Hz keepalive repeats the same
+    /// `Arc`, which is exactly what “static screen” means here.
+    last_capture: Option<Arc<Vec<u8>>>,
+    static_scene: bool,
     encoder: Option<Box<dyn VideoEncoder>>,
-    ladder: VideoLadder,
-    /// Byte-level fragment pacing at the ladder's current target.
-    pacer: SendPacer,
     fps: f64,
-    /// Viewer-reported sustainable rate and the cap it produced.
-    viewer_fps: Arc<AtomicU32>,
-    fps_cap: f64,
-    governor: PaceGovernor,
-    /// Governor-chosen height cap; None = the profile/dialog cap.
-    height_cap: Option<u32>,
-    /// Encoder height at the base cap: the height a probe can return to.
-    base_height: u32,
-    seq: u16,
     frame_id: u32,
     annexb: Vec<u8>,
-    max_payload: usize,
     encoded: u64,
     stale_skipped: u64,
     window: std::time::Instant,
@@ -845,7 +493,6 @@ struct ShareEncoder {
     last_keyframe: std::time::Instant,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
-    video_loss: Arc<AtomicU32>,
     /// The pre-share dialog's caps (see [`ShareOptions`]).
     options: ShareOptions,
     /// The camera composited into the bottom-right corner, when this is
@@ -891,9 +538,6 @@ struct ShareEncoder {
     /// say 47).
     report_start: std::time::Instant,
     report_frames: u32,
-    /// When this share started, for the no-feedback diagnostic.
-    started: std::time::Instant,
-    warned_no_feedback: bool,
 }
 
 /// One captured frame on its way to the preview thread. The pixels are
@@ -970,6 +614,52 @@ fn spawn_preview_thread(tap: PreviewSink) -> SyncSender<PreviewJob> {
     tx
 }
 
+/// Dial the room's MoQ listener for one share. Screen audio is an Opus
+/// track on the same broadcast; a camera share carries video only.
+///
+async fn connect_publisher(
+    options: &ShareOptions,
+    kind: ShareKind,
+    with_audio: bool,
+) -> Result<Option<MoqVideoPublisher>, String> {
+    let Some(endpoint) = options.moq.as_ref() else {
+        // A share has no second transport now: every screen/camera picture
+        // and share-audio packet goes through the MoQ plane. Returning an
+        // encoder with no destination made `start` report success and then
+        // end on the first frame, which the UI read as a mysterious stop.
+        return Err("server has no MoQ media plane".to_string());
+    };
+    let url = endpoint
+        .publisher_url(options.channel_id, endpoint.user_id, kind)
+        .map_err(|e| format!("moq publisher url: {e}"))?;
+    let fps = options
+        .max_fps
+        .filter(|f| *f > 0.0)
+        .map_or(60, |f| f.round() as u32);
+    let controller = AdaptiveScreenController::new(1920, 1080, fps);
+    let publisher = MoqVideoPublisher::connect(
+        &url,
+        &endpoint.fingerprint,
+        &format!(
+            "room/{}/user/{}/{}",
+            options.channel_id,
+            endpoint.user_id,
+            kind_label(kind)
+        ),
+        controller,
+        with_audio,
+    )
+    .await?;
+    Ok(Some(publisher))
+}
+
+fn kind_label(kind: ShareKind) -> &'static str {
+    match kind {
+        ShareKind::Screen => "screen",
+        ShareKind::Camera => "camera",
+    }
+}
+
 /// The connection-side handles the capture thread needs when it owns the
 /// encoder (DMA-BUF mode). Cloned from `start`'s arguments rather than
 /// shared through a channel, because in that mode the capture thread IS the
@@ -977,17 +667,10 @@ fn spawn_preview_thread(tap: PreviewSink) -> SyncSender<PreviewJob> {
 #[cfg_attr(not(feature = "vaapi"), allow(dead_code))]
 struct ShareSenderArgs {
     conn: quinn::Connection,
-    video_stream: Option<VideoSender>,
+    moq: Option<MoqVideoPublisher>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     force_idr: Arc<AtomicBool>,
-    video_loss: Arc<AtomicU32>,
-    /// The worst decode rate a viewer reported (0 = none). See
-    /// [`PaceGovernor`]: a busy viewer needs fewer pixels per picture
-    /// before it needs fewer pictures.
-    viewer_fps: Arc<AtomicU32>,
-    /// Capture frames dropped because the encoder was busy. The governor
-    /// reads this to distinguish an overwhelmed encoder from a still
-    /// source.
+    /// Capture frames dropped because the encoder was busy.
     capture_drops: Arc<AtomicU64>,
     options: ShareOptions,
     /// The camera overlay's latest-frame slot, when the dialog asked for
@@ -1053,7 +736,7 @@ fn pw_thread(
     // asks for the producer's own buffers. A request this build cannot
     // honor — no `vaapi` feature — was already refused by `start`.
     #[cfg(feature = "vaapi")]
-    let inline = dmabuf.then(|| ShareEncoder::new(sender));
+    let inline = dmabuf.then(|| ShareEncoder::new(sender, true));
     #[cfg(not(feature = "vaapi"))]
     let inline = {
         let _ = (dmabuf, sender);
@@ -1101,20 +784,30 @@ fn pw_thread(
             }
         })
         .param_changed(|_, user_data, id, param| {
-            let Some(param) = param else { return };
+            let Some(param) = param else {
+                // The producer withdrew the format: stop treating the
+                // buffers that follow as valid capture input.
+                user_data.accepted = false;
+                return;
+            };
             if id != spa::param::ParamType::Format.as_raw() {
                 return;
             }
             let (media_type, media_subtype) = match spa::param::format_utils::parse_format(param) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(_) => {
+                    user_data.accepted = false;
+                    return;
+                }
             };
             if media_type != spa::param::format::MediaType::Video
                 || media_subtype != spa::param::format::MediaSubtype::Raw
             {
+                user_data.accepted = false;
                 return;
             }
             if user_data.format.parse(param).is_err() {
+                user_data.accepted = false;
                 return;
             }
             let raw = user_data.format.format().as_raw();
@@ -1166,7 +859,11 @@ fn pw_thread(
                 if bgra { "BGRA" } else { "BGRx" },
                 fps
             );
-            let _ = user_data.tx.try_send(ToEncoder::Negotiated {
+            // A format change must not be dropped behind a full frame
+            // queue: the next buffer is already in the new geometry, and
+            // an encoder that missed this message would interpret it with
+            // the old dimensions. Block briefly for this rare event.
+            let _ = user_data.tx.send(ToEncoder::Negotiated {
                 width: user_data.width,
                 height: user_data.height,
                 fps,
@@ -1598,11 +1295,6 @@ fn buffers_data_type_property() -> spa::pod::Property {
     }
 }
 
-// 7h: `fragment_budget_for` (the connection's live datagram budget)
-// lives in crate::video — both senders use it and only one of them is
-// behind this module's feature gate.
-use crate::video::fragment_budget_for;
-
 /// Encoder dimensions for a capture, given the dialog's height cap.
 ///
 /// Aspect ratio is preserved and the frame is never grown: a 2560x1080
@@ -1611,13 +1303,18 @@ use crate::video::fragment_budget_for;
 /// driver-dependent failure. A cap at or above the capture's height
 /// returns the capture untouched.
 fn fit_encoder_dims(width: usize, height: usize, max_height: Option<u32>) -> (usize, usize) {
-    let Some(cap) = max_height.map(|h| h as usize).filter(|h| *h > 0) else {
-        return (width, height);
-    };
-    if height == 0 || height <= cap {
+    let even = |v: usize| (v & !1).max(2);
+    if width == 0 || height == 0 {
         return (width, height);
     }
-    let even = |v: usize| (v & !1).max(2);
+    let Some(cap) = max_height.map(|h| h as usize).filter(|h| *h > 0) else {
+        // The cap is absent, but every encoder still needs even dimensions:
+        // openh264 rejects an odd width and hardware surfaces are 4:2:0.
+        return (even(width), even(height));
+    };
+    if height <= cap {
+        return (even(width), even(height));
+    }
     let scaled = (width * cap) / height;
     (even(scaled), even(cap))
 }
@@ -1769,30 +1466,25 @@ fn render_preview(
 }
 
 impl ShareEncoder {
-    fn new(sender: ShareSenderArgs) -> Self {
-        let max_payload = fragment_budget_for(&sender.conn);
+    fn new(sender: ShareSenderArgs, requires_dmabuf: bool) -> Self {
         Self {
             conn: sender.conn,
-            video_stream: sender.video_stream,
+            moq: sender.moq,
+            adaptive: AdaptiveScreenController::new(1920, 1080, 60),
+            pending_decision: None,
+            pending_resolution: None,
+            requires_dmabuf,
+            last_capture: None,
+            static_scene: false,
             encoder: None,
-            pacer: SendPacer::new(VideoLadder::new().current_bps()),
-            ladder: VideoLadder::new(),
             fps: 30.0,
-            viewer_fps: sender.viewer_fps,
-            fps_cap: 0.0,
-            governor: PaceGovernor::new(),
-            height_cap: None,
-            base_height: 0,
-            seq: 0x8000,
             frame_id: 0,
             annexb: Vec::with_capacity(1 << 20),
-            max_payload,
             encoded: 0,
             stale_skipped: 0,
             window: std::time::Instant::now(),
             die: sender.die,
             force_idr: sender.force_idr,
-            video_loss: sender.video_loss,
             options: sender.options,
             overlay: sender.overlay,
             overlay_buf: Vec::new(),
@@ -1810,8 +1502,6 @@ impl ShareEncoder {
             sent_fps: 0.0,
             report_start: std::time::Instant::now(),
             report_frames: 0,
-            started: std::time::Instant::now(),
-            warned_no_feedback: false,
             last_encode: None,
             last_keyframe: std::time::Instant::now(),
         }
@@ -1825,21 +1515,19 @@ impl ShareEncoder {
     /// to 1/60 s.
     fn base_fps(&self) -> f64 {
         let cap = self.options.max_fps.filter(|f| *f > 0.0);
-        match cap {
+        let fps = match cap {
             Some(f) => self.fps.min(f64::from(target_fps())).min(f),
             None => self.fps.min(f64::from(target_fps())),
-        }
+        };
+        // A compositor is allowed to report 0/NaN for an unknown format;
+        // that must not become an infinite pacing interval.
+        if fps.is_finite() { fps.max(1.0) } else { 1.0 }
     }
 
     /// What the stream is paced at: the profile/dialog ceiling, lowered
     /// by the viewer's reported decode rate when it cannot hold that.
     fn paced_fps(&self) -> f64 {
-        let base = self.base_fps();
-        if self.fps_cap > 0.0 {
-            base.min(self.fps_cap)
-        } else {
-            base
-        }
+        self.base_fps()
     }
 
     /// The pacing interval the stream is being held to.
@@ -1876,17 +1564,25 @@ impl ShareEncoder {
     fn negotiate(&mut self, width: u32, height: u32, f: f64) {
         self.fps = f;
         self.source = (width as usize, height as usize);
+        // A capture format change replaces both the encoder and the
+        // adaptive controller. Decisions produced against the old one must
+        // not be replayed onto the new one.
+        self.pending_decision = None;
+        self.pending_resolution = None;
         // Two caps compose here: the dialog/profile ceiling
         // (`options.max_height`) and the governor's current height rung.
         // Every rebuild goes through this one rule, so a probe, a capture
         // format change and a stop/start all size the encoder the same.
         let (_, base_h) =
             fit_encoder_dims(width as usize, height as usize, self.options.max_height);
-        let cap = self
-            .height_cap
-            .map_or(base_h as u32, |h| h.min(base_h as u32));
-        let (wanted_w, wanted_h) = fit_encoder_dims(width as usize, height as usize, Some(cap));
-        match create_encoder_auto(wanted_w, wanted_h) {
+        let (wanted_w, wanted_h) =
+            fit_encoder_dims(width as usize, height as usize, Some(base_h as u32));
+        let created = if self.requires_dmabuf {
+            parley_core::video::create_encoder_auto_dmabuf(wanted_w, wanted_h)
+        } else {
+            create_encoder_auto(wanted_w, wanted_h)
+        };
+        match created {
             Ok(mut e) => {
                 // The backend has the last word on dimensions: software
                 // fits itself into the profile it can actually encode in
@@ -1895,25 +1591,14 @@ impl ShareEncoder {
                 // sharer's tile reports — is about the STREAM, so it is
                 // the encoder's size, never the capture's.
                 let (enc_w, enc_h) = e.dimensions();
-                // The height a probe can return to: the dialog/profile cap,
-                // further limited by what the software profile can encode
-                // in real time. The backend has the last word above; this
-                // is the height it would have chosen without a governor
-                // cap, so the governor never probes above the profile.
-                let (base_w, base_h) =
-                    fit_encoder_dims(width as usize, height as usize, self.options.max_height);
-                let base_h = if parley_core::video::hardware_encoder_active() {
-                    base_h
-                } else {
-                    parley_core::video::fit_software_dims(base_w, base_h).1
-                };
-                self.base_height = base_h as u32;
                 let eff = self.paced_fps();
-                let base = bitrate_for(enc_w, enc_h, eff as f32);
-                let applied = self.ladder.set_base(base);
+                let target_fps = eff.round().max(1.0) as u32;
+                self.adaptive =
+                    AdaptiveScreenController::new(enc_w as u32, enc_h as u32, target_fps);
+                let applied = self.adaptive.nominal_bitrate().min(u64::from(u32::MAX)) as u32;
                 println!(
                     "share: encoder ready ({enc_w}x{enc_h}, source {width}x{height} @ {f:.0} fps \
-                     → paced {eff:.0} fps, clean rung {base} bps); hardware={}",
+                     → paced {eff:.0} fps, nominal {applied} bps); hardware={}",
                     parley_core::video::hardware_encoder_active()
                 );
                 // Apply the target even when it equals the ladder's base:
@@ -1923,12 +1608,15 @@ impl ShareEncoder {
                 // untouched was a second source of over-budget bursts on
                 // a 30 fps hardware share.
                 e.set_bitrate(applied);
-                self.pacer.set_bps(applied);
-                if applied != base || self.ladder.on_robust_rung() {
-                    println!("share: bitrate → {applied} bps (scaled to profile)");
-                }
+                // A new encoder is a new H.264 stream. Always start it with
+                // an IDR, even if its first input is not marked as one.
+                e.force_keyframe();
                 self.encoder = Some(e);
                 self.stream = (enc_w as u32, enc_h as u32);
+                self.last_keyframe = std::time::Instant::now();
+                if let Some(moq) = self.moq.as_mut() {
+                    moq.set_video_dimensions(enc_w as u32, enc_h as u32);
+                }
                 self.shown_fps = eff;
                 self.report_start = std::time::Instant::now();
                 self.report_frames = 0;
@@ -1957,75 +1645,36 @@ impl ShareEncoder {
         }
     }
 
-    /// Ladder step + pending keyframe requests, applied to the next frame.
+    /// Apply the previous frame's adaptive decision and pending IDR
+    /// requests before this frame is encoded.
     fn prepare(&mut self) -> Option<&mut Box<dyn VideoEncoder>> {
-        self.encoder.as_ref()?;
-        let base = self.base_fps();
-        let reported = self.viewer_fps.load(Ordering::Relaxed);
-        let loss = self.video_loss.load(Ordering::Relaxed);
-        // Stream backpressure is real congestion: the writer queue or the
-        // server's per-viewer queue filled, so the network is not keeping
-        // up. The server's own reset feedback rides `video_loss` (its
-        // debounced IDR reports carry the viewer's gap rate), so the worse
-        // of the two wins. Taking only the sender's atomic would make a
-        // share look healthy in stream mode exactly while the server is
-        // shedding its frames.
-        let stream_pressure = self
-            .video_stream
-            .as_ref()
-            .map_or(0, VideoSender::take_pressure);
-        let pressure = stream_pressure.max(loss);
-        self.governor.sent_fps = self.sent_fps;
-        // A viewer can only report what was actually sent. If the
-        // encoder is delivering below the pace while capture frames are
-        // piling up, the resolution — not the viewer — is the lever. A
-        // still source has capture_drops at zero, so it cannot trigger
-        // this; neither can a 144 Hz compositor whose encoder is keeping
-        // up, because sent_fps is then at the target.
-        let pace = self.paced_fps();
-        self.governor.encoder_backlog = self.sent_fps > 0.0
-            && self.sent_fps < pace * 0.8
-            && self.capture_skips_last_second > self.sent_last_second / 2;
-        let (fps_cap, height_cap) = self.governor.step(
-            base,
-            reported,
-            self.stream.1,
-            self.base_height,
-            pressure,
-            self.ladder.on_robust_rung(),
-        );
-        self.fps_cap = fps_cap;
-        self.height_cap = height_cap;
-        if reported == 0
-            && self.encoded > 0
-            && self.started.elapsed() >= Duration::from_secs(20)
-            && !self.warned_no_feedback
-        {
-            self.warned_no_feedback = true;
-            eprintln!(
-                "share: no viewer fps report after 20 s of streaming — a viewer behind a server \
-                 older than 0.4.0 cannot steer this share"
-            );
+        let mut force_idr = false;
+        let mut bitrate = None;
+        if let Some(decision) = self.pending_decision.take() {
+            if decision.changed_resolution {
+                self.pending_resolution = Some((decision.width, decision.height));
+            }
+            bitrate = Some(decision.bitrate_bps.min(u64::from(u32::MAX)) as u32);
+            force_idr = decision.force_idr;
         }
-        // A cap change rebuilds the encoder at the new height; the capture
-        // thread keeps handing over full-size frames and `encode_bgra`
-        // scales them. Compare against the LIVE stream height so a rebuild
-        // that failed is retried instead of leaving the governor's state
-        // and the encoder permanently out of step.
-        let want_h = height_cap.map_or(self.base_height, |h| h.min(self.base_height));
-        if want_h != self.stream.1 && self.source.0 > 0 {
-            self.negotiate(self.source.0 as u32, self.source.1 as u32, self.fps);
+        if let Some((width, height)) = self.pending_resolution
+            && self.rebuild_encoder(width, height)
+        {
+            self.pending_resolution = None;
+            // A replacement encoder starts a new H.264 stream and needs an
+            // IDR even when the decision that requested the resize was not
+            // itself flagged for one.
+            force_idr = true;
+        }
+        if let Some(enc) = self.encoder.as_mut() {
+            if let Some(bps) = bitrate {
+                enc.set_bitrate(bps);
+            }
+            if force_idr {
+                enc.force_keyframe();
+            }
         }
         let enc = self.encoder.as_mut()?;
-        if let Some(bps) = self.ladder.step(pressure) {
-            enc.set_bitrate(bps);
-            self.pacer.set_bps(bps);
-            println!("share: bitrate → {bps} bps (video loss ladder)");
-        }
-        if self.ladder.should_force_keyframe() {
-            enc.force_keyframe();
-            println!("share: IDR re-poke (loss epoch)");
-        }
         if self.last_keyframe.elapsed() >= KEYFRAME_EVERY {
             enc.force_keyframe();
             self.last_keyframe = std::time::Instant::now();
@@ -2035,14 +1684,57 @@ impl ShareEncoder {
             println!("share: forced keyframe (viewer joined)");
         }
         if self
-            .video_stream
+            .moq
             .as_ref()
-            .is_some_and(VideoSender::take_keyframe_request)
+            .is_some_and(MoqVideoPublisher::join_idr_pending)
+            && self.adaptive.request_join_idr(std::time::Instant::now())
         {
+            // Only clear the publisher's flag once the controller accepts
+            // the request. If the join fell inside the debounce window,
+            // leave it pending so a later frame can still send the keyframe
+            // the new viewer needs.
+            if let Some(moq) = self.moq.as_ref() {
+                let _ = moq.take_join_idr_request();
+            }
             enc.force_keyframe();
-            println!("share: forced keyframe (stream backpressure)");
+            println!("share: forced keyframe (MoQ subscriber joined)");
         }
         Some(enc)
+    }
+
+    /// Recreate the encoder at a Stage-2 resolution tier. Bitrate-only
+    /// changes never come here, so the common adaptation path has no
+    /// teardown.
+    fn rebuild_encoder(&mut self, width: u32, height: u32) -> bool {
+        let created = if self.requires_dmabuf {
+            parley_core::video::create_encoder_auto_dmabuf(width as usize, height as usize)
+        } else {
+            create_encoder_auto(width as usize, height as usize)
+        };
+        match created {
+            Ok(mut enc) => {
+                let (w, h) = enc.dimensions();
+                enc.set_bitrate(self.adaptive.nominal_bitrate().min(u64::from(u32::MAX)) as u32);
+                self.encoder = Some(enc);
+                self.stream = (w as u32, h as u32);
+                if let Some(moq) = self.moq.as_mut() {
+                    moq.set_video_dimensions(w as u32, h as u32);
+                }
+                if let Some(tap) = &self.tap {
+                    tap.stream_info(StreamInfo {
+                        width: w as u32,
+                        height: h as u32,
+                        fps: self.paced_fps(),
+                    });
+                }
+                println!("share: Stage 2 resolution → {w}x{h}");
+                true
+            }
+            Err(e) => {
+                eprintln!("share: Stage 2 encoder rebuild failed: {e}");
+                false
+            }
+        }
     }
 
     /// Encode one BGRA frame (strided) and send it. Returns false when the
@@ -2068,6 +1760,11 @@ impl ShareEncoder {
             return true;
         }
         self.last_encode = Some(std::time::Instant::now());
+        self.static_scene = self
+            .last_capture
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, data));
+        self.last_capture = Some(data.clone());
         // The preview sees the CAPTURE, before any resolution cap — it is
         // the sharer checking "is the right window in the frame", not a
         // second viewer of the stream. Handing the shared buffer to the
@@ -2234,6 +1931,7 @@ impl ShareEncoder {
         ) -> Result<bool, parley_core::error::Error>,
     ) -> bool {
         let mut annexb = std::mem::take(&mut self.annexb);
+        let started = std::time::Instant::now();
         let encoded = match self.prepare() {
             Some(enc) => encode(enc, &mut annexb),
             None => {
@@ -2241,15 +1939,32 @@ impl ShareEncoder {
                 return true;
             }
         };
+        let encode_dt = started.elapsed();
         let keyframe = match encoded {
             Ok(k) => k,
             Err(e) => {
+                // An encoder error is not backpressure. Keeping the share
+                // "active" after this would show every viewer a frozen
+                // picture forever; end it and let the supervisor report a
+                // stopped share instead.
                 eprintln!("share: encode failed: {e}");
                 self.annexb = annexb;
-                return true;
+                return false;
             }
         };
         self.annexb = annexb;
+        let available_bps = self.moq.as_ref().and_then(|moq| moq.bandwidth_bps());
+        let queued_frames = self.moq.as_ref().map_or(0, |moq| moq.queued_frames());
+        self.pending_decision = Some(self.adaptive.observe(
+            FrameSample {
+                encode: encode_dt,
+                available_bps,
+                queued_frames,
+                static_scene: self.static_scene,
+                keyframe,
+            },
+            std::time::Instant::now(),
+        ));
         self.send(keyframe)
     }
 
@@ -2266,105 +1981,25 @@ impl ShareEncoder {
     }
 
     fn send_inner(&mut self, frame: &[u8], keyframe: bool) -> bool {
-        if let Some(stream) = self.video_stream.as_ref() {
-            // One frame per reliable QUIC stream. No fragmenter, no send
-            // pacer, no duplicate keyframe copies: QUIC owns reliability
-            // and the stream's own flow-control window is the backpressure.
-            let eff_fps = self.paced_fps();
-            let timestamp = (self.frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
-            // Streams and audio datagrams share one QUIC congestion
-            // controller. Pacing the frame here keeps an IDR burst from
-            // filling the window and delaying the audio that follows it —
-            // the same 4x keyframe credit the datagram path uses. Without
-            // this, a 2 s intra period became a periodic audio stutter.
-            self.pacer
-                .wait_burst(frame.len(), if keyframe { 4 } else { 1 });
-            let outcome = stream.send(self.frame_id, timestamp, keyframe, eff_fps > 45.0, frame);
-            self.frame_id = self.frame_id.wrapping_add(1);
-            if keyframe {
-                self.last_keyframe = std::time::Instant::now();
-            }
-            match outcome {
-                SendOutcome::Queued => self.record_send(),
-                SendOutcome::Dropped => {}
-                SendOutcome::Closed => return false,
-            }
-            return true;
+        let Some(moq) = self.moq.as_ref() else {
+            return false;
+        };
+        // Hardware codecs legitimately emit no access unit on some inputs
+        // (MediaCodec/Media Foundation pipeline priming). That is not a
+        // send failure and must not be counted as a dropped frame.
+        if frame.is_empty() {
+            return self.conn.close_reason().is_none();
         }
-        let first_seq = self.seq;
-        // The seq advance must match the fragmenter's own count — it is
-        // computed from the same budget, or the two drift apart the moment
-        // the MTU estimate changes.
-        let frags = frame.len().div_ceil(self.max_payload).max(1) as u16;
-        self.seq = self.seq.wrapping_add(frags);
-        // The codec clock the receiver sees must advance at the rate we
-        // actually pace at (see `paced_fps`), not the compositor's and not
-        // a constant.
-        let eff_fps = self.paced_fps();
-        let timestamp = (self.frame_id as f64 * eff_fps.recip() * 48_000.0) as u32;
-        let dgs = fragment_frame_with_max(
-            self.frame_id,
-            keyframe,
-            frame,
-            first_seq,
-            timestamp,
-            0, // sender_id: the server stamps the authenticated id
-            self.max_payload,
-            // 7h HD: tell viewers this stream runs above ~45 fps (mpv's
-            // rawvideo demuxer needs a nominal rate; a 60 fps stream
-            // announced as 30 plays at half speed).
-            eff_fps > 45.0,
-        );
+        if !moq.send_video(self.frame_id, keyframe, frame) {
+            // A full queue is backpressure (send_video requested an IDR);
+            // only a dead writer means this share is over. The control
+            // connection alone is not enough: the MoQ listener can drop
+            // while the voice session stays healthy.
+            return !moq.is_closed() && self.conn.close_reason().is_none();
+        }
         self.frame_id = self.frame_id.wrapping_add(1);
         if keyframe {
             self.last_keyframe = std::time::Instant::now();
-        }
-        // A keyframe is the recovery anchor. Send it twice when the link
-        // has shown loss, when the ladder is already on a robust rung,
-        // and always for the first frame of a share. A single lost
-        // fragment otherwise destroys the whole IDR and the viewer waits
-        // for the next intra period; two independent copies make that
-        // event p^2 instead of p. The second pass is flagged so the
-        // assembler ignores it once the frame has completed.
-        let copies = if keyframe
-            && (self.encoded == 0
-                || self.ladder.on_robust_rung()
-                || self.video_loss.load(Ordering::Relaxed) > 0)
-        {
-            2
-        } else {
-            1
-        };
-        // A keyframe may burst to 4x the stream's pace: at a low rung a
-        // 100 KB IDR otherwise occupies the link for seconds, exactly when
-        // a stalled viewer needs it most. P-frames keep the strict budget.
-        let burst = if keyframe { 4 } else { 1 };
-        for pass in 0..copies {
-            for dg in &dgs {
-                let bytes = if pass == 0 {
-                    dg.clone()
-                } else {
-                    parley_proto::video::mark_copy(dg)
-                };
-                // Byte pacing, not frame-interval pacing: a fragment may only
-                // leave when the link has budget for it. See `SendPacer`.
-                self.pacer.wait_burst(bytes.len(), burst);
-                if let Err(e) = self.conn.send_datagram(bytes.into()) {
-                    // Real reason, not a guess: TooLarge (the estimate moved
-                    // under us) and ConnectionLost are very different
-                    // diagnoses — and only the second one means the share is
-                    // over. Dropping the frame and re-reading the budget keeps
-                    // the session alive; the viewer rebases on the next
-                    // keyframe. This used to end the share outright, so a
-                    // transient MTU collapse looked like the share crashing.
-                    println!(
-                        "share: send_datagram failed: {e}; dropping this frame and re-reading the \
-                         datagram budget"
-                    );
-                    self.max_payload = fragment_budget_for(&self.conn);
-                    return self.conn.close_reason().is_none();
-                }
-            }
         }
         self.record_send();
         true
@@ -2404,21 +2039,28 @@ impl ShareEncoder {
         }
         let el = self.window.elapsed();
         if el.as_secs() >= 10 {
-            let stats = self.conn.stats();
             println!(
-                "share: encoded {} frames ({:.1} fps), {} stale skipped; target {} bps, \
-                 rtt {:?}, cwnd {} KiB, lost {} packets",
+                "share: encoded {} frames ({:.1} fps), {} stale skipped; target {} bps",
                 self.encoded,
                 self.encoded as f64 / el.as_secs_f64(),
                 self.stale_skipped,
-                self.pacer.bps,
-                stats.path.rtt,
-                stats.path.cwnd / 1024,
-                stats.path.lost_packets
+                self.adaptive.nominal_bitrate()
             );
             self.encoded = 0;
             self.stale_skipped = 0;
             self.window = std::time::Instant::now();
+        }
+    }
+}
+
+impl Drop for ShareEncoder {
+    fn drop(&mut self) {
+        // The parked ShareHandle may still hold a publisher clone after the
+        // supervisor tears the capture down. Closing explicitly stops the
+        // MoQ writer, bandwidth watcher and UDP session even if that UI slot
+        // has not been cleared yet.
+        if let Some(moq) = self.moq.as_ref() {
+            moq.close();
         }
     }
 }
@@ -2460,34 +2102,35 @@ fn encoder_thread(
     rx: Receiver<ToEncoder>,
     conn: quinn::Connection,
     force_idr: Arc<AtomicBool>,
-    video_loss: Arc<AtomicU32>,
-    viewer_fps: Arc<AtomicU32>,
+    _video_loss: Arc<AtomicU32>,
+    _viewer_fps: Arc<AtomicU32>,
     pending: Arc<AtomicBool>,
     capture_drops: Arc<AtomicU64>,
     die: tokio::sync::mpsc::UnboundedSender<()>,
     options: ShareOptions,
     overlay: Option<CameraOverlay>,
     tap: Option<PreviewSink>,
-    video_stream: Option<VideoSender>,
+    moq: Option<MoqVideoPublisher>,
 ) {
     // A panic here must end the share, not leave it looking active.
     let _death = EncoderDeathGuard(Some(die.clone()));
     // The preview gets its own thread for the life of this share; it
     // ends when the encoder drops the channel (share teardown).
     let preview_tx = tap.as_ref().map(|t| spawn_preview_thread(t.clone()));
-    let mut share = ShareEncoder::new(ShareSenderArgs {
-        conn,
-        video_stream,
-        die,
-        force_idr,
-        video_loss,
-        viewer_fps,
-        capture_drops,
-        options,
-        overlay,
-        tap,
-        preview_tx,
-    });
+    let mut share = ShareEncoder::new(
+        ShareSenderArgs {
+            conn,
+            moq,
+            die,
+            force_idr,
+            capture_drops,
+            options,
+            overlay,
+            tap,
+            preview_tx,
+        },
+        false,
+    );
     // The newest capture, kept so a still screen can be refreshed at
     // [`FRAME_KEEPALIVE`]. The Arc makes this one atomic increment, not a
     // second copy of a 1440p frame.
@@ -2517,7 +2160,12 @@ fn encoder_thread(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         match msg {
-            ToEncoder::Negotiated { width, height, fps } => share.negotiate(width, height, fps),
+            ToEncoder::Negotiated { width, height, fps } => {
+                share.negotiate(width, height, fps);
+                // Any frame from the previous format must not be used by
+                // the keepalive against the new encoder geometry.
+                last_frame = None;
+            }
             ToEncoder::Frame {
                 data: first,
                 stride: first_stride,
@@ -2531,9 +2179,11 @@ fn encoder_thread(
                     std::thread::sleep(min_interval - now.duration_since(t));
                 }
 
-                // 2. Skip-to-newest. A Negotiated here is impossible
-                //    (pw delivers the format before any buffer), but
-                //    stash and apply it rather than lose it.
+                // 2. Skip-to-newest. A Negotiated here can appear when a
+                //    capture is resized mid-stream (WGC and PipeWire both
+                //    renegotiate without stopping). It is applied before
+                //    the next frame; the in-hand frame belongs to the old
+                //    geometry and is discarded below.
                 let mut bgra = first;
                 let mut stride = first_stride;
                 let mut renegotiate: Option<(u32, u32, f64)> = None;
@@ -2557,6 +2207,15 @@ fn encoder_thread(
                 }
                 if let Some((width, height, f)) = renegotiate {
                     share.negotiate(width, height, f);
+                    // `bgra` predates the new format. Feeding an old
+                    // capture to a resized encoder would either read past
+                    // the new source geometry or interpret old rows with
+                    // the new dimensions. Drop this frame, clear the
+                    // capture's busy flag, and let the next (new-format)
+                    // frame be the first one encoded.
+                    last_frame = None;
+                    pending.store(false, Ordering::Release);
+                    continue;
                 }
                 last_frame = Some((bgra.clone(), stride));
                 // The Arc came in with the frame: the preview thread
@@ -3184,7 +2843,7 @@ fn f32_stereo_format_pod() -> Vec<u8> {
 pub fn spawn_share_audio_mux(
     mic_rx: Option<tokio::sync::mpsc::Receiver<Vec<f32>>>,
     sys_rx: std::sync::mpsc::Receiver<Vec<f32>>,
-    conn: quinn::Connection,
+    moq: Option<MoqVideoPublisher>,
     mic_route: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<Option<tokio::sync::mpsc::Receiver<Vec<f32>>>> {
     std::thread::spawn(move || {
@@ -3202,12 +2861,6 @@ pub fn spawn_share_audio_mux(
                 return mic_rx;
             }
         };
-        // 7k: FLAG_SHARE_AUDIO marks this stream as a share's system
-        // audio, so receivers gate it on "am I watching this share?"
-        // without touching the sender's voice stream.
-        let flags = parley_proto::media::FLAG_SPEAKING
-            | parley_proto::media::FLAG_STEREO
-            | parley_proto::media::FLAG_SHARE_AUDIO;
         let mut sys_buffer: Vec<f32> = Vec::new();
         let mut sys_alive = true;
         let mut capped: u64 = 0; // frames dropped by the drift cap
@@ -3314,9 +2967,9 @@ pub fn spawn_share_audio_mux(
                 eprintln!("share-audio: encode failed");
                 break;
             }
-            for (seq, ts, pkt) in packets {
-                let dg = parley_proto::media::encode(flags, seq, ts, 0, &pkt);
-                if conn.send_datagram(dg.into()).is_err() {
+            for (_seq, ts, pkt) in packets {
+                let sent = moq.as_ref().is_some_and(|moq| moq.send_audio(&pkt, ts));
+                if !sent {
                     println!("share-audio: connection closed");
                     mic_route.store(false, Ordering::Relaxed);
                     return mic_rx;
@@ -3424,9 +3077,6 @@ pub async fn start(
     let pending = Arc::new(AtomicBool::new(false));
     let capture_drops = Arc::new(AtomicU64::new(0));
     let force_idr = Arc::new(AtomicBool::new(false));
-    let handle = ShareHandle {
-        flag: force_idr.clone(),
-    };
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     // Encoder-death signal: whoever owns an encoder fires it on send
@@ -3442,18 +3092,18 @@ pub async fn start(
     // Only negotiate streams with a server that said it reads them. The
     // snapshot is taken once at startup and shared by the inline (DMA-BUF)
     // encoder and the encoder thread.
-    let video_stream = options
-        .video_streams
-        .then(|| VideoSender::spawn(conn.clone()));
+    let moq = connect_publisher(&options, ShareKind::Screen, audio.is_some()).await?;
+    let handle = ShareHandle {
+        flag: force_idr.clone(),
+        moq: moq.clone(),
+    };
     let sender = ShareSenderArgs {
         conn: conn.clone(),
-        video_stream: video_stream.clone(),
+        moq: moq.clone(),
         die: die_tx.clone(),
         force_idr: force_idr.clone(),
-        video_loss: video_loss.clone(),
-        viewer_fps: viewer_fps.clone(),
         capture_drops: capture_drops.clone(),
-        options,
+        options: options.clone(),
         overlay: overlay.clone(),
         tap: preview.clone(),
         preview_tx: None,
@@ -3480,6 +3130,7 @@ pub async fn start(
     // 7j: in DMA-BUF mode there is no encoder thread — the capture thread
     // owns the encoder, because the producer's buffer must stay dequeued
     // until the GPU has read it. The channel is unused (and dropped) there.
+    let encoder_options = options.clone();
     let enc_handle = if dmabuf {
         drop(frame_rx);
         None
@@ -3494,28 +3145,43 @@ pub async fn start(
                 pending,
                 capture_drops,
                 die_tx,
-                options,
+                encoder_options,
                 overlay_for_encoder,
                 preview,
-                video_stream,
+                moq,
             )
         }))
     };
 
-    // Surface pw setup failures (and close the session on them).
+    // Surface pw setup failures (and close the session on them). A
+    // failure must stop and join BOTH threads before returning: the
+    // PipeWire loop holds an fd and the encoder thread holds the MoQ
+    // publisher, so merely dropping the JoinHandles would detach them and
+    // leave a dead share's UDP session and portal stream alive.
+    let abort_setup = |pw: std::thread::JoinHandle<()>,
+                       enc: Option<std::thread::JoinHandle<()>>| {
+        stop_flag.store(true, Ordering::Relaxed);
+        let _ = pw.join();
+        if let Some(enc) = enc {
+            let _ = enc.join();
+        }
+    };
     let setup = tokio::time::timeout(Duration::from_secs(5), setup_rx).await;
     match setup {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => {
+            abort_setup(pw_handle, enc_handle);
             let _ = session.close().await;
             return Err(format!("pipewire: {e}"));
         }
         Ok(Err(_)) => {
             // oneshot dropped unsent: the thread died before signaling
+            abort_setup(pw_handle, enc_handle);
             let _ = session.close().await;
             return Err("pipewire setup thread died".to_string());
         }
         Err(_) => {
+            abort_setup(pw_handle, enc_handle);
             let _ = session.close().await;
             return Err("pipewire setup timeout".to_string());
         }
@@ -3699,6 +3365,7 @@ mod tests {
     #[test]
     fn resolution_cap_preserves_aspect_and_never_upscales() {
         assert_eq!(fit_encoder_dims(1920, 1080, None), (1920, 1080));
+        assert_eq!(fit_encoder_dims(1367, 769, None), (1366, 768));
         assert_eq!(fit_encoder_dims(1920, 1080, Some(720)), (1280, 720));
         assert_eq!(fit_encoder_dims(1920, 1080, Some(480)), (852, 480));
         assert_eq!(
@@ -3889,177 +3556,6 @@ mod tests {
         let y = h - w / 4 - 8 + 5;
         assert_eq!(&dst[(y * w + x) * 4..][..4], &[255, 255, 255, 255]);
         assert_eq!(&dst[0..4], &[0, 0, 0, 0], "the screen outside stays put");
-    }
-
-    /// 1.25 KB at 10 Mbps occupies 1 ms of link time. The old per-frame
-    /// burst sent the same fragment in microseconds.
-    #[test]
-    fn pacer_budget_is_bytes_over_bitrate() {
-        assert_eq!(pace_micros(1250, 10_000_000), 1000);
-        assert_eq!(pace_micros(0, 10_000_000), 1, "never spin");
-        assert_eq!(pace_micros(1, 0), 8_000_000, "a zero rate is clamped");
-    }
-
-    /// A governor whose first `step_at` is exactly one sample after `t0`
-    /// (the constructor stamps `last_sample` with the real clock, which
-    /// is a hair after a test's `t0` and would swallow the first call).
-    fn fresh_governor(t0: std::time::Instant) -> PaceGovernor {
-        let mut g = PaceGovernor::new();
-        g.last_sample = t0;
-        g
-    }
-
-    /// A still source (a WGC capture of a desktop that does not change)
-    /// sends about one frame a second. A viewer decoding all of them is
-    /// NOT starved, so the governor must leave the stream alone: the
-    /// configured 60 fps ceiling is not the sender's real rate.
-    #[test]
-    fn a_static_source_does_not_look_like_a_starved_viewer() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        g.sent_fps = 1.0;
-        for i in 1..=3 {
-            assert_eq!(
-                g.step_at(t0 + i * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false),
-                (0.0, None),
-                "a 1 fps stream decoded at 1 fps keeps its resolution"
-            );
-        }
-        // The same viewer on a stream that IS sending 30 fps is behind.
-        g.sent_fps = 30.0;
-        g.step_at(t0 + 4 * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false);
-        assert_eq!(
-            g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 1, 1080, 1080, 0, false),
-            (0.0, Some(720)),
-            "two reports short of the real send rate lower resolution"
-        );
-    }
-
-    /// A viewer cannot report the encoder's own shortfall: if 10 frames
-    /// are sent where 30 were promised and capture frames are piling up,
-    /// the report is 10 fps and the stream still needs to get cheaper.
-    #[test]
-    fn an_encoder_that_cannot_hold_the_pace_lowers_resolution() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        g.sent_fps = 10.0;
-        g.encoder_backlog = true;
-        assert_eq!(
-            g.step_at(t0 + SAMPLE_EVERY, 30.0, 10, 1080, 1080, 0, false),
-            (0.0, None)
-        );
-        assert_eq!(
-            g.step_at(t0 + 2 * SAMPLE_EVERY, 30.0, 10, 1080, 1080, 0, false),
-            (0.0, Some(720))
-        );
-    }
-
-    /// No report is not "zero fps": an older viewer (or none in the
-    /// channel yet) must leave the profile's own pace alone.
-    #[test]
-    fn no_viewer_report_keeps_the_profile_pace() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        let step = g.step_at(t0 + SAMPLE_EVERY, 60.0, 0, 1080, 1080, 0, false);
-        assert_eq!(step, (0.0, None));
-        let step = g.step_at(t0 + 2 * SAMPLE_EVERY, 30.0, 0, 1080, 1080, 0, false);
-        assert_eq!(step, (0.0, None));
-    }
-
-    /// A decode-starved viewer costs resolution, never cadence, until the
-    /// 480p floor. Two low reports are needed to step (one bad report is
-    /// noise), then one rung per report.
-    #[test]
-    fn a_slow_viewer_lowers_resolution_before_cadence() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        assert_eq!(
-            g.step_at(t0 + SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false),
-            (0.0, None)
-        );
-        assert_eq!(
-            g.step_at(t0 + 2 * SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false),
-            (0.0, Some(720))
-        );
-        // Each rung also needs two low reports: one bad report is noise.
-        assert_eq!(
-            g.step_at(t0 + 3 * SAMPLE_EVERY, 60.0, 20, 720, 1080, 0, false),
-            (0.0, Some(720))
-        );
-        assert_eq!(
-            g.step_at(t0 + 4 * SAMPLE_EVERY, 60.0, 20, 720, 1080, 0, false),
-            (0.0, Some(480))
-        );
-        // At the floor the only lever left is cadence.
-        assert_eq!(
-            g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 20, 480, 1080, 0, false),
-            (0.0, Some(480))
-        );
-        assert_eq!(
-            g.step_at(t0 + 6 * SAMPLE_EVERY, 60.0, 20, 480, 1080, 0, false),
-            (50.0, Some(480))
-        );
-    }
-
-    /// Loss is the bitrate ladder's problem first: while the viewer is
-    /// losing datagrams, the pace governor must not also spend resolution.
-    #[test]
-    fn loss_gets_the_bitrate_ladder_first() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        for i in 1..5 {
-            assert_eq!(
-                g.step_at(t0 + i * SAMPLE_EVERY, 60.0, 20, 1080, 1080, 100, false),
-                (0.0, None)
-            );
-        }
-    }
-
-    /// The cadence ladder stops at 15 fps. Five fps is not a stream; it
-    /// is the symptom of the old controller treating a transport burst
-    /// as a decode deficit.
-    #[test]
-    fn cadence_never_falls_below_live() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        let mut step = (0.0, Some(480));
-        // Walk the fps rungs from 60 down: every two reports step one
-        // rung, exactly as a sustained decode deficit would.
-        for i in 0..40 {
-            step = g.step_at(
-                t0 + (i as u32 + 1) * SAMPLE_EVERY,
-                60.0,
-                1,
-                480,
-                480,
-                0,
-                false,
-            );
-        }
-        assert_eq!(step.0, 15.0, "the floor is 15 fps, not 5");
-        assert_eq!(step.1, None, "already at the 480p floor");
-    }
-
-    /// A viewer that recovers is probed back up one rung at a time, and
-    /// not until three healthy reports have landed.
-    #[test]
-    fn recovery_walks_up_one_rung_at_a_time() {
-        let t0 = std::time::Instant::now();
-        let mut g = fresh_governor(t0);
-        g.step_at(t0 + SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false);
-        g.step_at(t0 + 2 * SAMPLE_EVERY, 60.0, 20, 1080, 1080, 0, false);
-        assert_eq!(
-            g.step_at(t0 + 3 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
-            (0.0, Some(720))
-        );
-        assert_eq!(
-            g.step_at(t0 + 4 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
-            (0.0, Some(720))
-        );
-        assert_eq!(
-            g.step_at(t0 + 5 * SAMPLE_EVERY, 60.0, 60, 720, 1080, 0, false),
-            (0.0, None)
-        );
     }
 }
 

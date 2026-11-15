@@ -21,6 +21,17 @@ fn config() -> Result<Config, Error> {
     if let Ok(listen) = std::env::var("PARLEY_PRESENCE_LISTEN") {
         config.presence_listen = listen;
     }
+    // The media port is announced to clients in HelloAck, so a published
+    // port that differs from the container's baked 4445 must also be the
+    // port the server binds. Compose passes the same value as both the
+    // host and container side; an explicit environment value wins over
+    // the baked config for that setup.
+    if let Ok(port) = std::env::var("PARLEY_MOQ_PORT") {
+        config.moq_port = port
+            .trim()
+            .parse()
+            .map_err(|e| Error::Config(format!("PARLEY_MOQ_PORT: {e}")))?;
+    }
     Ok(config)
 }
 

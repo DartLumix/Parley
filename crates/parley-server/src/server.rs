@@ -16,7 +16,6 @@ use crate::manage;
 use crate::presence::PresenceServer;
 use crate::session::{ClientHandle, SessionRegistry};
 use crate::tls;
-use crate::transcode::{ReportAction, TranscodeManager};
 use crate::voice::VoiceManager;
 use parley_core::session;
 use parley_proto::Capabilities;
@@ -33,7 +32,9 @@ pub struct Server {
     db: Db,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
-    transcode: Arc<TranscodeManager>,
+    moq_port: u16,
+    moq_fingerprint: String,
+    moq: Option<crate::moq::MoqRelay>,
     /// Chat attachment root (sharded by file id).
     files_dir: PathBuf,
     /// Read-only HTTP snapshot for a dashboard; `None` when disabled.
@@ -87,37 +88,33 @@ impl Server {
                 .expect("10 s is a valid IdleTimeout"),
         ));
 
-        // 6e/7m: outgoing datagram headroom — quinn's default send
-        // buffer is small relative to HD video; a full buffer runs the
+        // Voice datagrams only now: screen and camera media live on the
+        // separate MoQ listener. Keep the send headroom quinn's default
+        // lacks for a full voice channel; a full buffer runs the
         // drop-oldest path, whose accounting has a known panic under
-        // saturation on 0.11.17 (see §8). 8 MiB covers a 1440p60
-        // keyframe plus the frames queued behind it at the 30 Mbps
-        // profile ceiling.
+        // saturation on 0.11.17 (see §8).
         transport.datagram_send_buffer_size(8 * 1024 * 1024);
-        // 6.9: receive side of the 6e buffer fix — the server receives
-        // the sharer's firehose and forwards it; default overflows
-        // under load.
         transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-        // One unidirectional stream per video frame, in both directions
-        // (sharer→server and server→viewer). Quinn's default of 100 is
-        // below what a 60 fps share has in flight; at the cap `open_uni`
-        // waits and every frame behind it waits too. Mirrors the client's
-        // endpoint config. QUIC transport parameters are negotiated PER
-        // CONNECTION, so this is each peer's budget, not a server-wide
-        // pool: ten sharers cannot consume one another's stream slots.
+        // The old one-uni-per-video-frame budget is gone with the custom
+        // video transport, but keep the generous cap other transfers
+        // (attachments, bulk control) already rely on.
         transport.max_concurrent_uni_streams(1024_u32.into());
         quinn_config.transport_config(Arc::new(transport));
 
         let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
         let registry = Arc::new(SessionRegistry::new());
         let voice = Arc::new(VoiceManager::new());
-        // Built once: every session shares the same job table, so the
-        // `max_transcodes` cap is host-wide rather than per connection.
-        let transcode = Arc::new(TranscodeManager::new(
-            config.video.clone(),
-            registry.clone(),
-            voice.clone(),
-        ));
+        let moq = match config.moq_port(addr) {
+            Some(port) => Some(crate::moq::MoqRelay::bind(SocketAddr::new(
+                addr.ip(),
+                port,
+            ))?),
+            None => None,
+        };
+        let moq_port = moq.as_ref().map_or(0, |moq| moq.port);
+        let moq_fingerprint = moq
+            .as_ref()
+            .map_or_else(String::new, |moq| moq.fingerprint.clone());
         // Bound here, not in `run`, so a taken port is a startup error
         // rather than a listener that silently died in a task.
         let presence = if config.presence_listen.trim().is_empty() {
@@ -135,7 +132,9 @@ impl Server {
             db,
             registry,
             voice,
-            transcode,
+            moq_port,
+            moq_fingerprint,
+            moq,
             files_dir,
             presence,
         })
@@ -147,6 +146,18 @@ impl Server {
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// The MoQ media listener, when enabled. Tests use it to pin the
+    /// client to the same identity the control handshake advertised.
+    pub fn moq_addr(&self) -> Option<SocketAddr> {
+        self.moq
+            .as_ref()
+            .map(|moq| SocketAddr::new(self.local_addr().ip(), moq.port))
+    }
+
+    pub fn moq_fingerprint(&self) -> Option<&str> {
+        self.moq.as_ref().map(|moq| moq.fingerprint.as_str())
     }
 
     /// The presence endpoint's bound address, if it is enabled. Tests use
@@ -164,6 +175,10 @@ impl Server {
         // no Mutex, no lock poisoning, and blocking work (Argon2
         // verifies, WAL checkpoints) never touches a tokio worker.
         let db = DbHandle::spawn(self.db);
+        if let Some(moq) = self.moq.take() {
+            info!(port = moq.port, "moq media relay starting");
+            moq.spawn(db.clone(), self.registry.clone(), self.voice.clone());
+        }
         // Ephemeral chat: one sweep every ten minutes. Read-time
         // filtering makes the exact cadence invisible to clients.
         {
@@ -221,10 +236,17 @@ impl Server {
                     let db = db.clone();
                     let registry = self.registry.clone();
                     let voice = self.voice.clone();
-                    let transcode = self.transcode.clone();
                     let files_dir = self.files_dir.clone();
+                    let moq_port = self.moq_port;
+                    let moq_fingerprint = self.moq_fingerprint.clone();
                     tokio::spawn(handle_connection(
-                        conn, db, registry, voice, transcode, files_dir,
+                        conn,
+                        db,
+                        registry,
+                        voice,
+                        moq_port,
+                        moq_fingerprint,
+                        files_dir,
                     ));
                 }
                 Err(e) => warn!(error = %e, "handshake failed"),
@@ -239,11 +261,22 @@ async fn handle_connection(
     db: DbHandle,
     registry: Arc<SessionRegistry>,
     voice: Arc<VoiceManager>,
-    transcode: Arc<TranscodeManager>,
+    moq_port: u16,
+    moq_fingerprint: String,
     files_dir: PathBuf,
 ) {
     let peer = conn.remote_address();
-    match serve(conn.clone(), &db, &registry, &voice, &transcode, &files_dir).await {
+    match serve(
+        conn.clone(),
+        &db,
+        &registry,
+        &voice,
+        moq_port,
+        &moq_fingerprint,
+        &files_dir,
+    )
+    .await
+    {
         Ok(()) => info!(%peer, "session ended"),
         Err(e) => warn!(%peer, error = %e, "session failed"),
     }
@@ -255,7 +288,8 @@ async fn serve(
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
-    transcode: &Arc<TranscodeManager>,
+    moq_port: u16,
+    moq_fingerprint: &str,
     files_dir: &std::path::Path,
 ) -> Result<(), Error> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
@@ -271,10 +305,10 @@ async fn serve(
         &mut tx,
         &HelloAck {
             protocol_version: PROTOCOL_VERSION,
-            // Reliable per-frame streams, always. A client that did not
-            // advertise VIDEO_STREAMS keeps the datagram path regardless.
-            server_caps: Capabilities::VIDEO_STREAMS.0,
+            server_caps: Capabilities::MOQ_MEDIA.0,
             heartbeat_ms: 5_000,
+            moq_port: u32::from(moq_port),
+            moq_fingerprint: moq_fingerprint.to_string(),
         },
     )
     .await?;
@@ -336,7 +370,7 @@ async fn serve(
         media_id: 0, // assigned by register()
         device,
         device_name,
-        video_streams: hello.caps & Capabilities::VIDEO_STREAMS.0 != 0,
+        moq_media: hello.caps & Capabilities::MOQ_MEDIA.0 != 0 && moq_port != 0,
     });
     let session_gen = registered.session;
     let media_id = registered.media;
@@ -378,23 +412,6 @@ async fn serve(
         files_dir.to_path_buf(),
     );
 
-    // Video frames ride reliable unidirectional streams when the client
-    // understands them. Transcode no longer disables this path: the
-    // workers read whole stream frames and write their tiers back through
-    // the same framing. A datagram-era client never advertised the
-    // capability and keeps the fragment path.
-    if hello.caps & Capabilities::VIDEO_STREAMS.0 != 0 {
-        crate::video_stream::spawn_acceptor(
-            conn.clone(),
-            info.id,
-            info.username.clone(),
-            media_id,
-            registry.clone(),
-            voice.clone(),
-            transcode.clone(),
-        );
-    }
-
     // --- Dedicated reader tasks ---
     // Each reader owns its source, so an in-flight read is never
     // cancelled by select — partial reads can never be lost.
@@ -433,7 +450,7 @@ async fn serve(
             biased;
 
             dg = dg_rx.recv() => match dg {
-                Some(d) => route_datagram(&d, &info, media_id, registry, voice, transcode),
+                Some(d) => route_datagram(&d, &info, media_id, registry, voice),
                 None => break Ok(()),
             },
 
@@ -458,7 +475,6 @@ async fn serve(
                         db,
                         registry,
                         voice,
-                        transcode,
                     )
                     .await
                     {
@@ -509,10 +525,6 @@ async fn serve(
     {
         notify_share_stopped(member, member.channel_id, registry, voice);
     }
-    if still_current {
-        transcode.remove_share(media_id);
-        transcode.remove_viewer(media_id);
-    }
     info!(user_id = info.id, "session ended");
     let _ = tx.finish();
     if result.is_err() {
@@ -523,7 +535,7 @@ async fn serve(
 
 /// Handle one client control message. Ok(false) = end session gracefully.
 // The argument list is the session's whole environment (writer, db,
-// registry, voice, transcode); splitting it into a struct would only
+// registry, voice); splitting it into a struct would only
 // move the same list one line up at the single call site.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
@@ -536,7 +548,6 @@ async fn handle_client_message(
     db: &DbHandle,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
-    transcode: &Arc<TranscodeManager>,
 ) -> Result<bool, Error> {
     match msg.body {
         Some(ClientBody::Heartbeat(hb)) => {
@@ -694,8 +705,6 @@ async fn handle_client_message(
                     if voice.stop_sharing(media_id) {
                         notify_share_stopped(old, old.channel_id, registry, voice);
                     }
-                    transcode.remove_share(media_id);
-                    transcode.remove_viewer(media_id);
                     registry.broadcast_voice(
                         info.id,
                         session_gen,
@@ -749,8 +758,6 @@ async fn handle_client_message(
                 if voice.stop_sharing(media_id) {
                     notify_share_stopped(member, member.channel_id, registry, voice);
                 }
-                transcode.remove_share(media_id);
-                transcode.remove_viewer(media_id);
                 registry.broadcast_voice(
                     info.id,
                     session_gen,
@@ -969,17 +976,24 @@ async fn handle_client_message(
             // Scoped to THIS device's share. A desktop share must not be
             // stopped by the phone's state machine ending its own share.
             let member = voice.member(media_id);
-            voice.stop_sharing(media_id);
-            transcode.remove_share(media_id);
-            match member {
-                Some(member) => notify_share_stopped(member, member.channel_id, registry, voice),
-                None => registry.broadcast(ServerMessage {
-                    body: Some(ServerBody::ShareStopped(ShareStopped {
-                        user_id: info.id,
-                        session_id: session_gen,
-                        media_id,
-                    })),
-                }),
+            // The MoQ retraction path may already have retired the share and
+            // sent ShareStopped before this control message reaches us (the
+            // publisher closes its broadcast first). Notifying again makes
+            // viewers tear down the same share twice; only the path that
+            // actually removes the sharing mark owns the announcement.
+            if voice.stop_sharing(media_id) {
+                match member {
+                    Some(member) => {
+                        notify_share_stopped(member, member.channel_id, registry, voice)
+                    }
+                    None => registry.broadcast(ServerMessage {
+                        body: Some(ServerBody::ShareStopped(ShareStopped {
+                            user_id: info.id,
+                            session_id: session_gen,
+                            media_id,
+                        })),
+                    }),
+                }
             }
         }
 
@@ -993,8 +1007,7 @@ async fn handle_client_message(
             // Management is a request/response on the same control stream.
             // Permission failures are ordinary results, not session
             // errors: a regular client that asks still gets an answer.
-            let result =
-                manage::handle(req, info, session_gen, db, registry, voice, transcode).await;
+            let result = manage::handle(req, info, session_gen, db, registry, voice).await;
             session::write_message(
                 tx,
                 &ServerMessage {
@@ -1005,21 +1018,10 @@ async fn handle_client_message(
         }
 
         Some(ClientBody::VideoReport(rep)) => {
-            // 6e: video loss feedback, routed exactly like ReceiverReport
-            // — reporter's channel members, reporter excluded. When the
-            // server is re-encoding for this viewer, the report steers
-            // the server's tier instead: forwarding it would also make
-            // the sharer lower its own stream, and the viewer would get
-            // a double-degraded picture.
+            // Loss feedback is routed exactly like ReceiverReport. The
+            // server never transcodes, so the sharer is the only entity
+            // that can react to it.
             if let Some(channel_id) = voice.channel_of(media_id) {
-                // A request-only report is not a decode-capability
-                // sample: forwarding it must not create a transcode job.
-                if !rep.keyframe_request
-                    && transcode.on_report(media_id, channel_id, rep.viewer_fps)
-                        == ReportAction::Suppress
-                {
-                    return Ok(true);
-                }
                 let msg = ServerMessage {
                     body: Some(ServerBody::VideoReport(VideoReport {
                         reporter_id: info.id,
@@ -1069,7 +1071,10 @@ pub(crate) fn notify_share_stopped(
         })),
     };
     for member in voice.members_of(channel_id) {
-        if member.media_id != sharer.media_id {
+        // Match `announce_share`: same-account devices never received the
+        // ShareStarted for this device, so a ShareStopped for it is noise.
+        // The media id still scopes the message to the one share.
+        if member.media_id != sharer.media_id && member.user_id != sharer.user_id {
             registry.send_to_media(member.media_id, msg.clone());
         }
     }
@@ -1113,7 +1118,6 @@ fn route_datagram(
     media_id: u32,
     registry: &Arc<SessionRegistry>,
     voice: &Arc<VoiceManager>,
-    transcode: &Arc<TranscodeManager>,
 ) {
     let decoded = match parley_proto::media::decode(data) {
         Ok(d) => d,
@@ -1131,22 +1135,11 @@ fn route_datagram(
     let Some(channel_id) = voice.channel_of(media_id) else {
         return; // this device is not in a voice channel: drop
     };
-    let is_video = decoded.flags & parley_proto::media::FLAG_VIDEO != 0;
-    if is_video {
-        // First frame of a new share: tell every other device in the
-        // channel who is behind this media id. Video itself carries no
-        // account, so without this mapping a viewer can only say
-        // "user <media id>". Same-account devices are excluded exactly
-        // like their video is.
-        announce_share(
-            sender.id,
-            &sender.username,
-            media_id,
-            channel_id,
-            registry,
-            voice,
-        );
-        transcode.note_video(media_id, channel_id, decoded.payload);
+    // Video moved to the MoQ media plane. Any video datagram is from an
+    // old client (protocol version 1) and is ignored rather than
+    // relayed into a channel that no current client decodes.
+    if decoded.flags & parley_proto::media::FLAG_VIDEO != 0 {
+        return;
     }
 
     let forwarded = Bytes::from(parley_proto::media::encode(
@@ -1164,7 +1157,6 @@ fn route_datagram(
         .members_of(channel_id)
         .into_iter()
         .filter(|member| member.media_id != media_id && member.user_id != sender.id)
-        .filter(|member| !is_video || transcode.should_forward(media_id, member.media_id))
         .map(|member| member.media_id)
         .collect();
     registry.send_datagram_many(&targets, &forwarded);

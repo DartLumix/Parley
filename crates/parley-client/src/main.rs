@@ -44,6 +44,7 @@ use parley_core::session;
 use parley_proto::{
     AuthDenied, AuthOk, AuthRequest, ChannelMode, ClientBody, ClientMessage, Heartbeat, Hello,
     HelloAck, JoinVoice, ListChannels, PROTOCOL_VERSION, ServerBody, ServerMessage, StopShare,
+    VoiceStatesRequest,
 };
 use prost::Message as _;
 
@@ -264,14 +265,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut tx,
         &Hello {
             protocol_version: PROTOCOL_VERSION,
-            caps: parley_proto::Capabilities::VIDEO_STREAMS.0,
+            caps: parley_proto::Capabilities::MOQ_MEDIA.0,
         },
     )
     .await?;
     let ack: HelloAck = session::read_message(&mut rx).await?;
-    let video_streams = ack.server_caps & parley_proto::Capabilities::VIDEO_STREAMS.0 != 0;
+    let moq_supported = ack.server_caps & parley_proto::Capabilities::MOQ_MEDIA.0 != 0
+        && ack.moq_port != 0
+        && !ack.moq_fingerprint.is_empty();
     #[cfg(not(feature = "video"))]
-    let _ = video_streams;
+    let _ = moq_supported;
 
     session::write_message(
         &mut tx,
@@ -304,6 +307,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("session token (relogin with --token): {}", ok.session_token);
     }
+
+    // The media plane rides a separate UDP listener. The fingerprint and
+    // port came over this authenticated control channel; the token is the
+    // same session token MoQ SETUP presents, so the relay can authorize
+    // every publish and subscribe without a second login.
+    #[cfg(feature = "video")]
+    let moq_endpoint = moq_supported.then(|| parley_core::moq_media::MoqEndpoint {
+        host: conn.remote_address().ip().to_string(),
+        port: ack.moq_port as u16,
+        fingerprint: ack.moq_fingerprint.clone(),
+        token: ok.session_token.clone(),
+        media_id: ok.media_id,
+        user_id: ok.user_id,
+    });
 
     // --- --check: the release/ops smoke test ---
     // A real end-to-end without devices: QUIC + TLS + TOFU verifier +
@@ -416,6 +433,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // One snapshot after joining gives the CLI every pre-existing member's
+    // media id, so --volume (account-scoped) can reach their streams.
+    if !args.volumes.is_empty() {
+        session::write_message(
+            &mut tx,
+            &ClientMessage {
+                body: Some(ClientBody::VoiceStatesRequest(VoiceStatesRequest {})),
+            },
+        )
+        .await?;
+    }
+
     // --- TOFU: pin the server we just fully authenticated against ---
     if pin.is_none() {
         let fp = seen
@@ -464,9 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "video")]
     let video_viewers = parley_client::video::new_viewers();
     #[cfg(feature = "video")]
-    if video_streams {
-        parley_client::video::spawn_stream_reader(&video_viewers, conn.clone());
-    }
+    let moq_senders = parley_core::moq_media::SenderMap::default();
 
     // Feature-mismatch warnings, split per feature so every Args field
     // stays read in every feature combination (dead_code is per-build).
@@ -534,6 +561,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6.9: share-audio plumbing — the mic tee routes mic chunks to the
     // normal encoder, or to the share-audio mux while sharing (the mux
     // owns the route flag; it flips back on every mux exit).
+    // One MoQ subscription per room. It feeds the same receive hub and
+    // mixer the old stream reader fed, so display and playback need no
+    // second decode path. The sender is held for the process lifetime; the
+    // CLI has one room, and dropping it would stop the subscriber.
+    #[cfg(feature = "video")]
+    let (_moq_room_stop, moq_room_stop_rx) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "video")]
+    if let Some(endpoint) = moq_endpoint.clone() {
+        let hub = video_viewers.hub();
+        #[cfg(feature = "audio-device")]
+        let mixer = Some(shared_mixer.clone());
+        #[cfg(not(feature = "audio-device"))]
+        let mixer = None;
+        let senders = moq_senders.clone();
+        tokio::spawn(async move {
+            if let Err(e) = parley_core::moq_media::spawn_room_subscriber(
+                &endpoint,
+                args.channel_id,
+                hub,
+                mixer,
+                senders,
+                moq_room_stop_rx,
+            )
+            .await
+            {
+                eprintln!("moq: room subscription failed: {e}");
+            }
+        });
+    }
+
     #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
     let (mic_mux_tx, mic_mux_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(64);
     #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
@@ -625,6 +682,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "audio-device")]
     let ctrl_mixer = shared_mixer.clone();
     #[cfg(feature = "video")]
+    let ctrl_senders = moq_senders.clone();
+    #[cfg(feature = "video")]
     let ctrl_viewers = video_viewers.clone();
     #[cfg(feature = "screen-capture")]
     let ctrl_poke = keyframe_poke.clone();
@@ -636,6 +695,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match session::read_message::<ServerMessage>(&mut rx).await {
                 Ok(msg) => match msg.body {
+                    Some(ServerBody::VoiceStateList(l)) => {
+                        #[cfg(feature = "audio-device")]
+                        {
+                            let mut mixer = ctrl_mixer.lock().unwrap();
+                            for v in &l.states {
+                                if v.joined {
+                                    mixer.set_owner(v.media_id, v.user_id);
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "audio-device"))]
+                        let _ = l;
+                    }
                     Some(ServerBody::ChatMessage(m)) => {
                         if let Some(rest) = m.text.strip_prefix("PARLEY_LATENCY ") {
                             let Ok(detected) = rest.trim().parse::<i64>() else {
@@ -696,9 +768,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if !v.joined {
                             #[cfg(feature = "audio-device")]
-                            mixer::remove(&ctrl_mixer, v.user_id);
+                            mixer::remove(&ctrl_mixer, v.media_id);
                             #[cfg(feature = "video")]
-                            video::remove_viewer(&ctrl_viewers, v.user_id);
+                            video::remove_viewer(&ctrl_viewers, v.media_id);
+                        } else if v.media_id != 0 {
+                            // Gains are account-scoped; streams carry the
+                            // per-device media id. Keep the bridge current
+                            // so --volume and the speaking levels agree.
+                            #[cfg(feature = "audio-device")]
+                            ctrl_mixer.lock().unwrap().set_owner(v.media_id, v.user_id);
+                        }
+                    }
+                    Some(ServerBody::ShareStarted(s)) => {
+                        #[cfg(not(feature = "video"))]
+                        let _ = s;
+                        #[cfg(feature = "video")]
+                        {
+                            ctrl_senders.set(s.user_id, s.media_id);
                         }
                     }
                     Some(ServerBody::ShareStopped(s)) => {
@@ -708,7 +794,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if s.user_id != ok.user_id {
                             println!("video: user {} stopped sharing", s.user_id);
                             #[cfg(feature = "video")]
-                            video::mark_stopped(&ctrl_viewers, s.user_id);
+                            {
+                                ctrl_senders.remove(s.user_id);
+                                video::mark_stopped(&ctrl_viewers, s.media_id);
+                                #[cfg(feature = "audio-device")]
+                                ctrl_mixer.lock().unwrap().clear_share(s.media_id);
+                            }
                         }
                     }
                     Some(ServerBody::ReceiverReport(rep)) => {
@@ -1197,6 +1288,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 if share_starting || share_ctrl.lock().unwrap().is_some() {
                                     println!("share: already active or starting");
+                                } else if moq_endpoint.is_none() {
+                                    println!(
+                                        "share: this server advertises no MoQ media plane; \
+                                         screen sharing is unavailable"
+                                    );
                                 } else {
                                     share_starting = true;
                                     println!("share: requesting screen capture — pick a monitor or window in the portal dialog");
@@ -1209,6 +1305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let vloss = share_vloss.clone();
                                     let share_audio = cmd_share_audio;
                                     let mux_spawn = mux_spawn_tx.clone();
+                                    let share_moq = moq_endpoint.clone();
                                     tokio::spawn(async move {
                                         let (audio, sys_rx) = if share_audio {
                                             // The CLI keeps the whole-output monitor; our
@@ -1235,7 +1332,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             (None, None)
                                         };
                                         let share_options = screen::ShareOptions {
-                                            video_streams,
+                                            moq: share_moq,
+                                            channel_id: args.channel_id,
+                                            share_kind: parley_core::moq_media::ShareKind::Screen,
                                             ..Default::default()
                                         };
                                         match screen::start(
@@ -1330,10 +1429,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             #[cfg(all(feature = "audio-device", feature = "screen-capture"))]
                             if let Some(sys_rx) = sys {
                                 let mic_rx = cmd_mic_mux_slot.lock().unwrap().take();
+                                let moq_audio = share_poke
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .and_then(|h| h.moq.clone());
                                 cmd_mux_handle = Some(screen::spawn_share_audio_mux(
                                     mic_rx,
                                     sys_rx,
-                                    share_conn.clone(),
+                                    moq_audio,
                                     cmd_mic_route.clone(),
                                 ));
                                 println!("share-audio: mic + system audio mux running");

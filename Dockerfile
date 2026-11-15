@@ -1,8 +1,9 @@
 # ---- Stage 1: shared base with the tools we need ----
 # Alpine (musl-native), not a glibc image cross-compiling to musl: the
-# screen-share transcode path links openh264, a C++ library. A musl-native
-# g++ plus the static libstdc++ is what keeps the final binary self-contained
-# for the `scratch` image below.
+# server's dependency graph includes audiopus_sys, which builds Opus through
+# CMake. A musl-native toolchain plus the static C/C++ runtime is what keeps
+# the final binary self-contained for the `scratch` image below. The server
+# itself has no video codec: screen/camera media is relayed, never encoded.
 FROM rust:1-alpine AS chef
 RUN apk add --no-cache build-base cmake musl-dev perl nasm libstdc++-dev
 RUN cargo install cargo-chef
@@ -20,8 +21,8 @@ COPY --from=planner /app/recipe.json recipe.json
 # only carries workspace members: without this copy `cook` resolves /app/Cargo.toml
 # against a `vendor/moq-vaapi` that does not exist yet and dies on the patch.
 COPY vendor/ vendor/
-# openh264 is C++ and links libstdc++ dynamically by default. Ask the linker
-# for the static archive so the final scratch image needs no C++ runtime.
+# Static C/C++ runtime so the final scratch image needs no shared toolchain
+# libraries from the native CMake build dependencies.
 ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
 # audiopus_sys builds Opus 1.3, whose CMakeLists predates policy 3.5;
 # Alpine's CMake 4 refuses to configure it without this floor. Harmless
@@ -39,7 +40,7 @@ RUN cargo chef cook -p parley-server --release --recipe-path recipe.json \
 COPY . .
 RUN cargo build --release -p parley-server --bin parley-server --bin parley-adduser \
     --target x86_64-unknown-linux-musl
-RUN printf 'listen = "0.0.0.0:4443"\ndata_dir = "/data"\npresence_listen = "0.0.0.0:4444"\n' > /config.toml \
+RUN printf 'listen = "0.0.0.0:4443"\nmoq_port = 4445\ndata_dir = "/data"\npresence_listen = "0.0.0.0:4444"\n' > /config.toml \
     && mkdir -p /data && touch /data/.keep
 
 # ---- Stage 4: the image that actually ships ----
@@ -56,7 +57,7 @@ COPY --from=builder /config.toml /config.toml
 COPY --from=builder --chown=65534:65534 /data /data
 USER 65534:65534
 ENV PARLEY_CONFIG=/config.toml
-EXPOSE 4443/udp
+EXPOSE 4443/udp 4445/udp
 # Read-only presence API for a dashboard; compose publishes it to loopback.
 EXPOSE 4444/tcp
 ENTRYPOINT ["/parley-server"]

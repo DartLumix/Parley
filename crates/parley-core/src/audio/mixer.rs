@@ -129,6 +129,10 @@ impl Voice {
 
 pub struct Mixer {
     voices: HashMap<u32, Voice>,
+    /// media id -> account id. Media datagrams carry only the per-device
+    /// id; the roster and every user-facing control use the account id.
+    /// VoiceState is the authority that joins the two namespaces.
+    owners: HashMap<u32, u32>,
     /// Per-user output gain (the volume bar); unknown ids play at 1.0.
     /// One gain per user — applied to every stream they send.
     gains: HashMap<u32, f32>,
@@ -153,6 +157,7 @@ pub type SharedMixer = Arc<Mutex<Mixer>>;
 pub fn new() -> SharedMixer {
     Arc::new(Mutex::new(Mixer {
         voices: HashMap::new(),
+        owners: HashMap::new(),
         gains: HashMap::new(),
         share_gains: HashMap::new(),
         levels: HashMap::new(),
@@ -161,6 +166,28 @@ pub fn new() -> SharedMixer {
 }
 
 impl Mixer {
+    /// Bind a device's media id to its account. VoiceState/VoiceStateList
+    /// call this; a media packet can arrive before the state, in which
+    /// case the account gain starts applying as soon as this lands.
+    pub fn set_owner(&mut self, media_id: u32, user_id: u32) {
+        self.owners.insert(media_id, user_id);
+    }
+
+    /// The account behind a media id, when a voice-state has named it.
+    pub fn owner_of(&self, media_id: u32) -> Option<u32> {
+        self.owners.get(&media_id).copied()
+    }
+
+    fn gain_for(&self, media_id: u32) -> f32 {
+        let user_id = self.owners.get(&media_id).copied().unwrap_or(media_id);
+        self.gains.get(&user_id).copied().unwrap_or(1.0)
+    }
+
+    fn share_gain_for(&self, media_id: u32) -> f32 {
+        let user_id = self.owners.get(&media_id).copied().unwrap_or(media_id);
+        self.share_gains.get(&user_id).copied().unwrap_or(1.0)
+    }
+
     /// Set a user's output gain; 0.0 mutes them. Survives them
     /// leaving/rejoining.
     pub fn set_gain(&mut self, user_id: u32, gain: f32) {
@@ -186,16 +213,26 @@ impl Mixer {
     }
 
     /// Last peak per sender, (voice, share), measured before gains.
+    /// Keyed by ACCOUNT, aggregating a user's devices by their loudest
+    /// stream; unknown media ids keep their raw id as a fallback.
     pub fn levels(&self) -> Vec<(u32, f32, f32)> {
-        self.levels
-            .iter()
-            .map(|(&id, &(v, s))| (id, v, s))
+        let mut by_user: HashMap<u32, (f32, f32)> = HashMap::new();
+        for (&media_id, &(voice, share)) in &self.levels {
+            let user_id = self.owners.get(&media_id).copied().unwrap_or(media_id);
+            let entry = by_user.entry(user_id).or_insert((0.0, 0.0));
+            entry.0 = entry.0.max(voice);
+            entry.1 = entry.1.max(share);
+        }
+        by_user
+            .into_iter()
+            .map(|(id, (voice, share))| (id, voice, share))
             .collect()
     }
 
     /// Drop a departed sender's decoder state (their gain setting stays).
     pub fn remove(&mut self, sender_id: u32) {
         self.voices.remove(&sender_id);
+        self.owners.remove(&sender_id);
     }
 
     /// Feed one received packet, creating the sender's stream on first
@@ -220,6 +257,20 @@ impl Mixer {
     pub fn clear_share(&mut self, sender_id: u32) {
         if let Some(v) = self.voices.get_mut(&sender_id) {
             v.share = None;
+        }
+    }
+
+    /// Drop every device's share-audio state for one account. The
+    /// listener-facing control names an account, while streams are keyed
+    /// by media id (one account may have a phone and a desktop).
+    pub fn clear_share_for_user(&mut self, user_id: u32) {
+        let ids: Vec<u32> = self
+            .owners
+            .iter()
+            .filter_map(|(&media_id, &owner)| (owner == user_id).then_some(media_id))
+            .collect();
+        for media_id in ids {
+            self.clear_share(media_id);
         }
     }
 
@@ -272,11 +323,11 @@ impl Mixer {
         }
         let mut mix = vec![0.0f32; n * 2];
         for (&id, v) in self.voices.iter() {
-            let gain = self.gains.get(&id).copied().unwrap_or(1.0);
+            let gain = self.gain_for(id);
             if gain == 0.0 {
                 continue; // muted — pending still drains below, timing stays honest
             }
-            let share_gain = gain * self.share_gains.get(&id).copied().unwrap_or(1.0);
+            let share_gain = gain * self.share_gain_for(id);
             if let Some(s) = &v.voice {
                 s.add(&mut mix, gain);
             }
@@ -484,6 +535,63 @@ mod tests {
         );
     }
 
+    /// The roster sets volume by ACCOUNT; media packets carry a DEVICE
+    /// media id. A missing owner bridge made every slider and wheel step
+    /// a no-op even though the mixer was doing exactly what it was told.
+    #[test]
+    fn account_gain_reaches_every_device_stream() {
+        let mixer = new();
+        {
+            let mut m = mixer.lock().unwrap();
+            m.set_owner(101, 7);
+            m.set_owner(102, 7);
+            warm_up(&mut m, 101, &speech_packets(4), false);
+            warm_up(&mut m, 102, &speech_packets(4), false);
+            m.set_gain(7, 0.0);
+        }
+        let mixed = { mixer.lock().unwrap().mix(1) };
+        assert!(
+            mixed.iter().all(|&s| s.abs() < 1e-6),
+            "the account gain must silence every device stream"
+        );
+        let levels = { mixer.lock().unwrap().levels() };
+        assert!(
+            levels.iter().any(|(id, ..)| *id == 7),
+            "levels must be reported under the account id: {levels:?}"
+        );
+        assert!(
+            !levels.iter().any(|(id, ..)| *id == 101 || *id == 102),
+            "device ids must not leak into the roster: {levels:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_users_share_audio_spares_their_voice() {
+        let mixer = new();
+        {
+            let mut m = mixer.lock().unwrap();
+            m.set_owner(201, 9);
+            m.set_owner(202, 9);
+            for (seq, _ts, pkt) in speech_packets(2) {
+                m.push_packet(201, seq, &pkt, false, false).unwrap();
+                m.push_packet(202, seq, &pkt, false, false).unwrap();
+            }
+            for (seq, _ts, pkt) in music_packets(2) {
+                m.push_packet(201, seq, &pkt, true, true).unwrap();
+                m.push_packet(202, seq, &pkt, true, true).unwrap();
+            }
+            m.clear_share_for_user(9);
+            for media_id in [201, 202] {
+                let voice = m.voices.get(&media_id).expect("voice stream");
+                assert!(voice.voice.is_some(), "voice must survive for {media_id}");
+                assert!(
+                    voice.share.is_none(),
+                    "share must be cleared for {media_id}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn two_voices_sum_and_clamp() {
         let mixer = new();
@@ -574,13 +682,14 @@ mod tests {
         let with_share = new();
         {
             let mut m = with_share.lock().unwrap();
+            m.set_owner(11, 42);
             for (seq, _ts, pkt) in speech_packets(6) {
                 m.push_packet(11, seq, &pkt, false, false).unwrap();
             }
             for (seq, _ts, pkt) in music_packets(6) {
                 m.push_packet(11, seq, &pkt, true, true).unwrap();
             }
-            m.set_share_gain(11, 0.0);
+            m.set_share_gain(42, 0.0);
             let _ = m.mix(SAMPLES_PER_FRAME); // warm both decoders
         }
         let voice_only = new();

@@ -57,6 +57,7 @@ cargo run -p parley-server
 
 ```
 INFO parley listening addr=0.0.0.0:4443 fingerprint=<fingerprint>
+INFO parley_server::moq: addr=0.0.0.0:4445 port=4445 moq media listener bound
 ```
 
 A fingerprint that differs from an earlier run means A regenerated its
@@ -67,11 +68,11 @@ first, so settle this before B connects.
 
 ```sh
 ip -4 addr show scope global | grep inet    # <A-ip> is the 192.168.x.y one
-ss -lun | grep 4443                          # one UDP listener
-sudo ufw status                              # only if ufw exists; allow 4443/udp when active
+ss -lun | grep -E '4443|4445'                # control + MoQ media listeners
+sudo ufw status                              # only if ufw exists; allow 4443/udp and 4445/udp when active
 ```
 
-**Pass**: a UDP listener on 4443 and an address B can route to.
+**Pass**: UDP listeners on 4443 and 4445, a MoQ fingerprint in the handshake, and an address B can route to.
 
 ---
 
@@ -281,9 +282,10 @@ video: user 2: 120 shown (120 decoded, 0 no-picture, 0 decode errors), 0 dropped
 The prompt accepts `share` to start a share and `stop` to end one without
 leaving the session.
 
-**Choosing a rate.** `pacing up to P` is the profile ceiling (60 fps
-hardware, 30 fps software) lowered by the capture's own rate and the share
-dialog's cap — not a promise. What the encoder holds is what the 10 s
+**Choosing a rate.** `pacing up to P` is 95% of the measured sustained
+hardware rate (never above the 60 fps profile ceiling) or 30 fps software,
+lowered by the capture's own rate and the share dialog's cap — not a
+promise. What the encoder holds is what the 10 s
 `share: encoded N frames (R fps)` line and the sharer's own tile report
 (the tile replaces the negotiated rate with the measured one after the
 first second). On this project's RX 590 the VAAPI path measured ~14.8 ms
@@ -368,7 +370,7 @@ stats (frames arrived but did not decode vs frames never arrived).
 | `no picture in the last 90 frames` | viewer | frames arrive, nothing decodes — stream shape, not the network |
 | `Native:4 dsFrameCorrupted` / `Native:16 dsNoParamSets` | viewer | keyframes do not stand alone: encoder side |
 | `share: portal: A portal frontend implementing org.freedesktop.portal.ScreenCast was not found` | sender | no ScreenCast-capable backend, or none matching the desktop: see B1a (gtk alone does not count). If the backend is installed and running, the frontend was started without `XDG_CURRENT_DESKTOP` — restart it (B1a) |
-| `share: send_datagram failed: TooLarge` | sender | path MTU collapsed; one frame is dropped by design and the share continues |
+| `moq: room subscription failed` / share starts but no picture | sender or viewer | UDP 4445 is blocked, the server has no MoQ listener, or the authenticated room path was rejected; check the server's `moq media listener bound` line and both firewall rules |
 | session connects, no mpv window | viewer | `mpv` is not on PATH (step B1) |
 | connect times out from B | B | not the server's `0.0.0.0:4443`, wrong `<A-ip>`, or a firewall on A |
 

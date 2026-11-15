@@ -9,8 +9,12 @@ use crate::error::Error;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// UDP listen address for QUIC.
+    /// UDP listen address for the Parley control QUIC endpoint.
     pub listen: String,
+    /// UDP port for the MoQ media listener. Zero derives it from
+    /// `listen` (control port + 2); a control port of 0 disables MoQ,
+    /// which is what the in-process tests use.
+    pub moq_port: u16,
     /// Directory for persistent state (cert, key, database).
     pub data_dir: PathBuf,
     /// Chat attachments. Empty (the default) means `<data_dir>/files`,
@@ -22,78 +26,17 @@ pub struct Config {
     /// disables it. The container sets 0.0.0.0 and compose publishes the
     /// port to 127.0.0.1 on the host only.
     pub presence_listen: String,
-    /// Screen-share transcode policy. Off means the server stays a pure
-    /// datagram relay.
-    pub video: VideoConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:4443".to_string(),
+            moq_port: 0,
             data_dir: "data".into(),
             files_dir: PathBuf::new(),
             presence_listen: "127.0.0.1:4444".to_string(),
-            video: VideoConfig::default(),
         }
-    }
-}
-
-/// Server-side transcode for viewers that cannot decode the sharer's
-/// original stream. The sender still encodes once; a job decodes that
-/// stream and re-encodes only the tiers a weak viewer needs, so strong
-/// viewers keep the untouched original.
-///
-/// Off by default: a small VPS cannot decode a 1440p60 share and encode
-/// a 720p tier in real time, and the resulting 5 fps tier is worse than
-/// handing the viewer back to the sender's own ladder. Enable it only on
-/// a host with spare CPU, and watch the `transcode:` log lines.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct VideoConfig {
-    /// Enable per-viewer transcode. A pure relay when false.
-    pub transcode: bool,
-    /// How many shares may be transcoded at once. Each job is one
-    /// worker thread; 0 disables.
-    pub max_transcodes: usize,
-    /// A viewer reporting below this rate is a transcode candidate.
-    pub min_viewer_fps: u32,
-    /// First tier height (720p by default).
-    pub first_height: u32,
-    /// Second tier, used if the viewer is still slow at the first.
-    pub second_height: u32,
-    /// Encoder threads per job. 1 keeps a job near one core; raising it
-    /// makes the software encoder keep up more easily at 720p.
-    pub threads: usize,
-}
-
-impl Default for VideoConfig {
-    fn default() -> Self {
-        Self {
-            transcode: false,
-            max_transcodes: 1,
-            // A 60 fps share decoded at 30 is not a failure; starting a
-            // second encode for it used to turn a healthy viewer into a
-            // 720p30 one. Only a genuinely stalled decoder is a
-            // candidate, and the server gets two threads to keep up.
-            min_viewer_fps: 15,
-            first_height: 720,
-            second_height: 480,
-            threads: 2,
-        }
-    }
-}
-
-impl VideoConfig {
-    /// Clamp values that would make the worker divide by zero or grow a
-    /// tier instead of shrinking it.
-    pub fn normalized(mut self) -> Self {
-        let even = |v: u32| (v & !1).max(2);
-        self.first_height = even(self.first_height);
-        self.second_height = even(self.second_height).min(self.first_height);
-        self.min_viewer_fps = self.min_viewer_fps.max(1);
-        self.threads = self.threads.clamp(1, 16);
-        self
     }
 }
 
@@ -109,6 +52,21 @@ impl Config {
         }
     }
 
+    /// The MoQ UDP port, or `None` when disabled. Auto-derivation uses
+    /// control port + 2; the two listeners stay on separate sockets.
+    pub fn moq_port(&self, control: std::net::SocketAddr) -> Option<u16> {
+        if self.moq_port != 0 {
+            return Some(self.moq_port);
+        }
+        // Port 0 means the OS picks the control port; deriving "2" from it
+        // would try to bind a privileged socket. A port near 65535 cannot
+        // be derived without colliding with (or wrapping onto) the control
+        // listener either. Disabling the media plane is safer than silently
+        // binding the wrong socket.
+        let port = control.port();
+        (port != 0).then(|| port.checked_add(2)).flatten()
+    }
+
     /// Load from `path`, or defaults if the file doesn't exist.
     pub fn load_or_default(path: &Path) -> Result<Self, Error> {
         if !path.exists() {
@@ -122,22 +80,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     #[test]
-    fn transcode_is_opt_in_and_tiers_stay_ordered() {
-        let video = VideoConfig::default();
-        assert!(!video.transcode, "a small VPS must stay a pure relay");
-        let normalized = VideoConfig {
-            transcode: true,
-            first_height: 481,
-            second_height: 900,
-            ..VideoConfig::default()
-        }
-        .normalized();
-        assert_eq!(normalized.first_height, 480);
-        assert_eq!(
-            normalized.second_height, 480,
-            "second tier never exceeds first"
-        );
+    fn moq_port_derives_from_the_control_port() {
+        let config = Config::default();
+        let addr: SocketAddr = "127.0.0.1:4443".parse().unwrap();
+        assert_eq!(config.moq_port(addr), Some(4445));
+    }
+
+    #[test]
+    fn ephemeral_or_overflowing_control_port_disables_moq() {
+        let config = Config::default();
+        assert_eq!(config.moq_port("127.0.0.1:0".parse().unwrap()), None);
+        assert_eq!(config.moq_port("127.0.0.1:65534".parse().unwrap()), None);
+        assert_eq!(config.moq_port("127.0.0.1:65535".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn explicit_moq_port_wins() {
+        let config = Config {
+            moq_port: 5555,
+            ..Config::default()
+        };
+        assert_eq!(config.moq_port("127.0.0.1:0".parse().unwrap()), Some(5555));
     }
 }

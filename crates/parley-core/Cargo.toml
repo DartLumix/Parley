@@ -11,16 +11,37 @@ thiserror.workspace = true
 audiopus.workspace = true
 cpal = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
+moq-net.workspace = true
+moq-tokio.workspace = true
+moq-mux.workspace = true
+hang.workspace = true
+url.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+bytes.workspace = true
 # 7g: opt-in VAAPI H.264 hardware encoder (§8: polaris VCE wedges the
 # GPU — the user must ASK for this; runtime falls back to software).
 moq-vaapi = { version = "0.1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Media Foundation encode/decode. The same crate version the Windows
+# capture backend uses, so feature unification cannot produce two ABI
+# copies of windows-core in a Windows build.
+windows = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# MediaCodec bridge: the JavaVM/class-loader calls live in video_android.rs.
+# ndk-context is initialized by the Flutter activity before any share or
+# viewer exists; these are target-scoped so desktop builds never see JNI.
+jni = "0.21"
+ndk-context = "0.1"
 
 [features]
 default = []
 # Real audio device I/O (cpal/ALSA). Clients only — the server never
 # enables this, keeping the server build free of system audio deps.
 audio-device = ["cpal"]
-video = ["dep:openh264"]
+video = ["dep:openh264", "dep:windows"]
 # Opt-in hardware encode. NOT in any default chain; the client wires it
 # to --hw-encode. When enabled, create_encoder tries VAAPI first and
 # falls back to software on any init error (never mid-stream — see the

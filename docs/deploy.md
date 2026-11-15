@@ -1,19 +1,22 @@
 # Deploy the server
 
-One container, one UDP port, one volume. The image is a static musl
-binary on `scratch` — no shell, no libc, ~10 MB.
+One container, two UDP ports, one volume. The image is a static musl
+binary on `scratch` — no shell, no libc, ~10 MB. Port 4443 carries the
+control and voice QUIC connection; port 4445 carries MoQ screen, camera
+and share audio.
 
 ## 1. Prerequisites
 
 - A machine (VPS or spare box) with Docker and the compose plugin.
-- **UDP** port reachable from the internet. All traffic is QUIC over
-  UDP; a TCP-only firewall will not work. A domain name is optional —
-  clients accept a host name or an IP.
+- **UDP** ports 4443 and 4445 reachable from the internet. All media
+  traffic is QUIC/MoQ over UDP; a TCP-only firewall will not work. A
+  domain name is optional — clients accept a host name or an IP.
 - About 60 MB of RAM idle (measured 54.8 MB at info logging; the
   container is 1.4 MiB).
 
 ```sh
-sudo ufw allow 4443/udp     # or your chosen port
+sudo ufw allow 4443/udp     # control + voice
+sudo ufw allow 4445/udp     # MoQ screen/camera/share audio
 ```
 
 ## 2. Install
@@ -28,7 +31,8 @@ cd parley-deploy-<version>
 docker load -i parley-image-<version>.tar.gz
 
 cp .env.example .env
-# edit .env: set PARLEY_ADMIN_PASSWORD (first boot only), keep PARLEY_PORT=4443
+# edit .env: set PARLEY_ADMIN_PASSWORD (first boot only), keep
+# PARLEY_PORT=4443 and PARLEY_MOQ_PORT=4445
 
 docker compose up -d
 ```
@@ -39,6 +43,7 @@ Watch for the identity line:
 ```sh
 docker compose logs -f parley
 # INFO parley_server::server: parley listening addr=0.0.0.0:4443 fingerprint=<64 hex>
+# INFO parley_server::moq: addr=0.0.0.0:4445 port=4445 moq media listener bound
 ```
 
 The fingerprint is permanent (it lives in the volume). Send it to the
@@ -77,44 +82,28 @@ additive: an older client still works against a new server, and a new
 client connected to an older server simply has no management entry
 point.
 
-## 4. Screen-share transcode
+## 4. Screen sharing
 
-A viewer that cannot decode the sharer's original stream (a low
-`viewer_fps` in its five-second report) can be given a server-encoded
-tier instead. The sharer's stream is untouched: capable viewers keep
-1080p/60, the struggling viewer gets 720p or 480p at 30 fps. The
-server pays one worker thread per active share (plus its encoder
-threads), and only while a viewer is below the threshold.
+The server is a zero-transcode MoQ relay: screen video, camera video and
+share audio are published by the client and fanned out unchanged. It
+never decodes or re-encodes media, so no GPU or codec library is
+required on the VPS. Room voice stays on port 4443's low-latency QUIC
+datagrams and is independent of MoQ.
 
-It is **off by default**, because a small VPS cannot decode a 1440p60
-share and re-encode a tier in real time. A tier that manages only a few
-pictures per second looks exactly like a slow viewer, so the app hides
-the real stream behind a blurry slideshow. Enable it only on a host with
-spare CPU. The tunables are one concurrent transcode, 720p then 480p,
-two encoder threads and a 15 fps threshold:
+The publisher owns adaptation: capped VBR at a nominal rate scaled to
+its target resolution and FPS, a 2 s IDR interval, and a two-stage
+controller that protects FPS first, then resolution, then bitrate. A
+viewer that falls behind drops stale incomplete groups and resumes at
+the next keyframe rather than slowing the publisher.
 
-```toml
-[video]
-transcode = false
-max_transcodes = 1
-min_viewer_fps = 15
-first_height = 720
-second_height = 480
-threads = 2
-```
-
-When enabled, the worker watches its own output: if it cannot hold 10
-fps for three seconds it stops the job and hands the viewer back to the
-original stream, so a host that is too small cannot become the
-bottleneck it was meant to bypass.
-
-`max_transcodes` is host-wide, not per channel and is the CPU/memory
-ceiling: one job holds the decoded frame plus one encoder per active
-tier (roughly 30–60 MB at 1080p). A second share that needs help falls
-back to the sharer's own resolution ladder. Leaving `transcode = false`
-keeps the server a pure relay with no openh264 work. The
-container's `/config.toml` is baked; mount your own file over it to
-change these values:
+The MoQ listener is configured by `moq_port` in the server config. The
+image bakes `moq_port = 4445`; change it only if that UDP port is taken,
+and open the replacement in the firewall. In the shipped compose setup,
+`PARLEY_MOQ_PORT` sets both the published and the bound/announced port
+(the container gets the same value as an environment override), because
+the handshake advertises the listener port. The container's
+`/config.toml` is baked; mount your own file over it to change values
+not supplied by the environment:
 
 ```yaml
     volumes:
@@ -312,6 +301,7 @@ stored in the database itself, so the volume backup covers them too.
 | symptom | cause / fix |
 |:--|:--|
 | client hangs on "connect" | UDP port not open, wrong port, or a TCP-only firewall rule |
+| shares start but no video arrives | UDP 4445 not open, or the MoQ listener failed to bind (check the startup log) |
 | every client refuses the connection: certificate changed | the volume was recreated (new identity), or a stale pin. Clients show both fingerprints and ask before trusting; only accept it if the new one matches this container's startup log. From a shell, the pinned line lives in `~/.config/parley/known_hosts` |
 | `no users and PARLEY_ADMIN_PASSWORD not set` | first boot without the variable and an empty volume. Set it and restart once, or `adduser` |
 | `adduser` prints BUSY | server was writing; run it again |

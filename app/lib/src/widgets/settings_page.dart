@@ -113,10 +113,11 @@ class _SettingsPageState extends State<SettingsPage> {
           if (widget.hwEncodeSupported)
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Hardware encoding (VAAPI)'),
+              title: const Text('Hardware encoding'),
               subtitle: const Text(
-                'Uses the GPU for the next share you start. Software is '
-                'the safe default; switch back if the GPU misbehaves.',
+                'Uses the platform GPU encoder (VA-API, Media Foundation '
+                'or MediaCodec) for the next share. Software is the safe '
+                'fallback; switch back if the GPU misbehaves.',
               ),
               value: s.hwEncode,
               onChanged: (v) => _update(_copy(hwEncode: v)),

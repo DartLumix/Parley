@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    /// Prefer the VAAPI encoder. Applied by `save`; a share in flight
+    /// Prefer the platform hardware encoder (VA-API, Media Foundation or
+    /// MediaCodec). Applied by `save`; a share in flight
     /// keeps the backend it was created with.
     pub hw_encode: bool,
     /// Show the sharer their own frame while sharing. Off = the capture
@@ -63,6 +64,13 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            // VA-API stays opt-in on Linux (§8: VCE can wedge the GPU).
+            // Media Foundation and MediaCodec are the platform's normal
+            // encode path and fall back at runtime, so a fresh Windows or
+            // Android install starts on hardware.
+            #[cfg(any(windows, target_os = "android"))]
+            hw_encode: true,
+            #[cfg(not(any(windows, target_os = "android")))]
             hw_encode: false,
             // On by default: the first thing a first-time sharer asks is
             // "did I grab the right window?".

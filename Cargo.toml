@@ -13,7 +13,7 @@ exclude = ["vendor/moq-vaapi"]
 
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [workspace.dependencies]
@@ -62,7 +62,9 @@ windows = { version = "0.62", features = [
     "Win32_Media",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-capture = "2.0"
@@ -74,6 +76,14 @@ wasapi = "0.26"
 # pub package irondash_engine_context — app/pubspec.yaml).
 irondash_texture = "0.5"
 irondash_engine_context = "0.5"
+# The current moq-dev media plane. `moq-lite`/`moq-native` are the retired
+# names; do not reintroduce them. Every side of the wire shares these exact
+# versions because the catalog and container encodings are not frozen.
+moq-net = "0.3.23"
+moq-tokio = { version = "0.19.36", default-features = false, features = ["noq", "ring"] }
+moq-mux = "0.10.24"
+hang = "0.21.24"
+url = "2"
 
 # PARLEY PATCH: the published moq-vaapi 0.1.0 hands its SPS/PPS to the driver
 # as packed headers and trusts them to reach the coded buffer. On radeonsi/VCE

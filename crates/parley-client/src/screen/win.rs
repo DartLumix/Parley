@@ -4,7 +4,8 @@
 //! The shape is the Linux backend's, because everything downstream of
 //! the capture is shared: this module produces `ToEncoder` messages
 //! (format, then BGRA frames with a row stride) and the shared encoder
-//! thread paces, fragments and sends them. The share-audio mux is shared
+//! thread paces and publishes them to the room's MoQ broadcast. The
+//! share-audio mux is shared
 //! too; this module only produces interleaved 48 kHz stereo f32, exactly
 //! what PipeWire hands the mux on Linux.
 //!
@@ -17,12 +18,11 @@
 //! `CaptureControl` does.
 //!
 //! Static desktops are a real case (a document, a paused video, an idle
-//! window): WGC only delivers a frame when the content changes, while
-//! the receiver hides a share after five seconds without a datagram. A
-//! 1 Hz keepalive repeats the newest frame's `Arc` — no second copy — and
-//! the shared pace governor now compares viewer reports against the rate
-//! the sender actually delivered, so a still screen cannot be mistaken
-//! for a viewer that cannot keep up.
+//! window): WGC only delivers a frame when the content changes, while a
+//! viewer needs something to keep decoding. A 1 Hz keepalive repeats the
+//! newest frame's `Arc` — no second copy — and the adaptive controller
+//! treats that repeated buffer as a static scene, so a still desktop is
+//! never mistaken for encoder overload and never loses resolution.
 //!
 //! Share audio comes in the same two scopes as Linux:
 //!
@@ -52,9 +52,9 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MF_SOURCE_READERF_STREAMTICK,
-    MF_VERSION, MFCreateAttributes, MFCreateDeviceSource, MFCreateMediaType,
-    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFMediaType_Video, MFSTARTUP_LITE,
-    MFShutdown, MFStartup, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
+    MFCreateAttributes, MFCreateDeviceSource, MFCreateMediaType,
+    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFMediaType_Video,
+    MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
 };
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
@@ -351,9 +351,10 @@ fn open_mf_camera() -> Result<MfCamera, String> {
     unsafe {
         // MTA because this thread only ever owns the source reader; a
         // failure here (RPC_E_CHANGED_MODE on an already-STA thread) is
-        // harmless for Media Foundation's lite startup.
+        // harmless for Media Foundation's process-wide startup.
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_LITE).map_err(|e| format!("Media Foundation: {e}"))?;
+        parley_core::video::ensure_media_foundation()
+            .map_err(|e| format!("Media Foundation: {e}"))?;
 
         let mut attrs: Option<IMFAttributes> = None;
         MFCreateAttributes(&mut attrs, 1).map_err(|e| format!("camera attributes: {e}"))?;
@@ -535,8 +536,11 @@ pub async fn start_camera(
     let force_idr = Arc::new(AtomicBool::new(false));
     let pending = Arc::new(AtomicBool::new(false));
     let capture_drops = Arc::new(AtomicU64::new(0));
+    let moq = super::connect_publisher(&options, parley_core::moq_media::ShareKind::Camera, false)
+        .await?;
     let handle = ShareHandle {
         flag: force_idr.clone(),
+        moq: moq.clone(),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let (die_tx, mut die_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -544,9 +548,6 @@ pub async fn start_camera(
 
     let encoder_pending = pending.clone();
     let encoder_drops = capture_drops.clone();
-    let video_stream = options
-        .video_streams
-        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
     let enc_handle = std::thread::Builder::new()
         .name("parley-camera-encode".into())
         .spawn(move || {
@@ -562,7 +563,7 @@ pub async fn start_camera(
                 options,
                 None,
                 preview,
-                video_stream,
+                moq,
             )
         })
         .map_err(|e| format!("camera encoder thread: {e}"))?;
@@ -619,9 +620,8 @@ pub async fn start_camera(
             }) {
                 eprintln!("camera: capture ended: {e}");
             }
-            unsafe {
-                let _ = MFShutdown();
-            }
+            // Media Foundation is process-wide (the screen encoder and
+            // decoders share it): never shut it down from a camera thread.
             let _ = done_tx.send(());
         })
         .map_err(|e| format!("camera capture thread: {e}"))?;
@@ -635,6 +635,11 @@ pub async fn start_camera(
         }
         Err(_) => {
             stop.store(true, Ordering::Relaxed);
+            // No supervisor was installed. Reap both threads so a slow
+            // camera open cannot outlive the failed start and keep the
+            // device (and its encoder) alive invisibly.
+            let _ = capture_handle.join();
+            let _ = enc_handle.join();
             return Err("camera did not open within 5 s".to_string());
         }
     }
@@ -682,9 +687,7 @@ pub fn start_overlay(
                 if let Err(e) = mf_read(&cam, &stop, |data| slot.publish(data, width, height)) {
                     eprintln!("camera overlay: capture ended: {e}");
                 }
-                unsafe {
-                    let _ = MFShutdown();
-                }
+                // MF is process-wide; see open_mf_camera.
                 overlay.clear();
             }
             Err(e) => {
@@ -714,8 +717,15 @@ pub async fn start(
     }
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ToEncoder>(4);
     let force_idr = Arc::new(AtomicBool::new(false));
+    let moq = super::connect_publisher(
+        &options,
+        parley_core::moq_media::ShareKind::Screen,
+        audio.is_some(),
+    )
+    .await?;
     let handle = ShareHandle {
         flag: force_idr.clone(),
+        moq: moq.clone(),
     };
     // The overlay is opt-in. If the camera fails to open, the thread
     // logs it and the screen keeps going; nothing downstream depends on
@@ -817,14 +827,19 @@ pub async fn start(
     // error, exactly as the portal dialog's cancel is on Linux.
     match ready_rx.await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("capture thread died before starting".to_string()),
+        Ok(Err(e)) => {
+            // The picker/setup path is finished, but join it so the handle
+            // and its COM apartment are released before returning.
+            let _ = capture_thread.join();
+            return Err(e);
+        }
+        Err(_) => {
+            let _ = capture_thread.join();
+            return Err("capture thread died before starting".to_string());
+        }
     }
 
-    let video_stream = options
-        .video_streams
-        .then(|| crate::video_stream::VideoSender::spawn(conn.clone()));
-    let encoder = std::thread::Builder::new()
+    let encoder = match std::thread::Builder::new()
         .name("parley-share-encoder".into())
         .spawn(move || {
             encoder_thread(
@@ -839,10 +854,33 @@ pub async fn start(
                 options,
                 overlay_for_encoder,
                 preview,
-                video_stream,
+                moq,
             )
-        })
-        .map_err(|e| format!("encoder thread: {e}"))?;
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // No supervisor exists yet. Stop WGC and release the picker
+            // session rather than leaving a capture thread the caller can
+            // no longer reach.
+            stop_flag.store(true, Ordering::Relaxed);
+            let thread_id = tid.load(Ordering::Relaxed);
+            if thread_id != 0 {
+                unsafe {
+                    let _ = PostThreadMessageW(
+                        thread_id,
+                        WM_QUIT,
+                        Default::default(),
+                        Default::default(),
+                    );
+                }
+            }
+            // No supervisor was installed, so this is the last owner of
+            // the capture thread's handle. Reap it now rather than leaving
+            // a WGC session alive behind a returned error.
+            let _ = capture_thread.join();
+            return Err(format!("encoder thread: {e}"));
+        }
+    };
 
     let overlay_thread = overlay_for_capture.as_ref().and_then(|overlay| {
         match start_overlay(stop_flag.clone(), overlay.clone()) {

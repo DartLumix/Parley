@@ -11,4 +11,11 @@ message HelloAck {
   uint32 protocol_version = 1;
   uint32 server_caps = 2;
   uint32 heartbeat_ms = 3;
+  // UDP port of the server's MoQ listener. Zero means the server has no
+  // MoQ media plane (and the client must not offer one).
+  uint32 moq_port = 4;
+  // SHA-256 of the MoQ listener certificate, pinned by the client. It
+  // travels over the already-pinned control TLS connection; the MoQ
+  // SETUP itself must present the authenticated session token.
+  string moq_fingerprint = 5;
 }

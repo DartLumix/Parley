@@ -27,7 +27,8 @@ Future<void> save({required AppSettings settings}) =>
 /// Everything the settings page edits. `#[serde(default)]` is on the
 /// container so a file written by an older build (fewer fields) loads.
 class AppSettings {
-  /// Prefer the VAAPI encoder. Applied by `save`; a share in flight
+  /// Prefer the platform hardware encoder (VA-API, Media Foundation or
+  /// MediaCodec). Applied by `save`; a share in flight
   /// keeps the backend it was created with.
   final bool hwEncode;
 

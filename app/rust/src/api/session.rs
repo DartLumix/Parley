@@ -31,9 +31,7 @@
 
 use parley_core::audio::mixer::{self as core_mixer, SharedMixer};
 use std::collections::HashMap;
-#[cfg(feature = "audio-device")]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -430,11 +428,26 @@ struct LiveSession {
     /// the voice startup path; a default-feature build has no voice.
     #[cfg_attr(not(feature = "audio-device"), allow(dead_code))]
     media_id: u32,
-    /// The server advertised reliable video streams in its HelloAck.
-    /// Share startup passes this to the encoder; an older server keeps
-    /// the datagram path.
+    /// The voice channel this session is in. MoQ broadcasts are room
+    /// scoped, so share creation needs it.
     #[cfg_attr(not(feature = "screen-capture"), allow(dead_code))]
-    video_streams: bool,
+    share_channel: Arc<AtomicU64>,
+    /// The room's MoQ listener, as advertised over the authenticated
+    /// control channel. `None` means this server has no media plane.
+    #[cfg(feature = "video")]
+    moq: Option<parley_core::moq_media::MoqEndpoint>,
+    /// Decode hub shared by the display bridge and the room subscriber.
+    #[cfg(feature = "video")]
+    video_hub: SharedVideoReceiveHub,
+    /// MoQ path account id → Parley media id, filled from ShareStarted.
+    #[cfg(feature = "video")]
+    moq_senders: parley_core::moq_media::SenderMap,
+    /// Stops the room's MoQ subscriber when voice ends or the room changes.
+    /// Dropping the sender also stops it (the receiver sees the channel
+    /// close).
+    #[cfg(feature = "video")]
+    #[cfg_attr(not(feature = "audio-device"), allow(dead_code))]
+    moq_room_stop: Option<tokio::sync::watch::Sender<bool>>,
     /// Mic mute: the capture callback drops chunks while this is set
     /// (no packets at all, rather than silence packets). Session-scoped
     /// and deliberately not cleared by leave/join — muting is a user
@@ -959,6 +972,14 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             vec![e]
         }
         ServerBody::VoiceState(v) => {
+            // Media streams are keyed by the per-device media id; the
+            // roster and the volume controls are account-scoped. Record
+            // the join before any packet can reach the mixer.
+            if v.joined {
+                if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                    s.mixer.lock().unwrap().set_owner(v.media_id, v.user_id);
+                }
+            }
             // A departed user's decoder state drops (the terminal
             // client's mixer::remove — done here so the event path and
             // the mix stay consistent). 7f: their video surface is
@@ -1138,6 +1159,16 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             vec![e]
         }
         ServerBody::VoiceStateList(l) => {
+            // The snapshot is where a late joiner learns which device
+            // belongs to which account. Without this, a user already in
+            // the channel has no owner mapping until they rejoin, and
+            // their volume slider/scroll appears inert.
+            if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+                let mut mixer = s.mixer.lock().unwrap();
+                for v in &l.states {
+                    mixer.set_owner(v.media_id, v.user_id);
+                }
+            }
             let mut e = ev("voice_states");
             e.states = l
                 .states
@@ -1153,6 +1184,10 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             vec![e]
         }
         ServerBody::ShareStarted(s) => {
+            #[cfg(feature = "video")]
+            if let Some(sess) = SESSIONS.lock().unwrap().get(&session_id) {
+                sess.moq_senders.set(s.user_id, s.media_id);
+            }
             // Video datagrams carry the per-device media id. This is the
             // server-stamped owner, so the card can show a name instead
             // of "user 5" and can be pruned against the account roster.
@@ -1184,14 +1219,14 @@ fn to_event(session_id: u32, msg: &ServerMessage) -> Vec<SessionEvent> {
             {
                 if s.user_id != own_user_id(session_id) {
                     if let Some(sess) = SESSIONS.lock().unwrap().get(&session_id) {
-                        // 7k: the sharer's audio stream ends with the
-                        // share. Flush what is still buffered (and stop
-                        // the decoder's PLC extrapolation) so no tail
-                        // plays on after the card is gone — the stream
-                        // itself keeps existing for their voice. Keyed
-                        // by media id: the account id is not a mixer or
-                        // display key.
-                        sess.mixer.lock().unwrap().remove(s.media_id);
+                        // 7k: the sharer's SHARE audio stream ends with
+                        // the share. Flush what is still buffered (and stop
+                        // the decoder's PLC extrapolation) so no tail plays
+                        // on after the card is gone; their voice stream keeps
+                        // existing. Keyed by media id: the account id is not
+                        // a mixer or display key.
+                        sess.moq_senders.remove(s.user_id);
+                        sess.mixer.lock().unwrap().clear_share(s.media_id);
                         if let Some(d) = sess.display.as_ref() {
                             d.sender_stopped(s.media_id, false);
                         }
@@ -1361,6 +1396,7 @@ fn enable_voice(session_id: u32, channel_id: u64) {
                 return;
             }
         }
+        s.share_channel.store(channel_id, Ordering::Relaxed);
         (
             s.mixer.clone(),
             s.conn.clone(),
@@ -1375,6 +1411,49 @@ fn enable_voice(session_id: u32, channel_id: u64) {
             s.mic_level.clone(),
         )
     };
+
+    // Subscribe to every share in the room on the same voice membership
+    // event that enables audio. The server scopes the origin to the
+    // channel, so this task only ever sees broadcasts it may watch.
+    #[cfg(feature = "video")]
+    let (moq_room, moq_room_stop) = {
+        let mut sessions = SESSIONS.lock().unwrap();
+        let Some(s) = sessions.get_mut(&session_id) else {
+            return;
+        };
+        // A join for a new room must stop the previous room's subscriber.
+        if let Some(previous) = s.moq_room_stop.take() {
+            let _ = previous.send(true);
+        }
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        s.moq_room_stop = Some(stop_tx);
+        let room = s.moq.clone().map(|endpoint| {
+            (
+                endpoint,
+                s.video_hub.clone(),
+                s.moq_senders.clone(),
+                s.mixer.clone(),
+            )
+        });
+        (room, stop_rx)
+    };
+    #[cfg(feature = "video")]
+    if let Some((endpoint, hub, senders, room_mixer)) = moq_room {
+        tokio::spawn(async move {
+            if let Err(e) = parley_core::moq_media::spawn_room_subscriber(
+                &endpoint,
+                channel_id,
+                hub,
+                Some(room_mixer),
+                senders,
+                moq_room_stop,
+            )
+            .await
+            {
+                eprintln!("moq: room subscription failed: {e}");
+            }
+        });
+    }
 
     let epoch = VOICE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     tokio::task::spawn_blocking(move || {
@@ -1431,6 +1510,43 @@ fn enable_voice(session_id: u32, channel_id: u64) {
 #[cfg(feature = "audio-device")]
 fn disable_voice(session_id: u32) {
     VOICE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    // Close the room's MoQ subscription before dropping the devices. The
+    // receiver also stops when the sender is merely dropped, but sending
+    // explicitly wakes it immediately instead of on the next announcement.
+    #[cfg(feature = "video")]
+    if let Some(stop) = SESSIONS
+        .lock()
+        .unwrap()
+        .get_mut(&session_id)
+        .and_then(|s| s.moq_room_stop.take())
+    {
+        let _ = stop.send(true);
+    }
+    // Account ids can repeat in the next room while device media ids do
+    // not; a leftover mapping would feed a new room's frames into the old
+    // room's decoder/mixer slot.
+    #[cfg(feature = "video")]
+    if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+        s.moq_senders.clear();
+    }
+    // A share cannot outlive voice membership; leaving must also drop the
+    // room id so a later share cannot target the old channel.
+    if let Some(s) = SESSIONS.lock().unwrap().get(&session_id) {
+        s.share_channel.store(0, Ordering::Relaxed);
+    }
+    // Stop the capture explicitly. Waiting for the server's MoQ channel
+    // check only ends the publisher a second later and leaves the picker /
+    // supervisor holding a device for that whole window.
+    #[cfg(feature = "screen-capture")]
+    let share_ctrl = SESSIONS
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .and_then(|s| s.share_ctrl.lock().unwrap().take());
+    #[cfg(feature = "screen-capture")]
+    if let Some(ctrl) = share_ctrl {
+        ctrl.request_stop();
+    }
     let ctrl = SESSIONS
         .lock()
         .unwrap()
@@ -1530,7 +1646,7 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
         &mut tx,
         &Hello {
             protocol_version: PROTOCOL_VERSION,
-            caps: parley_proto::Capabilities::VIDEO_STREAMS.0,
+            caps: parley_proto::Capabilities::MOQ_MEDIA.0,
         },
     )
     .await
@@ -1538,7 +1654,10 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     let ack: HelloAck = session::read_message(&mut rx)
         .await
         .map_err(|e| format!("hello ack: {e}"))?;
-    let video_streams = ack.server_caps & parley_proto::Capabilities::VIDEO_STREAMS.0 != 0;
+    #[cfg_attr(not(feature = "video"), allow(unused_variables))]
+    let moq_supported = ack.server_caps & parley_proto::Capabilities::MOQ_MEDIA.0 != 0
+        && ack.moq_port != 0
+        && !ack.moq_fingerprint.is_empty();
 
     let (password, session_token) = match auth {
         Auth::Password(p) => (p, String::new()),
@@ -1689,9 +1808,14 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
     #[cfg(feature = "video")]
     start_video_reporter(session_id, session_hub.clone(), cmd_tx.clone());
     #[cfg(feature = "video")]
-    if video_streams {
-        parley_client::video_stream::spawn_reader(conn.clone(), session_hub.clone());
-    }
+    let moq = moq_supported.then(|| parley_core::moq_media::MoqEndpoint {
+        host: conn.remote_address().ip().to_string(),
+        port: ack.moq_port as u16,
+        fingerprint: ack.moq_fingerprint.clone(),
+        token: ok.session_token.clone(),
+        media_id: ok.media_id,
+        user_id: ok.user_id,
+    });
 
     SESSIONS.lock().unwrap().insert(
         session_id,
@@ -1705,7 +1829,15 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
             user_id: ok.user_id,
             server_session_id: ok.session_id,
             media_id: ok.media_id,
-            video_streams,
+            share_channel: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "video")]
+            moq,
+            #[cfg(feature = "video")]
+            video_hub: session_hub.clone(),
+            #[cfg(feature = "video")]
+            moq_senders: parley_core::moq_media::SenderMap::default(),
+            #[cfg(feature = "video")]
+            moq_room_stop: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "audio-device")]
             mic_level: Arc::new(AtomicU32::new(0)),
@@ -2198,10 +2330,15 @@ pub fn manage_kick(session_id: u32, user_id: u32, channel_id: u64) -> Result<(),
 static SHARE_AUDIO_AUDIBLE: LazyLock<Mutex<std::collections::HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-/// Is this sender's share audio being played? Read by the media reader
-/// (voice.rs) for every FLAG_SHARE_AUDIO datagram.
+/// Is this device's share audio being played? Read by the media reader
+/// (voice.rs) for every FLAG_SHARE_AUDIO datagram. The listener toggled
+/// an ACCOUNT; the datagram names a MEDIA id; the mixer's owner map is
+/// the bridge between the two namespaces.
 #[cfg(feature = "audio-device")]
-pub(crate) fn share_audio_audible(user_id: u32) -> bool {
+pub(crate) fn share_audio_audible(mixer: &SharedMixer, media_id: u32) -> bool {
+    let Some(user_id) = mixer.lock().unwrap().owner_of(media_id) else {
+        return false;
+    };
     SHARE_AUDIO_AUDIBLE.lock().unwrap().contains(&user_id)
 }
 
@@ -2231,8 +2368,9 @@ pub fn set_share_audio(session_id: u32, user_id: u32, audible: bool) -> Result<(
         }
         if !audible {
             // Flush the share's buffered tail — the voice stream is a
-            // separate pipeline and is deliberately untouched.
-            mixer.lock().unwrap().clear_share(user_id);
+            // separate pipeline and is deliberately untouched. A user can
+            // have more than one device sharing, so clear all of them.
+            mixer.lock().unwrap().clear_share_for_user(user_id);
         }
         Ok(())
     }
@@ -2296,7 +2434,7 @@ pub fn play_voice_chime(join: bool) {
 // share OR the desktop's own sharing indicator — both converge on Ended
 // → StopShare AFTER teardown.
 
-/// Toggle hardware (VAAPI) encode preference. Takes effect at the next
+/// Toggle the platform hardware encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
 /// re-share to switch. Returns the new state. Featureless: no-op stub
 /// (generated glue references this unconditionally).
@@ -2326,12 +2464,14 @@ pub fn hw_encode_enabled() -> bool {
     }
 }
 
-/// Whether this build can hardware-encode at all (the `hw-encode`
-/// feature pulls the VAAPI backend). The Dart side hides the HW-encode
-/// toggle when this is false — flipping the preference without the
-/// backend would silently do nothing.
+/// Whether this build can hardware-encode at all. Linux needs the opt-in
+/// `hw-encode` feature (VA-API); Windows and Android carry Media Foundation
+/// and MediaCodec in every `video` build. The Dart side hides the toggle
+/// when this is false — flipping the preference without a backend would
+/// silently do nothing.
 pub fn hw_encode_supported() -> bool {
     cfg!(feature = "hw-encode")
+        || (cfg!(any(windows, target_os = "android")) && cfg!(feature = "video"))
 }
 
 /// Whether this build can share a screen at all. The `screen-capture`
@@ -2406,7 +2546,7 @@ pub fn start_screen_share(
     // The own-share card reads the NEW share's shape, not the last one's
     // while the source picker is still open.
     crate::api::video::clear_share_stats();
-    let (event_tx, share_loss, share_viewer_fps, conn, poke_slot, ctrl_slot, video_streams) = {
+    let (event_tx, share_loss, share_viewer_fps, conn, poke_slot, ctrl_slot, moq, share_channel) = {
         let sessions = SESSIONS.lock().unwrap();
         let s = sessions
             .get(&session_id)
@@ -2421,9 +2561,22 @@ pub fn start_screen_share(
             s.conn.clone(),
             s.share_poke.clone(),
             s.share_ctrl.clone(),
-            s.video_streams,
+            #[cfg(feature = "video")]
+            s.moq.clone(),
+            #[cfg(not(feature = "video"))]
+            None,
+            s.share_channel.load(Ordering::Relaxed),
         )
     };
+    // The MoQ broadcast is room-scoped: without voice membership there is
+    // no room path the server will authorize. Say so before opening the
+    // picker instead of surfacing a tunnel rejection as "share failed".
+    if share_channel == 0 {
+        return Err("join a voice channel before sharing".to_string());
+    }
+    if moq.is_none() {
+        return Err("server has no MoQ media plane".to_string());
+    }
     // Spawned (not awaited): the source picker blocks for seconds and FRB
     // calls must return fast. The owner task forwards lifecycle events
     // into the session's stream and clears the slots on Ended.
@@ -2506,7 +2659,13 @@ pub fn start_screen_share(
                 max_fps: (max_fps > 0).then(|| f64::from(max_fps)),
                 // A standalone camera share has no screen to overlay on.
                 camera_overlay: camera_overlay && !camera,
-                video_streams,
+                moq,
+                channel_id: share_channel,
+                share_kind: if camera {
+                    parley_core::moq_media::ShareKind::Camera
+                } else {
+                    parley_core::moq_media::ShareKind::Screen
+                },
             };
             // The sharer's own preview: the tap is always installed and
             // checks the settings switch per frame, so toggling it mid-
@@ -2558,10 +2717,10 @@ pub fn start_screen_share(
                             // encoder, at speech quality, all share long.
                             let mic_rx = None;
                             let route = share_mic_route().clone();
-                            let mux_conn = conn.clone();
+                            let mux_moq = handle.moq.clone();
                             std::thread::spawn(move || {
                                 let returned = parley_client::screen::spawn_share_audio_mux(
-                                    mic_rx, sys_rx, mux_conn, route,
+                                    mic_rx, sys_rx, mux_moq, route,
                                 );
                                 // Mux exited (share over or error): park
                                 // the mic receiver back for reuse.
@@ -3009,11 +3168,11 @@ mod disconnect_tests {
         // TOFU pinning writes here; keep the real user config untouched.
         std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
         let config = Config {
+            moq_port: 0,
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
             files_dir: dir.join("data").join("files"),
             presence_listen: "127.0.0.1:0".to_string(),
-            video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         {
@@ -3082,11 +3241,11 @@ mod resume_tests {
         // The remembered login and the TOFU pin both live under this.
         std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
         let config = Config {
+            moq_port: 0,
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
             files_dir: dir.join("data").join("files"),
             presence_listen: "127.0.0.1:0".to_string(),
-            video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         {
@@ -3149,11 +3308,11 @@ mod tofu_tests {
         let dir = temp_dir("tofu");
         std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
         let config = Config {
+            moq_port: 0,
             listen: "127.0.0.1:0".to_string(),
             data_dir: dir.join("data"),
             files_dir: dir.join("data").join("files"),
             presence_listen: "127.0.0.1:0".to_string(),
-            video: Default::default(),
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         {

@@ -5,8 +5,8 @@ A release is a git tag. Nothing builds downloadable artifacts from
 
 | tag | meaning |
 |:--|:--|
-| `v0.2.0` | stable; also tagged `latest` in the registry |
-| `v0.2.1-rc1` | prerelease; never `latest` |
+| `v0.6.1` | stable; also tagged `latest` in the registry |
+| `v0.6.2-rc1` | prerelease; never `latest` |
 
 ## Before tagging
 
@@ -14,6 +14,8 @@ A release is a git tag. Nothing builds downloadable artifacts from
    `app/rust/Cargo.toml` and `app/pubspec.yaml`.
 2. Move `CHANGELOG.md`'s unreleased notes under the new version — the
    release body is extracted from that section.
+   Protocol 2 (0.6.x) is a breaking media-plane change: the server and
+   every client must ship together, and UDP 4445 must be reachable.
 3. From a clean tree:
 
 ```sh
@@ -28,7 +30,7 @@ cargo test --workspace
 ```sh
 docker build -t parley:local .
 cargo build --release -p parley-client && tools/e2e-container.sh
-tools/package-client.sh 0.2.0 dist   # needs Flutter on PATH
+tools/package-client.sh 0.6.1 dist   # needs Flutter on PATH
 ```
 
 ### Android signing secrets
@@ -75,7 +77,7 @@ PARLEY_ANDROID_KEYSTORE_PASSWORD=... \
 PARLEY_ANDROID_KEY_ALIAS=... \
 PARLEY_ANDROID_KEY_PASSWORD=... \
 flutter build apk --release \
-  --dart-define=PARLEY_VERSION=0.5.1 \
+  --dart-define=PARLEY_VERSION=0.6.1 \
   --dart-define=PARLEY_BUILD=$(git rev-parse HEAD)
 ```
 
@@ -85,8 +87,8 @@ naming the missing variables, rather than producing a debug-signed APK.
 ## Tag and push
 
 ```sh
-git tag -a v0.2.0 -m "Parley 0.2.0"
-git push origin v0.2.0
+git tag -a v0.6.1 -m "Parley 0.6.1"
+git push origin v0.6.1
 ```
 
 ## What the workflow does
@@ -182,9 +184,10 @@ and push steps are in that README.
 
 ```sh
 sha256sum -c SHA256SUMS
-tar xf parley-deploy-0.2.0.tar.gz
-docker load -i parley-deploy-0.2.0/parley-image-0.2.0.tar.gz
-docker run -d --name parley -p 4443:4443/udp -e PARLEY_ADMIN_PASSWORD=secret parley:0.2.0
+tar xf parley-deploy-0.6.1.tar.gz
+docker load -i parley-deploy-0.6.1/parley-image-0.6.1.tar.gz
+docker run -d --name parley -p 4443:4443/udp -p 4445:4445/udp \
+  -e PARLEY_ADMIN_PASSWORD=secret parley:0.6.1
 cargo build --release -p parley-client
 tools/e2e-container.sh          # builds its own image and boots it on a free port
 ```
@@ -196,9 +199,9 @@ Or against the running server, with the shipped CLI:
 ```
 
 The Windows zip is unsigned, so SmartScreen warns on first run
-("More info" → "Run anyway"). It carries voice with echo cancellation
-but cannot start a screen share — both stated in the release notes
-rather than left for the user to discover. The Android APK is signed
+("More info" → "Run anyway"). It carries voice with echo cancellation,
+screen sharing through Windows Graphics Capture, and Media Foundation
+encode/decode. Camera sharing remains Linux/Android-only. The Android APK is signed
 with the release key; Android may still warn about installing outside a
 store, and the first install has to allow installs from the app that
 opened it.

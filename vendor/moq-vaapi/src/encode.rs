@@ -580,6 +580,19 @@ impl Encoder {
 		// The reconstructed surface syncs implicitly; read the coded bitstream.
 		let mut bitstream = self.read_coded()?;
 
+		// PARLEY PATCH — Raven2 VCN sometimes emits a slice NAL whose first
+		// header byte is 0x00 (type 0) instead of 0x65/0x41. The payload is a
+		// normal slice; only the one-byte NAL header is missing. A decoder
+		// therefore reports "missing picture" (and a zero-width stream) even
+		// though the SPS/PPS and slice data are intact. Repair that driver
+		// quirk before the in-band parameter-set pass so a fresh receiver can
+		// decode the frame. Verified against the failing Vega keyframe: adding
+		// the header makes the exact bytes decode cleanly with ffmpeg/openh264.
+		let repaired = repair_missing_slice_headers(&mut bitstream, is_idr);
+		if repaired > 0 {
+			log::debug!("repaired {repaired} VA-API slice NAL header(s)");
+		}
+
 		// PARLEY PATCH — every IDR carries its parameter sets in-band.
 		//
 		// A driver that accepts packed SPS/PPS is not obliged to write them
@@ -641,6 +654,33 @@ impl Encoder {
 		}
 		Ok(out)
 	}
+}
+
+/// Repair a driver that drops the one-byte NAL header on slice NALs.
+///
+/// The bitstream remains Annex-B; only NALs whose type is the unspecified
+/// zero value are rewritten to an IDR (0x65) or a reference P slice (0x41).
+/// A conforming driver never emits type 0 here, so this is a no-op elsewhere.
+fn repair_missing_slice_headers(annexb: &mut [u8], is_idr: bool) -> usize {
+	let header = if is_idr { 0x65 } else { 0x41 };
+	let mut repaired = 0;
+	let mut i = 0;
+	while i + 3 < annexb.len() {
+		let start_code = if annexb[i..i + 4] == [0, 0, 0, 1] {
+			4
+		} else if annexb[i..i + 3] == [0, 0, 1] {
+			3
+		} else {
+			i += 1;
+			continue;
+		};
+		i += start_code;
+		if i < annexb.len() && annexb[i] & 0x1F == 0 {
+			annexb[i] = header;
+			repaired += 1;
+		}
+	}
+	repaired
 }
 
 /// Whether an Annex-B buffer already carries an SPS NAL (type 7).
@@ -1147,6 +1187,21 @@ mod tests {
 		Config::new(WIDTH, HEIGHT, 30, 2_000_000, 30)
 	}
 
+	#[test]
+	fn repairs_missing_slice_nal_headers() {
+		// Raven2 VCN has been observed emitting the slice payload with a
+		// zero NAL header. Rewrite only that byte; SPS/PPS and payload stay
+		// byte-for-byte untouched.
+		let mut idr = vec![0, 0, 0, 1, 0x67, 0x4d, 0, 0, 0, 1, 0, 0x88, 0x80];
+		assert_eq!(repair_missing_slice_headers(&mut idr, true), 1);
+		assert_eq!(idr[10], 0x65);
+		assert_eq!(&idr[11..], &[0x88, 0x80]);
+
+		let mut p = vec![0, 0, 1, 0, 0x88, 0x80];
+		assert_eq!(repair_missing_slice_headers(&mut p, false), 1);
+		assert_eq!(p[3], 0x41);
+	}
+
 	/// Opens an encoder, or `None` to skip on a machine without VA-API H.264 encode.
 	fn encoder(config: Config) -> Option<Encoder> {
 		match Encoder::new(config) {
@@ -1313,7 +1368,15 @@ mod tests {
 	/// Returns an NV12 surface holding `nv12_frame`, exported as a DMA-BUF.
 	fn nv12_dmabuf(display: &Arc<Display>, (width, height): (u32, u32), step: u32) -> DmaBuf {
 		let surface = surface_with(display, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420, (width, height), |_, _| {});
-		upload_nv12(display, &surface, width, height, &nv12_frame(width, height, step)).expect("upload");
+		upload_nv12(
+			display,
+			&surface,
+			width,
+			height,
+			&nv12_frame(width, height, step),
+			&mut None,
+		)
+		.expect("upload");
 		DmaBuf::from_prime(surface.export_prime().expect("export the surface")).expect("one object")
 	}
 

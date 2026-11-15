@@ -2,7 +2,7 @@
 # 🎙️ Parley
 
 > Self-hosted voice, video and screen-share for teams that already know each other.
-> **One binary. One container. One UDP port.**
+> **One binary. One container. Two UDP ports.**
 
 TeamSpeak's shape, not Discord's — one install serves one community.
 Voice is the product; everything else grows later.
@@ -49,14 +49,15 @@ Voice is the product; everything else grows later.
 | 7k | Share teardown notices, ghost-card race, real fullscreen, app chrome | ✅ |
 | 0.2 | First downloadable release — client tarball, container kit, release CI | ✅ |
 | 0.3 | Settings page, screens grid with own-stream preview, share size/rate dialog | ✅ |
-| 7+ | Windows capture + share audio (WGC + WASAPI) | ✅ |
-| Next | Android / iOS bring-up, file transfer | ⏳ |
+| 7+ | Windows capture + share audio (WGC + WASAPI), Android client | ✅ |
+| 0.6.1 | MoQ media plane, adaptive publisher, native hardware encode/decode | ✅ |
+| Next | iOS/macOS, Windows camera share, moderation depth | ⏳ |
 
 ---
 
 ## ⚡ Quickstart
 
-**Server** — one container, one UDP port. From the release page:
+**Server** — one container, two UDP ports (control 4443, MoQ media 4445). From the release page:
 
 ```sh
 tar xf parley-deploy-<version>.tar.gz   # compose file + env template + image
@@ -67,6 +68,8 @@ docker compose up -d
 docker compose exec parley /parley-server adduser alice 'a long password'
 ```
 
+Open UDP 4443 (control/voice) and 4445 (MoQ media) in the host firewall.
+
 **Client** — the Linux tarball from the same release:
 
 ```sh
@@ -74,18 +77,19 @@ tar xf parley-<version>-linux-x86_64.tar.gz
 cd parley-<version>-linux-x86_64 && ./install.sh
 ```
 
-Connect to `your-server` (port 4443, the client default). The full runbooks are
+Connect to `your-server` (port 4443, the client default; the server advertises
+4445 for media). The full runbooks are
 [docs/deploy.md](docs/deploy.md) and [docs/client.md](docs/client.md).
 
 ---
 
 ## ✨ What it is
 
-- 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — the profile rate is measured at encoder creation, so it follows the machine), camera sharing on Linux, and poke notifications
+- 🎯 Group voice channels, screen share at source quality (1080p30 software · 720p60 / 1080p~48 / 1440p~29 hardware-encoded on the dev box — pacing follows 95% of the sustained measured rate), camera sharing on Linux and Android, and poke notifications
 - 👀 Every share is a live 16:9 tile — including yours while you send — with *Watch*, several open at once, and per-share audio · pick a resolution/rate cap before the portal opens · settings for video, audio and your account
 - 🐧 Native clients: **Linux → Windows → Android → iOS** — no Electron, no webviews, ever. The Windows client (voice with echo cancellation, chat, sharing and watching — WGC capture + WASAPI per-app audio) builds from the same code
 - 🔑 Join by IP/domain + account · 15–20 concurrent users target
-- 🐳 Deploy with `docker compose up` · one TOML config · one UDP port
+- 🐳 Deploy with `docker compose up` · one TOML config · two UDP ports
 
 ## 🚫 What it's not
 
@@ -102,10 +106,10 @@ Connect to `your-server` (port 4443, the client default). The full runbooks are
 |:---|:---|:---|
 | Language | **Rust** | Server *and* shared core crate compiled into every client — protocol exists once |
 | UI | **Flutter** + `flutter_rust_bridge` | UI only; all performance-critical code stays in Rust |
-| Transport | **QUIC** (quinn) | TLS 1.3 built in · streams for control, datagrams for media · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
+| Transport | **QUIC** + **MoQ** | TLS 1.3 built in · control and voice on the QUIC connection, screen/camera/share audio on an authenticated MoQ relay · no WebRTC (no browser, no P2P = no ICE/STUN/TURN) |
 | Voice | **SFU, no transcoding** | Server forwards packets; clients mix — per-user volume, near-zero server CPU |
 | Audio codec | Opus | Speech: 64 kbps ↔ 24 kbps + in-band FEC, adaptive via gap-rate feedback · Music channels: 256 kbps stereo (Application::Audio) |
-| Video codec | **H.264, SFU + optional server transcode** | openh264 (software, universal fallback) behind an encoder trait — hardware backends (VAAPI/MediaCodec/VideoToolbox) slot in per-platform · fragmented datagrams + drop-until-IDR loss recovery · the server re-encodes a lower tier only for a viewer that reports it cannot keep up |
+| Video codec | **H.264, zero-transcode MoQ relay** | openh264 (software, universal fallback) behind an encoder trait — VA-API on Linux, Media Foundation on Windows, MediaCodec on Android · capped VBR, 2 s IDR groups, FPS-first two-stage adaptation on the publisher · viewers drop stale groups and rejoin at the next keyframe; the server only fans out |
 | AEC / NS | **WebRTC APM** (Sonora AEC3 on Windows) | Echo cancellation + noise suppression on the mic path; far-end reference from the render mix |
 | Auth | **Argon2id** | Per-server username + password · TOFU cert pinning (share the fingerprint with the invite) |
 | Storage | **SQLite** (WAL) | Zero-config persistence |
@@ -157,8 +161,9 @@ Every message carries version + capability bits — later features are additive,
       verified in both directions
 
 ### Phase 5 — Screen Share
-- [x] Wire format: `FLAG_VIDEO` + fragment sub-header; drop-until-IDR assembler
-      (loss/reorder hardened; unit + SFU integration tests)
+- [x] Video wire format: H.264 access units on the authenticated MoQ media
+      plane, one group per IDR interval; protocol 2 has no server path for
+      the legacy `FLAG_VIDEO` datagram flow (unit + relay integration tests)
 - [x] H.264 codec layer — openh264 (vendored source build, `video` feature-gated,
       CI-clean); encode/decode roundtrip + forced-IDR + Annex-B tests
 - [x] Synthetic 720p30 sender (`--share`) + mpv viewer — 30 fps sustained end-to-end
@@ -230,9 +235,9 @@ backend feature through `flutter_rust_bridge` before any real UI design.
       is a pure struct unit-tested under `--features audio-device`. Music
       channels ignore reports by design
 - [x] 7f Video receive — the app is the second display consumer of
-      parley-core's VideoReceiveHub (the seam 6.9 built it for): media
-      reader forwards FLAG_VIDEO payloads to a dedicated hub task (3b:
-      decode never on the reader), one irondash_texture external texture
+      parley-core's VideoReceiveHub (the seam 6.9 built it for): the MoQ
+      room subscriber feeds groups to a dedicated hub task (3b: decode
+      never on the reader), one irondash_texture external texture
       per sender (RGB24→RGBA, latest-frame-wins, created/destroyed on
       the platform thread), `video_started`/`video_stopped` events drive
       a plain Texture widget; viewer-side VideoReport (5 s worst gap
@@ -265,10 +270,11 @@ backend feature through `flutter_rust_bridge` before any real UI design.
 - [x] Windows client — voice with echo cancellation (`aec-rust`, the Rust AEC3 port), chat,
       screen sharing (Windows Graphics Capture) with whole-output or per-app audio,
       and share viewing
-- [ ] Android / iOS bring-up
-- [ ] File transfer (QUIC streams), rich text, search, DMs, push, auto-update
+- [x] Android client — voice, chat, screen/camera share (MediaProjection +
+      Camera2), hardware MediaCodec encode/decode, APK updater
+- [ ] iOS bring-up, rich text, search, DMs, push
 
-**Platform gap**: camera sharing is Linux-only for now. The V4L2 source feeds the same H.264 share pipeline; Windows needs a Media Foundation source reader before the camera choice can appear there.
+**Platform gap**: camera sharing is Linux (V4L2) and Android (Camera2) for now. Both feed the same H.264 share pipeline; Windows needs a Media Foundation source reader before the camera choice can appear there. Android screen and camera shares carry video only — system share audio is not implemented on that platform.
 
 ---
 
@@ -306,7 +312,7 @@ cd app && flutter run --release -d linux
 | Server idle RSS | ≤ 64 MB — **current: 54.8 MB (info logging), 48.1 MB at RUST_LOG=warn; container 1.4 MiB idle** |
 | 10 active talkers | ≤ 50% of one core — **current: 43% at 10× occupancy (10 senders × 10 recipients, 5000 forwarded pps, loopback; 100% delivery; perf-profiled: cost is per-datagram kernel sendmsg + loopback softirq, not parley code)** |
 | Login → connected | ≤ 400 ms — **current: 70 ms (loopback); 1.0–2.2 s laptop first join over Wi-Fi/internet (re-login with --token is faster)** |
-| Binary size | ≤ 15 MB — **current: 6.2 MB relay binary; the transcode build adds openh264 (docker image ~12 MB)** |
+| Binary size | ≤ 15 MB — **current: 6.2 MB relay binary; the server has no codec dependency** |
 
 A regression is a bug, tracked as one.
 
@@ -314,16 +320,19 @@ A regression is a bug, tracked as one.
 
 ## 🐳 Deployment
 
-One container, one UDP port, one volume — [deploy/compose.yaml](deploy/compose.yaml):
+One container, two UDP ports, one volume — [deploy/compose.yaml](deploy/compose.yaml):
 
 ```yaml
 services:
   parley:
     image: ${PARLEY_IMAGE:-parley:latest}
-    ports: ["${PARLEY_PORT:-4443}:4443/udp"]
+    ports:
+      - "${PARLEY_PORT:-4443}:4443/udp"
+      - "${PARLEY_MOQ_PORT:-4445}:${PARLEY_MOQ_PORT:-4445}/udp"
     volumes: ["parley-data:/data"]
     environment:
       PARLEY_ADMIN_PASSWORD: ${PARLEY_ADMIN_PASSWORD:-}
+      PARLEY_MOQ_PORT: ${PARLEY_MOQ_PORT:-4445}
     restart: unless-stopped
 volumes:
   parley-data:
@@ -343,7 +352,7 @@ connections. Full runbook: [docs/deploy.md](docs/deploy.md).
 ```
 proto/                  # .proto files — protocol source of truth
 crates/
-  parley-proto/         # wire types, framing, media + video fragmentation
+  parley-proto/         # wire types, framing, media and MoQ catalog glue
   parley-core/          # session I/O, audio pipeline, encoder trait, H.264
   parley-server/        # QUIC listener, TLS, config, routing (+ adduser)
   parley-client/        # terminal client + shared capture/audio modules

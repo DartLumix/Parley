@@ -18,8 +18,11 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-parley-core = { workspace = true, features = ["video"] }
+parley-core.workspace = true
 rusqlite.workspace = true
 argon2.workspace = true
 rand_core.workspace = true
 bytes.workspace = true
+moq-net.workspace = true
+moq-tokio.workspace = true
+url.workspace = true

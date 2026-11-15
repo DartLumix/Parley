@@ -1,23 +1,15 @@
-//! Phase 5c/5d/6a/6e/6.9: screen-share over the media datagram path.
+//! Receive hub and the synthetic video-only fallback.
 //!
-//! Send side: `--share` (or the "share" stdin command) with the `video`
-//! feature sends the synthetic moving-bar pattern; with
-//! `screen-capture` (5d) it sends the real screen via the portal (see
-//! screen.rs). Both fragment + send with FLAG_VIDEO, paced so a
-//! keyframe doesn't burst datagrams into quinn.
+//! Real screen and camera shares now publish H.264 over MoQ; the room
+//! subscriber feeds complete access units into parley-core's
+//! `VideoReceiveHub`, and this file remains the DISPLAY consumer (mpv in
+//! the CLI, a Flutter texture bridge in the app). The fragmented
+//! `FLAG_VIDEO` sender and datagram handler below are kept only for a
+//! `video`-without-`screen-capture` test build: the server drops video
+//! datagrams, so that path is not a supported share transport.
 //!
-//! Receive side (6.9): everything protocol lives in
-//! parley-core's `VideoReceiveHub` (assembler, decoder, stopped-set,
-//! gap rates, bounded frame queue). This file is a DISPLAY consumer:
-//! one std thread drains decoded frames and feeds a spawned mpv per
-//! sender (lazily, sized from the decoded frame). The Phase 7 Flutter
-//! client becomes a second consumer of the same hub — no mpv knowledge
-//! anywhere near the protocol path.
-//!
-//! 6e: the loss-driven video bitrate ladder (`VideoLadder`) mirrors
-//! 4d's audio controller — viewers report assembler gap rates, senders
-//! switch between Clean (2.5 Mbps) and Robust (1 Mbps) on an EMA with
-//! hysteresis.
+//! Hub responsibilities are unchanged: assembler, decoder, stopped-set,
+//! bounded frame queue and the loss statistics the UI reads.
 
 use std::collections::{HashMap, HashSet};
 use std::process::{Child, Command, Stdio};
@@ -337,6 +329,13 @@ pub struct ClientViewers {
 /// Shared receiver handle (name preserved from the ViewerTable era).
 pub type Viewers = Arc<ClientViewers>;
 
+impl ClientViewers {
+    /// The decode hub, shared with the MoQ room subscriber.
+    pub fn hub(&self) -> SharedVideoReceiveHub {
+        self.hub.clone()
+    }
+}
+
 pub fn new_viewers() -> Viewers {
     let hub = VideoReceiveHub::shared();
     let shown: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -366,19 +365,26 @@ pub fn new_viewers() -> Viewers {
 /// sender's real resolution), feed it. This is the ONLY place in the
 /// client that knows mpv exists; Phase 7's Flutter consumer replaces
 /// exactly this function against the same hub.
+struct MpvViewer {
+    child: Child,
+    width: usize,
+    height: usize,
+    high_rate: bool,
+}
+
 fn mpv_consumer(
     hub: SharedVideoReceiveHub,
     shown: Arc<Mutex<HashMap<u32, u64>>>,
     dead: Arc<Mutex<HashSet<u32>>>,
     retire: Arc<Mutex<HashSet<u32>>>,
 ) {
-    let mut mpvs: HashMap<u32, Child> = HashMap::new();
+    let mut mpvs: HashMap<u32, MpvViewer> = HashMap::new();
     loop {
         // Reap requests first: stop/leave kill their window.
         for id in retire.lock().unwrap().drain() {
-            if let Some(mut c) = mpvs.remove(&id) {
-                let _ = c.kill();
-                let _ = c.wait();
+            if let Some(mut viewer) = mpvs.remove(&id) {
+                let _ = viewer.child.kill();
+                let _ = viewer.child.wait();
             }
         }
         let Some(frame) = hub.pop_frame(Duration::from_secs(1)) else {
@@ -387,7 +393,34 @@ fn mpv_consumer(
         if dead.lock().unwrap().contains(&frame.sender_id) {
             continue; // window closed earlier: keep draining, display nothing
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = mpvs.entry(frame.sender_id) {
+        // Adaptive resolution can change the decoded frame size mid-stream.
+        // mpv's rawvideo demuxer is configured for one width/height at
+        // spawn, so feeding it the new size without a restart corrupts every
+        // frame (the blurred/glitching display this used to show).
+        let restart = mpvs.get(&frame.sender_id).is_some_and(|viewer| {
+            viewer.width != frame.width
+                || viewer.height != frame.height
+                || viewer.high_rate != frame.high_rate
+        });
+        if restart {
+            if let Some(viewer) = mpvs.get(&frame.sender_id) {
+                println!(
+                    "video: user {} stream shape changed ({}x{} @ {} fps → {}x{} @ {} fps) — restarting viewer",
+                    frame.sender_id,
+                    viewer.width,
+                    viewer.height,
+                    hinted_frame_rate(viewer.high_rate),
+                    frame.width,
+                    frame.height,
+                    hinted_frame_rate(frame.high_rate)
+                );
+            }
+            if let Some(mut viewer) = mpvs.remove(&frame.sender_id) {
+                let _ = viewer.child.kill();
+                let _ = viewer.child.wait();
+            }
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = mpvs.entry(frame.sender_id) {
             println!("video: starting viewer for user {}", frame.sender_id);
             match spawn_mpv(frame.sender_id, frame.width, frame.height, frame.high_rate) {
                 Ok(child) => {
@@ -398,7 +431,12 @@ fn mpv_consumer(
                         frame.height,
                         hinted_frame_rate(frame.high_rate)
                     );
-                    e.insert(child);
+                    slot.insert(MpvViewer {
+                        child,
+                        width: frame.width,
+                        height: frame.height,
+                        high_rate: frame.high_rate,
+                    });
                 }
                 Err(e) => {
                     eprintln!("video: {e}");
@@ -407,10 +445,10 @@ fn mpv_consumer(
                 }
             }
         }
-        let Some(mpv) = mpvs.get_mut(&frame.sender_id) else {
+        let Some(viewer) = mpvs.get_mut(&frame.sender_id) else {
             continue;
         };
-        if feed_mpv(mpv, &frame.rgb) {
+        if feed_mpv(&mut viewer.child, &frame.rgb) {
             *shown.lock().unwrap().entry(frame.sender_id).or_insert(0) += 1;
         } else {
             // 3b: a dead viewer stops paying decode too — hub-side
@@ -418,14 +456,14 @@ fn mpv_consumer(
             // (frame_id-0 keyframe), so a closed window costs nothing.
             hub.mark_stopped(frame.sender_id);
             dead.lock().unwrap().insert(frame.sender_id);
-            let _ = mpv.try_wait(); // reap if already exited
+            let _ = viewer.child.try_wait(); // reap if already exited
             println!(
                 "video: viewer for user {} exited — not displaying (window closed?)",
                 frame.sender_id
             );
-            if let Some(mut c) = mpvs.remove(&frame.sender_id) {
-                let _ = c.kill();
-                let _ = c.wait();
+            if let Some(mut viewer) = mpvs.remove(&frame.sender_id) {
+                let _ = viewer.child.kill();
+                let _ = viewer.child.wait();
             }
         }
     }
@@ -439,13 +477,6 @@ pub fn handle_video_datagram(viewers: &Viewers, sender_id: u32, codec: u8, paylo
     viewers
         .hub
         .push_datagram_with_codec(sender_id, codec, payload);
-}
-
-/// Start the reliable-stream reader for this connection. The stream
-/// transport and the datagram transport share the same hub, so display,
-/// stopped-state and stats need no second code path.
-pub fn spawn_stream_reader(viewers: &Viewers, conn: quinn::Connection) {
-    crate::video_stream::spawn_reader(conn, viewers.hub.clone());
 }
 
 /// A sender stopped sharing: the hub suppresses stragglers, the

@@ -376,7 +376,7 @@ Future<void> setScreenWatched({
 Future<void> playVoiceChime({required bool join}) =>
     RustLib.instance.api.crateApiSessionPlayVoiceChime(join: join);
 
-/// Toggle hardware (VAAPI) encode preference. Takes effect at the next
+/// Toggle the platform hardware encode preference. Takes effect at the next
 /// encoder creation — a running share keeps its backend; stop and
 /// re-share to switch. Returns the new state. Featureless: no-op stub
 /// (generated glue references this unconditionally).
@@ -389,10 +389,11 @@ Future<bool> setHwEncode({required bool enable}) =>
 Future<bool> hwEncodeEnabled() =>
     RustLib.instance.api.crateApiSessionHwEncodeEnabled();
 
-/// Whether this build can hardware-encode at all (the `hw-encode`
-/// feature pulls the VAAPI backend). The Dart side hides the HW-encode
-/// toggle when this is false — flipping the preference without the
-/// backend would silently do nothing.
+/// Whether this build can hardware-encode at all. Linux needs the opt-in
+/// `hw-encode` feature (VA-API); Windows and Android carry Media Foundation
+/// and MediaCodec in every `video` build. The Dart side hides the toggle
+/// when this is false — flipping the preference without a backend would
+/// silently do nothing.
 Future<bool> hwEncodeSupported() =>
     RustLib.instance.api.crateApiSessionHwEncodeSupported();
 

@@ -5,7 +5,7 @@
 ```
 proto/                  .proto files — protocol source of truth
 crates/
-  parley-proto/         wire types, framing, media + video fragmentation
+  parley-proto/         wire types, framing, media and MoQ catalog glue
   parley-core/          shared session I/O, audio pipeline, encoder trait, H.264
   parley-server/        QUIC listener, TLS, config, routing (+ parley-adduser)
   parley-client/        terminal client + reusable capture/audio modules
@@ -35,10 +35,9 @@ sudo apt install clang cmake ninja-build meson nasm pkg-config libclang-dev \
 
 The WebRTC AEC is built from source (`bundled`) — hence meson, ninja,
 a C++ toolchain and libclang — so the binaries carry no system WebRTC
-dependency. The **server** now links openh264 for its per-viewer
-transcode path, so a C++ compiler (and, for a musl server build, a
-musl C++ toolchain with the static `libstdc++`) is required there too;
-the Docker image installs them on Alpine. One caveat: the crate prefers a **system abseil >= 20240722**
+dependency. The **server** is a zero-transcode relay and links no codec;
+the Docker image still carries a C/C++ toolchain because `audiopus_sys`
+builds Opus through CMake. One caveat: the crate prefers a **system abseil >= 20240722**
 when pkg-config finds one (Arch ships it; Ubuntu does not) and otherwise
 fetches abseil via a meson wrap during the build. A local packaging run
 on such a machine produces a binary that links system absl; the release
@@ -102,7 +101,7 @@ link device libraries):
 | `aec-rust` | the same DSP from the pure-Rust AEC3 port — what Windows builds |
 | `video` | openh264 encode/decode + the video receive hub |
 | `screen-capture` | capture + share audio: portal/PipeWire (Linux), WGC/WASAPI (Windows) |
-| `vaapi` | hardware encode via the vendored crate (`--hw-encode`) — Linux only |
+| `vaapi` | Linux VA-API encode/decode via the vendored crate (`--hw-encode`); Windows Media Foundation and Android MediaCodec ride in `video` builds |
 
 ## Flutter client
 
@@ -161,11 +160,12 @@ The second desktop target builds `audio-device` (WASAPI), `video` and
   the flag still exists for builds that leave the feature out. Watching
   shares is `video`, a separate feature.
 
-Hardware encode is VAAPI, so it is still Linux-only: Windows uses the
-software H.264 encoder (1080p30 ceiling). The custom title bar is
-Linux-only: the Windows runner keeps its native frame. The window
-channel (`parley/window`) is implemented on both, so the fullscreen
-viewer takes the real window fullscreen on Windows too.
+Hardware encode/decode uses the platform backend: Media Foundation on
+Windows and MediaCodec on Android, both enabled by default and falling
+back to openh264 when the machine has no usable encoder. The custom
+title bar is Linux-only: the Windows runner keeps its native frame. The
+window channel (`parley/window`) is implemented on both, so the
+fullscreen viewer takes the real window fullscreen on Windows too.
 
 ```sh
 cargo build --release -p parley_flutter --features audio-device,aec-rust,video,screen-capture
@@ -188,15 +188,17 @@ The app's config (remembered session, TOFU pins) lives in
 - `tools/hw-probe.sh` — driver and encoder probe, keyframe shape,
   per-profile rates; `--encode h264` prints a RESULT line.
 - Measurements and transcripts: [hd-encode-runs.md](hd-encode-runs.md).
-- VAAPI is opt-in everywhere; machines inside the known driver window
-  must not pass `--hw-encode` (see the runbook).
+- VAAPI is opt-in on Linux; machines inside the known driver window must
+  not enable hardware encoding (see the runbook). Windows Media
+  Foundation and Android MediaCodec are the normal path and fall back at
+  runtime.
 
 ## Container
 
 ```sh
 docker build -t parley:local .
 cargo build --release -p parley-client
-tools/e2e-container.sh          # builds, boots, adduser, two logins, negative
+tools/e2e-container.sh          # builds, boots both UDP listeners, adduser, two logins, negative
 ```
 
 The root `docker-compose.yml` builds and runs from a checkout;
@@ -206,7 +208,7 @@ The root `docker-compose.yml` builds and runs from a checkout;
 
 | test | what it protects |
 |:--|:--|
-| `parley-core` video tests | wire format, fragment assembly, loss recovery |
+| `parley-core` video tests | MoQ/media framing, adaptive controller, hardware conversion and decoder fallback |
 | `parley-core` `video_receive` tests | display hub: one stale frame after a stop (the ghost card) |
 | `parley-server/tests/transport.rs` | SFU routing, scoping, presence, generations |
 | `parley-client/tests/aec.rs` | synthetic echo cancellation, no hardware needed |

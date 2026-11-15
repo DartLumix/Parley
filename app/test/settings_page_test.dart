@@ -113,7 +113,7 @@ void main() {
     await tester.scrollUntilVisible(find.text('Signed in as'), 200);
     expect(find.text('elliot'), findsOneWidget);
     // No hardware switch when the build has no VAAPI backend.
-    expect(find.text('Hardware encoding (VAAPI)'), findsNothing);
+    expect(find.text('Hardware encoding'), findsNothing);
 
     // The account section is at the bottom of a scrollable page.
     await tester.scrollUntilVisible(find.text('Sign out'), 200);
@@ -172,6 +172,10 @@ void main() {
 
     await tester.scrollUntilVisible(find.text('Noise reduction'), 200);
     expect(find.text('Noise reduction'), findsOneWidget);
+    // The label can be at the viewport edge while its slider is still below
+    // it; bring the control itself into view before dragging.
+    await tester.ensureVisible(find.byType(Slider).last);
+    await tester.pumpAndSettle();
     await tester.drag(find.byType(Slider).last, const Offset(-120, 0));
     await tester.pumpAndSettle();
     expect(saved.last.noiseLevel, lessThan(initial.noiseLevel));

@@ -18,6 +18,13 @@
 # the method names even if a future R8 version changes its defaults.
 -keep class dev.parley.app.ShareService { *; }
 
+# HardwareCodec is called through JNI by its exact class and method names
+# (createEncoder/createDecoder, encode/decode/setBitrate/close). Renaming
+# any of them makes every release build silently fall back to software.
+-keep class dev.parley.app.HardwareCodec { *; }
+-keep class dev.parley.app.HardwareEncoder { *; }
+-keep class dev.parley.app.HardwareDecoder { *; }
+
 # Standard JNI safety net for any other plugin that uses a native
 # method's declaring class or signature.
 -keepclasseswithmembernames class * {

@@ -1,4 +1,4 @@
-# Production: one container, one UDP port, one volume.
+# Production: one container, two UDP ports, one volume.
 #
 #   cp .env.example .env    # set PARLEY_ADMIN_PASSWORD, then edit it out
 #   docker compose up -d
@@ -14,6 +14,7 @@ services:
     image: ${PARLEY_IMAGE:-parley:latest}
     ports:
       - "${PARLEY_PORT:-4443}:4443/udp"
+      - "${PARLEY_MOQ_PORT:-4445}:${PARLEY_MOQ_PORT:-4445}/udp"
       # Read-only JSON snapshot for a dashboard on this host
       # (GET /api/presence). Published to loopback on purpose: it is not
       # a public API. Set PARLEY_PRESENCE_BIND only if the caller cannot
@@ -23,6 +24,8 @@ services:
       - parley-data:/data
     environment:
       PARLEY_ADMIN_PASSWORD: ${PARLEY_ADMIN_PASSWORD:-}
+      # Keep the announced/bound media port identical to the published one.
+      PARLEY_MOQ_PORT: ${PARLEY_MOQ_PORT:-4445}
       # The container's own interface, so the published port reaches it.
       PARLEY_PRESENCE_LISTEN: 0.0.0.0:4444
       # Optional bearer gate for /api/presence. Empty means localhost-only

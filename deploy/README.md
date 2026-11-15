@@ -1,6 +1,6 @@
 # Parley server — deploy kit
 
-One container, one UDP port, one volume. No database service, no proxy.
+One container, two UDP ports, one volume. No database service, no proxy.
 
 ```sh
 cd parley-deploy-<version>          # this directory
@@ -24,24 +24,28 @@ the users table is empty.
 
 ## Ports and firewall
 
-`PARLEY_PORT` (default 4443) is the host UDP port; the container always
-listens on 4443. QUIC is UDP only — no TCP rule is needed.
+`PARLEY_PORT` (default 4443) is the control/voice UDP port and
+`PARLEY_MOQ_PORT` (default 4445) carries screen, camera and share audio
+over MoQ. The container listens on both. All traffic is UDP — no TCP
+rule is needed.
 
 ```sh
 sudo ufw allow 4443/udp
+sudo ufw allow 4445/udp
 ```
 
 Clients connect with `your-server` (the client default is 4443), or
-`your-server:<port>` if you chose something else.
+`your-server:<port>` if you chose something else. The MoQ port is
+announced by the server in the authenticated handshake, so clients do
+not need it in the address; it must still be reachable.
 
-## Screen-share transcode
+## Screen sharing
 
-The server can re-encode a share at a lower tier for a viewer that
-cannot keep up; capable viewers keep the original stream. It is **off
-by default**: on a small VPS the decode plus re-encode cannot hold 30
-fps, and a slow tier is worse than the sender's own ladder. Enable it
-only on a host with spare CPU. The values live in `[video]` in the
-config file (see [docs/deploy.md](../docs/deploy.md)).
+The server is a zero-transcode MoQ relay. It forwards each publisher's
+H.264 video and Opus share audio to the room and never decodes or
+re-encodes a frame, so a GPU-less VPS is enough. The publisher adapts
+its own bitrate and, only under sustained encoder pressure, a small
+resolution tier; see [docs/deploy.md](../docs/deploy.md).
 
 ## Identity
 

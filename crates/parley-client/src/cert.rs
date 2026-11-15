@@ -216,6 +216,14 @@ impl ServerCertVerifier for TofuVerifier {
 /// Client endpoint + the slot the verifier drops the presented
 /// fingerprint into (read it after connecting).
 pub fn build_endpoint(pinned: Option<String>) -> (quinn::Endpoint, Arc<Mutex<Option<String>>>) {
+    // Cargo feature unification can enable both `ring` and `aws-lc-rs` on
+    // rustls (the MoQ dependency enables the latter through its default
+    // features). Without an explicit choice, `ClientConfig::builder()`
+    // panics at runtime instead of selecting one. The server already does
+    // this; the CLI and Flutter bridge both come through here.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let seen = Arc::new(Mutex::new(None));
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -282,6 +290,14 @@ mod tests {
             None => unsafe { std::env::remove_var("PARLEY_DATA_DIR") },
         }
         assert_eq!(path, dir.join("parley").join("known_hosts"));
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_selects_a_crypto_provider() {
+        // Regression: the CLI used to panic during startup when dependency
+        // feature unification enabled both rustls providers.
+        let (_endpoint, _seen) = build_endpoint(None);
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]
