@@ -581,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.channel_id,
                 hub,
                 mixer,
+                None,
                 senders,
                 moq_room_stop_rx,
             )

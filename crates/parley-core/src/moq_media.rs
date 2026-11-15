@@ -532,6 +532,11 @@ impl SenderMap {
     }
 }
 
+/// Optional account-id gate for share audio. `None` plays every audio
+/// track (the terminal client's behavior); the Flutter app passes its
+/// watched-share set so opening a share is what makes its sound audible.
+pub type ShareAudioAudible = Arc<dyn Fn(u32) -> bool + Send + Sync>;
+
 /// Subscribe to every screen/camera broadcast in one room.
 ///
 /// The server scopes the origin to that room, so paths arriving here are
@@ -539,11 +544,16 @@ impl SenderMap {
 /// consumers; a `max_age` of one second lets a stalled viewer skip an
 /// incomplete GOP and resume at the next IDR without touching the
 /// publisher.
+///
+/// `share_audio_audible` is checked for every audio frame using the
+/// broadcast path's account id. The app gates it on the open share; `None`
+/// preserves the CLI's play-everything behavior.
 pub async fn spawn_room_subscriber(
     endpoint: &MoqEndpoint,
     room_id: u64,
     hub: SharedVideoReceiveHub,
     mixer: Option<SharedMixer>,
+    share_audio_audible: Option<ShareAudioAudible>,
     senders: SenderMap,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -644,7 +654,11 @@ pub async fn spawn_room_subscriber(
                                 .with_max_age(SUBSCRIBE_MAX_AGE);
                             if let Ok(subscriber) = track.subscribe(subscription).await {
                                 handles.push(tokio::spawn(read_audio(
-                                    subscriber, user_id, mixer, senders,
+                                    subscriber,
+                                    user_id,
+                                    mixer,
+                                    senders,
+                                    share_audio_audible.clone(),
                                 )));
                             }
                         }
@@ -738,6 +752,7 @@ async fn read_audio(
     user_id: u32,
     mixer: SharedMixer,
     senders: SenderMap,
+    share_audio_audible: Option<ShareAudioAudible>,
 ) {
     let mut consumer = moq_mux::container::Consumer::new(
         subscriber,
@@ -747,6 +762,18 @@ async fn read_audio(
     loop {
         match consumer.read().await {
             Ok(Some(frame)) => {
+                // The account id is what the app's watch gate names; the
+                // broadcast path also carries the per-device media id in
+                // the control plane. Drop before advancing `sequence`, so
+                // the first audible packet after opening starts at zero
+                // instead of looking like a late arrival to the jitter
+                // buffer.
+                if share_audio_audible
+                    .as_ref()
+                    .is_some_and(|audible| !audible(user_id))
+                {
+                    continue;
+                }
                 let Some(sender) = senders.resolve(user_id) else {
                     continue;
                 };

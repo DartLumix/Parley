@@ -1439,12 +1439,19 @@ fn enable_voice(session_id: u32, channel_id: u64) {
     };
     #[cfg(feature = "video")]
     if let Some((endpoint, hub, senders, room_mixer)) = moq_room {
+        // MoQ audio does not travel through voice.rs, so its reader needs
+        // the same watch gate the datagram path applies. The gate is
+        // account-scoped (the broadcast path names the account); the
+        // mixer's sender map supplies the media id for playback.
+        let share_audio_audible: parley_core::moq_media::ShareAudioAudible =
+            Arc::new(crate::api::session::share_audio_audible_for_account);
         tokio::spawn(async move {
             if let Err(e) = parley_core::moq_media::spawn_room_subscriber(
                 &endpoint,
                 channel_id,
                 hub,
                 Some(room_mixer),
+                Some(share_audio_audible),
                 senders,
                 moq_room_stop,
             )
@@ -1816,6 +1823,12 @@ async fn connect_async(server: String, user: String, auth: Auth) -> Result<Sessi
         media_id: ok.media_id,
         user_id: ok.user_id,
     });
+
+    // Every new session starts with every share silent. The watch gate is
+    // app-global, so an account id left over from a prior session or a
+    // reconnect must not make a new share audible before its card opens.
+    #[cfg(feature = "audio-device")]
+    SHARE_AUDIO_AUDIBLE.lock().unwrap().clear();
 
     SESSIONS.lock().unwrap().insert(
         session_id,
@@ -2330,6 +2343,13 @@ pub fn manage_kick(session_id: u32, user_id: u32, channel_id: u64) -> Result<(),
 static SHARE_AUDIO_AUDIBLE: LazyLock<Mutex<std::collections::HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// Is this ACCOUNT's share audio being played? The MoQ room subscriber
+/// uses this directly; the datagram reader resolves its media id first.
+#[cfg(feature = "audio-device")]
+pub(crate) fn share_audio_audible_for_account(user_id: u32) -> bool {
+    SHARE_AUDIO_AUDIBLE.lock().unwrap().contains(&user_id)
+}
+
 /// Is this device's share audio being played? Read by the media reader
 /// (voice.rs) for every FLAG_SHARE_AUDIO datagram. The listener toggled
 /// an ACCOUNT; the datagram names a MEDIA id; the mixer's owner map is
@@ -2339,7 +2359,7 @@ pub(crate) fn share_audio_audible(mixer: &SharedMixer, media_id: u32) -> bool {
     let Some(user_id) = mixer.lock().unwrap().owner_of(media_id) else {
         return false;
     };
-    SHARE_AUDIO_AUDIBLE.lock().unwrap().contains(&user_id)
+    share_audio_audible_for_account(user_id)
 }
 
 /// Play (or stop playing) one sharer's screen audio. The UI calls this

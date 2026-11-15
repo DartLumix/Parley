@@ -481,6 +481,15 @@ class _HomePageState extends State<HomePage> {
     if (next != level) unawaited(_applyVolume(userId, next));
   }
 
+  /// Tile sliders carry the share's media id; the mixer's share trim and
+  /// the roster dialog are account-scoped. The announced identity is the
+  /// bridge between the two namespaces.
+  Future<void> _applyShareVolumeForMedia(int mediaId, double gain) async {
+    final userId = _shareAccount[mediaId];
+    if (userId == null) return;
+    await _applyShareVolume(userId, gain);
+  }
+
   Future<void> _applyShareVolume(int userId, double gain) async {
     final sessionId = _session?.sessionId;
     if (sessionId == null) return;
@@ -500,7 +509,8 @@ class _HomePageState extends State<HomePage> {
     var share = _shareVolume[userId] ?? 1.0;
     final self = userId == _session?.userId;
     final sharing =
-        _videos.containsKey(userId) || _shareVolume.containsKey(userId);
+        _shareMediaIdForAccount(userId) != null ||
+        _shareVolume.containsKey(userId);
     await showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -1103,14 +1113,33 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _setShareAudio(int userId, bool audible) async {
+  /// Whether another open share from this account keeps its audio on.
+  /// The Rust gate is account-scoped, so closing one of two shares must
+  /// not mute the one still being watched.
+  bool _anotherShareAudibleForAccount(int mediaId, int account) {
+    for (final id in _audibleShares) {
+      if (id != mediaId && _shareAccount[id] == account) return true;
+    }
+    return false;
+  }
+
+  Future<void> _setShareAudio(int mediaId, bool audible) async {
     final sessionId = _session?.sessionId;
     if (sessionId == null) return;
+    // The tile/event key is a media id; the Rust gate names the account
+    // that owns the share. Keep the local set keyed by media so pruning is
+    // per stream, but send the account id over the bridge.
+    final userId = _shareAccount[mediaId];
     if (audible) {
-      _audibleShares.add(userId);
+      _audibleShares.add(mediaId);
     } else {
-      _audibleShares.remove(userId);
+      _audibleShares.remove(mediaId);
     }
+    // Opening a card before its identity announcement must not install a
+    // media-id gate that could collide with an unrelated account id. The
+    // identity event replays the pending open once the mapping lands.
+    if (userId == null) return;
+    if (!audible && _anotherShareAudibleForAccount(mediaId, userId)) return;
     try {
       await setShareAudio(
         sessionId: sessionId,
@@ -1128,8 +1157,14 @@ class _HomePageState extends State<HomePage> {
     _audibleShares.clear();
     if (sessionId == null) return;
     for (final id in ids) {
+      final userId = _shareAccount[id];
+      if (userId == null) continue;
       try {
-        await setShareAudio(sessionId: sessionId, userId: id, audible: false);
+        await setShareAudio(
+          sessionId: sessionId,
+          userId: userId,
+          audible: false,
+        );
       } catch (_) {}
     }
   }
@@ -1804,6 +1839,12 @@ class _HomePageState extends State<HomePage> {
               _status = '${ev.username} is sharing';
             }
           });
+          // The card may have been opened before its identity arrived;
+          // replay the pending audible state now that media id -> account
+          // is known.
+          if (_audibleShares.contains(sid.userId)) {
+            _setShareAudio(sid.userId, true);
+          }
         }
       case 'video_started':
         final s0 = ev.surface;
@@ -2120,6 +2161,16 @@ class _HomePageState extends State<HomePage> {
     final account = _shareAccount[mediaId];
     if (account == null) return 'user $mediaId';
     return _nameOf(account);
+  }
+
+  /// The media id of one of this account's live shares, if any. The roster
+  /// controls are account-scoped while the share maps are keyed by device
+  /// media id.
+  int? _shareMediaIdForAccount(int userId) {
+    for (final mediaId in _videos.keys) {
+      if (_shareAccount[mediaId] == userId) return mediaId;
+    }
+    return null;
   }
 
   /// Display name for the connected account: presence is the authority
@@ -2447,7 +2498,7 @@ class _HomePageState extends State<HomePage> {
         onClose: _unwatch,
         onFullscreen: _enterFullscreen,
         onPreviewEnabled: _setPreviewEnabled,
-        onVolume: _applyShareVolume,
+        onVolume: _applyShareVolumeForMedia,
       ),
     );
   }
@@ -2536,7 +2587,7 @@ class _HomePageState extends State<HomePage> {
                 onClose: _unwatch,
                 onFullscreen: _enterFullscreen,
                 onPreviewEnabled: _setPreviewEnabled,
-                onVolume: _applyShareVolume,
+                onVolume: _applyShareVolumeForMedia,
               ),
             ),
             const SizedBox(height: 12),
@@ -3201,7 +3252,7 @@ class _HomePageState extends State<HomePage> {
                     ? (_previewError ?? 'waiting for the first frame\u2026')
                     : (own ? null : 'connecting\u2026')),
           previewEnabled: _settings.showSharePreview,
-          volume: _shareVolume[id] ?? 1.0,
+          volume: _shareVolume[_shareAccount[id] ?? id] ?? 1.0,
         ),
       );
     }
