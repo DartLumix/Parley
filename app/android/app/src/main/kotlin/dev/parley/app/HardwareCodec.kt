@@ -436,16 +436,19 @@ class HardwareEncoder internal constructor(
      */
     private fun toAnnexB(data: ByteArray): ByteArray {
         if (data.isEmpty()) return data
-        // Parse AVCC first. A 300-byte NAL has the length prefix 00 00 01
-        // 2c, which begins with a valid three-byte start code; testing for
-        // Annex-B first would misclassify that access unit and, worse, mix
-        // AVCC bytes into an Annex-B CSD group.
+        // A four-byte start code is unambiguous; never let an AVCC length
+        // misclassify an Annex-B access unit. A three-byte start code is
+        // ambiguous with an AVCC length such as 00 00 01 2c, so parse AVCC
+        // first and validate every length and NAL header below.
+        if (data.size >= 4 && data[0] == 0.toByte() && data[1] == 0.toByte() &&
+            data[2] == 0.toByte() && data[3] == 1.toByte()
+        ) return data
         if (data.size >= 4) {
             val out = ByteArrayOutputStream(data.size + 8)
             var i = 0
             var avcc = true
             while (i < data.size) {
-                if (i + 4 > data.size) {
+                if (data.size - i < 4) {
                     avcc = false
                     break
                 }
@@ -454,7 +457,14 @@ class HardwareEncoder internal constructor(
                     ((data[i + 2].toInt() and 0xff) shl 8) or
                     (data[i + 3].toInt() and 0xff)
                 i += 4
-                if (len <= 0 || i + len > data.size) {
+                // Compare against the remaining bytes rather than computing
+                // i + len: a hostile or corrupt length can overflow Int.
+                if (len <= 0 || len > data.size - i) {
+                    avcc = false
+                    break
+                }
+                val nal = data[i].toInt() and 0xff
+                if (nal and 0x80 != 0 || (nal and 0x1f) !in 1..23) {
                     avcc = false
                     break
                 }
@@ -467,8 +477,6 @@ class HardwareEncoder internal constructor(
             }
             if (avcc && i == data.size && out.size() > 0) return out.toByteArray()
         }
-        if (data.size >= 3 && data[0] == 0.toByte() && data[1] == 0.toByte() && data[2] == 1.toByte()) return data
-        if (data.size >= 4 && data[0] == 0.toByte() && data[1] == 0.toByte() && data[2] == 0.toByte() && data[3] == 1.toByte()) return data
         return data
     }
 }

@@ -143,6 +143,14 @@ unsafe fn activate_first(
             chosen = Some(transform);
             break;
         }
+        // MFTEnumEx returns a CoTaskMem array of owned activation references.
+        // A borrowed slice does not drop the elements, so release each COM
+        // reference explicitly before freeing the array storage; otherwise
+        // every enumeration leaks one reference per codec (and keeps its DLL
+        // loaded for the process lifetime).
+        for activate in list.iter().flatten() {
+            drop(ptr::read(activate));
+        }
         CoTaskMemFree(Some(activates as *const c_void));
         Ok(chosen)
     }
@@ -560,76 +568,73 @@ impl MfEncoder {
             pEvents: ManuallyDrop::new(None),
         };
         let mut status = 0u32;
-        let mut keyframe = false;
-        loop {
-            let result = unsafe {
-                self.transform
-                    .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status)
-            };
-            match result {
-                Ok(()) => {
-                    let produced = unsafe { ManuallyDrop::take(&mut output.pSample) };
-                    let _events = unsafe { ManuallyDrop::take(&mut output.pEvents) };
-                    let Some(produced) = produced else {
-                        return Ok(false);
-                    };
-                    let buffer: IMFMediaBuffer = unsafe {
-                        produced
-                            .ConvertToContiguousBuffer()
-                            .map_err(|e| mf_err("output buffer", e))?
-                    };
-                    let mut data: *mut u8 = ptr::null_mut();
-                    let mut len = 0u32;
-                    unsafe {
-                        buffer
-                            .Lock(&mut data, None, Some(&mut len))
-                            .map_err(|e| mf_err("output lock", e))?;
-                        let bytes = std::slice::from_raw_parts(data, len as usize);
-                        let is_key = h264_to_annexb(bytes, &mut self.normalized);
-                        let _ = buffer.Unlock();
-                        if is_key {
-                            keyframe = true;
-                            // Some encoders publish the sequence header only
-                            // once streaming starts. Pick it up on the first
-                            // IDR rather than sending a group without SPS/PPS.
-                            if self.parameter_sets.is_empty()
-                                && let Ok(current) = self.transform.GetOutputCurrentType(0)
-                            {
-                                self.parameter_sets = sequence_header(&current);
-                            }
-                            // A keyframe may carry SPS but omit PPS (or vice
-                            // versa). Prepend the full set unless both are
-                            // already present.
-                            if !self.parameter_sets.is_empty()
-                                && !(h264_has_nal(&self.normalized, 7)
-                                    && h264_has_nal(&self.normalized, 8))
-                            {
-                                out.extend_from_slice(&self.parameter_sets);
-                            }
+        let result = unsafe {
+            self.transform
+                .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status)
+        };
+        match result {
+            Ok(()) => {
+                let produced = unsafe { ManuallyDrop::take(&mut output.pSample) };
+                let _events = unsafe { ManuallyDrop::take(&mut output.pEvents) };
+                let Some(produced) = produced else {
+                    return Ok(false);
+                };
+                let buffer: IMFMediaBuffer = unsafe {
+                    produced
+                        .ConvertToContiguousBuffer()
+                        .map_err(|e| mf_err("output buffer", e))?
+                };
+                let mut data: *mut u8 = ptr::null_mut();
+                let mut len = 0u32;
+                let keyframe = unsafe {
+                    buffer
+                        .Lock(&mut data, None, Some(&mut len))
+                        .map_err(|e| mf_err("output lock", e))?;
+                    let bytes = std::slice::from_raw_parts(data, len as usize);
+                    let keyframe = h264_to_annexb(bytes, &mut self.normalized);
+                    let _ = buffer.Unlock();
+                    if keyframe {
+                        // Some encoders publish the sequence header only
+                        // once streaming starts. Pick it up on the first
+                        // IDR rather than sending a group without SPS/PPS.
+                        if self.parameter_sets.is_empty()
+                            && let Ok(current) = self.transform.GetOutputCurrentType(0)
+                        {
+                            self.parameter_sets = sequence_header(&current);
                         }
-                        out.extend_from_slice(&self.normalized);
+                        // A keyframe may carry SPS but omit PPS (or vice
+                        // versa). Prepend the full set unless both are
+                        // already present.
+                        if !self.parameter_sets.is_empty()
+                            && !(h264_has_nal(&self.normalized, 7)
+                                && h264_has_nal(&self.normalized, 8))
+                        {
+                            out.extend_from_slice(&self.parameter_sets);
+                        }
                     }
-                    if out.is_empty() {
-                        return Ok(false);
-                    }
-                    return Ok(keyframe);
-                }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
-                    let _ = unsafe { ManuallyDrop::take(&mut output.pSample) };
-                    let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
+                    out.extend_from_slice(&self.normalized);
+                    keyframe
+                };
+                if out.is_empty() {
                     return Ok(false);
                 }
-                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    let _ = unsafe { ManuallyDrop::take(&mut output.pSample) };
-                    let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
-                    self.update_output_type()?;
-                    return Ok(false);
-                }
-                Err(e) => {
-                    let _ = unsafe { ManuallyDrop::take(&mut output.pSample) };
-                    let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
-                    return Err(mf_err("process output", e));
-                }
+                Ok(keyframe)
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                let _ = unsafe { ManuallyDrop::take(&mut output.pSample) };
+                let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
+                Ok(false)
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                let _ = unsafe { ManuallyDrop::take(&mut output.pSample) };
+                let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
+                self.update_output_type()?;
+                Ok(false)
+            }
+            Err(e) => {
+                let _ = unsafe { ManuallyDrop::take(&mut output.pSample) };
+                let _ = unsafe { ManuallyDrop::take(&mut output.pEvents) };
+                Err(mf_err("process output", e))
             }
         }
     }

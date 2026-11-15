@@ -138,6 +138,10 @@ impl MediaCodecEncoder {
     }
 
     fn encode_frame(&mut self, keyframe: bool) -> Result<bool, Error> {
+        // A null result means the codec has not produced an access unit yet.
+        // Clear the previous frame first so the caller cannot mistake stale
+        // bytes for output from this attempt.
+        self.normalized.clear();
         let mut env = self
             .vm
             .attach_current_thread()

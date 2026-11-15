@@ -12,6 +12,22 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.6.2
+
+A small reliability patch for the 0.6.1 hardware media paths. There is no
+protocol change; this build is wire-compatible with 0.6.1.
+
+## Fixes
+
+- Windows builds pass the release lint gate again, so the Windows client
+  can be rebuilt and published from this tag.
+- Recreating a Media Foundation encoder or decoder no longer leaks codec
+  activation references.
+- Android hardware decoding handles unusual vendor AVCC buffers without
+  risking an integer overflow or a misclassified frame.
+- Android hardware encoding no longer repeats the previous frame while
+  the codec is still buffering its first output.
+
 # Parley 0.6.1
 
 A new media plane, smoother sharing, and volume controls that finally do

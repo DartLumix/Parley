@@ -3,6 +3,29 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.6.2] — 2026-11-15
+
+A reliability patch for the 0.6.1 hardware media paths. There is no
+protocol change: a 0.6.2 client and server remain wire-compatible with
+0.6.1.
+
+### Fixed
+
+- The Windows build passes the workspace clippy gate again. The Media
+  Foundation encoder's `take_output` used a single-iteration `loop`, which
+  current clippy rejects as `never_loop`; the one `ProcessOutput` call is
+  now expressed directly with the same sample and event ownership.
+- Media Foundation MFT enumeration releases every activation reference
+  before freeing the returned array, so recreating an encoder or decoder
+  after a resolution change no longer leaks codec objects.
+- Android's AVCC-to-Annex-B normalization validates each length and NAL
+  header and checks the length against the remaining bytes instead of
+  computing an end offset that can overflow. A corrupt or unusual vendor
+  buffer can no longer crash the media thread.
+- Android hardware encoding no longer resends the previous access unit
+  when MediaCodec buffers a frame and returns no output yet; the wrapper
+  clears its normalized buffer on every attempt.
+
 ## [0.6.1] — 2026-11-15
 
 The MoQ media-plane release. Screen video, camera video and share audio

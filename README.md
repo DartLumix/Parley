@@ -51,6 +51,7 @@ Voice is the product; everything else grows later.
 | 0.3 | Settings page, screens grid with own-stream preview, share size/rate dialog | ✅ |
 | 7+ | Windows capture + share audio (WGC + WASAPI), Android client | ✅ |
 | 0.6.1 | MoQ media plane, adaptive publisher, native hardware encode/decode | ✅ |
+| 0.6.2 | Hardware-codec reliability fixes; Windows lint gate repaired | ✅ |
 | Next | iOS/macOS, Windows camera share, moderation depth | ⏳ |
 
 ---

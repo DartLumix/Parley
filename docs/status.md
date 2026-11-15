@@ -1,13 +1,14 @@
 # Status
 
-Snapshot: **0.6.1** (2026-11-15). Self-hosted voice, video and screen
+Snapshot: **0.6.2** (2026-11-15). Self-hosted voice, video and screen
 sharing with Linux and Windows desktop clients, an Android client, a
 single-container server and a deploy kit.
 
-Protocol 2 is a breaking media-plane change. The server, every desktop
-client and the Android APK must be upgraded together; there is no
-mixed-version call path. The server needs both UDP ports reachable:
-control/voice on 4443 and MoQ media on 4445.
+Protocol 2 was introduced in 0.6.1 as a breaking media-plane change from
+0.6.0: that upgrade requires the server, every desktop client and the
+Android APK together. 0.6.2 keeps protocol 2 and is wire-compatible with
+0.6.1. The server needs both UDP ports reachable: control/voice on 4443
+and MoQ media on 4445.
 
 ## What works, and what proves it
 

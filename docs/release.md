@@ -5,7 +5,8 @@ A release is a git tag. Nothing builds downloadable artifacts from
 
 | tag | meaning |
 |:--|:--|
-| `v0.6.1` | stable; also tagged `latest` in the registry |
+| `v0.6.2` | stable; also tagged `latest` in the registry |
+| `v0.6.1` | previous stable |
 | `v0.6.2-rc1` | prerelease; never `latest` |
 
 ## Before tagging
@@ -14,8 +15,9 @@ A release is a git tag. Nothing builds downloadable artifacts from
    `app/rust/Cargo.toml` and `app/pubspec.yaml`.
 2. Move `CHANGELOG.md`'s unreleased notes under the new version — the
    release body is extracted from that section.
-   Protocol 2 (0.6.x) is a breaking media-plane change: the server and
-   every client must ship together, and UDP 4445 must be reachable.
+   Protocol 2 (introduced in 0.6.1) is a breaking media-plane change from
+   0.6.0: the server and every client must ship together for that upgrade,
+   and UDP 4445 must be reachable. 0.6.2 remains wire-compatible with 0.6.1.
 3. From a clean tree:
 
 ```sh
@@ -30,7 +32,7 @@ cargo test --workspace
 ```sh
 docker build -t parley:local .
 cargo build --release -p parley-client && tools/e2e-container.sh
-tools/package-client.sh 0.6.1 dist   # needs Flutter on PATH
+tools/package-client.sh 0.6.2 dist   # needs Flutter on PATH
 ```
 
 ### Android signing secrets
@@ -77,7 +79,7 @@ PARLEY_ANDROID_KEYSTORE_PASSWORD=... \
 PARLEY_ANDROID_KEY_ALIAS=... \
 PARLEY_ANDROID_KEY_PASSWORD=... \
 flutter build apk --release \
-  --dart-define=PARLEY_VERSION=0.6.1 \
+  --dart-define=PARLEY_VERSION=0.6.2 \
   --dart-define=PARLEY_BUILD=$(git rev-parse HEAD)
 ```
 
@@ -87,8 +89,8 @@ naming the missing variables, rather than producing a debug-signed APK.
 ## Tag and push
 
 ```sh
-git tag -a v0.6.1 -m "Parley 0.6.1"
-git push origin v0.6.1
+git tag -a v0.6.2 -m "Parley 0.6.2"
+git push origin v0.6.2
 ```
 
 ## What the workflow does
@@ -184,10 +186,10 @@ and push steps are in that README.
 
 ```sh
 sha256sum -c SHA256SUMS
-tar xf parley-deploy-0.6.1.tar.gz
-docker load -i parley-deploy-0.6.1/parley-image-0.6.1.tar.gz
+tar xf parley-deploy-0.6.2.tar.gz
+docker load -i parley-deploy-0.6.2/parley-image-0.6.2.tar.gz
 docker run -d --name parley -p 4443:4443/udp -p 4445:4445/udp \
-  -e PARLEY_ADMIN_PASSWORD=secret parley:0.6.1
+  -e PARLEY_ADMIN_PASSWORD=secret parley:0.6.2
 cargo build --release -p parley-client
 tools/e2e-container.sh          # builds its own image and boots it on a free port
 ```
