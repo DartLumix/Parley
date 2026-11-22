@@ -72,6 +72,12 @@ class AppSettings {
   /// Target RMS level for automatic gain, in dBFS (-36..-6).
   final int micAutogainTargetDb;
 
+  /// Raise a desktop notification when somebody pokes this client. Off by
+  /// default: the in-app notice and the poke cue already say so, and a
+  /// system banner is the louder option. The Shell side decides how to
+  /// show it; a build without a notification backend simply ignores it.
+  final bool pokeNotifications;
+
   const AppSettings({
     required this.hwEncode,
     required this.showSharePreview,
@@ -84,6 +90,7 @@ class AppSettings {
     required this.outputDevice,
     required this.micAutogain,
     required this.micAutogainTargetDb,
+    required this.pokeNotifications,
   });
 
   static Future<AppSettings> default_() =>
@@ -101,7 +108,8 @@ class AppSettings {
       inputDevice.hashCode ^
       outputDevice.hashCode ^
       micAutogain.hashCode ^
-      micAutogainTargetDb.hashCode;
+      micAutogainTargetDb.hashCode ^
+      pokeNotifications.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -118,7 +126,8 @@ class AppSettings {
           inputDevice == other.inputDevice &&
           outputDevice == other.outputDevice &&
           micAutogain == other.micAutogain &&
-          micAutogainTargetDb == other.micAutogainTargetDb;
+          micAutogainTargetDb == other.micAutogainTargetDb &&
+          pokeNotifications == other.pokeNotifications;
 }
 
 /// The device names the settings page offers. Plain strings because they

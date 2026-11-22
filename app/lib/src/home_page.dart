@@ -13,6 +13,7 @@ import 'rust/api/session.dart';
 import 'rust/api/settings.dart' as settings_api;
 import 'rust/api/soundboard.dart' as soundboard_api;
 import 'rust/api/video.dart' as video_api;
+import 'notifications.dart';
 import 'platform/android_platform.dart';
 import 'theme.dart';
 import 'update/notes.dart' as notes;
@@ -240,6 +241,7 @@ class _HomePageState extends State<HomePage> {
     outputDevice: '',
     micAutogain: false,
     micAutogainTargetDb: -18,
+    pokeNotifications: false,
   );
   // The sharer's own preview texture (Rust creates it once per process).
   video_api.SharePreview? _preview;
@@ -1422,6 +1424,7 @@ class _HomePageState extends State<HomePage> {
         outputDevice: _settings.outputDevice,
         micAutogain: _settings.micAutogain,
         micAutogainTargetDb: _settings.micAutogainTargetDb,
+        pokeNotifications: _settings.pokeNotifications,
       ),
     );
     if (on && _preview == null && _sharing) await _loadPreview();
@@ -1493,6 +1496,7 @@ class _HomePageState extends State<HomePage> {
             outputDevice: _settings.outputDevice,
             micAutogain: _settings.micAutogain,
             micAutogainTargetDb: _settings.micAutogainTargetDb,
+            pokeNotifications: _settings.pokeNotifications,
           ),
         ),
       );
@@ -1710,6 +1714,12 @@ class _HomePageState extends State<HomePage> {
               .where((c) => c.id == ev.channelId)
               .map((c) => c.name)
               .firstOrNull;
+          // Opt-in desktop copy of the same poke. It is intentionally in
+          // addition to the snackbar: the banner is for someone who is in
+          // another window (Minecraft), the snackbar carries *Poke back*.
+          if (_settings.pokeNotifications) {
+            unawaited(showPokeNotification(from: from, channel: where));
+          }
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(

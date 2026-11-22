@@ -21,6 +21,7 @@ void main() {
     outputDevice: '',
     micAutogain: false,
     micAutogainTargetDb: -18,
+    pokeNotifications: false,
   );
 
   Future<AudioDevices> devices() async => const AudioDevices(
@@ -161,6 +162,21 @@ void main() {
     await tester.pumpAndSettle();
     expect(saved.last.micAutogainTargetDb, lessThan(-18));
     expect(saved.last.micAutogainTargetDb, greaterThanOrEqualTo(-36));
+  });
+
+  testWidgets('poke system notifications are opt-in and persisted', (
+    tester,
+  ) async {
+    final saved = <AppSettings>[];
+    await tester.pumpWidget(host(saved));
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(find.text('Poke notifications'), 200);
+    await tester.tap(find.text('Poke notifications'));
+    await tester.pumpAndSettle();
+
+    expect(saved.last.pokeNotifications, isTrue);
+    expect(saved.last.echoCancel, initial.echoCancel, reason: 'one control');
   });
 
   testWidgets('echo and noise strength are separate persisted levels', (

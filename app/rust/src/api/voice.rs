@@ -791,7 +791,7 @@ pub(crate) fn start_voice(
             if stop_for_thread.load(Ordering::Relaxed) {
                 break;
             }
-            let health = StreamHealth::default();
+            let health = StreamHealth::new();
             let built = build_streams(
                 &mixer,
                 aec.clone(),
@@ -919,10 +919,20 @@ struct AudioStreams {
 /// another application takes the output away (the symptom reported as
 /// "voice input still works, but I hear nothing until I rejoin").
 #[cfg(feature = "audio-device")]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct StreamHealth {
     ticks: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "audio-device")]
+impl StreamHealth {
+    fn new() -> Self {
+        Self {
+            ticks: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// Backoff that still notices a leave. A plain `sleep(5 s)` would keep the

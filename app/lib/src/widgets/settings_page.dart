@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../notifications.dart';
 import '../rust/api/settings.dart' as settings_api;
 import '../theme.dart';
 import 'report_section.dart';
@@ -297,6 +298,22 @@ class _SettingsPageState extends State<SettingsPage> {
                 ],
               ),
             ),
+          if (systemNotificationsSupported) ...[
+            const SizedBox(height: 16),
+            _section(theme, 'Notifications'),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Poke notifications'),
+              subtitle: const Text(
+                'Raise a desktop notification when someone pokes you, so '
+                'the poke reaches you while Parley is in the background. '
+                'The in-app notice and the poke sound stay on either way. '
+                'Off by default.',
+              ),
+              value: s.pokeNotifications,
+              onChanged: (v) => _update(_copy(pokeNotifications: v)),
+            ),
+          ],
           const SizedBox(height: 16),
           _section(theme, 'Account'),
           ListTile(
@@ -371,6 +388,7 @@ class _SettingsPageState extends State<SettingsPage> {
     String? outputDevice,
     bool? micAutogain,
     int? micAutogainTargetDb,
+    bool? pokeNotifications,
   }) {
     final s = _settings;
     return settings_api.AppSettings(
@@ -385,6 +403,7 @@ class _SettingsPageState extends State<SettingsPage> {
       outputDevice: outputDevice ?? s.outputDevice,
       micAutogain: micAutogain ?? s.micAutogain,
       micAutogainTargetDb: micAutogainTargetDb ?? s.micAutogainTargetDb,
+      pokeNotifications: pokeNotifications ?? s.pokeNotifications,
     );
   }
 

@@ -2696,8 +2696,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   AppSettings dco_decode_app_settings(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 11)
-      throw Exception('unexpected arr length: expect 11 but see ${arr.length}');
+    if (arr.length != 12)
+      throw Exception('unexpected arr length: expect 12 but see ${arr.length}');
     return AppSettings(
       hwEncode: dco_decode_bool(arr[0]),
       showSharePreview: dco_decode_bool(arr[1]),
@@ -2710,6 +2710,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       outputDevice: dco_decode_String(arr[8]),
       micAutogain: dco_decode_bool(arr[9]),
       micAutogainTargetDb: dco_decode_i_32(arr[10]),
+      pokeNotifications: dco_decode_bool(arr[11]),
     );
   }
 
@@ -3322,6 +3323,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_outputDevice = sse_decode_String(deserializer);
     var var_micAutogain = sse_decode_bool(deserializer);
     var var_micAutogainTargetDb = sse_decode_i_32(deserializer);
+    var var_pokeNotifications = sse_decode_bool(deserializer);
     return AppSettings(
       hwEncode: var_hwEncode,
       showSharePreview: var_showSharePreview,
@@ -3334,6 +3336,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       outputDevice: var_outputDevice,
       micAutogain: var_micAutogain,
       micAutogainTargetDb: var_micAutogainTargetDb,
+      pokeNotifications: var_pokeNotifications,
     );
   }
 
@@ -4113,6 +4116,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.outputDevice, serializer);
     sse_encode_bool(self.micAutogain, serializer);
     sse_encode_i_32(self.micAutogainTargetDb, serializer);
+    sse_encode_bool(self.pokeNotifications, serializer);
   }
 
   @protected

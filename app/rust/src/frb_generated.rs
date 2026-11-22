@@ -2542,6 +2542,7 @@ impl SseDecode for crate::api::settings::AppSettings {
         let mut var_outputDevice = <String>::sse_decode(deserializer);
         let mut var_micAutogain = <bool>::sse_decode(deserializer);
         let mut var_micAutogainTargetDb = <i32>::sse_decode(deserializer);
+        let mut var_pokeNotifications = <bool>::sse_decode(deserializer);
         return crate::api::settings::AppSettings {
             hw_encode: var_hwEncode,
             show_share_preview: var_showSharePreview,
@@ -2554,6 +2555,7 @@ impl SseDecode for crate::api::settings::AppSettings {
             output_device: var_outputDevice,
             mic_autogain: var_micAutogain,
             mic_autogain_target_db: var_micAutogainTargetDb,
+            poke_notifications: var_pokeNotifications,
         };
     }
 }
@@ -3407,6 +3409,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::settings::AppSettings {
             self.output_device.into_into_dart().into_dart(),
             self.mic_autogain.into_into_dart().into_dart(),
             self.mic_autogain_target_db.into_into_dart().into_dart(),
+            self.poke_notifications.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -3984,6 +3987,7 @@ impl SseEncode for crate::api::settings::AppSettings {
         <String>::sse_encode(self.output_device, serializer);
         <bool>::sse_encode(self.mic_autogain, serializer);
         <i32>::sse_encode(self.mic_autogain_target_db, serializer);
+        <bool>::sse_encode(self.poke_notifications, serializer);
     }
 }
 

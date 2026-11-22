@@ -59,6 +59,11 @@ pub struct AppSettings {
     pub mic_autogain: bool,
     /// Target RMS level for automatic gain, in dBFS (-36..-6).
     pub mic_autogain_target_db: i32,
+    /// Raise a desktop notification when somebody pokes this client. Off by
+    /// default: the in-app notice and the poke cue already say so, and a
+    /// system banner is the louder option. The Shell side decides how to
+    /// show it; a build without a notification backend simply ignores it.
+    pub poke_notifications: bool,
 }
 
 impl Default for AppSettings {
@@ -96,6 +101,7 @@ impl Default for AppSettings {
             output_device: String::new(),
             mic_autogain: false,
             mic_autogain_target_db: -18,
+            poke_notifications: false,
         }
     }
 }
@@ -278,6 +284,7 @@ mod tests {
         assert!(parsed.show_share_preview, "default keeps the preview on");
         assert!(!parsed.mic_autogain, "autogain stays opt-in");
         assert_eq!(parsed.mic_autogain_target_db, -18);
+        assert!(!parsed.poke_notifications, "system pokes stay opt-in");
         assert_eq!(parsed.echo_level, AppSettings::default().echo_level);
         assert_eq!(parsed.noise_level, AppSettings::default().noise_level);
     }
@@ -298,6 +305,7 @@ mod tests {
             output_device: "Headphones".to_string(),
             mic_autogain: true,
             mic_autogain_target_db: -20,
+            poke_notifications: true,
         };
         write(&path, &settings).expect("write");
         assert_eq!(read_at(&path).expect("read"), settings);
@@ -333,6 +341,7 @@ mod tests {
             output_device: String::new(),
             mic_autogain: true,
             mic_autogain_target_db: -22,
+            poke_notifications: true,
         };
         install(settings.clone());
         assert_eq!(load(), settings);

@@ -25,6 +25,65 @@ static FlMethodChannel* window_channel = nullptr;
 /// event fires for every window-state change, focus included).
 static gboolean window_is_fullscreen = FALSE;
 
+// Poke notifications ("parley/notifications", Dart side
+// app/lib/src/notifications.dart). GNotification hands the banner to the
+// session's notification service, so the desktop draws it in its own style
+// with Parley's icon and name and keeps it in the notification centre. A
+// click comes back as the "app.present" action below and raises the window.
+static FlMethodChannel* notifications_channel = nullptr;
+
+static void present_action_cb(GSimpleAction* action, GVariant* parameter,
+                              gpointer user_data) {
+  (void)action;
+  (void)parameter;
+  gtk_window_present(GTK_WINDOW(user_data));
+}
+
+static void notifications_method_call_cb(FlMethodChannel* channel,
+                                         FlMethodCall* method_call,
+                                         gpointer user_data) {
+  (void)channel;
+  GtkWindow* window = GTK_WINDOW(user_data);
+  const gchar* method = fl_method_call_get_name(method_call);
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (g_strcmp0(method, "notify") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    const gchar* title = nullptr;
+    const gchar* body = nullptr;
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_MAP) {
+      FlValue* t = fl_value_lookup_string(args, "title");
+      FlValue* b = fl_value_lookup_string(args, "body");
+      if (t != nullptr && fl_value_get_type(t) == FL_VALUE_TYPE_STRING) {
+        title = fl_value_get_string(t);
+      }
+      if (b != nullptr && fl_value_get_type(b) == FL_VALUE_TYPE_STRING) {
+        body = fl_value_get_string(b);
+      }
+    }
+    GApplication* app = G_APPLICATION(gtk_window_get_application(window));
+    gboolean sent = FALSE;
+    if (app != nullptr && title != nullptr) {
+      g_autoptr(GNotification) notification = g_notification_new(title);
+      if (body != nullptr) {
+        g_notification_set_body(notification, body);
+      }
+      g_notification_set_category(notification, "im.received");
+      g_notification_set_priority(notification, G_NOTIFICATION_PRIORITY_NORMAL);
+      g_notification_set_default_action(notification, "app.present");
+      // One id on purpose: a second poke updates the banner instead of
+      // leaving a stack of them.
+      g_application_send_notification(app, "poke", notification);
+      sent = TRUE;
+      g_message("notifications: poke (%s)", title);
+    }
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_bool(sent)));
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+  fl_method_call_respond(method_call, response, nullptr);
+}
+
 // The desktop can leave fullscreen on its own — its own shortcut, its
 // own exit hint. Tell Dart so the viewer PAGE goes away with the window:
 // staying in a fullscreen viewer inside a decorated window is worse than
@@ -178,6 +237,20 @@ static void my_application_activate(GApplication* application) {
   fl_method_channel_set_method_call_handler(window_channel,
                                             window_method_call_cb, window,
                                             nullptr);
+
+  // The app action the notification's click is routed to. Registered per
+  // window (the app is G_APPLICATION_NON_UNIQUE, so one process has one).
+  static const GActionEntry app_entries[] = {
+      {"present", present_action_cb, nullptr, nullptr, nullptr},
+  };
+  g_action_map_add_action_entries(G_ACTION_MAP(application), app_entries,
+                                  G_N_ELEMENTS(app_entries), window);
+
+  notifications_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(fl_view_get_engine(view)),
+      "parley/notifications", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(
+      notifications_channel, notifications_method_call_cb, window, nullptr);
   g_signal_connect(window, "window-state-event",
                    G_CALLBACK(window_state_event_cb), nullptr);
 

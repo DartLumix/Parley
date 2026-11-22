@@ -26,7 +26,7 @@ and MoQ media on 4445.
 | Hardware decode: VA-API, Media Foundation, MediaCodec with software fallback | shipping | backend round-trip tests; Linux hardware stream run; cross-target builds |
 | Adaptive publisher: capped VBR, 2 s IDR, FPS-first two-stage, snap-back | shipping | `parley-core` controller tests; live 1080p/30 screen share |
 | Camera share (Linux V4L2, Android Camera2) | shipping | conversion/rotation unit tests; Android release build; a live Linux camera run is still the manual check |
-| Poke notifications, wheel volume on roster rows | shipping | server routing test; widget tests |
+| Poke notifications (in-app notice, opt-in desktop banner), wheel volume on roster rows | shipping | server routing test; widget tests; Linux GNotification/Windows balloon runners are compile-checked only |
 | Flutter client: session, channels, chat, voice, share watch/send, fullscreen | shipping | widget tests, release bundle, live two-machine runs |
 | Windows client: voice, chat, share send/watch, WGC + WASAPI audio, MF codecs | shipping, cross-built | CI cross-build; no live Windows desktop in this repository's CI |
 | Android client: voice, chat, screen/camera share, MediaCodec, APK updater | shipping | release build; no live Android device in this repository's CI |
@@ -40,6 +40,12 @@ longer scale with the number or resolution of shares.
 
 ## Limits and unverified things
 
+- **Desktop poke banners are native to each runner.** Linux uses
+  GNotification, so the desktop's notification service draws, stores and
+  routes a click; Windows uses a notification-area balloon, which Windows
+  11 shows as a transient banner rather than keeping it in the notification
+  centre (a real toast needs an MSIX identity the zip does not have).
+  Android keeps the in-app notice and does not offer the switch.
 - **Linux is the reference client.** The live two-machine media runs in
   this repository use Linux on both ends. Windows is verified by the
   cross-target build and unit tests; Android by the release build and

@@ -111,9 +111,12 @@ same trust decision.
   so their voice keeps its level.
 - **Poke** — the same user dialog has a *Poke* button for anyone online,
   in a channel or in the idle list. The server sends it to that user
-  alone; their client plays a distinct cue and shows a notification with
-  a *Poke back* action. *Mute all* keeps the cue silent, like every other
-  local sound.
+  alone; their client plays a distinct cue and shows an in-app notice with
+  a *Poke back* action. Settings → Notifications › *Poke notifications*
+  additionally raises a desktop notification (GNotification on Linux, a
+  notification-area banner on Windows), which is what finds someone who is
+  in another window; clicking it brings Parley back. It is off by default,
+  and *Mute all* keeps the cue silent, like every other local sound.
 - **Screen share** — *Share screen* in the floating bar asks for a
   resolution and frame-rate cap first (defaults from Settings, *Source*
   means the capture's own size and rate — caps never upscale), then the
@@ -163,10 +166,11 @@ same trust decision.
   actually sent, so a 60 fps request on a machine that encodes 47 says 47.
 - **Settings** — the gear in the app bar: video (hardware encoding,
   default share resolution and frame rate), audio (echo cancellation,
-  which applies to the next channel you join), account (the connected
-  server and account, plus *Sign out*) and updates. Every control saves
-  immediately to `~/.config/parley/settings.toml`; a preference that only
-  takes effect at encoder/AEC creation says so on the page.
+  which applies to the next channel you join), notifications (the opt-in
+  desktop poke banner), account (the connected server and account, plus
+  *Sign out*) and updates. Every control saves immediately to
+  `~/.config/parley/settings.toml`; a preference that only takes effect at
+  encoder/AEC creation says so on the page.
 - **Updates** — Settings → *Updates*: **Check for updates** asks the
   release channel (`github.com/DartLumix/Parley`), and when a
   newer version is published, *Install … and restart* downloads it, checks
@@ -242,6 +246,7 @@ folder.
 | an update downloads, the app closes and the old version opens again | the swap script force-closes a stuck process, starts the new build, and rolls back to the old one if it exits immediately; the reason is in `~/.cache/parley/update.log` (`%LOCALAPPDATA%\parley\update.log` on Windows). Settings → Updates also shows that the last handoff did not finish. Send that log from Settings → Support › Report a problem |
 | others hear me but I hear nothing | the native device thread watches the render callback and stream errors, and reopens the audio devices automatically after a device switch, driver reset or another application taking the output. If it persists, the `voice:` lines are in the report's `rust-current.log` |
 | I deafened but can still unmute my mic | while deafened the mic/AFK buttons are replaced by a disabled *Deafened* label; only the headset button undeafens, restoring both directions |
+| no desktop banner when someone pokes me | it is opt-in: Settings → Notifications › *Poke notifications*. Linux needs a running notification service; the in-app notice and the cue work without it |
 | *Apply sounds* says a file is missing | the MP3 must be named exactly `join.mp3`/`leave.mp3`/`afk.mp3` in the folder the Profile page prints, and edited files need another *Apply* |
 | a chat file card will not download | the message expired (24 h ephemeral, unless pinned) or the server's disk is full — the server log names the missing id |
 

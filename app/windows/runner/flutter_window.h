@@ -7,8 +7,10 @@
 #include <flutter/method_channel.h>
 
 #include <memory>
+#include <string>
 
 #include "win32_window.h"
+#include <shellapi.h>
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -30,6 +32,16 @@ class FlutterWindow : public Win32Window {
   // controls are served here; the custom title bar stays Linux-only.
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       window_channel_;
+
+  // The Dart side's `parley/notifications` channel. A Win32 app without
+  // an MSIX identity can only raise a notification-area balloon, which
+  // needs a tray icon: one is added on the first poke notification and
+  // kept (clicking it restores the window), then removed with the process.
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+      notifications_channel_;
+  NOTIFYICONDATAW tray_icon_{};
+  bool tray_icon_added_ = false;
+  void ShowNotification(const std::wstring& title, const std::wstring& body);
 
   // Borderless fullscreen state, restored exactly on exit.
   bool fullscreen_ = false;
