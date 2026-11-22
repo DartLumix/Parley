@@ -3,6 +3,42 @@
 All notable changes are recorded here. Releases are tagged `vX.Y.Z`;
 `vX.Y.Z-rcN` tags are prereleases and are never marked latest.
 
+## [0.6.3] — 2026-11-22
+
+A client reliability release. Desktop poke notifications and a built-in
+report tool are new; share audio, audio-output recovery, deafen and the
+updater are fixed. There is no protocol change: 0.6.3 stays wire-compatible
+with 0.6.2.
+
+### Added
+
+- Settings → Notifications › *Poke notifications* sends a poke to the
+  desktop as well as the in-app notice: a GNotification on Linux and a
+  notification-area balloon on Windows. Clicking it raises Parley. The
+  switch is off by default and hidden on Android, which keeps the in-app
+  notice.
+- Settings → Support › *Report a problem* collects the current session log,
+  the previous session after a crash, the native voice log and `system.txt`
+  (distribution, desktop, audio and video drivers), plus an optional
+  screenshot, into `reports/parley-report-…`. It opens a prefilled GitHub
+  issue; *Save report* and *Copy summary* work without a GitHub account.
+
+### Fixed
+
+- Share audio from a MoQ broadcast is gated by the watched share like the
+  datagram path, and share audio and volume calls translate tile media ids
+  to account ids. Starting a session clears the gate, so a reconnect cannot
+  inherit an audible account.
+- The native audio thread watches the render callback and stream errors and
+  reopens the devices after a device switch, driver reset or another
+  application taking the output.
+- While deafened the mic and AFK buttons are replaced by a disabled
+  *Deafened* label; only the headset button undeafens and restores both
+  directions.
+- The Windows update handoff force-closes a stuck process, health-checks
+  the new build, rolls back and relaunches the old one if it fails, and
+  leaves a pending marker in Settings → Updates.
+
 ## [0.6.2] — 2026-11-15
 
 A reliability patch for the 0.6.1 hardware media paths. There is no
