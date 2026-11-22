@@ -156,6 +156,14 @@ tagged release needs no extra step** for the updater to see it. Override
 the channel for a fork or a test build with
 `--dart-define=PARLEY_UPDATE_REPO=owner/repo`.
 
+The desktop swap is deliberately defensive: the helper outlives the app,
+waits for the old pid only briefly and force-stops it if the process is
+stuck, keeps the previous directory until the new build has survived its
+first seconds, and restores and relaunches it if the new build exits or a
+move fails. The old build leaves a `pending-update.json` marker in the
+update cache; if it is the build that starts again, Settings → Updates says
+the handoff did not finish instead of silently claiming to be current.
+
 What the updater depends on, and what to check after publishing:
 
 - **Every platform asset and `SHA256SUMS`** must be attached, and the
@@ -165,6 +173,9 @@ What the updater depends on, and what to check after publishing:
   offered, and the last stable release stays the one clients see.
 - A release with **no asset for the platform** is reported in the Settings
   card ("release X has no …") rather than failing silently.
+- A **failed handoff** is visible twice: in the next Settings → Updates
+  card (the pending marker) and in `update.log`. The old build is kept, so
+  a failed update is recoverable, not fatal.
 - The updater ships **inside the client**, so the first release carrying it
   has to be installed by hand; from then on the app can move forward on its
   own. It never installs an older build.

@@ -406,6 +406,104 @@ Future<UpdateCheck> checkForUpdate({
   }
 }
 
+/// A staged update that was handed to the swap script. It is written before
+/// the app exits and removed by the next version on startup; if the old
+/// version starts again, Settings can say the update did not finish instead
+/// of silently looking up to date.
+class PendingUpdate {
+  const PendingUpdate({
+    required this.target,
+    required this.asset,
+    required this.archive,
+    required this.destination,
+    required this.startedAt,
+  });
+
+  final String target;
+  final String asset;
+  final String archive;
+  final String destination;
+  final String startedAt;
+
+  Map<String, dynamic> toJson() => {
+    'target': target,
+    'asset': asset,
+    'archive': archive,
+    'destination': destination,
+    'startedAt': startedAt,
+  };
+}
+
+File pendingUpdateFile() =>
+    File('${updateRoot().path}${_sep}pending-update.json');
+
+/// Record the handoff before [installAndRestart] closes this process.
+void recordPendingUpdate(UpdateCheck check, File archive) {
+  try {
+    final file = pendingUpdateFile();
+    file.parent.createSync(recursive: true);
+    file.writeAsStringSync(
+      jsonEncode(
+        PendingUpdate(
+          target: check.latest ?? '',
+          asset: check.assetName ?? '',
+          archive: archive.path,
+          destination: installDir().path,
+          startedAt: DateTime.now().toIso8601String(),
+        ).toJson(),
+      ),
+      flush: true,
+    );
+  } on Object {
+    // The update can still succeed; the marker is only for a failed handoff.
+  }
+}
+
+/// The last handoff, or null when there is none (or it is unreadable).
+PendingUpdate? readPendingUpdate() {
+  try {
+    final file = pendingUpdateFile();
+    if (!file.existsSync()) return null;
+    final decoded = jsonDecode(file.readAsStringSync());
+    if (decoded is! Map) return null;
+    final map = Map<String, dynamic>.from(decoded);
+    final target = map['target'] as String? ?? '';
+    if (target.isEmpty) return null;
+    return PendingUpdate(
+      target: target,
+      asset: map['asset'] as String? ?? '',
+      archive: map['archive'] as String? ?? '',
+      destination: map['destination'] as String? ?? '',
+      startedAt: map['startedAt'] as String? ?? '',
+    );
+  } on Object {
+    return null;
+  }
+}
+
+void clearPendingUpdate() {
+  try {
+    final file = pendingUpdateFile();
+    if (file.existsSync()) file.deleteSync();
+  } on Object {
+    // Harmless: the stale marker is replaced by the next attempt.
+  }
+}
+
+/// Called on startup: a new build is running, so its marker is done. An old
+/// build keeps it, which is what the Settings warning reads.
+void clearCompletedUpdate() {
+  final pending = readPendingUpdate();
+  if (pending == null) return;
+  try {
+    if (Version.parse(parleyVersion) >= Version.parse(pending.target)) {
+      clearPendingUpdate();
+    }
+  } on Object {
+    // Keep the marker if the version string is odd.
+  }
+}
+
 /// The install directory: where the running binary actually lives — the
 /// unpacked tarball for a run-in-place copy, `~/.local/opt/parley` for
 /// `install.sh`, `/opt/parley` for the AUR package.
@@ -525,7 +623,15 @@ Future<void> installAndRestart(
       '${check.latest} in ${archive.path}; handing over to ${script.path}\n',
       mode: FileMode.append,
     );
-    await _spawn(script);
+    recordPendingUpdate(check, archive);
+    try {
+      await _spawn(script);
+    } on Object {
+      // The script never started, so nothing will replace this build. Do not
+      // leave a marker that makes the next normal launch look failed.
+      clearPendingUpdate();
+      rethrow;
+    }
   } finally {
     if (client == null) owned.close(force: true);
   }
@@ -563,16 +669,18 @@ File _windowsScript({
   required File log,
 }) {
   final script = File('${stage.path}${_sep}update.ps1');
-  script.writeAsStringSync(
-    windowsSwapScript(
-      pid: pid,
-      dest: installDir().path,
-      archive: archive.path,
-      newDir: '${stage.path}${_sep}new',
-      bin: _binaryName,
-      log: log.path,
-    ),
+  // PowerShell 5.1 reads a BOM-less .ps1 as the system ANSI code page, which
+  // corrupts a path with a non-ASCII user name. The BOM makes the generated
+  // file UTF-8 on every Windows version.
+  final text = windowsSwapScript(
+    pid: pid,
+    dest: installDir().path,
+    archive: archive.path,
+    newDir: '${stage.path}${_sep}new',
+    bin: _binaryName,
+    log: log.path,
   );
+  script.writeAsStringSync('\uFEFF$text');
   return script;
 }
 
@@ -707,25 +815,62 @@ $archive = @ARCHIVE@
 $new = @NEW@
 $bin = @BIN@
 $log = @LOG@
+$appPath = Join-Path $dest $bin
+$old = "$dest.old"
 
 function Write-Log([string]$message) {
-    "$(Get-Date -Format o) $message" | Add-Content -LiteralPath $log
+    try {
+        $parent = Split-Path -Parent $log
+        if ($parent) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        "$(Get-Date -Format o) $message" |
+            Add-Content -LiteralPath $log -Encoding UTF8
+    } catch { }
+}
+
+function Start-App([string]$path) {
+    Start-Process -FilePath $path -WorkingDirectory $dest -PassThru
 }
 
 Write-Log "parley update: replacing $dest"
 # A process cannot rename a directory that is its own working directory.
 # `_spawn` already points this script at the update root; this is the
 # belt-and-braces version for a shortcut or a launcher that ignored it.
-Set-Location -LiteralPath $env:TEMP
-
-$deadline = (Get-Date).AddSeconds(90)
-while (Get-Process -Id $appPid -ErrorAction SilentlyContinue) {
-    if ((Get-Date) -gt $deadline) {
-        Write-Log 'parley did not exit within 90 s; leaving the install alone'
-        exit 1
-    }
-    Start-Sleep -Milliseconds 500
+try {
+    Set-Location -LiteralPath $env:TEMP
+} catch {
+    Write-Log "could not enter TEMP: $_; staying in the updater directory"
 }
+
+# Wait for the exact old process. Do not wait 90 s and silently give up:
+# the app already asked to restart, so after a short grace period force it
+# closed and carry on. A reused pid must never be killed as if it were us.
+$deadline = (Get-Date).AddSeconds(20)
+while ($true) {
+    $proc = Get-Process -Id $appPid -ErrorAction SilentlyContinue
+    if (-not $proc) { break }
+    $same = $true
+    try {
+        if ($proc.Path -and $proc.Path -ne $appPath) { $same = $false }
+    } catch { }
+    if (-not $same) {
+        Write-Log "pid $appPid is a different process now; continuing"
+        break
+    }
+    if ((Get-Date) -gt $deadline) {
+        Write-Log "parley did not exit within 20 s; force-stopping pid $appPid"
+        try {
+            Stop-Process -Id $appPid -Force -ErrorAction Stop
+        } catch {
+            Write-Log "could not stop pid $appPid`: $_"
+        }
+        Start-Sleep -Seconds 2
+        break
+    }
+    Start-Sleep -Milliseconds 250
+}
+Start-Sleep -Milliseconds 300
 
 try {
     Remove-Item -Recurse -Force $new -ErrorAction SilentlyContinue
@@ -745,8 +890,7 @@ try {
         Expand-Archive -LiteralPath $archive -DestinationPath $new -Force
     }
     if (-not (Test-Path (Join-Path $new $bin))) {
-        Write-Log "the package does not contain $bin; refusing to install"
-        exit 1
+        throw "the package does not contain $bin"
     }
 
     # Personal sounds live in <app dir>\sounds; keep them across the
@@ -758,42 +902,72 @@ try {
         Copy-Item -LiteralPath $userSounds -Destination $newSounds -Recurse -Force
     }
 
-    $old = "$dest.old"
     Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue
     $moved = $false
     for ($i = 0; $i -lt 20 -and -not $moved; $i++) {
         try {
-            Move-Item -LiteralPath $dest -Destination $old
+            Move-Item -LiteralPath $dest -Destination $old -ErrorAction Stop
             $moved = $true
         } catch {
             Start-Sleep -Milliseconds 500
         }
     }
     if (-not $moved) {
-        Write-Log "cannot move $dest aside (still in use?); the install is untouched"
-        exit 1
+        throw "cannot move $dest aside (still in use?)"
     }
+
     try {
-        Move-Item -LiteralPath $new -Destination $dest
+        Move-Item -LiteralPath $new -Destination $dest -ErrorAction Stop
     } catch {
         Write-Log "install failed: $_; restoring the previous build"
         Move-Item -LiteralPath $old -Destination $dest
+        Start-App (Join-Path $dest $bin) | Out-Null
         exit 1
     }
-    # The install has already succeeded at this point. A file left open
-    # in the old directory must not stop the new build from starting.
+
+    # Start the new build and keep the old directory until it has survived
+    # its first seconds. A bad build must not leave the user with no app.
+    Write-Log 'installed; starting the new build'
+    $child = Start-App (Join-Path $dest $bin)
+    Write-Log "started $bin as pid $($child.Id)"
+    Start-Sleep -Seconds 4
+    if ($child.HasExited) {
+        Write-Log "the new build exited immediately (code $($child.ExitCode)); rolling back"
+        Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $old -Destination $dest
+        Start-App (Join-Path $dest $bin) | Out-Null
+        Write-Log 'restored the previous build'
+        exit 1
+    }
+
     try {
         Remove-Item -Recurse -Force $old -ErrorAction Stop
     } catch {
         Write-Log "could not remove $old (harmless): $_"
     }
-    Write-Log 'installed; starting the new build'
-    $child = Start-Process -FilePath (Join-Path $dest $bin) `
-        -WorkingDirectory $dest -PassThru
-    Write-Log "started $bin as pid $($child.Id)"
+    Write-Log 'update complete; the new build is running'
     exit 0
 } catch {
     Write-Log "update failed: $_"
+    # Put the previous build back if it was moved aside, and always try to
+    # leave the user with a running app.
+    try {
+        if (Test-Path -LiteralPath $old) {
+            if (Test-Path -LiteralPath $dest) {
+                Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
+            }
+            Move-Item -LiteralPath $old -Destination $dest
+        }
+    } catch {
+        Write-Log "could not restore the previous build: $_"
+    }
+    try {
+        if (Test-Path (Join-Path $dest $bin)) {
+            Start-App $appPath | Out-Null
+        }
+    } catch {
+        Write-Log "could not restart $appPath`: $_"
+    }
     exit 1
 }
 ''';
@@ -811,7 +985,9 @@ Future<void> _spawn(File script) async {
     await Process.start(
       'powershell.exe',
       [
+        '-NoLogo',
         '-NoProfile',
+        '-NonInteractive',
         '-ExecutionPolicy',
         'Bypass',
         '-WindowStyle',
@@ -838,7 +1014,10 @@ Future<void> _quit() async {
   if (!_windows) {
     await closeWindow();
   }
-  await Future<void>.delayed(const Duration(milliseconds: 500));
+  // Give the detached script time to open its log and start watching this
+  // pid. The script force-closes this process after a grace period anyway,
+  // so a slow engine shutdown cannot strand the swap.
+  await Future<void>.delayed(const Duration(milliseconds: 800));
   exit(0);
 }
 

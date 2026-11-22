@@ -35,10 +35,27 @@ class UpdateSection extends StatefulWidget {
 
 class _UpdateSectionState extends State<UpdateSection> {
   updater.UpdateCheck? _check;
+  updater.PendingUpdate? _pending;
   bool _busy = false;
   double? _progress;
   String _phase = '';
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _pending = updater.readPendingUpdate();
+  }
+
+  /// A handoff is stale when the app that came back is still older than the
+  /// version the script was asked to install. That is exactly the Windows
+  /// symptom this marker exists to make visible.
+  bool get _pendingStale {
+    final pending = _pending;
+    if (pending == null || parleyVersion == 'dev') return false;
+    return updater.Version.parse(parleyVersion) <
+        updater.Version.parse(pending.target);
+  }
 
   Future<void> _runCheck() async {
     setState(() {
@@ -158,6 +175,46 @@ class _UpdateSectionState extends State<UpdateSection> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (_pendingStale)
+          Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: Colors.amber.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.amber.withValues(alpha: 0.35)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'The last update to ${_pending!.target} did not finish. '
+                  'This copy is still $parleyVersion.',
+                  style: const TextStyle(
+                    color: Colors.amberAccent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'The old build is intact, so nothing is lost. The reason is '
+                  'in update.log; check for updates and try again, and if it '
+                  'fails again send that log from Settings → Support.',
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 11,
+                    height: 1.35,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                SelectableText(
+                  '${updater.updateRoot().path}${Platform.pathSeparator}update.log',
+                  style: const TextStyle(color: Colors.white38, fontSize: 10),
+                ),
+              ],
+            ),
+          ),
         ListTile(
           contentPadding: EdgeInsets.zero,
           leading: const Icon(Icons.system_update_alt, size: 20),

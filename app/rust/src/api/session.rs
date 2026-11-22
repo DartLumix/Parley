@@ -1624,6 +1624,10 @@ enum Auth {
 }
 
 async fn connect_async(server: String, user: String, auth: Auth) -> Result<SessionInfo, String> {
+    // Start the native log and panic hook before the first connection, not
+    // only when a channel is joined: a crash during login must leave a file
+    // behind for Settings → Support too.
+    crate::android_log::install_panic_hook();
     // host[:port], with DNS. The user may type an IP, a LAN name or a
     // domain; the TOFU pin stays keyed by the exact string they typed.
     let (addr, server_name) = parley_client::endpoint::resolve(&server)?;

@@ -7,6 +7,7 @@
 mod android_share;
 mod api;
 mod frb_generated;
+mod logging;
 
 /// Android's stdout/stderr is not visible in logcat from the Flutter
 /// embedding, which makes native stream failures invisible on a phone.
@@ -37,10 +38,12 @@ pub(crate) mod android_log {
 
     pub(crate) fn info(message: &str) {
         write(4, message); // ANDROID_LOG_INFO
+        crate::logging::write("INFO", message);
     }
 
     pub(crate) fn error(message: &str) {
         write(6, message); // ANDROID_LOG_ERROR
+        crate::logging::write("ERROR", message);
     }
 
     /// Route Rust panics to logcat once. A panic on the cpal device
@@ -56,15 +59,24 @@ pub(crate) mod android_log {
                 previous(panic);
             }));
         });
+        crate::logging::install_panic_hook();
     }
 }
 
 #[cfg(not(target_os = "android"))]
 #[allow(dead_code)] // The same surface as the Android logger; some calls only exist on phone builds.
 pub(crate) mod android_log {
-    pub(crate) fn info(_message: &str) {}
-    pub(crate) fn error(_message: &str) {}
-    pub(crate) fn install_panic_hook() {}
+    pub(crate) fn info(message: &str) {
+        crate::logging::write("INFO", message);
+    }
+
+    pub(crate) fn error(message: &str) {
+        crate::logging::write("ERROR", message);
+    }
+
+    pub(crate) fn install_panic_hook() {
+        crate::logging::install_panic_hook();
+    }
 }
 
 /// Oboe talks to Android's AudioManager through `ndk-context`, which

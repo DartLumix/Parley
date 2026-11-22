@@ -71,8 +71,12 @@ longer scale with the number or resolution of shares.
 - **The update swap is not covered by CI.** The release decision, the
   checksum check, the notes popup and the generated scripts are tested; the
   part that waits for the app to exit and moves directories runs on a real
-  desktop. It is verified by hand on Linux and on Windows, and every step
-  is logged to `update.log` beside the download.
+  desktop. It is verified by hand on Linux; Windows execution is still
+  unverified on this development machine, so the script now force-closes a
+  stuck process, health-checks the new build, rolls back on failure and
+  relaunches the old build. Every step is logged to `update.log` beside the
+  download, and a failed handoff leaves a visible pending marker in
+  Settings → Updates.
 - **The updater reads published releases only.** It installs the asset for
   its platform from `releases/latest` and verifies it against that release's
   `SHA256SUMS`; an `-rc` tag is never offered, and a release that lacks the

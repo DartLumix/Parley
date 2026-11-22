@@ -269,6 +269,12 @@ not a checksum line
       expect(script, contains(r'$appPid = 42'));
       expect(script, contains(r"$dest = 'C:\Users\a b\Parley'"));
       expect(script, contains('Get-Process -Id \$appPid'));
+      // A closed window with a stuck process must not strand the swap.
+      expect(script, contains('Stop-Process -Id \$appPid -Force'));
+      expect(script, contains('\$appPath = Join-Path \$dest \$bin'));
+      // The new build gets a health check; a crash rolls the old one back.
+      expect(script, contains('\$child.HasExited'));
+      expect(script, contains('rolling back'));
       expect(script, contains('Move-Item -LiteralPath \$dest'));
       expect(
         script,

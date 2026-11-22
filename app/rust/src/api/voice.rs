@@ -80,7 +80,7 @@ use parley_core::audio::MicAutogain;
 #[cfg(feature = "audio-device")]
 use parley_proto::media::FLAG_STEREO;
 #[cfg(feature = "audio-device")]
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "audio-device")]
 use std::sync::Arc;
 #[cfg(feature = "audio-device")]
@@ -778,30 +778,108 @@ pub(crate) fn start_voice(
     let stop_for_thread = stop.clone();
     let device_thread = std::thread::spawn(move || {
         crate::android_log::info("voice: device thread started");
-        match build_streams(&mixer, aec, pcm_tx, muted, mic_level) {
-            Ok(streams) => {
-                let AudioStreams { input, output } = streams;
-                let played = input.play().and_then(|_| output.play());
-                match played {
-                    Ok(()) => {
-                        crate::android_log::info("voice: both streams playing");
-                        let _ = ready_tx.send(Ok(()));
-                        while !stop_for_thread.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                        // scope exit drops both streams: devices closed
+        // A stream is opened once for the session; if the device then
+        // disappears (a Bluetooth/HDMI switch, a driver reset, another
+        // application taking the endpoint) the render callback either
+        // reports an error or stops being called at all. The mic keeps
+        // working, which is exactly the "I can talk but hear nothing
+        // until I rejoin" failure. Keep the session alive and reopen the
+        // pair with backoff instead.
+        let mut announced = false;
+        let mut retry = Duration::from_millis(500);
+        loop {
+            if stop_for_thread.load(Ordering::Relaxed) {
+                break;
+            }
+            let health = StreamHealth::default();
+            let built = build_streams(
+                &mixer,
+                aec.clone(),
+                pcm_tx.clone(),
+                muted.clone(),
+                mic_level.clone(),
+                &health,
+            );
+            let AudioStreams { input, output } = match built {
+                Ok(streams) => streams,
+                Err(e) => {
+                    crate::android_log::error(&format!("voice: build streams failed: {e}"));
+                    if !announced {
+                        // The first attempt is the join: report the error
+                        // to the caller instead of joining silently.
+                        let _ = ready_tx.send(Err(e));
+                        return;
                     }
-                    Err(e) => {
-                        // Dropping both streams at scope exit; report.
-                        crate::android_log::error(&format!("voice: start streams failed: {e}"));
-                        let _ = ready_tx.send(Err(format!("start streams: {e}")));
-                    }
+                    let message = format!(
+                        "voice: audio devices unavailable ({e}); retrying in {} ms",
+                        retry.as_millis()
+                    );
+                    eprintln!("{message}");
+                    crate::logging::write("ERROR", &message);
+                    sleep_while_connected(&stop_for_thread, retry);
+                    retry = (retry * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+            };
+            if let Err(e) = input.play().and_then(|_| output.play()) {
+                crate::android_log::error(&format!("voice: start streams failed: {e}"));
+                if !announced {
+                    let _ = ready_tx.send(Err(format!("start streams: {e}")));
+                    return;
+                }
+                let message = format!(
+                    "voice: could not restart audio ({e}); retrying in {} ms",
+                    retry.as_millis()
+                );
+                eprintln!("{message}");
+                crate::logging::write("ERROR", &message);
+                sleep_while_connected(&stop_for_thread, retry);
+                retry = (retry * 2).min(Duration::from_secs(5));
+                continue;
+            }
+            if announced {
+                crate::android_log::info("voice: audio streams reopened");
+            } else {
+                announced = true;
+                crate::android_log::info("voice: both streams playing");
+                let _ = ready_tx.send(Ok(()));
+            }
+            retry = Duration::from_millis(500);
+
+            // Watch both signals. `ticks` catches a device that stopped
+            // calling the render callback without producing an error;
+            // `failed` catches the callbacks cpal does report. Either way
+            // drop the streams and rebuild them outside this loop body.
+            let mut last_ticks = health.ticks.load(Ordering::Relaxed);
+            let mut last_progress = Instant::now();
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                if health.failed.swap(false, Ordering::Relaxed) {
+                    crate::android_log::error("voice: audio stream error; reopening");
+                    break;
+                }
+                let ticks = health.ticks.load(Ordering::Relaxed);
+                if ticks != last_ticks {
+                    last_ticks = ticks;
+                    last_progress = Instant::now();
+                } else if last_progress.elapsed() >= Duration::from_secs(3) {
+                    crate::android_log::error("voice: render callback stalled; reopening");
+                    break;
                 }
             }
-            Err(e) => {
-                crate::android_log::error(&format!("voice: build streams failed: {e}"));
-                let _ = ready_tx.send(Err(e));
+            // Leaving this block drops both streams; the next iteration
+            // re-enumerates devices so a new system default is picked up.
+            if stop_for_thread.load(Ordering::Relaxed) {
+                break;
             }
+            let message = format!(
+                "voice: audio output lost; reopening in {} ms",
+                retry.as_millis()
+            );
+            eprintln!("{message}");
+            crate::logging::write("ERROR", &message);
+            sleep_while_connected(&stop_for_thread, retry);
+            retry = (retry * 2).min(Duration::from_secs(5));
         }
     });
     // Build outcome surfaces to the caller; a failure also drops
@@ -835,6 +913,32 @@ struct AudioStreams {
     output: cpal::Stream,
 }
 
+/// Liveness of one opened pair of device streams. The render callback
+/// bumps `ticks`; either error callback raises `failed`. The device
+/// thread watches both and rebuilds the pair when a device disappears or
+/// another application takes the output away (the symptom reported as
+/// "voice input still works, but I hear nothing until I rejoin").
+#[cfg(feature = "audio-device")]
+#[derive(Clone, Default)]
+struct StreamHealth {
+    ticks: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
+}
+
+/// Backoff that still notices a leave. A plain `sleep(5 s)` would keep the
+/// microphone device open after the user already left the channel.
+#[cfg(feature = "audio-device")]
+fn sleep_while_connected(stop: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(100)));
+    }
+}
+
 /// Open both device streams at 48 kHz (refuse-not-degrade on rate),
 /// quantum-aligned period with device-default fallback — the terminal
 /// client's two-attempt discipline, per direction.
@@ -845,6 +949,7 @@ fn build_streams(
     pcm_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
     muted: Arc<AtomicBool>,
     mic_level: Arc<AtomicU32>,
+    health: &StreamHealth,
 ) -> Result<AudioStreams, String> {
     crate::android_log::info("voice: build_streams entered");
     let audio = crate::api::settings::audio_prefs();
@@ -896,6 +1001,7 @@ fn build_streams(
         let drops = drops.clone();
         let muted = muted.clone();
         let mic_level = mic_level.clone();
+        let health = health.clone();
         let autogain_enabled = audio.mic_autogain;
         let autogain_target = audio.mic_autogain_target_db;
         let mut autogain = MicAutogain::new(autogain_enabled, autogain_target);
@@ -946,7 +1052,12 @@ fn build_streams(
                     }
                 }
             },
-            |e| eprintln!("voice: capture stream error: {e}"),
+            move |e| {
+                health.failed.store(true, Ordering::Relaxed);
+                let message = format!("voice: capture stream error: {e}");
+                eprintln!("{message}");
+                crate::logging::write("ERROR", &message);
+            },
             None,
         )
     };
@@ -982,6 +1093,7 @@ fn build_streams(
     let build_output = |cfg: &cpal::StreamConfig| {
         let mixer = mixer.clone();
         let aec = aec.clone();
+        let health = health.clone();
         let mut first = true;
         let mut render_carry: Vec<f32> = Vec::new();
         // The cue being played: its samples and how far in the callback
@@ -992,6 +1104,7 @@ fn build_streams(
         out_dev.build_output_stream(
             cfg,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                health.ticks.fetch_add(1, Ordering::Relaxed);
                 let frames = data.len() / out_channels.max(1);
                 if first {
                     first = false;
@@ -1084,7 +1197,12 @@ fn build_streams(
                     }
                 }
             },
-            |e| eprintln!("voice: render stream error: {e}"),
+            move |e| {
+                health.failed.store(true, Ordering::Relaxed);
+                let message = format!("voice: render stream error: {e}");
+                eprintln!("{message}");
+                crate::logging::write("ERROR", &message);
+            },
             None,
         )
     };

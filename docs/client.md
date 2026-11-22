@@ -239,10 +239,21 @@ folder.
 | a share's tile says "connecting…" | the first decoded frame has not reached the display yet; if it stays there, check the receiver's `video:` lines |
 | *Check for updates* reports "no releases at …" | no `v*` release is published yet, or the GitHub API is rate-limiting. The check reads `releases/latest`, which needs no token and no account |
 | the update card says this copy is not writable | it is a package-manager install (`/opt/parley`); update with `pacman`/`yay`. Only a `install.sh` copy under `~/.local` is the app's to replace |
-| Parley does not come back after installing an update | the reason is in `~/.cache/parley/update.log` (`%LOCALAPPDATA%\parley\update.log` on Windows); the previous build is still on disk and starts normally |
+| an update downloads, the app closes and the old version opens again | the swap script force-closes a stuck process, starts the new build, and rolls back to the old one if it exits immediately; the reason is in `~/.cache/parley/update.log` (`%LOCALAPPDATA%\parley\update.log` on Windows). Settings → Updates also shows that the last handoff did not finish. Send that log from Settings → Support › Report a problem |
+| others hear me but I hear nothing | the native device thread watches the render callback and stream errors, and reopens the audio devices automatically after a device switch, driver reset or another application taking the output. If it persists, the `voice:` lines are in the report's `rust-current.log` |
+| I deafened but can still unmute my mic | while deafened the mic/AFK buttons are replaced by a disabled *Deafened* label; only the headset button undeafens, restoring both directions |
 | *Apply sounds* says a file is missing | the MP3 must be named exactly `join.mp3`/`leave.mp3`/`afk.mp3` in the folder the Profile page prints, and edited files need another *Apply* |
 | a chat file card will not download | the message expired (24 h ephemeral, unless pinned) or the server's disk is full — the server log names the missing id |
 
 Logs: run `~/.local/opt/parley/parley` from a terminal to see
 `video:`/`voice:`/`window:` lines; the login page shows the build
-version.
+version. The app also keeps `logs/session-current.log` under its data
+directory (`%APPDATA%\parley` on Windows, `$XDG_CONFIG_HOME/parley` or
+`~/.config/parley` elsewhere) and rotates the previous session to
+`session-previous.log`, so a hard crash is still reportable. The native
+voice log is `logs/rust-current.log` beside it. Settings → Support ›
+*Report a problem* saves all of these with `system.txt` (distro, desktop,
+audio/video drivers, PipeWire/Pulse state) and an optional screenshot in
+`reports/parley-report-…`, then opens a prefilled GitHub issue. GitHub
+requires an account to submit; use *Save report* or *Copy summary* when
+signing in is not possible.

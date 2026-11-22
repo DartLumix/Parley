@@ -1219,7 +1219,8 @@ class _HomePageState extends State<HomePage> {
       final loaded = await settings_api.load();
       final supported = await hwEncodeSupported();
       final canShare = await screenShareSupported();
-      final canCamera = await cameraShareSupported() &&
+      final canCamera =
+          await cameraShareSupported() &&
           (!AndroidPlatform.supported || await AndroidPlatform.hasCamera());
       if (!mounted) return;
       setState(() {
@@ -3262,6 +3263,13 @@ class _HomePageState extends State<HomePage> {
   Future<void> _toggleMic() async {
     final sessionId = _session?.sessionId;
     if (sessionId == null) return;
+    // Deafened is one state, not two independent switches: there is no
+    // useful "mic on while I hear nothing" halfway point. The only way
+    // out is undeafen, which restores both directions.
+    if (_outputMuted) {
+      await _toggleHeadphones();
+      return;
+    }
     final me = _session?.userId;
     final next = !_micMuted;
     try {
@@ -3437,9 +3445,22 @@ class _HomePageState extends State<HomePage> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // Deafened replaces the mic and AFK controls with a disabled
+            // reminder; the headset button is the single way back. That
+            // removes the contradictory "unmute my mic but keep hearing
+            // nothing" state the old two switches allowed.
+            if (_outputMuted)
+              TextButton.icon(
+                onPressed: null,
+                style: TextButton.styleFrom(
+                  disabledForegroundColor: Colors.white30,
+                ),
+                icon: const Icon(Icons.mic_off, size: 20),
+                label: const Text('Deafened'),
+              )
             // While away the AFK button REPLACES the mic button: one
             // control for the state you are in, not two ways out of it.
-            if (_afkStatus != null)
+            else if (_afkStatus != null)
               TextButton.icon(
                 onPressed: inVoice ? _exitAfk : null,
                 style: TextButton.styleFrom(foregroundColor: _afkAmber),
@@ -3453,8 +3474,9 @@ class _HomePageState extends State<HomePage> {
                 label: Text(_micMuted ? 'Unmute' : 'Mute'),
               ),
             // Away is one click from a muted mic, next to it — the
-            // muted state is what makes AFK meaningful.
-            if (_afkStatus == null && _micMuted)
+            // muted state is what makes AFK meaningful. Deafened owns the
+            // whole audio state, so AFK is not offered there.
+            if (!_outputMuted && _afkStatus == null && _micMuted)
               TextButton.icon(
                 onPressed: inVoice ? _enterAfk : null,
                 style: TextButton.styleFrom(foregroundColor: _afkAmber),
@@ -3469,8 +3491,8 @@ class _HomePageState extends State<HomePage> {
             // and the bar must stay narrow on small windows.
             Tooltip(
               message: _outputMuted
-                  ? 'Unmute your mic and sound'
-                  : 'Mute your mic and everything you hear',
+                  ? 'Undeafen your mic and sound'
+                  : 'Deafen: mute your mic and everything you hear',
               child: IconButton(
                 onPressed: inVoice ? _toggleHeadphones : null,
                 iconSize: 20,

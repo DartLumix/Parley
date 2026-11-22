@@ -1,18 +1,35 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:irondash_engine_context/irondash_engine_context.dart';
 
 import 'src/app.dart';
+import 'src/app_log.dart';
+import 'src/update/updater.dart' as updater;
 import 'src/rust/api/video.dart' as video_api;
 import 'src/rust/frb_generated.dart';
 import 'src/window.dart';
 
-Future<void> main() async {
+void main() {
   // Platform channels (EngineContext.getEngineHandle) need the services
   // binding before runApp initializes it for us.
   WidgetsFlutterBinding.ensureInitialized();
+  // Start the crash-proof session log before Rust and the first frame: the
+  // previous session stays on disk, which is what a report after a hard
+  // crash needs.
+  AppLog.start();
+  runZonedGuarded(_start, (error, stack) {
+    AppLog.write('dart', 'uncaught error: $error\n$stack');
+    AppLog.flush();
+  });
+}
+
+Future<void> _start() async {
   await RustLib.init();
+  // If this is the build a previous update handed over to, the marker has
+  // done its job. An older build keeps it so Settings can explain the stall.
+  updater.clearCompletedUpdate();
   // 7f: hand the Rust texture bridge the engine handle BEFORE any
   // session can start receiving shares. A failure is non-fatal for
   // the client (voice/chat still work; video will error later).
@@ -23,6 +40,7 @@ Future<void> main() async {
   } catch (e, st) {
     debugPrint('video prepare failed (video disabled): $e\n$st');
   }
+  AppLog.flush();
   // One probe at startup. Whether the platform channel is reachable is
   // the difference between REAL fullscreen (the compositor's) and a page
   // that merely covers our window — and a silent failure only shows up

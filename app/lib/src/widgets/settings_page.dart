@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../rust/api/settings.dart' as settings_api;
 import '../theme.dart';
+import 'report_section.dart';
 import 'update_section.dart';
 
 /// Audio, video and account preferences.
@@ -99,6 +100,7 @@ class _SettingsPageState extends State<SettingsPage> {
         ],
       ),
       body: ListView(
+        key: const Key('settings-scroll'),
         padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
         children: [
           if (_error != null)
@@ -331,6 +333,21 @@ class _SettingsPageState extends State<SettingsPage> {
             'Signing out forgets the saved session on this machine. '
             'Closing the window does not — it reconnects on the next launch.',
             style: TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+          const SizedBox(height: 20),
+          _section(theme, 'Support'),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.bug_report_outlined, size: 20),
+            title: const Text('Report a problem'),
+            subtitle: const Text(
+              'Collect logs, the previous session, system and driver details, '
+              'and an optional screenshot for a GitHub issue.',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (context) => const ReportPage()),
+            ),
           ),
           const SizedBox(height: 20),
           _section(theme, 'Updates'),
