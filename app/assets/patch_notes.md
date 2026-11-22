@@ -12,6 +12,21 @@
      stripped. Emoji and plain Unicode (·, →, —) are fine.
 -->
 
+# Parley 0.6.3
+
+## Features
+- Per l'incredibile felicità di FladioGelo, nelle impostazioni c'è il toggle per avere le notifiche di sistema per il poke (se le attivi e non funzionano te la vedi tu, puoi emulare un altro DE se ti va)
+- Issues report: sezione nelle impostazioni per reportare bug, crash, problemi vari e robe. Vi allega i log della sessione corrente oppure potete allegare i log dell'ultima se era crushata. Se serve allegate screenshot. Vi allega in automatico anche tutte le informazioni di sistema di driver, versioni robe (così FladioGelo viene automaticamente flaggato come se lo fixa da solo). Dovrebbe penso servire l'account di Github per caricare l'Issue almeno che non sia cambiato qualcosa
+
+## Fixes
+
+- Windows di mmerda. L'updater dovrebbe funzionare. (chiaramente si vedrà con la 0.6.4)
+- Audio della stream da chiusa
+- Unmute da Deaf adesso funziona sensatamente
+- Forse fixato il problema dell'audio che svanisce quando ti tippi sulla stoneblock (LOL)
+
+
+
 # Parley 0.6.2
 
 A small reliability patch for the 0.6.1 hardware media paths. There is no
